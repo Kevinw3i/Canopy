@@ -436,10 +436,7 @@ impl Component for CloudWatchSearchScreen {
             }
             // `/` elsewhere (except text inputs) → jump to query input
             KeyCode::Char('/')
-                if !matches!(
-                    self.focus,
-                    CwFocus::QueryInput | CwFocus::LogGroupFilter
-                ) =>
+                if !matches!(self.focus, CwFocus::QueryInput | CwFocus::LogGroupFilter) =>
             {
                 self.focus = CwFocus::QueryInput;
                 self.query_input.focused = true;
@@ -562,12 +559,12 @@ impl Component for CloudWatchSearchScreen {
         self.log_group_filter.render(left_chunks[1], buf);
 
         // Log group table (use filtered_indices)
-        let lg_border_color = if matches!(self.focus, CwFocus::LogGroupList | CwFocus::LogGroupFilter)
-        {
-            Color::Green
-        } else {
-            Color::Cyan
-        };
+        let lg_border_color =
+            if matches!(self.focus, CwFocus::LogGroupList | CwFocus::LogGroupFilter) {
+                Color::Green
+            } else {
+                Color::Cyan
+            };
         let selected_lg = self.selected_log_group.clone();
         let lg_rows = self.filtered_indices.iter().filter_map(|&i| {
             let lg = self.log_groups.get(i)?;
@@ -653,8 +650,8 @@ impl Component for CloudWatchSearchScreen {
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(right_chunks[2]);
 
-        let use_insights = matches!(self.search_mode, SearchMode::InsightsQuery)
-            && self.query_id.is_some();
+        let use_insights =
+            matches!(self.search_mode, SearchMode::InsightsQuery) && self.query_id.is_some();
 
         if use_insights {
             let rows = self.query_results.iter().map(|fields| {
@@ -797,8 +794,16 @@ mod tests {
             groups: vec!["ops".into()],
             features: FeatureFlags::default(),
             allowed_accounts: vec![
-                AllowedAccount { account_id: "111".into(), account_name: "dev".into(), role_arn: "arn:1".into() },
-                AllowedAccount { account_id: "222".into(), account_name: "prod".into(), role_arn: "arn:2".into() },
+                AllowedAccount {
+                    account_id: "111".into(),
+                    account_name: "dev".into(),
+                    role_arn: "arn:1".into(),
+                },
+                AllowedAccount {
+                    account_id: "222".into(),
+                    account_name: "prod".into(),
+                    role_arn: "arn:2".into(),
+                },
             ],
             allowed_regions: vec!["us-east-1".into(), "eu-west-1".into()],
             allowed_log_group_arns: vec!["arn:aws:logs:*:*:log-group:/app/web-service*".into()],
@@ -811,9 +816,24 @@ mod tests {
 
     fn test_log_groups() -> Vec<LogGroup> {
         vec![
-            LogGroup { name: "/app/web-service".into(), arn: "arn:1".into(), stored_bytes: Some(1024), retention_days: Some(30) },
-            LogGroup { name: "/app/api-gateway".into(), arn: "arn:2".into(), stored_bytes: None, retention_days: None },
-            LogGroup { name: "/system/ecs".into(), arn: "arn:3".into(), stored_bytes: Some(2048), retention_days: Some(7) },
+            LogGroup {
+                name: "/app/web-service".into(),
+                arn: "arn:1".into(),
+                stored_bytes: Some(1024),
+                retention_days: Some(30),
+            },
+            LogGroup {
+                name: "/app/api-gateway".into(),
+                arn: "arn:2".into(),
+                stored_bytes: None,
+                retention_days: None,
+            },
+            LogGroup {
+                name: "/system/ecs".into(),
+                arn: "arn:3".into(),
+                stored_bytes: Some(2048),
+                retention_days: Some(7),
+            },
         ]
     }
 
@@ -863,7 +883,10 @@ mod tests {
         screen.refilter_log_groups();
 
         assert_eq!(screen.filtered_indices.len(), 1);
-        assert_eq!(screen.log_groups[screen.filtered_indices[0]].name, "/app/api-gateway");
+        assert_eq!(
+            screen.log_groups[screen.filtered_indices[0]].name,
+            "/app/api-gateway"
+        );
     }
 
     // ── Account/region cycling ──
@@ -1019,7 +1042,10 @@ mod tests {
     #[test]
     fn set_events_clears_query_results() {
         let mut screen = CloudWatchSearchScreen::new();
-        screen.query_results = vec![vec![QueryResultField { field: "f".into(), value: "v".into() }]];
+        screen.query_results = vec![vec![QueryResultField {
+            field: "f".into(),
+            value: "v".into(),
+        }]];
 
         screen.set_events(vec![LogEvent {
             timestamp: 1000,
@@ -1047,7 +1073,10 @@ mod tests {
 
         screen.set_query_results(GetQueryResultsResponse {
             status: QueryStatus::Complete,
-            results: vec![vec![QueryResultField { field: "@message".into(), value: "new".into() }]],
+            results: vec![vec![QueryResultField {
+                field: "@message".into(),
+                value: "new".into(),
+            }]],
             statistics: None,
         });
 
@@ -1071,7 +1100,9 @@ mod tests {
     fn on_enter_refreshes_log_groups() {
         let mut screen = CloudWatchSearchScreen::new();
         let actions = screen.on_enter();
-        assert!(actions.iter().any(|a| matches!(a, Action::RefreshLogGroups)));
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::RefreshLogGroups)));
         assert!(matches!(screen.focus, CwFocus::LogGroupList));
     }
 

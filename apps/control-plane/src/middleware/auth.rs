@@ -90,12 +90,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, middleware as axum_mw, routing::get, Router};
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
     use crate::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
     use crate::services::audit::AuditService;
     use crate::services::oidc::OidcClient;
+    use axum::{body::Body, middleware as axum_mw, routing::get, Router};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -272,9 +272,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(
-                b"test-secret-at-least-32-chars-long!!",
-            ),
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret-at-least-32-chars-long!!"),
         )
         .unwrap();
 

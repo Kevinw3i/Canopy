@@ -155,8 +155,14 @@ mod tests {
 
     #[test]
     fn instance_state_kebab_case() {
-        assert_eq!(serde_json::to_value(InstanceState::Running).unwrap(), "running");
-        assert_eq!(serde_json::to_value(InstanceState::ShuttingDown).unwrap(), "shutting-down");
+        assert_eq!(
+            serde_json::to_value(InstanceState::Running).unwrap(),
+            "running"
+        );
+        assert_eq!(
+            serde_json::to_value(InstanceState::ShuttingDown).unwrap(),
+            "shutting-down"
+        );
 
         let val: InstanceState = serde_json::from_value(json!("shutting-down")).unwrap();
         assert_eq!(val, InstanceState::ShuttingDown);

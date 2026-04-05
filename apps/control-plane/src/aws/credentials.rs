@@ -149,7 +149,10 @@ pub async fn assume_role_scoped(
     let mut assume = sts_client
         .assume_role()
         .role_arn(&account.role_arn)
-        .role_session_name(sanitize_session_name("ops-connect", &session_context.user_id))
+        .role_session_name(sanitize_session_name(
+            "ops-connect",
+            &session_context.user_id,
+        ))
         .duration_seconds(duration)
         .policy(inline_policy);
 
@@ -226,9 +229,9 @@ pub fn connect_session_policy(
     if use_ssm {
         let mut resources = vec![instance_arn.clone()];
         if ssm_os_user_enforced {
-            resources.push(
-                format!("arn:aws:ssm:{region}::document/AWS-StartSSHSession"),
-            );
+            resources.push(format!(
+                "arn:aws:ssm:{region}::document/AWS-StartSSHSession"
+            ));
         } else {
             resources.extend([
                 format!("arn:aws:ssm:{region}::document/AWS-StartSSHSession"),
@@ -378,10 +381,12 @@ mod tests {
         assert!(actions.iter().any(|a| a == "ssm:StartSession"));
 
         // Should have OS user condition
-        assert!(stmts[0]["Condition"]["StringEquals"]["ssm:resourceTag/SSMSessionRunAs"]
-            .as_str()
-            .unwrap()
-            == "ec2-user");
+        assert!(
+            stmts[0]["Condition"]["StringEquals"]["ssm:resourceTag/SSMSessionRunAs"]
+                .as_str()
+                .unwrap()
+                == "ec2-user"
+        );
     }
 
     #[test]
@@ -400,8 +405,12 @@ mod tests {
         assert_eq!(stmts.len(), 1);
 
         let actions = stmts[0]["Action"].as_array().unwrap();
-        assert!(actions.iter().any(|a| a == "ec2-instance-connect:SendSSHPublicKey"));
-        assert!(actions.iter().any(|a| a == "ec2-instance-connect:OpenTunnel"));
+        assert!(actions
+            .iter()
+            .any(|a| a == "ec2-instance-connect:SendSSHPublicKey"));
+        assert!(actions
+            .iter()
+            .any(|a| a == "ec2-instance-connect:OpenTunnel"));
 
         // EIC OS user condition
         assert_eq!(
@@ -451,9 +460,8 @@ mod tests {
 
     #[test]
     fn test_policy_neither_ssm_nor_eic() {
-        let policy = connect_session_policy(
-            "i-none", "444", "us-west-2", false, false, false, None,
-        );
+        let policy =
+            connect_session_policy("i-none", "444", "us-west-2", false, false, false, None);
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
         let stmts = v["Statement"].as_array().unwrap();
         assert!(stmts.is_empty());

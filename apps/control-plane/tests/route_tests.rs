@@ -6,8 +6,7 @@
 use axum::{
     body::Body,
     http::{Request, StatusCode},
-    middleware as axum_mw,
-    Router,
+    middleware as axum_mw, Router,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
@@ -57,8 +56,7 @@ fn dev_config() -> AppConfig {
 }
 
 fn build_state(config: AppConfig) -> Arc<AppState> {
-    let entitlement_store =
-        control_plane::models::entitlements::EntitlementStore::dev_defaults();
+    let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
     let audit_service = AuditService::new();
 
@@ -884,10 +882,7 @@ async fn cloudwatch_insights_results_rejects_tampered_token_prod_path() {
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp.into_body()).await;
-    assert!(json["message"]
-        .as_str()
-        .unwrap()
-        .contains("tampered"));
+    assert!(json["message"].as_str().unwrap().contains("tampered"));
 }
 
 #[tokio::test]
@@ -1074,7 +1069,10 @@ async fn ec2_list_pagination_next_token_roundtrip() {
     // Page 1 and page 2 should have different instances
     let id1 = json1["instances"][0]["instance_id"].as_str().unwrap();
     let id2 = json2["instances"][0]["instance_id"].as_str().unwrap();
-    assert_ne!(id1, id2, "Paginated pages should return different instances");
+    assert_ne!(
+        id1, id2,
+        "Paginated pages should return different instances"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1607,7 +1605,10 @@ async fn cloudwatch_insights_rejects_empty_log_group_names() {
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = body_json(resp.into_body()).await;
-    assert!(json["message"].as_str().unwrap().contains("log_group_names"));
+    assert!(json["message"]
+        .as_str()
+        .unwrap()
+        .contains("log_group_names"));
 }
 
 #[tokio::test]
@@ -1834,9 +1835,13 @@ async fn entitlements_for_readonly_user_has_limited_features() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp.into_body()).await;
     assert!(json["features"]["can_view_ec2"].as_bool().unwrap());
-    assert!(json["features"]["can_use_cloudwatch_search"].as_bool().unwrap());
+    assert!(json["features"]["can_use_cloudwatch_search"]
+        .as_bool()
+        .unwrap());
     assert!(!json["features"]["can_use_ssm"].as_bool().unwrap());
-    assert!(!json["features"]["can_use_ec2_instance_connect"].as_bool().unwrap());
+    assert!(!json["features"]["can_use_ec2_instance_connect"]
+        .as_bool()
+        .unwrap());
     assert_eq!(json["allowed_accounts"].as_array().unwrap().len(), 1);
     assert_eq!(json["allowed_accounts"][0]["account_id"], "222222222222");
 }

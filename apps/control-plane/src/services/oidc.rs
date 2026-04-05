@@ -259,8 +259,14 @@ impl OidcClient {
     fn decoding_key_from_jwk(jwk: &Jwk) -> anyhow::Result<(DecodingKey, Algorithm)> {
         match jwk.kty.as_str() {
             "RSA" => {
-                let n = jwk.n.as_ref().ok_or_else(|| anyhow::anyhow!("RSA JWK missing 'n'"))?;
-                let e = jwk.e.as_ref().ok_or_else(|| anyhow::anyhow!("RSA JWK missing 'e'"))?;
+                let n = jwk
+                    .n
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("RSA JWK missing 'n'"))?;
+                let e = jwk
+                    .e
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("RSA JWK missing 'e'"))?;
                 let key = DecodingKey::from_rsa_components(n, e)?;
                 let alg = match jwk.alg.as_deref() {
                     Some("RS384") => Algorithm::RS384,
@@ -273,8 +279,14 @@ impl OidcClient {
                 Ok((key, alg))
             }
             "EC" => {
-                let x = jwk.x.as_ref().ok_or_else(|| anyhow::anyhow!("EC JWK missing 'x'"))?;
-                let y = jwk.y.as_ref().ok_or_else(|| anyhow::anyhow!("EC JWK missing 'y'"))?;
+                let x = jwk
+                    .x
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("EC JWK missing 'x'"))?;
+                let y = jwk
+                    .y
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("EC JWK missing 'y'"))?;
                 let key = DecodingKey::from_ec_components(x, y)?;
                 let alg = match jwk.crv.as_deref() {
                     Some("P-384") => Algorithm::ES384,
@@ -479,10 +491,7 @@ impl OidcClient {
 
     /// Poll for device code completion. Returns Ok(Some(tokens)) on success,
     /// Ok(None) if still pending, or Err on terminal failure.
-    pub async fn device_poll(
-        &self,
-        device_code: &str,
-    ) -> anyhow::Result<DevicePollResult> {
+    pub async fn device_poll(&self, device_code: &str) -> anyhow::Result<DevicePollResult> {
         let ep = self.endpoints().await?;
 
         let mut params = vec![
@@ -655,11 +664,7 @@ mod tests {
             x: None,
             y: None,
         };
-        client
-            .jwks_cache
-            .write()
-            .await
-            .insert(TEST_KID.into(), jwk);
+        client.jwks_cache.write().await.insert(TEST_KID.into(), jwk);
         client
     }
 
@@ -742,7 +747,11 @@ mod tests {
         };
         let result = OidcClient::decoding_key_from_jwk(&jwk);
         assert!(result.is_err());
-        assert!(result.err().unwrap().to_string().contains("Unsupported JWK key type: OKP"));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Unsupported JWK key type: OKP"));
     }
 
     #[test]
@@ -878,7 +887,10 @@ mod tests {
         };
         let client = OidcClient::new(config);
         let ep = client.endpoints().await.unwrap();
-        assert_eq!(ep.authorization_endpoint, "https://auth.example.com/authorize");
+        assert_eq!(
+            ep.authorization_endpoint,
+            "https://auth.example.com/authorize"
+        );
         assert_eq!(ep.token_endpoint, "https://auth.example.com/token");
         assert_eq!(
             ep.device_authorization_endpoint.as_deref(),

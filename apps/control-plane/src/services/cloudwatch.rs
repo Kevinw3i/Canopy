@@ -147,8 +147,14 @@ mod tests {
     #[test]
     fn test_mock_log_groups_two_accounts() {
         let groups = mock_log_groups();
-        let acct_111: Vec<_> = groups.iter().filter(|g| g.arn.contains("111111111111")).collect();
-        let acct_222: Vec<_> = groups.iter().filter(|g| g.arn.contains("222222222222")).collect();
+        let acct_111: Vec<_> = groups
+            .iter()
+            .filter(|g| g.arn.contains("111111111111"))
+            .collect();
+        let acct_222: Vec<_> = groups
+            .iter()
+            .filter(|g| g.arn.contains("222222222222"))
+            .collect();
         assert_eq!(acct_111.len(), 3);
         assert_eq!(acct_222.len(), 1);
     }
@@ -165,7 +171,11 @@ mod tests {
     #[test]
     fn test_mock_log_events_contain_all_levels() {
         let events = mock_log_events();
-        let messages: String = events.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join(" ");
+        let messages: String = events
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(messages.contains("INFO"));
         assert!(messages.contains("WARN"));
         assert!(messages.contains("ERROR"));

@@ -408,11 +408,7 @@ async fn do_check_and_apply(
             }))
         }
         Err(e) => {
-            tracing::warn!(
-                "Cannot replace binary at {}: {}",
-                current_exe.display(),
-                e
-            );
+            tracing::warn!("Cannot replace binary at {}: {}", current_exe.display(), e);
             cleanup_tmp(&tmp_bin, &fallback_tmp_dir);
 
             // Do NOT set last_attempted_version on failure — a transient error
@@ -524,10 +520,7 @@ mod tests {
         assert!(suffix.is_some());
         let s = suffix.unwrap();
         assert!(
-            s == "darwin-arm64"
-                || s == "darwin-amd64"
-                || s == "linux-amd64"
-                || s == "linux-arm64"
+            s == "darwin-arm64" || s == "darwin-amd64" || s == "linux-amd64" || s == "linux-arm64"
         );
     }
 

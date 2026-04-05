@@ -55,16 +55,11 @@ async fn main() -> anyhow::Result<()> {
     let cors = if config.dev_mode && config.cors_allowed_origins.is_empty() {
         if config.mock_aws_data == Some(false) {
             // Real AWS with dev auth: restrict CORS to localhost only
-            tracing::warn!(
-                "CORS: dev_mode with real AWS — restricting to localhost origins only"
-            );
-            let localhost_origins: Vec<_> = [
-                "http://localhost:8443",
-                "http://127.0.0.1:8443",
-            ]
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
+            tracing::warn!("CORS: dev_mode with real AWS — restricting to localhost origins only");
+            let localhost_origins: Vec<_> = ["http://localhost:8443", "http://127.0.0.1:8443"]
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(localhost_origins))
                 .allow_methods(tower_http::cors::Any)
@@ -139,9 +134,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to register SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => tracing::info!("Received SIGINT, shutting down"),
             _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down"),

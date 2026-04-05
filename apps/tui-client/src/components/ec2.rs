@@ -35,9 +35,9 @@ struct PendingConnect {
 /// Which instances to show based on state
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StateFilter {
-    All,            // Show everything
-    Running,        // Only running (not stopped)
-    Stopped,        // Only stopped
+    All,     // Show everything
+    Running, // Only running (not stopped)
+    Stopped, // Only stopped
 }
 
 impl StateFilter {
@@ -151,7 +151,8 @@ impl Ec2Screen {
     }
 
     fn apply_state_filter(&mut self) {
-        let count = self.instances
+        let count = self
+            .instances
             .iter()
             .filter(|i| self.state_filter.matches(&i.state))
             .count();
@@ -325,7 +326,10 @@ impl Ec2Screen {
                     lines.push(Line::from(vec![
                         Span::styled("  [s] ", Style::default().fg(Color::Gray)),
                         Span::styled("SSM Session Manager", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not available (no SSM agent)", Style::default().fg(Color::Gray)),
+                        Span::styled(
+                            " - not available (no SSM agent)",
+                            Style::default().fg(Color::Gray),
+                        ),
                     ]));
                 }
 
@@ -333,7 +337,10 @@ impl Ec2Screen {
                 if inst.instance_connect_capable && has_eic {
                     lines.push(Line::from(vec![
                         Span::styled("  [e] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled("EC2 Instance Connect SSH", Style::default().fg(Color::White)),
+                        Span::styled(
+                            "EC2 Instance Connect SSH",
+                            Style::default().fg(Color::White),
+                        ),
                         Span::styled(" - ready", Style::default().fg(Color::Green)),
                     ]));
                 } else if inst.instance_connect_capable && !has_eic {
@@ -353,13 +360,18 @@ impl Ec2Screen {
                 // Direct SSH
                 let has_ip = inst.private_ip.is_some() || inst.public_ip.is_some();
                 if has_ip && has_ssm {
-                    let ip_display = inst.public_ip.as_deref()
+                    let ip_display = inst
+                        .public_ip
+                        .as_deref()
                         .or(inst.private_ip.as_deref())
                         .unwrap_or("?");
                     lines.push(Line::from(vec![
                         Span::styled("  [c] ", Style::default().fg(Color::Green).bold()),
                         Span::styled("SSH (your key)", Style::default().fg(Color::White)),
-                        Span::styled(format!(" - {}", ip_display), Style::default().fg(Color::Green)),
+                        Span::styled(
+                            format!(" - {}", ip_display),
+                            Style::default().fg(Color::Green),
+                        ),
                     ]));
                 } else if has_ip && !has_ssm {
                     lines.push(Line::from(vec![
@@ -418,7 +430,9 @@ impl Ec2Screen {
             }
             shared::dto::ec2::ConnectMethod::Ec2InstanceConnect => {
                 if !inst.instance_connect_capable {
-                    return Action::ShowError("Instance does not support EC2 Instance Connect".into());
+                    return Action::ShowError(
+                        "Instance does not support EC2 Instance Connect".into(),
+                    );
                 }
             }
             shared::dto::ec2::ConnectMethod::Ssh => {
@@ -594,7 +608,13 @@ impl Component for Ec2Screen {
                         } else {
                             Ec2Focus::Table
                         };
-                        return self.dispatch_connect(method, instance_id, account_id, region, Some(user));
+                        return self.dispatch_connect(
+                            method,
+                            instance_id,
+                            account_id,
+                            region,
+                            Some(user),
+                        );
                     }
                     _ => return Action::Noop,
                 }
@@ -644,7 +664,10 @@ impl Component for Ec2Screen {
                     return Action::Noop;
                 }
                 if self.cycle_account(false) {
-                    let label = format!("Account → {}", self.selected_account_id.as_deref().unwrap_or("All"));
+                    let label = format!(
+                        "Account → {}",
+                        self.selected_account_id.as_deref().unwrap_or("All")
+                    );
                     self.scope_transition = Some(ScopeTransition::new(label));
                     return Action::RefreshEc2;
                 }
@@ -655,7 +678,10 @@ impl Component for Ec2Screen {
                     return Action::Noop;
                 }
                 if self.cycle_account(true) {
-                    let label = format!("Account → {}", self.selected_account_id.as_deref().unwrap_or("All"));
+                    let label = format!(
+                        "Account → {}",
+                        self.selected_account_id.as_deref().unwrap_or("All")
+                    );
                     self.scope_transition = Some(ScopeTransition::new(label));
                     return Action::RefreshEc2;
                 }
@@ -667,7 +693,10 @@ impl Component for Ec2Screen {
                     return Action::Noop;
                 }
                 if self.cycle_region(false) {
-                    let label = format!("Region → {}", self.selected_region.as_deref().unwrap_or("All"));
+                    let label = format!(
+                        "Region → {}",
+                        self.selected_region.as_deref().unwrap_or("All")
+                    );
                     self.scope_transition = Some(ScopeTransition::new(label));
                     return Action::RefreshEc2;
                 }
@@ -678,7 +707,10 @@ impl Component for Ec2Screen {
                     return Action::Noop;
                 }
                 if self.cycle_region(true) {
-                    let label = format!("Region → {}", self.selected_region.as_deref().unwrap_or("All"));
+                    let label = format!(
+                        "Region → {}",
+                        self.selected_region.as_deref().unwrap_or("All")
+                    );
                     self.scope_transition = Some(ScopeTransition::new(label));
                     return Action::RefreshEc2;
                 }
@@ -736,14 +768,8 @@ impl Component for Ec2Screen {
         self.search_input.render(main_chunks[0], buf);
 
         // Account/Region scope header
-        let acct_display = self
-            .selected_account_id
-            .as_deref()
-            .unwrap_or("All");
-        let region_display = self
-            .selected_region
-            .as_deref()
-            .unwrap_or("All");
+        let acct_display = self.selected_account_id.as_deref().unwrap_or("All");
+        let region_display = self.selected_region.as_deref().unwrap_or("All");
         let acct_label = if self.available_accounts.len() > 1 {
             format!("Account [/]: {}", acct_display)
         } else {
@@ -877,7 +903,13 @@ impl Ec2Screen {
         let mut lines = Vec::new();
         for (i, user) in pending.users.iter().enumerate() {
             let (prefix, style) = if i == pending.selected {
-                (">> ", Style::default().fg(Color::White).bg(Color::Indexed(24)).bold())
+                (
+                    ">> ",
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Indexed(24))
+                        .bold(),
+                )
             } else {
                 ("   ", Style::default().fg(Color::White))
             };
@@ -911,49 +943,57 @@ impl Ec2Screen {
 impl Ec2Screen {
     fn render_table(&mut self, area: Rect, buf: &mut Buffer) {
         let filter = self.state_filter;
-        let rows: Vec<_> = self.instances.iter()
+        let rows: Vec<_> = self
+            .instances
+            .iter()
             .filter(|i| filter.matches(&i.state))
             .map(|inst| {
-            let state_style = match inst.state {
-                shared::dto::ec2::InstanceState::Running => Style::default().fg(Color::Green),
-                shared::dto::ec2::InstanceState::Stopped => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Yellow),
-            };
+                let state_style = match inst.state {
+                    shared::dto::ec2::InstanceState::Running => Style::default().fg(Color::Green),
+                    shared::dto::ec2::InstanceState::Stopped => Style::default().fg(Color::Red),
+                    _ => Style::default().fg(Color::Yellow),
+                };
 
-            Row::new(vec![
-                Cell::from(inst.instance_id.as_str()).style(Style::default().fg(Color::Yellow)),
-                Cell::from(inst.name.as_deref().unwrap_or("-")).style(Style::default().fg(Color::White).bold()),
-                Cell::from(inst.private_ip.as_deref().unwrap_or("-")).style(Style::default().fg(Color::White)),
-                Cell::from(inst.public_ip.as_deref().unwrap_or("-")).style(Style::default().fg(Color::White)),
-                Cell::from(inst.state.to_string()).style(state_style),
-                Cell::from(inst.instance_type.as_str()).style(Style::default().fg(Color::Gray)),
-                Cell::from(if inst.ssm_managed { "Yes" } else { "No" }).style(
-                    if inst.ssm_managed {
+                Row::new(vec![
+                    Cell::from(inst.instance_id.as_str()).style(Style::default().fg(Color::Yellow)),
+                    Cell::from(inst.name.as_deref().unwrap_or("-"))
+                        .style(Style::default().fg(Color::White).bold()),
+                    Cell::from(inst.private_ip.as_deref().unwrap_or("-"))
+                        .style(Style::default().fg(Color::White)),
+                    Cell::from(inst.public_ip.as_deref().unwrap_or("-"))
+                        .style(Style::default().fg(Color::White)),
+                    Cell::from(inst.state.to_string()).style(state_style),
+                    Cell::from(inst.instance_type.as_str()).style(Style::default().fg(Color::Gray)),
+                    Cell::from(if inst.ssm_managed { "Yes" } else { "No" }).style(
+                        if inst.ssm_managed {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    ),
+                    Cell::from(if inst.instance_connect_capable {
+                        "Yes"
+                    } else {
+                        "No"
+                    })
+                    .style(if inst.instance_connect_capable {
                         Style::default().fg(Color::Green)
                     } else {
                         Style::default().fg(Color::Gray)
-                    },
-                ),
-                Cell::from(if inst.instance_connect_capable {
-                    "Yes"
-                } else {
-                    "No"
-                })
-                .style(if inst.instance_connect_capable {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default().fg(Color::Gray)
-                }),
-                Cell::from(inst.environment.as_deref().unwrap_or("-")).style(Style::default().fg(Color::Cyan)),
-            ])
-        }).collect();
+                    }),
+                    Cell::from(inst.environment.as_deref().unwrap_or("-"))
+                        .style(Style::default().fg(Color::Cyan)),
+                ])
+            })
+            .collect();
 
         let title = if self.state_filter == StateFilter::All {
             "Instances".to_string()
         } else {
             format!("Instances [{}]", self.state_filter.label())
         };
-        self.table.render_with_rows(rows.into_iter(), &title, area, buf);
+        self.table
+            .render_with_rows(rows.into_iter(), &title, area, buf);
     }
 }
 
@@ -987,8 +1027,16 @@ mod tests {
                 can_use_ec2_instance_connect: true,
             },
             allowed_accounts: vec![
-                AllowedAccount { account_id: "111".into(), account_name: "dev".into(), role_arn: "arn:1".into() },
-                AllowedAccount { account_id: "222".into(), account_name: "prod".into(), role_arn: "arn:2".into() },
+                AllowedAccount {
+                    account_id: "111".into(),
+                    account_name: "dev".into(),
+                    role_arn: "arn:1".into(),
+                },
+                AllowedAccount {
+                    account_id: "222".into(),
+                    account_name: "prod".into(),
+                    role_arn: "arn:2".into(),
+                },
             ],
             allowed_regions: vec!["us-east-1".into(), "eu-west-1".into()],
             allowed_log_group_arns: vec![],

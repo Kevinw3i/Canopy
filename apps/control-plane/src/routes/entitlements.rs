@@ -19,25 +19,34 @@ async fn get_entitlements(
     if !state.audit_service.is_healthy() {
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(shared::errors::ApiError::internal("Audit logging unavailable")),
+            Json(shared::errors::ApiError::internal(
+                "Audit logging unavailable",
+            )),
         ));
     }
 
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
-    state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::EntitlementsView,
-        AuditOutcome::Success,
-        None,
-        None,
-        None,
-        None,
-    ).map_err(|_| (
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(shared::errors::ApiError::internal("Audit logging failed — refusing to return data")),
-    ))?;
+    state
+        .audit_service
+        .log_event(
+            &claims.sub,
+            AuditAction::EntitlementsView,
+            AuditOutcome::Success,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(shared::errors::ApiError::internal(
+                    "Audit logging failed — refusing to return data",
+                )),
+            )
+        })?;
 
     Ok(Json(entitlements))
 }

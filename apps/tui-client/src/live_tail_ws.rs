@@ -15,9 +15,7 @@ pub async fn stream_live_tail(
     tx: mpsc::UnboundedSender<Action>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    tracing::info!(
-        "Live tail: streaming simulated events (WebSocket client not yet wired)"
-    );
+    tracing::info!("Live tail: streaming simulated events (WebSocket client not yet wired)");
 
     for i in 1..=20 {
         tokio::select! {

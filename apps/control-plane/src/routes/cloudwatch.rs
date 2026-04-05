@@ -79,7 +79,8 @@ async fn get_cwl_client_for_account(
     region: &str,
     user_id: &str,
 ) -> Result<aws_sdk_cloudwatchlogs::Client, (axum::http::StatusCode, Json<ApiError>)> {
-    let mut clients = get_cwl_clients_for_account(state, entitlements, account_id, region, user_id).await?;
+    let mut clients =
+        get_cwl_clients_for_account(state, entitlements, account_id, region, user_id).await?;
     // Return the first; callers that need retry should use get_cwl_clients_for_account directly.
     Ok(clients.remove(0))
 }
@@ -104,28 +105,25 @@ async fn get_cwl_client(
         sts_external_id: state.config.aws.sts_external_id.clone(),
     };
 
-    let effective_config = crate::aws::credentials::resolve_aws_config(
-        &base_config, account, region, &session_ctx,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("AWS config resolution failed for {}: {e}", account.role_arn);
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::internal(format!(
-                "Failed to get AWS credentials for account {}: {e}",
-                account.account_id
-            ))),
-        )
-    })?;
+    let effective_config =
+        crate::aws::credentials::resolve_aws_config(&base_config, account, region, &session_ctx)
+            .await
+            .map_err(|e| {
+                tracing::error!("AWS config resolution failed for {}: {e}", account.role_arn);
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::internal(format!(
+                        "Failed to get AWS credentials for account {}: {e}",
+                        account.account_id
+                    ))),
+                )
+            })?;
 
     Ok(AwsClients::cloudwatch_logs(&effective_config))
 }
 
 /// Fail-closed when the durable audit sink is broken.
-fn require_audit_healthy(
-    state: &AppState,
-) -> Result<(), (axum::http::StatusCode, Json<ApiError>)> {
+fn require_audit_healthy(state: &AppState) -> Result<(), (axum::http::StatusCode, Json<ApiError>)> {
     if !state.audit_service.is_healthy() {
         Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -147,10 +145,24 @@ async fn list_log_groups(
 
     // Scope-aware check: verify that at least one rule grants CloudWatch
     // search AND access to the requested account+region (prevents cross-group escalation)
-    if !ent_service.has_feature_for_scope(&claims, &req.account_id, Some(&req.region), None, None, |f| f.can_use_cloudwatch_search).await {
+    if !ent_service
+        .has_feature_for_scope(
+            &claims,
+            &req.account_id,
+            Some(&req.region),
+            None,
+            None,
+            |f| f.can_use_cloudwatch_search,
+        )
+        .await
+    {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), None,
+            &claims.sub,
+            AuditAction::LogGroupList,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
             Some("CloudWatch search not authorized"),
         );
         return Err((
@@ -166,8 +178,12 @@ async fn list_log_groups(
         .any(|a| a.account_id == req.account_id)
     {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), None,
+            &claims.sub,
+            AuditAction::LogGroupList,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
             Some("Account not authorized"),
         );
         return Err((
@@ -179,8 +195,12 @@ async fn list_log_groups(
     // Enforce region entitlement
     if !entitlements.allowed_regions.contains(&req.region) {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), None,
+            &claims.sub,
+            AuditAction::LogGroupList,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
             Some("Region not authorized"),
         );
         return Err((
@@ -191,9 +211,11 @@ async fn list_log_groups(
 
     // Use scope-aware log-group ARN patterns: only patterns from rules that
     // also grant CloudWatch search + this account (prevents cross-group leak).
-    let scoped_log_arns = ent_service.allowed_log_group_arns_for_scope(
-        &claims, &req.account_id, &req.region, |f| f.can_use_cloudwatch_search,
-    ).await;
+    let scoped_log_arns = ent_service
+        .allowed_log_group_arns_for_scope(&claims, &req.account_id, &req.region, |f| {
+            f.can_use_cloudwatch_search
+        })
+        .await;
 
     let filtered: Vec<LogGroup> = if state.config.use_mock_aws() {
         // Dev mode: filter mock data to the requested scope
@@ -218,8 +240,13 @@ async fn list_log_groups(
     } else {
         // Production: fetch log groups from AWS via SDK
         let client = get_cwl_client_for_account(
-            &state, &entitlements, &req.account_id, &req.region, &claims.sub,
-        ).await?;
+            &state,
+            &entitlements,
+            &req.account_id,
+            &req.region,
+            &claims.sub,
+        )
+        .await?;
 
         let mut all_groups: Vec<LogGroup> = Vec::new();
         let mut next_token: Option<String> = None;
@@ -274,18 +301,25 @@ async fn list_log_groups(
     };
 
     // Audit after all checks pass and data is ready — fail-closed on write failure
-    state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::LogGroupList,
-        AuditOutcome::Success,
-        Some(&req.account_id),
-        Some(&req.region),
-        None,
-        None,
-    ).map_err(|_| (
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiError::internal("Audit logging failed — refusing to return data")),
-    ))?;
+    state
+        .audit_service
+        .log_event(
+            &claims.sub,
+            AuditAction::LogGroupList,
+            AuditOutcome::Success,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
+            None,
+        )
+        .map_err(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::internal(
+                    "Audit logging failed — refusing to return data",
+                )),
+            )
+        })?;
 
     Ok(Json(LogGroupsResponse {
         log_groups: filtered,
@@ -305,10 +339,24 @@ async fn filter_log_events(
         "arn:aws:logs:{}:{}:log-group:{}",
         req.region, req.account_id, req.log_group_name
     );
-    if !ent_service.has_feature_for_scope(&claims, &req.account_id, Some(&req.region), Some(&filter_lg_arn), None, |f| f.can_use_cloudwatch_search).await {
+    if !ent_service
+        .has_feature_for_scope(
+            &claims,
+            &req.account_id,
+            Some(&req.region),
+            Some(&filter_lg_arn),
+            None,
+            |f| f.can_use_cloudwatch_search,
+        )
+        .await
+    {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchSearch, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), Some(&req.log_group_name),
+            &claims.sub,
+            AuditAction::CloudwatchSearch,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            Some(&req.log_group_name),
             Some("CloudWatch search not authorized for this scope"),
         );
         return Err((
@@ -323,8 +371,12 @@ async fn filter_log_events(
         .any(|a| a.account_id == req.account_id)
     {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchSearch, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), Some(&req.log_group_name),
+            &claims.sub,
+            AuditAction::CloudwatchSearch,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            Some(&req.log_group_name),
             Some("Account not authorized"),
         );
         return Err((
@@ -336,8 +388,12 @@ async fn filter_log_events(
     // Enforce region entitlement
     if !entitlements.allowed_regions.contains(&req.region) {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchSearch, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), Some(&req.log_group_name),
+            &claims.sub,
+            AuditAction::CloudwatchSearch,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            Some(&req.log_group_name),
             Some("Region not authorized"),
         );
         return Err((
@@ -347,9 +403,11 @@ async fn filter_log_events(
     }
 
     // Enforce log-group ARN entitlement using scope-aware patterns
-    let scoped_log_arns = ent_service.allowed_log_group_arns_for_scope(
-        &claims, &req.account_id, &req.region, |f| f.can_use_cloudwatch_search,
-    ).await;
+    let scoped_log_arns = ent_service
+        .allowed_log_group_arns_for_scope(&claims, &req.account_id, &req.region, |f| {
+            f.can_use_cloudwatch_search
+        })
+        .await;
     let log_group_arn = format!(
         "arn:aws:logs:{}:{}:log-group:{}",
         req.region, req.account_id, req.log_group_name
@@ -360,8 +418,12 @@ async fn filter_log_events(
         })
     {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchSearch, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), Some(&req.log_group_name),
+            &claims.sub,
+            AuditAction::CloudwatchSearch,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            Some(&req.log_group_name),
             Some("Log group not authorized"),
         );
         return Err((
@@ -375,8 +437,13 @@ async fn filter_log_events(
     } else {
         // Production: call FilterLogEvents via AWS SDK
         let client = get_cwl_client_for_account(
-            &state, &entitlements, &req.account_id, &req.region, &claims.sub,
-        ).await?;
+            &state,
+            &entitlements,
+            &req.account_id,
+            &req.region,
+            &claims.sub,
+        )
+        .await?;
 
         let mut filter = client
             .filter_log_events()
@@ -419,18 +486,25 @@ async fn filter_log_events(
     };
 
     // Audit after the operation succeeds — fail-closed on write failure
-    state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::CloudwatchSearch,
-        AuditOutcome::Success,
-        Some(&req.account_id),
-        Some(&req.region),
-        Some(&req.log_group_name),
-        None,
-    ).map_err(|_| (
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiError::internal("Audit logging failed — refusing to return data")),
-    ))?;
+    state
+        .audit_service
+        .log_event(
+            &claims.sub,
+            AuditAction::CloudwatchSearch,
+            AuditOutcome::Success,
+            Some(&req.account_id),
+            Some(&req.region),
+            Some(&req.log_group_name),
+            None,
+        )
+        .map_err(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::internal(
+                    "Audit logging failed — refusing to return data",
+                )),
+            )
+        })?;
 
     Ok(Json(FilterLogEventsResponse {
         events,
@@ -447,10 +521,24 @@ async fn start_insights_query(
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
-    if !ent_service.has_feature_for_scope(&claims, &req.account_id, Some(&req.region), None, None, |f| f.can_use_cloudwatch_search).await {
+    if !ent_service
+        .has_feature_for_scope(
+            &claims,
+            &req.account_id,
+            Some(&req.region),
+            None,
+            None,
+            |f| f.can_use_cloudwatch_search,
+        )
+        .await
+    {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchInsightsQuery, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), None,
+            &claims.sub,
+            AuditAction::CloudwatchInsightsQuery,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
             Some("CloudWatch search not authorized"),
         );
         return Err((
@@ -466,8 +554,12 @@ async fn start_insights_query(
         .any(|a| a.account_id == req.account_id)
     {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchInsightsQuery, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), None,
+            &claims.sub,
+            AuditAction::CloudwatchInsightsQuery,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
             Some("Account not authorized"),
         );
         return Err((
@@ -479,8 +571,12 @@ async fn start_insights_query(
     // Enforce region entitlement
     if !entitlements.allowed_regions.contains(&req.region) {
         let _ = state.audit_service.log_event(
-            &claims.sub, AuditAction::CloudwatchInsightsQuery, AuditOutcome::Denied,
-            Some(&req.account_id), Some(&req.region), None,
+            &claims.sub,
+            AuditAction::CloudwatchInsightsQuery,
+            AuditOutcome::Denied,
+            Some(&req.account_id),
+            Some(&req.region),
+            None,
             Some("Region not authorized"),
         );
         return Err((
@@ -500,9 +596,11 @@ async fn start_insights_query(
         ));
     }
 
-    let scoped_log_arns = ent_service.allowed_log_group_arns_for_scope(
-        &claims, &req.account_id, &req.region, |f| f.can_use_cloudwatch_search,
-    ).await;
+    let scoped_log_arns = ent_service
+        .allowed_log_group_arns_for_scope(&claims, &req.account_id, &req.region, |f| {
+            f.can_use_cloudwatch_search
+        })
+        .await;
     if !scoped_log_arns.is_empty() {
         for lg_name in &req.log_group_names {
             let lg_arn = format!(
@@ -525,26 +623,38 @@ async fn start_insights_query(
     }
 
     // Write audit BEFORE launching StartQuery to prevent orphaned unaudited queries
-    state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::CloudwatchInsightsQuery,
-        AuditOutcome::Success,
-        Some(&req.account_id),
-        Some(&req.region),
-        Some(&req.log_group_names.join(",")),
-        None,
-    ).map_err(|_| (
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiError::internal("Audit logging failed — refusing to start query")),
-    ))?;
+    state
+        .audit_service
+        .log_event(
+            &claims.sub,
+            AuditAction::CloudwatchInsightsQuery,
+            AuditOutcome::Success,
+            Some(&req.account_id),
+            Some(&req.region),
+            Some(&req.log_group_names.join(",")),
+            None,
+        )
+        .map_err(|_| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::internal(
+                    "Audit logging failed — refusing to start query",
+                )),
+            )
+        })?;
 
     let query_id = if state.config.use_mock_aws() {
         uuid::Uuid::new_v4().to_string()
     } else {
         // Production: call StartQuery via AWS SDK
         let client = get_cwl_client_for_account(
-            &state, &entitlements, &req.account_id, &req.region, &claims.sub,
-        ).await?;
+            &state,
+            &entitlements,
+            &req.account_id,
+            &req.region,
+            &claims.sub,
+        )
+        .await?;
 
         let mut start = client
             .start_query()
@@ -597,10 +707,22 @@ async fn get_query_results(
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
-    if !ent_service.has_feature_for_scope(&claims, &req.account_id, Some(&req.region), None, None, |f| f.can_use_cloudwatch_search).await {
+    if !ent_service
+        .has_feature_for_scope(
+            &claims,
+            &req.account_id,
+            Some(&req.region),
+            None,
+            None,
+            |f| f.can_use_cloudwatch_search,
+        )
+        .await
+    {
         return Err((
             axum::http::StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden("CloudWatch search not authorized for this scope")),
+            Json(ApiError::forbidden(
+                "CloudWatch search not authorized for this scope",
+            )),
         ));
     }
 
@@ -639,9 +761,11 @@ async fn get_query_results(
                     ));
                 }
                 // Re-verify log group entitlements using scope-aware patterns
-                let scoped_arns = ent_service.allowed_log_group_arns_for_scope(
-                    &claims, &req.account_id, &req.region, |f| f.can_use_cloudwatch_search,
-                ).await;
+                let scoped_arns = ent_service
+                    .allowed_log_group_arns_for_scope(&claims, &req.account_id, &req.region, |f| {
+                        f.can_use_cloudwatch_search
+                    })
+                    .await;
                 if !scoped_arns.is_empty() {
                     for lg_name in &auth.log_group_names {
                         let lg_arn = format!(
@@ -709,8 +833,13 @@ async fn get_query_results(
     } else {
         // Production: call GetQueryResults via AWS SDK
         let client = get_cwl_client_for_account(
-            &state, &entitlements, &req.account_id, &req.region, &claims.sub,
-        ).await?;
+            &state,
+            &entitlements,
+            &req.account_id,
+            &req.region,
+            &claims.sub,
+        )
+        .await?;
 
         let resp = client
             .get_query_results()

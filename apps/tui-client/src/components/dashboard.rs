@@ -223,7 +223,10 @@ impl Component for DashboardScreen {
                 (Style::default().fg(Color::Gray), "  ")
             } else if i == self.selected {
                 (
-                    Style::default().fg(Color::White).bg(Color::Indexed(24)).bold(),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::Indexed(24))
+                        .bold(),
                     ">>",
                 )
             } else {
@@ -301,8 +304,8 @@ mod tests {
         assert_eq!(visible.len(), 4);
         assert!(!visible[0].enabled); // EC2
         assert!(!visible[1].enabled); // CW
-        assert!(visible[2].enabled);  // Access
-        assert!(visible[3].enabled);  // Settings
+        assert!(visible[2].enabled); // Access
+        assert!(visible[3].enabled); // Settings
     }
 
     #[test]
@@ -311,8 +314,8 @@ mod tests {
         screen.set_entitlements(test_entitlements(true, true, false));
 
         let visible = screen.visible_items();
-        assert!(visible[0].enabled);  // EC2
-        assert!(visible[1].enabled);  // CW
+        assert!(visible[0].enabled); // EC2
+        assert!(visible[1].enabled); // CW
     }
 
     #[test]
@@ -334,7 +337,11 @@ mod tests {
         let mut screen = DashboardScreen::new(true, false);
         screen.set_entitlements(test_entitlements(false, false, true));
 
-        let lt = screen.items.iter().find(|i| i.screen == Screen::LiveTail).unwrap();
+        let lt = screen
+            .items
+            .iter()
+            .find(|i| i.screen == Screen::LiveTail)
+            .unwrap();
         assert!(lt.enabled);
     }
 
@@ -388,7 +395,10 @@ mod tests {
         screen.set_entitlements(test_entitlements(true, true, false));
 
         let action = screen.handle_key(key(KeyCode::Char('2')));
-        assert!(matches!(action, Action::NavigateTo(Screen::CloudWatchSearch)));
+        assert!(matches!(
+            action,
+            Action::NavigateTo(Screen::CloudWatchSearch)
+        ));
     }
 
     #[test]

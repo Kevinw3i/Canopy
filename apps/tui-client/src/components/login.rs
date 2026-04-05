@@ -186,7 +186,10 @@ impl Component for LoginScreen {
 
         // Buttons
         let dev_btn_style = if self.focus == LoginFocus::LoginButton {
-            Style::default().bg(Color::Indexed(24)).fg(Color::White).bold()
+            Style::default()
+                .bg(Color::Indexed(24))
+                .fg(Color::White)
+                .bold()
         } else {
             Style::default().fg(Color::Cyan)
         };
@@ -316,7 +319,10 @@ mod tests {
 
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, Action::Noop));
-        assert_eq!(screen.status_message.as_deref(), Some("Username is required"));
+        assert_eq!(
+            screen.status_message.as_deref(),
+            Some("Username is required")
+        );
     }
 
     #[test]

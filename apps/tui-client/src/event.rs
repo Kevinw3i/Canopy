@@ -34,7 +34,7 @@ pub enum Action {
     RefreshEc2,
     SearchEc2(String),
     Ec2Loaded(Vec<shared::dto::ec2::Ec2Instance>, Vec<String>, u64), // instances, failed_scopes, generation
-    Ec2FetchFailed(String, u64), // error message, generation
+    Ec2FetchFailed(String, u64),                                     // error message, generation
     SelectInstance(usize),
     ConnectSsm(String, String, String, Option<String>), // instance_id, account_id, region, os_user
     ConnectEic(String, String, String, Option<String>), // instance_id, account_id, region, os_user
@@ -43,7 +43,7 @@ pub enum Action {
     // CloudWatch
     RefreshLogGroups,
     LogGroupsLoaded(Vec<shared::dto::cloudwatch::LogGroup>, u64), // log_groups, generation
-    LogGroupsFetchFailed(String, u64), // error, generation
+    LogGroupsFetchFailed(String, u64),                            // error, generation
     RunFilterSearch,
     RunInsightsQuery,
     PollQueryResults(String),

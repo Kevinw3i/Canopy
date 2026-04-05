@@ -20,22 +20,17 @@ pub struct QueryAuthorization {
 
 /// Encode query authorization into a signed token that can survive restarts.
 /// Format: `{aws_query_id}.{base64url(json)}.{hmac_hex}`
-pub fn sign_query_token(
-    aws_query_id: &str,
-    auth: &QueryAuthorization,
-    secret: &str,
-) -> String {
+pub fn sign_query_token(aws_query_id: &str, auth: &QueryAuthorization, secret: &str) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use sha2::Sha256;
     use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     let payload = serde_json::to_string(auth).unwrap_or_default();
     let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
 
     let msg = format!("{}.{}", aws_query_id, encoded);
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC key length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC key length");
     mac.update(msg.as_bytes());
     let sig = hex::encode(mac.finalize().into_bytes());
 
@@ -43,14 +38,11 @@ pub fn sign_query_token(
 }
 
 /// Verify and extract authorization from a signed query token.
-pub fn verify_query_token(
-    token: &str,
-    secret: &str,
-) -> Option<(String, QueryAuthorization)> {
+pub fn verify_query_token(token: &str, secret: &str) -> Option<(String, QueryAuthorization)> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use sha2::Sha256;
     use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     let parts: Vec<&str> = token.rsplitn(2, '.').collect();
     if parts.len() != 2 {
@@ -191,14 +183,21 @@ impl AppState {
         for attempt in 0..max_attempts {
             if attempt > 0 {
                 let delay = std::time::Duration::from_secs(2u64.pow(attempt.min(4)));
-                tracing::warn!("Preflight attempt {} failed, retrying in {:?}...", attempt, delay);
+                tracing::warn!(
+                    "Preflight attempt {} failed, retrying in {:?}...",
+                    attempt,
+                    delay
+                );
                 tokio::time::sleep(delay).await;
             }
 
             let step_timeout = std::time::Duration::from_secs(10);
 
             // 1. OIDC discovery (bounded by timeout)
-            tracing::info!("Preflight (attempt {}): verifying OIDC discovery...", attempt + 1);
+            tracing::info!(
+                "Preflight (attempt {}): verifying OIDC discovery...",
+                attempt + 1
+            );
             match tokio::time::timeout(step_timeout, self.oidc_client.endpoints()).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {

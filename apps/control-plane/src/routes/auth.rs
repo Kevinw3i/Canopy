@@ -1,4 +1,8 @@
-use axum::{extract::State, routing::{get, post}, Json, Router};
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 use std::sync::Arc;
 
 use crate::services::{auth::AuthService, AppState};
@@ -17,9 +21,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/auth/refresh", post(refresh_token))
 }
 
-async fn health(
-    State(state): State<Arc<AppState>>,
-) -> axum::http::StatusCode {
+async fn health(State(state): State<Arc<AppState>>) -> axum::http::StatusCode {
     if state.audit_service.is_healthy() && state.is_ready() {
         axum::http::StatusCode::OK
     } else {
@@ -49,18 +51,23 @@ async fn dev_login(
     let auth_service = AuthService::new(state.config.clone());
     match auth_service.dev_login(&req) {
         Ok(resp) => {
-            state.audit_service.log_event(
-                &req.username,
-                AuditAction::Login,
-                AuditOutcome::Success,
-                None,
-                None,
-                None,
-                None,
-            ).map_err(|_| (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(ApiError::internal("Audit logging failed — login blocked")),
-            ))?;
+            state
+                .audit_service
+                .log_event(
+                    &req.username,
+                    AuditAction::Login,
+                    AuditOutcome::Success,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|_| {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ApiError::internal("Audit logging failed — login blocked")),
+                    )
+                })?;
             Ok(Json(resp))
         }
         Err(e) => {
@@ -133,7 +140,9 @@ async fn pkce_exchange(
     if !auth_service.verify_pkce_state(&req.state) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
-            Json(ApiError::bad_request("Invalid or tampered PKCE state parameter")),
+            Json(ApiError::bad_request(
+                "Invalid or tampered PKCE state parameter",
+            )),
         ));
     }
 
@@ -170,18 +179,23 @@ async fn pkce_exchange(
 
     // Audit the successful login — fail-closed if audit write fails
     if let Ok(claims) = auth_service.validate_token(&token.access_token) {
-        state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::Login,
-            AuditOutcome::Success,
-            None,
-            None,
-            None,
-            Some("pkce"),
-        ).map_err(|_| (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError::internal("Audit logging failed — login blocked")),
-        ))?;
+        state
+            .audit_service
+            .log_event(
+                &claims.sub,
+                AuditAction::Login,
+                AuditOutcome::Success,
+                None,
+                None,
+                None,
+                Some("pkce"),
+            )
+            .map_err(|_| {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::internal("Audit logging failed — login blocked")),
+                )
+            })?;
     }
 
     Ok(Json(token))
@@ -290,17 +304,19 @@ async fn device_code_poll(
             let store = state.entitlement_store.read().await;
 
             if let Some(ref id_token) = oidc_tokens.id_token {
-                let oidc_claims =
-                    state.oidc_client.decode_and_validate_id_token(id_token).await
-                        .map_err(|e| {
-                            (
-                                axum::http::StatusCode::BAD_GATEWAY,
-                                Json(ApiError::internal(format!(
-                                    "Failed to decode id_token: {}",
-                                    e
-                                ))),
-                            )
-                        })?;
+                let oidc_claims = state
+                    .oidc_client
+                    .decode_and_validate_id_token(id_token)
+                    .await
+                    .map_err(|e| {
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(ApiError::internal(format!(
+                                "Failed to decode id_token: {}",
+                                e
+                            ))),
+                        )
+                    })?;
 
                 let email = oidc_claims
                     .email
@@ -321,18 +337,23 @@ async fn device_code_poll(
                     )
                 })?;
 
-                state.audit_service.log_event(
-                    &oidc_claims.sub,
-                    AuditAction::Login,
-                    AuditOutcome::Success,
-                    None,
-                    None,
-                    None,
-                    Some("device_code"),
-                ).map_err(|_| (
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ApiError::internal("Audit logging failed — login blocked")),
-                ))?;
+                state
+                    .audit_service
+                    .log_event(
+                        &oidc_claims.sub,
+                        AuditAction::Login,
+                        AuditOutcome::Success,
+                        None,
+                        None,
+                        None,
+                        Some("device_code"),
+                    )
+                    .map_err(|_| {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            Json(ApiError::internal("Audit logging failed — login blocked")),
+                        )
+                    })?;
 
                 Ok(Json(DeviceCodePollResponse::Complete {
                     access_token: token.access_token,
@@ -397,16 +418,19 @@ async fn refresh_token(
     let auth_service = AuthService::new(state.config.clone());
 
     if let Some(ref id_token) = oidc_tokens.id_token {
-        let oidc_claims = state.oidc_client.decode_and_validate_id_token(id_token).await
+        let oidc_claims = state
+            .oidc_client
+            .decode_and_validate_id_token(id_token)
+            .await
             .map_err(|e| {
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(ApiError::internal(format!(
-                    "Failed to decode refreshed id_token: {}",
-                    e
-                ))),
-            )
-        })?;
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    Json(ApiError::internal(format!(
+                        "Failed to decode refreshed id_token: {}",
+                        e
+                    ))),
+                )
+            })?;
 
         let store = state.entitlement_store.read().await;
         let email = oidc_claims
@@ -436,18 +460,23 @@ async fn refresh_token(
             })?;
 
         // Audit the refresh — fail-closed
-        state.audit_service.log_event(
-            &oidc_claims.sub,
-            AuditAction::Login,
-            AuditOutcome::Success,
-            None,
-            None,
-            None,
-            Some("refresh"),
-        ).map_err(|_| (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError::internal("Audit logging failed — refresh blocked")),
-        ))?;
+        state
+            .audit_service
+            .log_event(
+                &oidc_claims.sub,
+                AuditAction::Login,
+                AuditOutcome::Success,
+                None,
+                None,
+                None,
+                Some("refresh"),
+            )
+            .map_err(|_| {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiError::internal("Audit logging failed — refresh blocked")),
+                )
+            })?;
 
         Ok(Json(token))
     } else {

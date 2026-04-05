@@ -256,8 +256,16 @@ mod tests {
             AuditAction::EntitlementsView,
         ];
         for action in &actions {
-            svc.log_event("test", action.clone(), AuditOutcome::Success, None, None, None, None)
-                .unwrap();
+            svc.log_event(
+                "test",
+                action.clone(),
+                AuditOutcome::Success,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
         }
 
         let content = std::fs::read_to_string(&path).unwrap();
@@ -274,19 +282,35 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let svc = AuditService::with_file(path_str).unwrap();
-        svc.log_event("alice", AuditAction::Login, AuditOutcome::Success, None, None, None, None)
-            .unwrap();
+        svc.log_event(
+            "alice",
+            AuditAction::Login,
+            AuditOutcome::Success,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
 
         // event_id should be a valid UUID
         let event_id = event["event_id"].as_str().unwrap();
-        assert!(uuid::Uuid::parse_str(event_id).is_ok(), "invalid UUID: {}", event_id);
+        assert!(
+            uuid::Uuid::parse_str(event_id).is_ok(),
+            "invalid UUID: {}",
+            event_id
+        );
 
         // timestamp should be RFC3339
         let ts = event["timestamp"].as_str().unwrap();
-        assert!(chrono::DateTime::parse_from_rfc3339(ts).is_ok(), "invalid timestamp: {}", ts);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+            "invalid timestamp: {}",
+            ts
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -306,8 +330,16 @@ mod tests {
         let svc = AuditService::with_file(path_str).unwrap();
         // log_event doesn't expose metadata directly, but we can verify the
         // event structure includes the field (as null when not set)
-        svc.log_event("alice", AuditAction::Login, AuditOutcome::Success, None, None, None, None)
-            .unwrap();
+        svc.log_event(
+            "alice",
+            AuditAction::Login,
+            AuditOutcome::Success,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
@@ -331,8 +363,16 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let svc = AuditService::with_file(path_str).unwrap();
-        svc.log_event("test", AuditAction::Login, AuditOutcome::Success, None, None, None, None)
-            .unwrap();
+        svc.log_event(
+            "test",
+            AuditAction::Login,
+            AuditOutcome::Success,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             !svc.sink_failed.load(std::sync::atomic::Ordering::Relaxed),
             "sink_failed should be false after successful write"

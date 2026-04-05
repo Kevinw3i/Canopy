@@ -65,7 +65,6 @@ pub async fn start_pkce_flow(api: &ApiClient, callback_port: u16) -> Result<Stri
 /// Accept one HTTP GET request on the given listener, extract
 /// `code` and `state` query parameters, respond with a success page.
 async fn accept_callback_on(listener: &TcpListener) -> Result<(String, String)> {
-
     let (mut stream, _addr) = listener.accept().await?;
 
     // Read the HTTP request (small — just the GET line + headers)
@@ -207,8 +206,7 @@ mod tests {
 
     #[test]
     fn test_parse_callback_encoded_values() {
-        let (code, state) =
-            parse_callback_params("/callback?code=a%20b&state=c%3Dd").unwrap();
+        let (code, state) = parse_callback_params("/callback?code=a%20b&state=c%3Dd").unwrap();
         assert_eq!(code, "a b");
         assert_eq!(state, "c=d");
     }

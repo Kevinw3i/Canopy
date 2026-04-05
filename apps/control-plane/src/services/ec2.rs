@@ -45,7 +45,10 @@ pub fn filter_instances_by_entitlements(
                     .any(|a| a.account_id == inst.account_id)
                     && entitlements.allowed_regions.contains(&inst.region)
                     && (entitlements.instance_tag_selectors.is_empty()
-                        || entitlements.instance_tag_selectors.iter().any(|sel| sel.matches(&inst.tags)));
+                        || entitlements
+                            .instance_tag_selectors
+                            .iter()
+                            .any(|sel| sel.matches(&inst.tags)));
             }
 
             // Check that at least one rule scope covers this instance
@@ -60,12 +63,19 @@ pub fn filter_instances_by_entitlements(
                 }
                 // Tag selectors from THIS rule only
                 if !scope.allow_selectors.is_empty()
-                    && !scope.allow_selectors.iter().any(|sel| sel.matches(&inst.tags))
+                    && !scope
+                        .allow_selectors
+                        .iter()
+                        .any(|sel| sel.matches(&inst.tags))
                 {
                     return false;
                 }
                 // Per-rule deny selectors
-                if scope.deny_selectors.iter().any(|sel| sel.matches(&inst.tags)) {
+                if scope
+                    .deny_selectors
+                    .iter()
+                    .any(|sel| sel.matches(&inst.tags))
+                {
                     return false;
                 }
                 true
@@ -180,12 +190,19 @@ pub fn build_connect_command(
             }
             // Allow selectors from THIS rule
             if !scope.allow_selectors.is_empty()
-                && !scope.allow_selectors.iter().any(|sel| sel.matches(instance_tags))
+                && !scope
+                    .allow_selectors
+                    .iter()
+                    .any(|sel| sel.matches(instance_tags))
             {
                 return false;
             }
             // Per-rule deny selectors
-            if scope.deny_selectors.iter().any(|sel| sel.matches(instance_tags)) {
+            if scope
+                .deny_selectors
+                .iter()
+                .any(|sel| sel.matches(instance_tags))
+            {
                 return false;
             }
             true
@@ -196,7 +213,10 @@ pub fn build_connect_command(
     } else {
         // Fallback to merged selectors (mock mode)
         if !entitlements.instance_tag_selectors.is_empty()
-            && !entitlements.instance_tag_selectors.iter().any(|sel| sel.matches(instance_tags))
+            && !entitlements
+                .instance_tag_selectors
+                .iter()
+                .any(|sel| sel.matches(instance_tags))
         {
             return denied("Instance does not match any allowed tag selector".into());
         }
@@ -244,9 +264,7 @@ pub fn build_connect_command(
                     "EC2 Instance Connect requires an OS user but none are authorized".into(),
                 );
             }
-            return denied(
-                "EC2 Instance Connect requires an explicit --os-user".into(),
-            );
+            return denied("EC2 Instance Connect requires an explicit --os-user".into());
         }
         // Any method with an explicit OS user must be in the allowed list (or wildcard)
         (_, Some(os_user)) => {
@@ -373,9 +391,12 @@ pub fn build_connect_command(
                 authorized: true,
                 command: "ssh".into(),
                 args: vec![
-                    "-o".into(), "ConnectTimeout=10".into(),
-                    "-o".into(), "ServerAliveInterval=15".into(),
-                    "-o".into(), "ServerAliveCountMax=3".into(),
+                    "-o".into(),
+                    "ConnectTimeout=10".into(),
+                    "-o".into(),
+                    "ServerAliveInterval=15".into(),
+                    "-o".into(),
+                    "ServerAliveCountMax=3".into(),
                     format!("{}@{}", os_user, ip),
                 ],
                 env_vars: HashMap::new(), // no AWS env vars needed
@@ -621,9 +642,9 @@ mod tests {
         let filtered = filter_instances_by_entitlements(instances, &ent, &[]);
         // web-prod-01 and web-staging-01 should be excluded
         assert_eq!(filtered.len(), 3);
-        assert!(filtered.iter().all(|i| {
-            i.tags.get("Service").map(|s| s.as_str()) != Some("web")
-        }));
+        assert!(filtered
+            .iter()
+            .all(|i| { i.tags.get("Service").map(|s| s.as_str()) != Some("web") }));
     }
 
     #[test]

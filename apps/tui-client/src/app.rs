@@ -77,9 +77,7 @@ impl App {
             running: true,
             action_tx,
             action_rx,
-            event_reader_paused: std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
+            event_reader_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ec2_fetch_cancel: None,
             cw_fetch_cancel: None,
             live_tail_cancel: None,
@@ -207,7 +205,9 @@ impl App {
                 // Update banner: Ctrl+D dismisses on any screen, no conflict with text input
                 if self.update_banner.is_some()
                     && key.code == crossterm::event::KeyCode::Char('d')
-                    && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                    && key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
                 {
                     let _ = self.action_tx.send(Action::DismissUpdateBanner);
                     return;
@@ -224,13 +224,11 @@ impl App {
                 };
                 let _ = self.action_tx.send(action);
             }
-            Event::Tick => {
-                match self.current_screen {
-                    Screen::Ec2Inventory => self.ec2.on_tick(),
-                    Screen::CloudWatchSearch => self.cloudwatch_search.on_tick(),
-                    _ => {}
-                }
-            }
+            Event::Tick => match self.current_screen {
+                Screen::Ec2Inventory => self.ec2.on_tick(),
+                Screen::CloudWatchSearch => self.cloudwatch_search.on_tick(),
+                _ => {}
+            },
             Event::Resize(_, _) => {
                 // Terminal will re-render automatically
             }
@@ -320,11 +318,7 @@ impl App {
                 self.spawn_ec2_fetch(None);
             }
             Action::SearchEc2(query) => {
-                let filter = if query.is_empty() {
-                    None
-                } else {
-                    Some(query)
-                };
+                let filter = if query.is_empty() { None } else { Some(query) };
                 self.spawn_ec2_fetch(filter);
             }
             Action::Ec2Loaded(instances, failed_scopes, generation) => {
@@ -436,11 +430,13 @@ impl App {
                     let base_url = self.config.control_plane_url.clone();
                     let token = self.api.get_token();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::live_tail_ws::stream_live_tail(
-                                &base_url, token.as_deref(), tx, cancel,
-                            )
-                            .await
+                        if let Err(e) = crate::live_tail_ws::stream_live_tail(
+                            &base_url,
+                            token.as_deref(),
+                            tx,
+                            cancel,
+                        )
+                        .await
                         {
                             tracing::warn!("Live tail stream ended: {}", e);
                         }
@@ -846,11 +842,10 @@ impl App {
                                 }
                                 if !connected {
                                     println!(" FAILED");
+                                    eprintln!("\n  Port 22 on {} is not reachable.", ip);
                                     eprintln!(
-                                        "\n  Port 22 on {} is not reachable.",
-                                        ip
+                                        "  Check: Security Group, instance state, network route.\n"
                                     );
-                                    eprintln!("  Check: Security Group, instance state, network route.\n");
                                     println!("Press Enter to return to the console...");
                                     let _ = std::io::stdin().read_line(&mut String::new());
 
@@ -869,7 +864,9 @@ impl App {
                     if let Some(secs) = resp.max_session_seconds {
                         println!(
                             "--- Connecting to {} via {} (max {} min) ---\n",
-                            instance_id, resp.command, secs / 60
+                            instance_id,
+                            resp.command,
+                            secs / 60
                         );
                     } else {
                         println!(
@@ -923,7 +920,10 @@ impl App {
                                                 break;
                                             }
                                             let remaining = connect_timeout_secs - elapsed;
-                                            print!("\r  Waiting for connection... {}s  ", remaining);
+                                            print!(
+                                                "\r  Waiting for connection... {}s  ",
+                                                remaining
+                                            );
                                             use std::io::Write;
                                             std::io::stdout().flush().ok();
 
@@ -931,7 +931,9 @@ impl App {
                                             // (the process would have exited quickly on auth failure)
                                             if elapsed >= 3 {
                                                 connected = true;
-                                                print!("\r                                       \r");
+                                                print!(
+                                                    "\r                                       \r"
+                                                );
                                                 std::io::stdout().flush().ok();
                                             }
                                         }

@@ -180,8 +180,14 @@ mod tests {
 
     #[test]
     fn query_status_pascal_case() {
-        assert_eq!(serde_json::to_value(QueryStatus::Complete).unwrap(), "Complete");
-        assert_eq!(serde_json::to_value(QueryStatus::Running).unwrap(), "Running");
+        assert_eq!(
+            serde_json::to_value(QueryStatus::Complete).unwrap(),
+            "Complete"
+        );
+        assert_eq!(
+            serde_json::to_value(QueryStatus::Running).unwrap(),
+            "Running"
+        );
 
         let val: QueryStatus = serde_json::from_value(json!("Failed")).unwrap();
         assert_eq!(val, QueryStatus::Failed);

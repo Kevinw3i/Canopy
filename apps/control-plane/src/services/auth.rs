@@ -213,7 +213,8 @@ impl AuthService {
             .unwrap_or_else(|| format!("{}@unknown", oidc_claims.sub));
 
         let email_verified = oidc_claims.email_verified.unwrap_or(false);
-        let ent = entitlement_store.evaluate(&oidc_claims.sub, &email, &display_name, email_verified);
+        let ent =
+            entitlement_store.evaluate(&oidc_claims.sub, &email, &display_name, email_verified);
 
         let identity = Self::identity_from_oidc_claims(&oidc_claims, ent.groups);
 
@@ -315,9 +316,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &jsonwebtoken::Header::default(),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(
-                b"test-secret-at-least-32-chars-long!!",
-            ),
+            &jsonwebtoken::EncodingKey::from_secret(b"test-secret-at-least-32-chars-long!!"),
         )
         .unwrap();
         let svc = AuthService::new(test_config(false));
@@ -422,4 +421,3 @@ mod tests {
         assert!(!id.email_verified);
     }
 }
-

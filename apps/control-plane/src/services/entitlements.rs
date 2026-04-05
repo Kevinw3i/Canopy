@@ -17,7 +17,12 @@ impl EntitlementService {
     /// Evaluate entitlements for authenticated user from JWT claims
     pub async fn evaluate(&self, claims: &Claims) -> UserEntitlements {
         let store = self.store.read().await;
-        store.evaluate(&claims.sub, &claims.email, &claims.name, claims.email_verified)
+        store.evaluate(
+            &claims.sub,
+            &claims.email,
+            &claims.name,
+            claims.email_verified,
+        )
     }
 
     /// Scope-aware feature check: verifies that at least one single rule
@@ -57,13 +62,18 @@ impl EntitlementService {
     ) -> Vec<String> {
         let store = self.store.read().await;
         let rules = store.matching_rules_for_scope(
-            &claims.sub, &claims.email, claims.email_verified,
-            account_id, feature_check,
+            &claims.sub,
+            &claims.email,
+            claims.email_verified,
+            account_id,
+            feature_check,
         );
         let mut arns = Vec::new();
         for rule in rules {
             // Only include patterns from rules that also grant this region
-            if !rule.allowed_regions.is_empty() && !rule.allowed_regions.contains(&region.to_string()) {
+            if !rule.allowed_regions.is_empty()
+                && !rule.allowed_regions.contains(&region.to_string())
+            {
                 continue;
             }
             for arn in &rule.allowed_log_group_arns {
@@ -101,9 +111,13 @@ impl EntitlementService {
             for acct in &rule.allowed_accounts {
                 // Pair each account with ONLY the regions from this rule
                 let regions = rule.allowed_regions.clone();
-                if !result.iter().any(|(a, r): &(shared::dto::entitlements::AllowedAccount, Vec<String>)| {
-                    a.account_id == acct.account_id && a.role_arn == acct.role_arn && *r == regions
-                }) {
+                if !result.iter().any(
+                    |(a, r): &(shared::dto::entitlements::AllowedAccount, Vec<String>)| {
+                        a.account_id == acct.account_id
+                            && a.role_arn == acct.role_arn
+                            && *r == regions
+                    },
+                ) {
                     result.push((acct.clone(), regions));
                 }
             }
@@ -129,11 +143,16 @@ impl EntitlementService {
             .map(|m| m.group.clone())
             .collect();
 
-        store.rules
+        store
+            .rules
             .iter()
             .filter(|rule| user_groups.contains(&rule.group) && feature_check(&rule.features))
             .map(|rule| crate::services::ec2::RuleScope {
-                account_ids: rule.allowed_accounts.iter().map(|a| a.account_id.clone()).collect(),
+                account_ids: rule
+                    .allowed_accounts
+                    .iter()
+                    .map(|a| a.account_id.clone())
+                    .collect(),
                 regions: rule.allowed_regions.clone(),
                 allow_selectors: rule.instance_tag_selectors.clone(),
                 deny_selectors: rule.excluded_tag_selectors.clone(),
@@ -148,7 +167,8 @@ impl EntitlementService {
         account_id: &str,
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> bool {
-        self.has_feature_for_scope(claims, account_id, None, None, None, feature_check).await
+        self.has_feature_for_scope(claims, account_id, None, None, None, feature_check)
+            .await
     }
 
     /// Check if user is allowed to access a specific account
@@ -248,7 +268,10 @@ mod tests {
 
     #[test]
     fn test_arn_pure_wildcard_matches_anything() {
-        assert!(arn_matches_pattern("*", "arn:aws:logs:us-east-1:123:log-group:/any"));
+        assert!(arn_matches_pattern(
+            "*",
+            "arn:aws:logs:us-east-1:123:log-group:/any"
+        ));
         assert!(arn_matches_pattern("*", ""));
         assert!(arn_matches_pattern("*", "literally-anything"));
     }
@@ -360,10 +383,22 @@ mod tests {
                 },
             ],
             memberships: vec![
-                GroupMembership { user_id: "alice".into(), group: "eng".into() },
-                GroupMembership { user_id: "bob".into(), group: "ops".into() },
-                GroupMembership { user_id: "charlie".into(), group: "eng".into() },
-                GroupMembership { user_id: "charlie".into(), group: "ops".into() },
+                GroupMembership {
+                    user_id: "alice".into(),
+                    group: "eng".into(),
+                },
+                GroupMembership {
+                    user_id: "bob".into(),
+                    group: "ops".into(),
+                },
+                GroupMembership {
+                    user_id: "charlie".into(),
+                    group: "eng".into(),
+                },
+                GroupMembership {
+                    user_id: "charlie".into(),
+                    group: "ops".into(),
+                },
             ],
         }
     }
@@ -411,8 +446,14 @@ mod tests {
     async fn test_check_log_group_access_with_wildcard() {
         let svc = make_service();
         let claims = test_claims("alice", "alice@example.com");
-        assert!(svc.check_log_group_access(&claims, "arn:aws:logs:us-east-1:111:log-group:/app/web").await);
-        assert!(!svc.check_log_group_access(&claims, "arn:aws:logs:us-east-1:222:log-group:/infra/db").await);
+        assert!(
+            svc.check_log_group_access(&claims, "arn:aws:logs:us-east-1:111:log-group:/app/web")
+                .await
+        );
+        assert!(
+            !svc.check_log_group_access(&claims, "arn:aws:logs:us-east-1:222:log-group:/infra/db")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -420,15 +461,17 @@ mod tests {
         let svc = make_service();
         // alice is in eng only → has cloudwatch_search for account 111
         let claims = test_claims("alice", "alice@example.com");
-        assert!(svc.has_feature_for_scope(
-            &claims, "111", Some("us-east-1"), None, None,
-            |f| f.can_use_cloudwatch_search,
-        ).await);
+        assert!(
+            svc.has_feature_for_scope(&claims, "111", Some("us-east-1"), None, None, |f| f
+                .can_use_cloudwatch_search,)
+                .await
+        );
         // alice should NOT have cloudwatch_search for account 222 (ops group only)
-        assert!(!svc.has_feature_for_scope(
-            &claims, "222", Some("eu-west-1"), None, None,
-            |f| f.can_use_cloudwatch_search,
-        ).await);
+        assert!(
+            !svc.has_feature_for_scope(&claims, "222", Some("eu-west-1"), None, None, |f| f
+                .can_use_cloudwatch_search,)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -437,17 +480,19 @@ mod tests {
         // charlie is in both groups
         let claims = test_claims("charlie", "charlie@example.com");
         // For account 111, region us-east-1 → only eng rule's ARNs
-        let arns = svc.allowed_log_group_arns_for_scope(
-            &claims, "111", "us-east-1",
-            |f| f.can_use_cloudwatch_search,
-        ).await;
+        let arns = svc
+            .allowed_log_group_arns_for_scope(&claims, "111", "us-east-1", |f| {
+                f.can_use_cloudwatch_search
+            })
+            .await;
         assert_eq!(arns.len(), 1);
         assert!(arns[0].contains("111"));
         // For account 222, region eu-west-1 → only ops rule's ARNs
-        let arns = svc.allowed_log_group_arns_for_scope(
-            &claims, "222", "eu-west-1",
-            |f| f.can_use_cloudwatch_search,
-        ).await;
+        let arns = svc
+            .allowed_log_group_arns_for_scope(&claims, "222", "eu-west-1", |f| {
+                f.can_use_cloudwatch_search
+            })
+            .await;
         assert_eq!(arns.len(), 1);
         assert!(arns[0].contains("222"));
     }
@@ -456,13 +501,15 @@ mod tests {
     async fn test_scoped_accounts_deduplicates() {
         let svc = make_service();
         let claims = test_claims("charlie", "charlie@example.com");
-        let accounts = svc.scoped_accounts_for_feature(
-            &claims,
-            |f| f.can_view_ec2,
-        ).await;
+        let accounts = svc
+            .scoped_accounts_for_feature(&claims, |f| f.can_view_ec2)
+            .await;
         // charlie has eng (account 111) and ops (account 222) → 2 entries
         assert_eq!(accounts.len(), 2);
-        let ids: Vec<&str> = accounts.iter().map(|(a, _)| a.account_id.as_str()).collect();
+        let ids: Vec<&str> = accounts
+            .iter()
+            .map(|(a, _)| a.account_id.as_str())
+            .collect();
         assert!(ids.contains(&"111"));
         assert!(ids.contains(&"222"));
     }

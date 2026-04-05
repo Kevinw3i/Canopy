@@ -30,9 +30,7 @@ impl EntitlementStore {
         let user_groups: Vec<String> = self
             .memberships
             .iter()
-            .filter(|m| {
-                m.user_id == user_id || (email_verified && m.user_id == email)
-            })
+            .filter(|m| m.user_id == user_id || (email_verified && m.user_id == email))
             .map(|m| m.group.clone())
             .collect();
 
@@ -63,9 +61,10 @@ impl EntitlementStore {
                 // Dedup by (account_id, role_arn) so that two groups
                 // granting the same account with different roles both
                 // survive the merge.
-                if !allowed_accounts.iter().any(|a| {
-                    a.account_id == acct.account_id && a.role_arn == acct.role_arn
-                }) {
+                if !allowed_accounts
+                    .iter()
+                    .any(|a| a.account_id == acct.account_id && a.role_arn == acct.role_arn)
+                {
                     allowed_accounts.push(acct.clone());
                 }
             }
@@ -94,9 +93,8 @@ impl EntitlementStore {
             // Use the strictest (smallest non-zero) session limit across groups
             if let Some(secs) = rule.max_session_seconds {
                 if secs > 0 {
-                    max_session_seconds = Some(
-                        max_session_seconds.map_or(secs, |existing| existing.min(secs)),
-                    );
+                    max_session_seconds =
+                        Some(max_session_seconds.map_or(secs, |existing| existing.min(secs)));
                 }
             }
         }
@@ -149,11 +147,17 @@ impl EntitlementStore {
             if !feature_check(&rule.features) {
                 return false;
             }
-            if !rule.allowed_accounts.iter().any(|a| a.account_id == account_id) {
+            if !rule
+                .allowed_accounts
+                .iter()
+                .any(|a| a.account_id == account_id)
+            {
                 return false;
             }
             if let Some(region) = region {
-                if !rule.allowed_regions.is_empty() && !rule.allowed_regions.contains(&region.to_string()) {
+                if !rule.allowed_regions.is_empty()
+                    && !rule.allowed_regions.contains(&region.to_string())
+                {
                     return false;
                 }
             }
@@ -168,7 +172,10 @@ impl EntitlementStore {
             }
             if let Some(user) = os_user {
                 let has_wildcard = rule.allowed_os_users.iter().any(|u| u == "*");
-                if !rule.allowed_os_users.is_empty() && !has_wildcard && !rule.allowed_os_users.contains(&user.to_string()) {
+                if !rule.allowed_os_users.is_empty()
+                    && !has_wildcard
+                    && !rule.allowed_os_users.contains(&user.to_string())
+                {
                     return false;
                 }
             }
@@ -200,7 +207,10 @@ impl EntitlementStore {
             .filter(|rule| {
                 user_groups.contains(&rule.group)
                     && feature_check(&rule.features)
-                    && rule.allowed_accounts.iter().any(|a| a.account_id == account_id)
+                    && rule
+                        .allowed_accounts
+                        .iter()
+                        .any(|a| a.account_id == account_id)
             })
             .collect()
     }
@@ -214,7 +224,16 @@ impl EntitlementStore {
         account_id: &str,
         feature_check: impl Fn(&FeatureFlags) -> bool,
     ) -> bool {
-        self.has_feature_for_scope(user_id, email, email_verified, account_id, None, None, None, feature_check)
+        self.has_feature_for_scope(
+            user_id,
+            email,
+            email_verified,
+            account_id,
+            None,
+            None,
+            None,
+            feature_check,
+        )
     }
 
     /// Load entitlements from a TOML file.
@@ -481,8 +500,10 @@ mod tests {
         let prod_count = ent
             .allowed_accounts
             .iter()
-            .filter(|a| a.account_id == "111111111111"
-                && a.role_arn == "arn:aws:iam::111111111111:role/CanopyRole")
+            .filter(|a| {
+                a.account_id == "111111111111"
+                    && a.role_arn == "arn:aws:iam::111111111111:role/CanopyRole"
+            })
             .count();
         assert_eq!(prod_count, 1, "Same account+role should appear only once");
     }
