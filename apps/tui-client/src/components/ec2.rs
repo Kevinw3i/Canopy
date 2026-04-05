@@ -89,6 +89,12 @@ pub struct Ec2Screen {
     pub fetch_generation: u64,
 }
 
+impl Default for Ec2Screen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ec2Screen {
     pub fn new() -> Self {
         Self {

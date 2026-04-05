@@ -1398,12 +1398,10 @@ mod tests {
         let stale_gen = 3u64;
 
         // Simulate the action handling logic
-        if stale_gen != app.ec2.fetch_generation {
-            // Stale — should be ignored
-            assert!(true);
-        } else {
-            panic!("Should have been stale");
-        }
+        assert!(
+            stale_gen != app.ec2.fetch_generation,
+            "Should have been stale"
+        );
 
         // Instances should still be empty
         assert!(app.ec2.instances.is_empty());

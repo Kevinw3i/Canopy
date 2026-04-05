@@ -54,7 +54,7 @@ pub fn filter_instances_by_entitlements(
             // Check that at least one rule scope covers this instance
             rule_scopes.iter().any(|scope| {
                 // Account must match
-                if !scope.account_ids.iter().any(|a| *a == inst.account_id) {
+                if !scope.account_ids.contains(&inst.account_id) {
                     return false;
                 }
                 // Region must match (empty = all regions from this rule)
@@ -181,7 +181,7 @@ pub fn build_connect_command(
     if !rule_scopes.is_empty() {
         let tag_authorized = rule_scopes.iter().any(|scope| {
             // Account must match
-            if !scope.account_ids.iter().any(|a| *a == req.account_id) {
+            if !scope.account_ids.contains(&req.account_id) {
                 return false;
             }
             // Region must match

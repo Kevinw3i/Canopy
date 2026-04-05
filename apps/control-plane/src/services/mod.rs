@@ -70,53 +70,6 @@ pub fn verify_query_token(token: &str, secret: &str) -> Option<(String, QueryAut
     Some((aws_query_id.to_string(), auth))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_query_token_roundtrip() {
-        let auth = QueryAuthorization {
-            user_id: "alice".into(),
-            log_group_names: vec!["/app/web".into(), "/app/api".into()],
-        };
-        let token = sign_query_token("query-abc-123", &auth, "my-secret");
-        let (id, decoded) = verify_query_token(&token, "my-secret").unwrap();
-        assert_eq!(id, "query-abc-123");
-        assert_eq!(decoded.user_id, "alice");
-        assert_eq!(decoded.log_group_names, vec!["/app/web", "/app/api"]);
-    }
-
-    #[test]
-    fn test_query_token_rejects_wrong_secret() {
-        let auth = QueryAuthorization {
-            user_id: "alice".into(),
-            log_group_names: vec![],
-        };
-        let token = sign_query_token("q1", &auth, "secret-a");
-        assert!(verify_query_token(&token, "secret-b").is_none());
-    }
-
-    #[test]
-    fn test_query_token_rejects_tampered_payload() {
-        let auth = QueryAuthorization {
-            user_id: "alice".into(),
-            log_group_names: vec!["/app/x".into()],
-        };
-        let token = sign_query_token("q1", &auth, "secret");
-        // Tamper with the query ID portion (before first dot)
-        let tampered = token.replacen("q1", "q2", 1);
-        assert!(verify_query_token(&tampered, "secret").is_none());
-    }
-
-    #[test]
-    fn test_query_token_rejects_malformed() {
-        assert!(verify_query_token("", "secret").is_none());
-        assert!(verify_query_token("no-dots-at-all", "secret").is_none());
-        assert!(verify_query_token("one.two", "secret").is_none());
-    }
-}
-
 /// Shared application state passed to all handlers
 pub struct AppState {
     pub config: AppConfig,
@@ -240,5 +193,52 @@ impl AppState {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_token_roundtrip() {
+        let auth = QueryAuthorization {
+            user_id: "alice".into(),
+            log_group_names: vec!["/app/web".into(), "/app/api".into()],
+        };
+        let token = sign_query_token("query-abc-123", &auth, "my-secret");
+        let (id, decoded) = verify_query_token(&token, "my-secret").unwrap();
+        assert_eq!(id, "query-abc-123");
+        assert_eq!(decoded.user_id, "alice");
+        assert_eq!(decoded.log_group_names, vec!["/app/web", "/app/api"]);
+    }
+
+    #[test]
+    fn test_query_token_rejects_wrong_secret() {
+        let auth = QueryAuthorization {
+            user_id: "alice".into(),
+            log_group_names: vec![],
+        };
+        let token = sign_query_token("q1", &auth, "secret-a");
+        assert!(verify_query_token(&token, "secret-b").is_none());
+    }
+
+    #[test]
+    fn test_query_token_rejects_tampered_payload() {
+        let auth = QueryAuthorization {
+            user_id: "alice".into(),
+            log_group_names: vec!["/app/x".into()],
+        };
+        let token = sign_query_token("q1", &auth, "secret");
+        // Tamper with the query ID portion (before first dot)
+        let tampered = token.replacen("q1", "q2", 1);
+        assert!(verify_query_token(&tampered, "secret").is_none());
+    }
+
+    #[test]
+    fn test_query_token_rejects_malformed() {
+        assert!(verify_query_token("", "secret").is_none());
+        assert!(verify_query_token("no-dots-at-all", "secret").is_none());
+        assert!(verify_query_token("one.two", "secret").is_none());
     }
 }

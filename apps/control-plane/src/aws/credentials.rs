@@ -322,6 +322,43 @@ async fn verify_account_identity(
     Ok(())
 }
 
+/// Resolve an SdkConfig for the given account based on the `role_arn` value:
+///
+/// - `"direct"`          → use ambient credentials (default profile)
+/// - `"profile:NAME"`    → use the named AWS profile from ~/.aws/credentials
+/// - any other ARN       → AssumeRole into that role
+///
+/// For `direct`/`profile:` modes, a `GetCallerIdentity` check ensures the
+/// resolved credentials actually belong to the configured `account_id`.
+pub async fn resolve_aws_config(
+    base_config: &SdkConfig,
+    account: &AllowedAccount,
+    region: &str,
+    session_context: &SessionContext,
+) -> anyhow::Result<SdkConfig> {
+    if account.role_arn == "direct" {
+        // Use default ambient credentials
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_string()))
+            .load()
+            .await;
+        verify_account_identity(&config, &account.account_id).await?;
+        Ok(config)
+    } else if let Some(profile_name) = account.role_arn.strip_prefix("profile:") {
+        // Use a specific AWS profile
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new(region.to_string()))
+            .profile_name(profile_name)
+            .load()
+            .await;
+        verify_account_identity(&config, &account.account_id).await?;
+        Ok(config)
+    } else {
+        // Standard AssumeRole
+        assume_role_for_account(base_config, account, region, session_context).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,42 +502,5 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
         let stmts = v["Statement"].as_array().unwrap();
         assert!(stmts.is_empty());
-    }
-}
-
-/// Resolve an SdkConfig for the given account based on the `role_arn` value:
-///
-/// - `"direct"`          → use ambient credentials (default profile)
-/// - `"profile:NAME"`    → use the named AWS profile from ~/.aws/credentials
-/// - any other ARN       → AssumeRole into that role
-///
-/// For `direct`/`profile:` modes, a `GetCallerIdentity` check ensures the
-/// resolved credentials actually belong to the configured `account_id`.
-pub async fn resolve_aws_config(
-    base_config: &SdkConfig,
-    account: &AllowedAccount,
-    region: &str,
-    session_context: &SessionContext,
-) -> anyhow::Result<SdkConfig> {
-    if account.role_arn == "direct" {
-        // Use default ambient credentials
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()))
-            .load()
-            .await;
-        verify_account_identity(&config, &account.account_id).await?;
-        Ok(config)
-    } else if let Some(profile_name) = account.role_arn.strip_prefix("profile:") {
-        // Use a specific AWS profile
-        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(region.to_string()))
-            .profile_name(profile_name)
-            .load()
-            .await;
-        verify_account_identity(&config, &account.account_id).await?;
-        Ok(config)
-    } else {
-        // Standard AssumeRole
-        assume_role_for_account(base_config, account, region, session_context).await
     }
 }

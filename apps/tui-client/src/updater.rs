@@ -531,8 +531,10 @@ mod tests {
         let owner = "test-owner";
         let repo = &format!("test-repo-{}", std::process::id());
 
-        let mut state = UpdateState::default();
-        state.pending_version = Some("1.2.3".into());
+        let mut state = UpdateState {
+            pending_version: Some("1.2.3".into()),
+            ..Default::default()
+        };
         state.record_check();
         state.save(owner, repo).unwrap();
 

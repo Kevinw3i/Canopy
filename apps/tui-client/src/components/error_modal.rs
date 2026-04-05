@@ -7,13 +7,14 @@ use ratatui::{
 use crate::event::Action;
 
 /// Modal overlay that shows error messages
+#[derive(Default)]
 pub struct ErrorModal {
     pub message: Option<String>,
 }
 
 impl ErrorModal {
     pub fn new() -> Self {
-        Self { message: None }
+        Self::default()
     }
 
     pub fn show(&mut self, message: String) {

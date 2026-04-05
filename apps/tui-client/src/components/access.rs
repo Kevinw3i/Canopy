@@ -8,13 +8,14 @@ use shared::dto::entitlements::UserEntitlements;
 use super::Component;
 use crate::event::Action;
 
+#[derive(Default)]
 pub struct AccessScreen {
     pub entitlements: Option<UserEntitlements>,
 }
 
 impl AccessScreen {
     pub fn new() -> Self {
-        Self { entitlements: None }
+        Self::default()
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {

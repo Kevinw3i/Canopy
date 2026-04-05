@@ -97,6 +97,12 @@ pub struct EventReader {
     pub paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl Default for EventReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventReader {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();

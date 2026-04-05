@@ -58,6 +58,12 @@ pub struct CloudWatchSearchScreen {
     query_history: Vec<String>,
 }
 
+impl Default for CloudWatchSearchScreen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CloudWatchSearchScreen {
     pub fn new() -> Self {
         Self {

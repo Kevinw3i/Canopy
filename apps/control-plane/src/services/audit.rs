@@ -14,6 +14,12 @@ pub struct AuditService {
     sink_failed: std::sync::atomic::AtomicBool,
 }
 
+impl Default for AuditService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuditService {
     pub fn new() -> Self {
         Self {

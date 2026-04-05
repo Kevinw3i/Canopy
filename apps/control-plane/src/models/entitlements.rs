@@ -122,6 +122,7 @@ impl EntitlementStore {
     ///
     /// Optionally validates region, log group ARN, and OS user against
     /// the *same rule* that grants the feature and account access.
+    #[allow(clippy::too_many_arguments)]
     pub fn has_feature_for_scope(
         &self,
         user_id: &str,
