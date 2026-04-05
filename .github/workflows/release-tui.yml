@@ -1,0 +1,150 @@
+name: Release TUI Client
+
+on:
+  push:
+    tags:
+      - "tui-v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: canopy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --workspace
+
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            suffix: darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            suffix: darwin-arm64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            suffix: linux-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux ARM64 cross-compilation toolchain
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure linker (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << 'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p tui-client
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          cp tui-client ${{ env.BINARY_NAME }}
+          tar czf ../../../${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz ${{ env.BINARY_NAME }}
+
+      - name: Generate SHA256
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 ${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz \
+              > ${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz.sha256
+          else
+            sha256sum ${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz \
+              > ${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz.sha256
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
+          path: |
+            ${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz
+            ${{ env.BINARY_NAME }}-${{ matrix.suffix }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#tui-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "TUI Client ${{ steps.version.outputs.version }}"
+          body: |
+            ## Canopy TUI Client ${{ steps.version.outputs.version }}
+
+            ### 安裝方式
+
+            ```bash
+            # macOS (Apple Silicon)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/canopy-darwin-arm64.tar.gz
+            tar xzf canopy-darwin-arm64.tar.gz
+            chmod +x canopy && sudo mv canopy /usr/local/bin/
+
+            # macOS (Intel)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/canopy-darwin-amd64.tar.gz
+            tar xzf canopy-darwin-amd64.tar.gz
+            chmod +x canopy && sudo mv canopy /usr/local/bin/
+
+            # Linux (x86_64)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/canopy-linux-amd64.tar.gz
+            tar xzf canopy-linux-amd64.tar.gz
+            chmod +x canopy && sudo mv canopy /usr/local/bin/
+            ```
+
+            ### 驗證下載
+            每個 asset 都附有 `.sha256` 檔，可用以下指令驗證：
+            ```bash
+            shasum -a 256 -c canopy-darwin-arm64.tar.gz.sha256
+            ```
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: artifacts/*

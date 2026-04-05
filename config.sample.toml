@@ -1,0 +1,65 @@
+# ============================================================
+# Control Plane 設定範本（生產環境用）
+#
+# 使用方式：
+#   cp config.sample.toml config.toml
+#   編輯 config.toml 填入你的設定值
+#   CONFIG_PATH=config.toml cargo run --release -p control-plane
+#
+# 必填欄位：
+#   [oidc] issuer_url, client_id
+#   [jwt]  secret
+#   entitlements_file
+# ============================================================
+
+# ── 伺服器 ──────────────────────────────────────────
+
+bind_address = "127.0.0.1:8443"    # 監聽地址，放在反向代理後面
+dev_mode = false                    # 生產環境必須為 false
+
+# mock_aws_data = false            # 省略時跟隨 dev_mode 的值
+                                    # dev_mode=false 時自動用真實 AWS
+
+# ── 權限規則 ────────────────────────────────────────
+
+# 必填。定義使用者/群組/帳號/區域/功能的對應關係。
+# entitlements_file = "entitlements.toml"
+
+# ── 稽核日誌 ────────────────────────────────────────
+
+# 可選。設定後所有操作會寫入此檔案（JSON-lines 格式）。
+# 寫入失敗時 API 會回傳 503（fail-closed 策略）。
+# audit_log = "/var/log/canopy/audit.jsonl"
+
+# ── CORS ────────────────────────────────────────────
+
+# 允許的來源清單。空 + dev_mode=false = 不允許跨域。
+# cors_allowed_origins = ["http://localhost:9876"]
+
+# ── OIDC（認證）──────────────────────────────────────
+
+[oidc]
+issuer_url = "https://accounts.google.com"   # OIDC Provider 的 issuer URL
+client_id = "your-client-id"                 # 從 OIDC Provider 取得
+# client_secret = "your-secret"              # 公開 PKCE 客戶端可省略
+scopes = ["openid", "profile", "email"]
+
+# 可選：手動指定端點（省略時自動從 issuer_url/.well-known 探索）
+# authorization_endpoint = "https://..."
+# token_endpoint = "https://..."
+# device_authorization_endpoint = "https://..."
+# userinfo_endpoint = "https://..."
+
+# ── JWT（內部 Token）─────────────────────────────────
+
+[jwt]
+secret = "change-this-in-production"         # 用 openssl rand -base64 32 產生
+expiry_seconds = 3600                        # Token 有效期（秒）
+
+# ── AWS ─────────────────────────────────────────────
+
+[aws]
+default_region = "us-east-1"                 # STS 呼叫的預設區域
+session_duration_seconds = 3600              # AssumeRole session 時長
+# sts_external_id = "canopy"           # AssumeRole ExternalId（預設 "canopy"）
+                                             # 必須與目標 role trust policy 一致

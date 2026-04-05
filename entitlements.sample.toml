@@ -1,0 +1,94 @@
+# ============================================================
+# 權限規則範本（生產環境用）
+#
+# 使用方式：
+#   cp entitlements.sample.toml entitlements.toml
+#   編輯後填入你的 AWS 帳號、區域、Role ARN
+#
+# 結構：
+#   [[rules]]       — 每個群組一組權限規則
+#   [[memberships]] — 使用者 ID 到群組的對應
+#
+# ── role_arn 三種模式 ────────────────────────────────
+#
+#   "direct"              直接用本機/Task Role 的 AWS 憑證（不走 AssumeRole）
+#   "profile:NAME"        用 ~/.aws/credentials 裡指定的 profile（本機開發用）
+#   "arn:aws:iam::...:role/..."  AssumeRole 到該 IAM Role（生產環境用）
+# ============================================================
+
+# ── 群組 1：平台工程（完整權限）───────────────────────
+
+[[rules]]
+id = "rule-platform-eng"
+group = "platform-engineering"
+allowed_regions = ["ap-northeast-1"]           # ← 改成你的區域
+allowed_log_group_arns = [
+    "arn:aws:logs:*:<ACCOUNT_ID>:log-group:*", # ← 改成你的帳號 ID，或限縮到特定 log group
+]
+allowed_os_users = ["ec2-user", "ubuntu"]
+
+[rules.features]
+can_view_ec2 = true
+can_use_cloudwatch_search = true
+can_use_cloudwatch_tail = true
+can_use_ssm = true
+can_use_ec2_instance_connect = true
+
+[[rules.allowed_accounts]]
+account_id = "<ACCOUNT_ID>"                    # ← 改成你的 AWS 帳號 ID
+account_name = "production"                    # ← 自訂名稱，顯示在 TUI 裡
+role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role ARN
+
+# 多帳號範例（取消註解即可同時看多個帳號的資源）：
+# [[rules.allowed_accounts]]
+# account_id = "<ACCOUNT_ID_2>"
+# account_name = "staging"
+# role_arn = "arn:aws:iam::<ACCOUNT_ID_2>:role/CanopyRole"
+
+# 只顯示特定 tag 的機器（取消註解啟用）：
+# [[rules.instance_tag_selectors]]
+# [rules.instance_tag_selectors.tags]
+# Environment = ["production", "staging"]
+
+# 排除特定機器（取消註解啟用）：
+# [[rules.excluded_tag_selectors]]
+# [rules.excluded_tag_selectors.tags]
+# Sensitivity = ["high"]
+
+
+# ── 群組 2：唯讀維運 ────────────────────────────────
+
+# [[rules]]
+# id = "rule-readonly"
+# group = "readonly-ops"
+# allowed_regions = ["ap-northeast-1"]
+# allowed_log_group_arns = [
+#     "arn:aws:logs:*:<ACCOUNT_ID>:log-group:/app/*",
+# ]
+# allowed_os_users = []
+#
+# [rules.features]
+# can_view_ec2 = true
+# can_use_cloudwatch_search = true
+# can_use_cloudwatch_tail = false
+# can_use_ssm = false
+# can_use_ec2_instance_connect = false
+#
+# [[rules.allowed_accounts]]
+# account_id = "<ACCOUNT_ID>"
+# account_name = "production"
+# role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyReadOnly"
+
+
+# ── 使用者 → 群組對應 ────────────────────────────────
+#
+# user_id 對應 OIDC 的 sub 或 email claim（production 模式）
+# 或 dev-login 的 username（dev 模式）
+
+[[memberships]]
+user_id = "admin@example.com"                  # ← 改成你的 OIDC email
+group = "platform-engineering"
+
+# [[memberships]]
+# user_id = "viewer@example.com"
+# group = "readonly-ops"

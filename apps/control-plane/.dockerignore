@@ -1,0 +1,8 @@
+target/
+dist/
+.git/
+*.md
+config.dev.toml
+config.local-aws.toml
+entitlements.dev.toml
+entitlements.local-aws.toml

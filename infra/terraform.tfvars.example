@@ -1,0 +1,34 @@
+aws_region         = "ap-northeast-1"
+vpc_id             = "vpc-xxxxxxxxxxxxxxxxx"
+public_subnet_ids  = ["subnet-aaa", "subnet-bbb"]
+private_subnet_ids = ["subnet-ccc", "subnet-ddd"]
+
+acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/xxxxxxxx"
+
+# Image tag (required — use a versioned tag or git SHA, not "latest")
+image_tag = "v0.1.0"
+
+# JWT secret — create out-of-band, pass ARN here (never stored in Terraform state)
+# aws secretsmanager create-secret --name canopy/jwt-secret --secret-string "$(openssl rand -base64 44)"
+jwt_secret_arn        = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX"
+jwt_secret_version_id = ""  # Required: pin with `aws secretsmanager describe-secret --secret-id canopy/jwt-secret --query 'VersionIdsToStages' --output json`
+
+# ALB defaults to internal. Provide at least one CIDR (e.g. your VPC CIDR for internal).
+alb_allowed_cidrs = ["10.0.0.0/16"]
+# alb_internal    = false  # set to false + office CIDRs for public access
+
+# Optional: Route 53 DNS record
+# route53_zone_id = "Z0123456789ABCDEFGHIJ"
+# domain_name     = "canopy.example.com"
+
+oidc_issuer_url = "https://accounts.google.com"
+oidc_client_id  = "your-client-id"
+
+# STS ExternalId for cross-account AssumeRole (must match target trust policy)
+# sts_external_id = "my-custom-external-id"
+
+# Cross-account roles the control-plane can assume
+# assumable_role_arns = [
+#   "arn:aws:iam::111111111111:role/CanopyRole",
+#   "arn:aws:iam::222222222222:role/CanopyRole",
+# ]

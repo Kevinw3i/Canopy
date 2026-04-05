@@ -1,0 +1,46 @@
+[package]
+name = "control-plane"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared = { path = "../../crates/shared" }
+
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+axum.workspace = true
+axum-extra.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+jsonwebtoken.workspace = true
+reqwest.workspace = true
+
+aws-config.workspace = true
+aws-sdk-ec2.workspace = true
+aws-sdk-cloudwatchlogs.workspace = true
+aws-sdk-sts.workspace = true
+aws-sdk-iam.workspace = true
+aws-credential-types.workspace = true
+aws-types.workspace = true
+
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+base64.workspace = true
+toml = "0.8"
+dashmap = "6"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+hyper = "1"
+http-body-util = "0.1"
+rsa = "0.9"
+rand = "0.8"

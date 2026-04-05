@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#020a13"/>
+      <stop offset="50%" style="stop-color:#0a1628"/>
+      <stop offset="100%" style="stop-color:#061220"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00ff88;stop-opacity:0"/>
+      <stop offset="50%" style="stop-color:#00ff88;stop-opacity:0.15"/>
+      <stop offset="100%" style="stop-color:#00ff88;stop-opacity:0"/>
+    </linearGradient>
+    <linearGradient id="titleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00ff88"/>
+      <stop offset="50%" style="stop-color:#00d4aa"/>
+      <stop offset="100%" style="stop-color:#00aaff"/>
+    </linearGradient>
+    <linearGradient id="nodeGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#00ff88"/>
+      <stop offset="100%" style="stop-color:#00aa66"/>
+    </linearGradient>
+    <filter id="neon">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="softGlow">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <radialGradient id="orbGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" style="stop-color:#00ff88;stop-opacity:0.3"/>
+      <stop offset="100%" style="stop-color:#00ff88;stop-opacity:0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="200" rx="12" fill="url(#bg)"/>
+
+  <!-- Circuit grid -->
+  <g opacity="0.06" stroke="#00ff88" stroke-width="0.5">
+    <line x1="0" y1="50" x2="800" y2="50"/>
+    <line x1="0" y1="100" x2="800" y2="100"/>
+    <line x1="0" y1="150" x2="800" y2="150"/>
+    <line x1="100" y1="0" x2="100" y2="200"/>
+    <line x1="200" y1="0" x2="200" y2="200"/>
+    <line x1="400" y1="0" x2="400" y2="200"/>
+    <line x1="600" y1="0" x2="600" y2="200"/>
+    <line x1="700" y1="0" x2="700" y2="200"/>
+  </g>
+
+  <!-- Scanline glow -->
+  <rect x="0" y="92" width="800" height="16" fill="url(#glow)"/>
+
+  <!-- Network tree structure -->
+  <g filter="url(#neon)" opacity="0.9">
+    <!-- Central trunk line -->
+    <line x1="108" y1="135" x2="108" y2="95" stroke="#00aa66" stroke-width="2"/>
+
+    <!-- Branch lines -->
+    <line x1="108" y1="95" x2="68" y2="65" stroke="#00aa66" stroke-width="1.5"/>
+    <line x1="108" y1="95" x2="148" y2="65" stroke="#00aa66" stroke-width="1.5"/>
+    <line x1="108" y1="95" x2="108" y2="55" stroke="#00aa66" stroke-width="1.5"/>
+
+    <!-- Sub-branches -->
+    <line x1="68" y1="65" x2="48" y2="45" stroke="#00aa66" stroke-width="1" opacity="0.7"/>
+    <line x1="68" y1="65" x2="78" y2="42" stroke="#00aa66" stroke-width="1" opacity="0.7"/>
+    <line x1="148" y1="65" x2="138" y2="42" stroke="#00aa66" stroke-width="1" opacity="0.7"/>
+    <line x1="148" y1="65" x2="168" y2="45" stroke="#00aa66" stroke-width="1" opacity="0.7"/>
+    <line x1="108" y1="55" x2="98" y2="35" stroke="#00aa66" stroke-width="1" opacity="0.7"/>
+    <line x1="108" y1="55" x2="118" y2="35" stroke="#00aa66" stroke-width="1" opacity="0.7"/>
+
+    <!-- Leaf nodes (glowing dots) -->
+    <circle cx="48" cy="45" r="3.5" fill="url(#nodeGrad)"/>
+    <circle cx="78" cy="42" r="3" fill="url(#nodeGrad)"/>
+    <circle cx="98" cy="35" r="3" fill="url(#nodeGrad)"/>
+    <circle cx="118" cy="35" r="3.5" fill="url(#nodeGrad)"/>
+    <circle cx="138" cy="42" r="3" fill="url(#nodeGrad)"/>
+    <circle cx="168" cy="45" r="3.5" fill="url(#nodeGrad)"/>
+
+    <!-- Junction nodes -->
+    <circle cx="68" cy="65" r="4" fill="#00dd77" opacity="0.9"/>
+    <circle cx="108" cy="55" r="3.5" fill="#00dd77" opacity="0.9"/>
+    <circle cx="148" cy="65" r="4" fill="#00dd77" opacity="0.9"/>
+    <circle cx="108" cy="95" r="5" fill="#00ff88"/>
+
+    <!-- Root node -->
+    <circle cx="108" cy="135" r="4" fill="#00ff88" opacity="0.8"/>
+  </g>
+
+  <!-- Ambient orb behind tree -->
+  <circle cx="108" cy="85" r="60" fill="url(#orbGlow)"/>
+
+  <!-- Data flow particles -->
+  <g opacity="0.5">
+    <circle cx="88" cy="80" r="1.2" fill="#00ff88"/>
+    <circle cx="128" cy="72" r="1" fill="#00ffaa"/>
+    <circle cx="58" cy="55" r="1" fill="#00ff88"/>
+    <circle cx="155" cy="56" r="1.2" fill="#00ffaa"/>
+    <circle cx="108" cy="115" r="1" fill="#00ff88"/>
+  </g>
+
+  <!-- Title -->
+  <text x="210" y="82" font-family="'SF Mono','Fira Code','JetBrains Mono',Consolas,monospace" font-size="50" font-weight="700" fill="url(#titleGrad)" letter-spacing="2" filter="url(#softGlow)">Canopy</text>
+
+  <!-- Terminal cursor blink effect -->
+  <rect x="430" y="62" width="3" height="24" fill="#00ff88" opacity="0.8">
+    <animate attributeName="opacity" values="0.8;0;0.8" dur="1.2s" repeatCount="indefinite"/>
+  </rect>
+
+  <!-- Subtitle -->
+  <text x="210" y="112" font-family="'SF Mono','Fira Code','JetBrains Mono',Consolas,monospace" font-size="13" fill="#4a9e7a" letter-spacing="1">Terminal operations console for AWS infrastructure</text>
+
+  <!-- Tech badges -->
+  <g transform="translate(210, 132)">
+    <rect x="0" y="0" width="52" height="22" rx="3" fill="none" stroke="#1a3a2a" stroke-width="1"/>
+    <text x="26" y="15" font-family="'SF Mono',monospace" font-size="10" fill="#f97583" text-anchor="middle">Rust</text>
+
+    <rect x="62" y="0" width="72" height="22" rx="3" fill="none" stroke="#1a3a2a" stroke-width="1"/>
+    <text x="98" y="15" font-family="'SF Mono',monospace" font-size="10" fill="#58a6ff" text-anchor="middle">ratatui</text>
+
+    <rect x="144" y="0" width="56" height="22" rx="3" fill="none" stroke="#1a3a2a" stroke-width="1"/>
+    <text x="172" y="15" font-family="'SF Mono',monospace" font-size="10" fill="#bc8cff" text-anchor="middle">axum</text>
+
+    <rect x="210" y="0" width="52" height="22" rx="3" fill="none" stroke="#1a3a2a" stroke-width="1"/>
+    <text x="236" y="15" font-family="'SF Mono',monospace" font-size="10" fill="#ffa657" text-anchor="middle">AWS</text>
+
+    <rect x="272" y="0" width="58" height="22" rx="3" fill="none" stroke="#1a3a2a" stroke-width="1"/>
+    <text x="301" y="15" font-family="'SF Mono',monospace" font-size="10" fill="#00ff88" text-anchor="middle">OIDC</text>
+  </g>
+
+  <!-- Corner accents -->
+  <path d="M2 20 L2 8 Q2 2 8 2 L20 2" fill="none" stroke="#00ff88" stroke-width="1" opacity="0.3"/>
+  <path d="M798 20 L798 8 Q798 2 792 2 L780 2" fill="none" stroke="#00ff88" stroke-width="1" opacity="0.3"/>
+  <path d="M2 180 L2 192 Q2 198 8 198 L20 198" fill="none" stroke="#00ff88" stroke-width="1" opacity="0.3"/>
+  <path d="M798 180 L798 192 Q798 198 792 198 L780 198" fill="none" stroke="#00ff88" stroke-width="1" opacity="0.3"/>
+</svg>
