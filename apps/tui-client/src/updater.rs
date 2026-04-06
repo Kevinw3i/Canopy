@@ -47,8 +47,7 @@ impl UpdateState {
         // Namespace by repo to avoid cross-contamination between upstream/forks
         let key = format!("{}/{}", repo_owner, repo_name);
         let hash = simple_hash(&key);
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
+        config_dir()
             .join("canopy")
             .join(format!("update_state_{}.toml", hash))
     }
@@ -69,6 +68,22 @@ impl UpdateState {
     pub fn record_check(&mut self) {
         self.last_check = Some(chrono::Utc::now().to_rfc3339());
     }
+}
+
+fn config_dir() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(path) = TEST_CONFIG_DIR.with(|slot| slot.borrow().clone()) {
+            return path;
+        }
+    }
+
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Stable 8-char hex hash for namespacing state files.
@@ -448,6 +463,25 @@ fn cleanup_tmp(tmp_bin: &std::path::Path, fallback_dir: &std::path::Path) {
 mod tests {
     use super::*;
 
+    struct TestConfigDirGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl TestConfigDirGuard {
+        fn set(path: PathBuf) -> Self {
+            let previous = TEST_CONFIG_DIR.with(|slot| slot.replace(Some(path)));
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestConfigDirGuard {
+        fn drop(&mut self) {
+            TEST_CONFIG_DIR.with(|slot| {
+                slot.replace(self.previous.take());
+            });
+        }
+    }
+
     // ── should_check throttle ───────────────────────────
 
     #[test]
@@ -528,8 +562,15 @@ mod tests {
 
     #[test]
     fn test_state_save_and_load() {
+        let tmp = std::env::temp_dir().join(format!("canopy-state-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _guard = TestConfigDirGuard::set(tmp.clone());
+
         let owner = "test-owner";
         let repo = &format!("test-repo-{}", std::process::id());
+
+        let path = UpdateState::state_path(owner, repo);
+        assert!(path.starts_with(tmp.join("canopy")));
 
         let mut state = UpdateState {
             pending_version: Some("1.2.3".into()),
@@ -543,8 +584,7 @@ mod tests {
         assert!(loaded.last_check.is_some());
 
         // Cleanup
-        let path = UpdateState::state_path(owner, repo);
-        std::fs::remove_file(path).ok();
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // ── replace_binary ──────────────────────────────────
