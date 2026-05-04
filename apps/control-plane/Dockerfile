@@ -2,9 +2,11 @@
 # Build from workspace root:
 #   docker build -t canopy/control-plane -f apps/control-plane/Dockerfile .
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.92-bookworm AS builder
 
 WORKDIR /build
+
+ENV CARGO_BUILD_JOBS=1
 
 # 1) Cache dependencies — copy manifests first, then do a dummy build
 COPY Cargo.toml Cargo.lock ./
@@ -22,8 +24,8 @@ RUN mkdir -p crates/shared/src && echo "pub fn _stub(){}" > crates/shared/src/li
 COPY crates/ crates/
 COPY apps/control-plane/ apps/control-plane/
 
-# Touch main.rs so cargo sees it changed after the stub
-RUN touch apps/control-plane/src/main.rs \
+# Touch real crate roots so cargo rebuilds them after the stub cache layer.
+RUN touch crates/shared/src/lib.rs apps/control-plane/src/lib.rs apps/control-plane/src/main.rs \
  && cargo build --release -p control-plane
 
 # ── Runtime ─────────────────────────────────────────────
