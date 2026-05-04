@@ -14,19 +14,62 @@ variable "project" {
 
 # ── Networking ──────────────────────────────────────────
 
+variable "create_vpc" {
+  description = "Whether Terraform should create a dedicated VPC for Canopy. If false, vpc_id/public_subnet_ids/private_subnet_ids must point to existing networking."
+  type        = bool
+  default     = false
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for the Terraform-managed VPC when create_vpc = true."
+  type        = string
+  default     = "10.200.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  description = "Public subnet CIDR blocks for the Terraform-managed VPC. Must span at least two AZs."
+  type        = list(string)
+  default     = ["10.200.0.0/24", "10.200.1.0/24"]
+
+  validation {
+    condition     = length(var.public_subnet_cidrs) >= 2
+    error_message = "public_subnet_cidrs must contain at least two CIDR blocks."
+  }
+}
+
+variable "private_subnet_cidrs" {
+  description = "Private subnet CIDR blocks for the Terraform-managed VPC. Must span at least two AZs."
+  type        = list(string)
+  default     = ["10.200.10.0/24", "10.200.11.0/24"]
+
+  validation {
+    condition     = length(var.private_subnet_cidrs) >= 2
+    error_message = "private_subnet_cidrs must contain at least two CIDR blocks."
+  }
+}
+
+variable "single_nat_gateway" {
+  description = "Use one NAT Gateway for all private subnets when create_vpc = true. Set false for one NAT per private subnet/AZ."
+  type        = bool
+  default     = true
+}
+
 variable "vpc_id" {
   description = "VPC ID where resources are deployed"
   type        = string
+  default     = ""
 }
 
 variable "public_subnet_ids" {
   description = "Public subnets for the ALB (at least 2 AZs)"
   type        = list(string)
+  default     = []
 }
 
 variable "private_subnet_ids" {
   description = "Private subnets for ECS tasks (at least 2 AZs)"
   type        = list(string)
+  default     = []
 }
 
 # ── ECS ─────────────────────────────────────────────────

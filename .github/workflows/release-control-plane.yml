@@ -1,0 +1,164 @@
+name: Release Control Plane Image
+
+on:
+  push:
+    tags:
+      - "cp-v*"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to publish, for example cp-v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  ECR_REPOSITORY: canopy/control-plane
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    concurrency:
+      group: control-plane-image-${{ github.ref_name || inputs.image_tag }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            image_tag="${{ inputs.image_tag }}"
+          else
+            image_tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ ! "$image_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::Invalid Docker tag: $image_tag"
+            exit 1
+          fi
+
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Write entitlements file
+        shell: bash
+        env:
+          ENTITLEMENTS_TOML_B64: ${{ secrets.CONTROL_PLANE_ENTITLEMENTS_TOML_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ENTITLEMENTS_TOML_B64}" ]; then
+            echo "::error::Missing GitHub secret CONTROL_PLANE_ENTITLEMENTS_TOML_B64"
+            exit 1
+          fi
+
+          printf '%s' "${ENTITLEMENTS_TOML_B64}" | base64 -d > entitlements.toml
+          test -s entitlements.toml
+
+      - name: Validate entitlements against Terraform variables
+        shell: bash
+        env:
+          TERRAFORM_TFVARS_B64: ${{ secrets.CONTROL_PLANE_TFVARS_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TERRAFORM_TFVARS_B64}" ]; then
+            echo "::warning::Skipping entitlements validation because CONTROL_PLANE_TFVARS_B64 is not set"
+            exit 0
+          fi
+
+          printf '%s' "${TERRAFORM_TFVARS_B64}" | base64 -d > infra/terraform.tfvars
+          ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GHA_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check image tag does not already exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          output=$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${{ steps.meta.outputs.image_tag }}" \
+            --region "${AWS_REGION}" 2>&1)
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "::error::ECR image tag already exists and the repository is immutable: ${{ steps.meta.outputs.image_tag }}"
+            exit 1
+          fi
+
+          if ! grep -q "ImageNotFoundException" <<< "$output"; then
+            echo "$output"
+            exit "$status"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/control-plane/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            ENTITLEMENTS_FILE=entitlements.toml
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write deployment summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_uri="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${{ steps.meta.outputs.image_tag }}"
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## Control-plane image pushed
+
+          Image:
+
+          \`\`\`text
+          ${image_uri}
+          \`\`\`
+
+          Next manual Terraform step:
+
+          \`\`\`bash
+          AWS_PROFILE=your-aws-profile terraform -chdir=infra plan -var="image_tag=${{ steps.meta.outputs.image_tag }}" -out=tfplan.phase2
+          AWS_PROFILE=your-aws-profile terraform -chdir=infra apply tfplan.phase2
+          \`\`\`
+          EOF

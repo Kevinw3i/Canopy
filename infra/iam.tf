@@ -29,8 +29,8 @@ resource "aws_iam_role_policy" "task_execution_secrets" {
     Version = "2012-10-17"
     Statement = concat(
       [{
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
+        Effect = "Allow"
+        Action = ["secretsmanager:GetSecretValue"]
         Resource = compact([
           data.aws_secretsmanager_secret.jwt_secret.arn,
           var.oidc_client_secret_arn != "" ? var.oidc_client_secret_arn : "",
@@ -78,9 +78,9 @@ resource "aws_iam_role_policy" "task_permissions" {
 
       # SimulatePrincipalPolicy for cross-account role selection (always when roles configured)
       length(var.assumable_role_arns) > 0 ? [{
-        Sid    = "SimulatePolicy"
-        Effect = "Allow"
-        Action = ["iam:SimulatePrincipalPolicy"]
+        Sid      = "SimulatePolicy"
+        Effect   = "Allow"
+        Action   = ["iam:SimulatePrincipalPolicy"]
         Resource = var.assumable_role_arns
       }] : [],
 
@@ -101,9 +101,9 @@ resource "aws_iam_role_policy" "task_permissions" {
 
       # STS GetCallerIdentity is always needed for preflight health check
       [{
-        Sid    = "StsIdentity"
-        Effect = "Allow"
-        Action = ["sts:GetCallerIdentity"]
+        Sid      = "StsIdentity"
+        Effect   = "Allow"
+        Action   = ["sts:GetCallerIdentity"]
         Resource = "*"
       }]
     )

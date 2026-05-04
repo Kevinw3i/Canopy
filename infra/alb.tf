@@ -5,7 +5,7 @@ resource "aws_lb" "control_plane" {
   load_balancer_type = "application"
   internal           = var.alb_internal
   security_groups    = [aws_security_group.alb.id]
-  subnets            = var.alb_internal ? var.private_subnet_ids : var.public_subnet_ids
+  subnets            = var.alb_internal ? local.network_private_subnet_ids : local.network_public_subnet_ids
 }
 
 # ── Target Group ────────────────────────────────────────
@@ -14,7 +14,7 @@ resource "aws_lb_target_group" "control_plane" {
   name        = "${var.project}-tg"
   port        = 8443
   protocol    = "HTTP"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.network_vpc_id
   target_type = "ip"
 
   health_check {

@@ -1,0 +1,5 @@
+bucket         = "canopy-tfstate-<ACCOUNT_ID>"
+key            = "control-plane/terraform.tfstate"
+region         = "ap-northeast-1"
+dynamodb_table = "canopy-tflock"
+encrypt        = true

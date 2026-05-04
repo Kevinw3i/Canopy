@@ -8,6 +8,21 @@ output "alb_dns_name" {
   value       = aws_lb.control_plane.dns_name
 }
 
+output "vpc_id" {
+  description = "VPC ID used by the control-plane deployment"
+  value       = local.network_vpc_id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs used by the control-plane deployment"
+  value       = local.network_public_subnet_ids
+}
+
+output "private_subnet_ids" {
+  description = "Private subnet IDs used by the control-plane deployment"
+  value       = local.network_private_subnet_ids
+}
+
 output "ecs_cluster_name" {
   description = "ECS cluster name"
   value       = aws_ecs_cluster.main.name

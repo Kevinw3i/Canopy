@@ -11,12 +11,7 @@ terraform {
   # REQUIRED: Configure via partial backend config before first init:
   #   terraform init -backend-config=backend.hcl
   #
-  # Create backend.hcl with:
-  #   bucket         = "canopy-tfstate-123456789012"
-  #   key            = "control-plane/terraform.tfstate"
-  #   region         = "ap-northeast-1"
-  #   dynamodb_table = "canopy-tflock"
-  #   encrypt        = true
+  # Copy backend.hcl.example to backend.hcl and fill in your account-specific values.
   backend "s3" {}
 }
 

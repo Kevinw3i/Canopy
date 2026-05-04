@@ -3,7 +3,7 @@
 resource "aws_security_group" "alb" {
   name        = "${var.project}-alb-sg"
   description = "ALB for ${var.project} control-plane"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.network_vpc_id
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_https" {
@@ -31,7 +31,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
 resource "aws_security_group" "tasks" {
   name        = "${var.project}-task-sg"
   description = "ECS tasks for ${var.project} control-plane"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.network_vpc_id
 }
 
 resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {

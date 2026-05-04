@@ -30,6 +30,7 @@
 
 ```bash
 cd infra
+cp backend.hcl.example backend.hcl
 terraform init -backend-config=backend.hcl
 terraform plan
 terraform apply
@@ -58,6 +59,7 @@ JWT_VER=$(aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secr
 #   jwt_secret_version_id = "<上面的 version ID>"
 
 cd infra
+cp backend.hcl.example backend.hcl
 terraform init -backend-config=backend.hcl
 terraform apply -var="create_service=false"
 ```
@@ -132,16 +134,20 @@ terraform apply   # 確認後套用
 
 ## 遠端 State（建議）
 
-正式使用前，取消 `versions.tf` 裡 S3 backend 的註解，改成你的 bucket：
+正式使用前，先複製範本並填入你的 bucket：
+
+```bash
+cp backend.hcl.example backend.hcl
+```
+
+內容如下：
 
 ```hcl
-backend "s3" {
-  bucket         = "canopy-tfstate-<ACCOUNT_ID>"
-  key            = "control-plane/terraform.tfstate"
-  region         = "ap-northeast-1"
-  dynamodb_table = "canopy-tflock"
-  encrypt        = true
-}
+bucket         = "canopy-tfstate-<ACCOUNT_ID>"
+key            = "control-plane/terraform.tfstate"
+region         = "ap-northeast-1"
+dynamodb_table = "canopy-tflock"
+encrypt        = true
 ```
 
 然後重新 `terraform init` 遷移 state。

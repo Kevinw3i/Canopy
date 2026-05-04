@@ -10,9 +10,14 @@ audit.dev.jsonl
 # 本機設定（含真實 AWS 帳號資訊），只保留 .sample 範本
 config.dev.toml
 config.local-aws.toml
+entitlements.toml
 entitlements.dev.toml
 entitlements.local-aws.toml
 docs/TODO.md
+
+# Editor swap files
+*.swp
+*.swo
 
 # Terraform
 infra/.terraform/
@@ -20,3 +25,5 @@ infra/*.tfstate
 infra/*.tfstate.backup
 infra/*.tfvars
 !infra/terraform.tfvars.example
+infra/tfplan*
+*.tfplan

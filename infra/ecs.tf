@@ -12,8 +12,8 @@ resource "aws_ecs_cluster" "main" {
 # ── Task Definition ─────────────────────────────────────
 
 resource "aws_ecs_task_definition" "control_plane" {
-  count                    = var.create_service ? 1 : 0
-  family                   = "${var.project}-control-plane"
+  count  = var.create_service ? 1 : 0
+  family = "${var.project}-control-plane"
 
   lifecycle {
     precondition {
@@ -104,7 +104,7 @@ resource "aws_ecs_service" "control_plane" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = var.private_subnet_ids
+    subnets          = local.network_private_subnet_ids
     security_groups  = [aws_security_group.tasks.id]
     assign_public_ip = false
   }
