@@ -243,7 +243,7 @@ VERSION=$(git describe --tags --always)
 
 docker build --platform linux/amd64 \
   -t "$ECR_URL:$VERSION" \
-  --build-arg ENTITLEMENTS_FILE=entitlements.toml \
+  --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 
 docker push "$ECR_URL:$VERSION"
@@ -300,7 +300,7 @@ VERSION=$(git describe --tags --always)
 
 docker build --platform linux/amd64 \
   -t "$ECR_URL:$VERSION" \
-  --build-arg ENTITLEMENTS_FILE=entitlements.toml \
+  --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 
 docker push "$ECR_URL:$VERSION"

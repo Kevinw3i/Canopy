@@ -56,8 +56,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
-        run: cargo test --workspace
+      # CI already runs the full workspace test suite on master and pull requests.
+      # Keep this release workflow focused on building and pushing the image.
+      # - name: Run tests
+      #   run: cargo test --workspace
 
       - name: Write entitlements file
         shell: bash
@@ -132,12 +134,10 @@ jobs:
           file: apps/control-plane/Dockerfile
           platforms: linux/amd64
           push: true
-          build-args: |
-            ENTITLEMENTS_FILE=entitlements.toml
+          secret-files: |
+            entitlements_toml=entitlements.toml
           tags: |
             ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Write deployment summary
         shell: bash

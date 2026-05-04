@@ -14,6 +14,7 @@ entitlements.toml
 entitlements.dev.toml
 entitlements.local-aws.toml
 docs/TODO.md
+docs/LOCAL_CONTROL_PLANE_DEPLOY.md
 
 # Editor swap files
 *.swp

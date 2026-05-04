@@ -32,7 +32,7 @@ ROLE_ARNS=$(strip_comments "$ENTITLEMENTS" | \
 
 for arn in $ROLE_ARNS; do
   if ! strip_comments "$TFVARS" | grep -qF "$arn"; then
-    echo "ERROR: role ARN '$arn' in entitlements but not found in $TFVARS assumable_role_arns"
+    echo "ERROR: a role_arn in entitlements is not listed in $TFVARS assumable_role_arns (value redacted)"
     ERRORS=$((ERRORS + 1))
   fi
 done

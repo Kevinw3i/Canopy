@@ -1,6 +1,10 @@
+# syntax=docker/dockerfile:1.7
+
 # ── Builder ──────────────────────────────────────────────
 # Build from workspace root:
-#   docker build -t canopy/control-plane -f apps/control-plane/Dockerfile .
+#   DOCKER_BUILDKIT=1 docker build \
+#     --secret id=entitlements_toml,src=entitlements.toml \
+#     -t canopy/control-plane -f apps/control-plane/Dockerfile .
 
 FROM rust:1.92-bookworm AS builder
 
@@ -55,12 +59,16 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Entitlements config — REQUIRED for production builds.
-# Build with: --build-arg ENTITLEMENTS_FILE=entitlements.toml
-# Omitting this arg or using entitlements.sample.toml will fail the build.
-ARG ENTITLEMENTS_FILE
-RUN test -n "${ENTITLEMENTS_FILE}" || { echo "ERROR: ENTITLEMENTS_FILE build-arg is required. Use --build-arg ENTITLEMENTS_FILE=entitlements.toml"; exit 1; }
-RUN test "${ENTITLEMENTS_FILE}" != "entitlements.sample.toml" || { echo "ERROR: entitlements.sample.toml is not allowed for production builds."; exit 1; }
-COPY ${ENTITLEMENTS_FILE} /etc/canopy/entitlements.toml
+# Pass it as a BuildKit secret so it is not sent in the Docker build context.
+RUN --mount=type=secret,id=entitlements_toml,target=/tmp/entitlements.toml,required=true \
+    test -s /tmp/entitlements.toml \
+ && if sed 's/#.*$//' /tmp/entitlements.toml | grep -q '<ACCOUNT_ID>'; then \
+      echo "ERROR: entitlements_toml contains sample <ACCOUNT_ID> placeholders."; \
+      exit 1; \
+    fi \
+ && cp /tmp/entitlements.toml /etc/canopy/entitlements.toml \
+ && chown canopy:canopy /etc/canopy/entitlements.toml \
+ && chmod 0400 /etc/canopy/entitlements.toml
 
 ENV CONFIG_PATH=/etc/canopy/config.toml \
     RUST_LOG=control_plane=info,tower_http=info

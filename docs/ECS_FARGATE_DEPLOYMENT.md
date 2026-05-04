@@ -71,6 +71,7 @@ aws ecr get-login-password --region ap-northeast-1 | \
 ```bash
 # 在專案根目錄執行（因為 Dockerfile 需要 workspace context）
 docker build \
+  --secret id=entitlements_toml,src=entitlements.toml \
   -t canopy/control-plane:latest \
   -f apps/control-plane/Dockerfile .
 
@@ -514,7 +515,8 @@ canopy.your-domain.com  CNAME  canopy-alb-xxxx.ap-northeast-1.elb.amazonaws.com
 
 ```bash
 # 1. Build & push 新 image
-docker build -t canopy/control-plane:v0.2.0 -f apps/control-plane/Dockerfile .
+docker build --secret id=entitlements_toml,src=entitlements.toml \
+  -t canopy/control-plane:v0.2.0 -f apps/control-plane/Dockerfile .
 docker tag canopy/control-plane:v0.2.0 \
   <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:v0.2.0
 docker push \

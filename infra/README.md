@@ -79,7 +79,7 @@ aws ecr get-login-password --region ap-northeast-1 | \
 cd ..
 VERSION=$(git describe --tags --always)
 docker build --platform linux/amd64 -t "$ECR_URL:$VERSION" \
-  --build-arg ENTITLEMENTS_FILE=entitlements.toml \
+  --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 docker push "$ECR_URL:$VERSION"
 
@@ -108,7 +108,7 @@ PLATFORM="linux/amd64"
 
 # Build + push（帶 platform 和 entitlements）
 docker build --platform "$PLATFORM" \
-  --build-arg ENTITLEMENTS_FILE=entitlements.toml \
+  --secret id=entitlements_toml,src=entitlements.toml \
   -t "$ECR_URL:$VERSION" \
   -f apps/control-plane/Dockerfile .
 docker push "$ECR_URL:$VERSION"
