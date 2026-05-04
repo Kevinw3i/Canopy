@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "cp-v*"
-  workflow_dispatch:
-    inputs:
-      image_tag:
-        description: "ECR image tag to publish, for example cp-v0.1.0"
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -24,7 +18,7 @@ jobs:
     name: Build and push image
     runs-on: ubuntu-latest
     concurrency:
-      group: control-plane-image-${{ github.ref_name || inputs.image_tag }}
+      group: control-plane-image-${{ github.ref_name }}
       cancel-in-progress: false
 
     steps:
@@ -37,11 +31,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            image_tag="${{ inputs.image_tag }}"
-          else
-            image_tag="${GITHUB_REF_NAME}"
-          fi
+          image_tag="${GITHUB_REF_NAME}"
 
           if [[ ! "$image_tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
             echo "::error::Invalid Docker tag: $image_tag"
