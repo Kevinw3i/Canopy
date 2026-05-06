@@ -47,6 +47,19 @@ fi
 # 移除尾端斜線
 CONTROL_PLANE_URL="${CONTROL_PLANE_URL%/}"
 
+case "$CONTROL_PLANE_URL" in
+    http://*|https://*) ;;
+    *)
+        echo "ERROR: Control Plane URL 必須以 http:// 或 https:// 開頭"
+        exit 1
+        ;;
+esac
+
+if [[ "$CONTROL_PLANE_URL" == *\"* || "$CONTROL_PLANE_URL" == *$'\n'* || "$CONTROL_PLANE_URL" == *$'\r'* ]]; then
+    echo "ERROR: Control Plane URL 不可包含引號或換行"
+    exit 1
+fi
+
 echo "URL:    $CONTROL_PLANE_URL"
 
 # ── 3. 建立 dist 資料夾 ─────────────────────────────
@@ -65,6 +78,7 @@ refresh_interval_secs = 30
 live_tail_scrollback = 10000
 pkce_callback_port = 9876
 enable_live_tail = false
+# change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 EOF
 
 # ── 5. 產生安裝腳本 ─────────────────────────────────
@@ -90,8 +104,27 @@ INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_SRC="$INSTALL_DIR/tui-client"
 BIN_DST="/usr/local/bin/canopy"
 CONFIG_SRC="$INSTALL_DIR/config.toml"
-CONFIG_DIR="$HOME/.config/canopy"
-CONFIG_DST="$CONFIG_DIR/config.toml"
+
+resolve_config_dir() {
+    case "$(uname -s)" in
+        Darwin)
+            printf '%s\n' "$HOME/Library/Application Support/canopy"
+            ;;
+        Linux)
+            printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/canopy"
+            ;;
+        CYGWIN*|MINGW*|MSYS*)
+            if [ -n "${APPDATA:-}" ]; then
+                printf '%s\n' "$APPDATA/canopy"
+            else
+                printf '%s\n' "$HOME/AppData/Roaming/canopy"
+            fi
+            ;;
+        *)
+            printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/canopy"
+            ;;
+    esac
+}
 
 # ── 安全工具函式 ────────────────────────────────────────
 # 下載檔案並驗證 SHA-256 雜湊。驗證失敗時刪除檔案並中止。
@@ -149,6 +182,8 @@ echo ""
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+CONFIG_DIR="$(resolve_config_dir)"
+CONFIG_DST="$CONFIG_DIR/config.toml"
 echo "系統: $OS $ARCH"
 echo ""
 
@@ -330,8 +365,8 @@ check() {
 }
 
 check "canopy 可執行"         "command -v canopy"
-check "設定檔存在"                 "test -f $CONFIG_DST"
-check "設定檔包含 control_plane_url" "grep -q control_plane_url $CONFIG_DST"
+check "設定檔存在"                 "test -f \"\$CONFIG_DST\""
+check "設定檔包含 control_plane_url" "grep -q control_plane_url \"\$CONFIG_DST\""
 check "AWS CLI v2 已安裝"          "aws --version 2>&1 | grep -q 'aws-cli/2'"
 check "Session Manager Plugin 已安裝" "command -v session-manager-plugin"
 

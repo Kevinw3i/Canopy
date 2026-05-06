@@ -390,7 +390,12 @@ default_region = "us-east-1"
 session_duration_seconds = 3600
 ```
 
-### 9.2 TUI Client (`~/.config/canopy/config.toml`)
+### 9.2 TUI Client config
+
+TUI config is stored under the OS standard config directory:
+
+- macOS: `~/Library/Application Support/canopy/config.toml`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml`
 
 ```toml
 control_plane_url = "https://canopy.internal"

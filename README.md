@@ -70,9 +70,9 @@ The TUI opens on the login screen. Type `dev-admin` and press Enter.
 | EC2 Inventory | Press `1` | 5 mock instances, search with `/`, detail with `Enter` |
 | CloudWatch Search | Press `2` | Query input, mock log events |
 | Access / Identity | Press `4` | Your user, groups, feature flags, allowed accounts |
-| Settings | Press `5` | Current config values |
+| Settings | Press `5` | Current config values; press `p` to open Change Password |
 
-Press `Esc` to go back, `q` to quit.
+Press `Esc` to go back, `Ctrl+x` on Dashboard to log out, `q` to quit.
 
 ### Dev users
 
@@ -249,7 +249,21 @@ group = "readonly-ops"
 
 **Merge rule**: If a user belongs to multiple groups, permissions are merged additively — if *any* group grants a feature, the user has it.
 
-### TUI client config (`~/.config/canopy/config.toml`)
+### TUI client config
+
+Prefer the setup script so the config is written to the OS-specific path the
+TUI actually reads:
+
+```bash
+scripts/setup-tui-config.sh https://<your-canopy-domain>
+```
+
+The TUI uses the standard config directory for each OS:
+
+| OS | Config path |
+|----|-------------|
+| macOS | `~/Library/Application Support/canopy/config.toml` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml` |
 
 ```toml
 control_plane_url = "http://localhost:8443"  # Control-plane URL
@@ -259,6 +273,7 @@ refresh_interval_secs = 30     # Auto-refresh interval
 live_tail_scrollback = 10000   # Max events in live-tail buffer
 pkce_callback_port = 9876      # Local port for OIDC PKCE callback
 enable_live_tail = true        # Show live-tail in menu (beta feature)
+# change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 
 # Auto-update (checks GitHub Releases at most every 10 minutes)
 auto_update = false            # true = check & apply updates on startup
@@ -273,8 +288,8 @@ When `auto_update = true`, the TUI checks for new `tui-v*` releases on GitHub at
 Press `Ctrl+D` to dismiss the update banner.
 
 **How it's loaded:**
-1. If `~/.config/canopy/config.toml` exists → load it
-2. Else if `DEV_MODE=1` → use built-in defaults (auto-creates the file)
+1. If `DEV_MODE=1` → use built-in defaults and ignore the OS config file
+2. Else if `canopy/config.toml` exists under the OS config directory → load it
 3. Else → error with path hint
 
 ### Environment variables
@@ -282,7 +297,7 @@ Press `Ctrl+D` to dismiss the update banner.
 | Variable | Used by | Purpose |
 |----------|---------|---------|
 | `CONFIG_PATH` | control-plane | Override config file path (default: `config.toml`) |
-| `DEV_MODE=1` | both | Fall back to built-in dev defaults if no config file found |
+| `DEV_MODE=1` | both | TUI: force built-in dev defaults and ignore the OS config file. Control-plane: fall back to built-in dev defaults if no config file is found |
 | `RUST_LOG` | both | Log level filter (e.g. `control_plane=debug,tower_http=debug`) |
 | `ALLOW_DEV_MODE_REMOTE=1` | control-plane | Override safety check that blocks dev_mode on non-loopback addresses |
 | `AWS_REGION` | control-plane | Base AWS region (also settable in config) |
@@ -469,7 +484,7 @@ Each operator runs one command:
 
 The script automatically:
 1. Installs the `canopy` binary to `/usr/local/bin/`
-2. Creates `~/.config/canopy/config.toml` (URL already filled in)
+2. Creates the TUI config file (URL already filled in, OS-specific path)
 3. Installs AWS CLI v2 if missing
 4. Installs Session Manager Plugin if missing
 5. Removes macOS Gatekeeper quarantine flag if needed
@@ -530,6 +545,8 @@ When the durable audit file is configured and a write fails, the API returns 503
 | `Tab` | CW Search | Toggle quick/insights mode |
 | `Esc` | Any | Go back / unfocus |
 | `q` | Dashboard | Quit |
+| `Ctrl+x` | Dashboard | Logout |
+| `p` | Settings | Open Change Password |
 | `Ctrl+C` | Any | Quit |
 
 ## Security model

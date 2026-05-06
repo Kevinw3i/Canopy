@@ -25,6 +25,7 @@ impl Component for SettingsScreen {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => Action::GoBack,
+            KeyCode::Char('p') if key.modifiers.is_empty() => Action::ChangePassword,
             _ => Action::Noop,
         }
     }
@@ -55,14 +56,92 @@ impl Component for SettingsScreen {
                 Span::raw(format!(" {}", self.config.live_tail_scrollback)),
             ]),
             Line::from(""),
+            Line::from(vec![
+                Span::styled("Change Password:    ", Style::default().bold()),
+                Span::raw("Press p to open the password page"),
+            ]),
+            Line::from(""),
             Line::from(Span::styled(
-                "Edit config at ~/.config/canopy/config.toml",
+                "Edit config in the OS config directory",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            Line::from("Esc/q: back"),
+            Line::from("p: change password | Esc/q: back"),
         ];
 
         Paragraph::new(lines).render(inner, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    fn test_config() -> ClientConfig {
+        ClientConfig {
+            control_plane_url: "https://canopy.example.com".into(),
+            dev_mode: false,
+            refresh_interval_secs: 30,
+            live_tail_scrollback: 10_000,
+            pkce_callback_port: 9876,
+            enable_live_tail: false,
+            show_public_ip: false,
+            auto_update: false,
+            update_repo_owner: "Kevinw3i".into(),
+            update_repo_name: "Canopy".into(),
+            change_password_url: None,
+        }
+    }
+
+    #[test]
+    fn p_opens_change_password() {
+        let mut screen = SettingsScreen::new(test_config());
+        let action = screen.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(action, Action::ChangePassword));
+    }
+
+    #[test]
+    fn modified_p_does_not_open_change_password() {
+        let mut screen = SettingsScreen::new(test_config());
+        assert!(matches!(
+            screen.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Action::Noop
+        ));
+        assert!(matches!(
+            screen.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::ALT)),
+            Action::Noop
+        ));
+    }
+
+    #[test]
+    fn esc_and_q_go_back() {
+        let mut screen = SettingsScreen::new(test_config());
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Esc)),
+            Action::GoBack
+        ));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('q'))),
+            Action::GoBack
+        ));
     }
 }

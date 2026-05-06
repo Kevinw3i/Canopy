@@ -69,9 +69,9 @@ DEV_MODE=1 cargo run -p tui-client
 | EC2 清查 | 按 `1` | 5 台 mock 執行個體，`/` 搜尋，`Enter` 看詳細 |
 | CloudWatch 搜尋 | 按 `2` | 查詢輸入框，mock 日誌事件 |
 | 存取/身分 | 按 `4` | 使用者、群組、功能旗標、允許的帳號 |
-| 設定 | 按 `5` | 目前的設定值 |
+| 設定 | 按 `5` | 目前的設定值；按 `p` 開啟 Change Password |
 
-按 `Esc` 返回上一頁，`q` 離開。
+按 `Esc` 返回上一頁，Dashboard 按 `Ctrl+x` 登出，按 `q` 離開。
 
 ### 開發用帳號
 
@@ -247,7 +247,20 @@ group = "platform-engineering"
 - `max_session_seconds` — 取最嚴格（最小非零值）
 - `excluded_tag_selectors` — 聯集（任一群組排除即排除）
 
-### TUI 客戶端設定（`~/.config/canopy/config.toml`）
+### TUI 客戶端設定
+
+建議用腳本建立設定檔，避免不同作業系統路徑不一致：
+
+```bash
+scripts/setup-tui-config.sh https://<your-canopy-domain>
+```
+
+TUI 會使用作業系統標準 config 目錄：
+
+| 作業系統 | 設定檔位置 |
+|----------|------------|
+| macOS | `~/Library/Application Support/canopy/config.toml` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml` |
 
 ```toml
 control_plane_url = "http://localhost:8443"  # Control Plane 網址
@@ -257,6 +270,7 @@ refresh_interval_secs = 30     # 自動重新整理間隔
 live_tail_scrollback = 10000   # Live Tail 緩衝區最大事件數
 pkce_callback_port = 9876      # OIDC PKCE 回呼的本地 port
 enable_live_tail = true        # 選單中顯示 Live Tail（beta 功能）
+# change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 
 # 自動更新（最多每 10 分鐘檢查一次 GitHub Releases）
 auto_update = false            # true = 啟動時檢查並套用更新
@@ -271,8 +285,8 @@ auto_update = false            # true = 啟動時檢查並套用更新
 按 `Ctrl+D` 關閉更新 banner。
 
 **載入順序：**
-1. `~/.config/canopy/config.toml` 存在 → 載入
-2. 否則 `DEV_MODE=1` → 用內建預設值（會自動建立設定檔）
+1. `DEV_MODE=1` → 用內建預設值，並忽略作業系統 config 路徑的設定檔
+2. 否則作業系統標準 config 路徑的 `canopy/config.toml` 存在 → 載入
 3. 以上都沒有 → 報錯並提示路徑
 
 ### 環境變數
@@ -280,7 +294,7 @@ auto_update = false            # true = 啟動時檢查並套用更新
 | 變數 | 使用者 | 用途 |
 |------|--------|------|
 | `CONFIG_PATH` | control-plane | 覆寫設定檔路徑（預設：`config.toml`） |
-| `DEV_MODE=1` | 兩者 | 找不到設定檔時改用內建預設值 |
+| `DEV_MODE=1` | 兩者 | TUI：強制使用內建 dev 預設值並忽略作業系統 config 設定檔。Control Plane：找不到設定檔時改用內建預設值 |
 | `RUST_LOG` | 兩者 | 日誌等級過濾（例：`control_plane=debug,tower_http=debug`） |
 | `ALLOW_DEV_MODE_REMOTE=1` | control-plane | 覆寫安全檢查，允許 dev_mode 在非 loopback 位址 |
 | `AWS_REGION` | control-plane | 基礎 AWS 區域（也可在設定檔設定） |
@@ -465,7 +479,7 @@ dist/
 
 腳本會自動：
 1. 安裝 `canopy` 二進位檔到 `/usr/local/bin/`
-2. 建立 `~/.config/canopy/config.toml`（URL 已預填）
+2. 建立 TUI 設定檔（URL 已預填，路徑依作業系統決定）
 3. 偵測並安裝 AWS CLI v2（如果沒有）
 4. 偵測並安裝 Session Manager Plugin（如果沒有）
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
@@ -530,6 +544,8 @@ TUI                     Control Plane              OIDC 提供者
 | `Tab` | CW 搜尋 | 切換 Quick/Insights 模式 |
 | `Esc` | 任何 | 返回/取消焦點 |
 | `q` | 儀表板 | 離開 |
+| `Ctrl+x` | 儀表板 | 登出 |
+| `p` | 設定 | 開啟 Change Password |
 | `Ctrl+C` | 任何 | 離開 |
 
 ## 安全模型

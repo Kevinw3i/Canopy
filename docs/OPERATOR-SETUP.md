@@ -29,7 +29,31 @@ cargo build --release -p tui-client
 >
 > 跨平台編譯需要先安裝對應的 target：`rustup target add <target>`
 
-### 2. 執行打包腳本
+### 2. 本機快速建立 TUI 設定檔
+
+如果只是在目前電腦測試剛編好的 TUI，可以直接執行：
+
+```bash
+cd ~/Desktop/Canopy
+scripts/setup-tui-config.sh https://<your-canopy-domain>
+./target/release/tui-client
+```
+
+這個腳本會依照作業系統寫到 TUI 實際讀取的位置：
+
+| 作業系統 | 設定檔位置 |
+|----------|------------|
+| macOS | `~/Library/Application Support/canopy/config.toml` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml` |
+| Windows Git Bash | `%APPDATA%/canopy/config.toml` |
+
+如果設定檔已存在，腳本預設不覆寫。需要重寫時：
+
+```bash
+scripts/setup-tui-config.sh https://<your-canopy-domain> --force
+```
+
+### 3. 執行打包腳本
 
 ```bash
 cd ~/Desktop/Canopy
@@ -45,7 +69,7 @@ scripts/package.sh
 > 第一次執行會提示你輸入 Control Plane 的網址（例如 `https://canopy.internal`）。
 > 這個網址會被寫死在安裝腳本中，維運人員不需要知道或手動填寫。
 
-### 3. 交付給維運人員
+### 4. 交付給維運人員
 
 將 `dist/` 資料夾透過你們的內部管道交付：
 
@@ -69,7 +93,7 @@ cd canopy-dist
 完成。安裝腳本會自動：
 
 1. 安裝 `canopy` 二進位檔到 `/usr/local/bin/`
-2. 建立設定檔 `~/.config/canopy/config.toml`（URL 已預填）
+2. 建立 TUI 設定檔（URL 已預填，路徑依作業系統決定）
 3. 偵測 AWS CLI v2，沒有就自動安裝
 4. 偵測 Session Manager Plugin，沒有就自動安裝
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
@@ -92,7 +116,9 @@ install.sh
 ├── 1. 偵測作業系統和 CPU 架構
 ├── 2. 安裝二進位檔 → /usr/local/bin/canopy
 ├── 3. macOS: 移除 Gatekeeper 隔離標記
-├── 4. 建立設定檔 → ~/.config/canopy/config.toml
+├── 4. 建立設定檔
+│      ├── macOS → ~/Library/Application Support/canopy/config.toml
+│      └── Linux → ${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml
 │      （如果已存在則跳過，不覆寫）
 ├── 5. 檢查 AWS CLI v2
 │      ├── 已安裝 → 跳過
@@ -147,8 +173,8 @@ echo $LANG    # 期望：包含 UTF-8
 
 ```bash
 sudo rm /usr/local/bin/canopy
-rm -rf ~/.config/canopy
-rm -rf ~/.local/share/canopy
+rm -rf "$HOME/Library/Application Support/canopy"  # macOS
+rm -rf ~/.config/canopy ~/.local/share/canopy      # Linux
 ```
 
 ---
@@ -158,6 +184,8 @@ rm -rf ~/.local/share/canopy
 | 檔案 | 路徑 | 用途 |
 |------|------|------|
 | 二進位檔 | `/usr/local/bin/canopy` | TUI 主程式 |
-| 設定檔 | `~/.config/canopy/config.toml` | 客戶端設定（URL 已預填） |
-| Token 快取 | `~/.local/share/canopy/token` | 登入後自動建立，權限 0600 |
+| 設定檔（macOS） | `~/Library/Application Support/canopy/config.toml` | 客戶端設定（URL 已預填） |
+| 設定檔（Linux） | `${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml` | 客戶端設定（URL 已預填） |
+| Token 快取（macOS） | `~/Library/Application Support/canopy/token` | 登入後自動建立，權限 0600 |
+| Token 快取（Linux） | `~/.local/share/canopy/token` | 登入後自動建立，權限 0600 |
 | 除錯日誌 | `./tui-client.log` 或 `/tmp/tui-client.log` | TUI 執行日誌 |

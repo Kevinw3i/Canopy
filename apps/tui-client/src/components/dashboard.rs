@@ -109,6 +109,9 @@ impl Component for DashboardScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
+        if key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::Logout;
+        }
         if key.code == KeyCode::Char('q') {
             return Action::Quit;
         }
@@ -239,7 +242,7 @@ impl Component for DashboardScreen {
         }
 
         // Help bar
-        Paragraph::new("q: quit | j/k: navigate | Enter: select | 1-5: quick nav")
+        Paragraph::new("Ctrl+x: logout | q: quit | j/k: navigate | Enter: select | 1-5: quick nav")
             .style(Style::default().fg(Color::Gray))
             .render(chunks[5], buf);
     }
@@ -260,9 +263,13 @@ mod tests {
     use shared::dto::entitlements::*;
 
     fn key(code: KeyCode) -> KeyEvent {
+        key_with_modifiers(code, KeyModifiers::empty())
+    }
+
+    fn key_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
             code,
-            modifiers: KeyModifiers::empty(),
+            modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
@@ -406,6 +413,29 @@ mod tests {
         let mut screen = DashboardScreen::new(false, false);
         let action = screen.handle_key(key(KeyCode::Char('q')));
         assert!(matches!(action, Action::Quit));
+    }
+
+    #[test]
+    fn ctrl_x_logs_out() {
+        let mut screen = DashboardScreen::new(false, false);
+        let action = screen.handle_key(key_with_modifiers(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(matches!(action, Action::Logout));
+    }
+
+    #[test]
+    fn plain_x_upper_x_and_tab_do_not_log_out() {
+        let mut screen = DashboardScreen::new(false, false);
+
+        let plain_x = screen.handle_key(key(KeyCode::Char('x')));
+        let upper_x = screen.handle_key(key(KeyCode::Char('X')));
+        let tab = screen.handle_key(key(KeyCode::Tab));
+
+        assert!(!matches!(plain_x, Action::Logout));
+        assert!(!matches!(upper_x, Action::Logout));
+        assert!(!matches!(tab, Action::Logout));
     }
 
     #[test]

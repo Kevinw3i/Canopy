@@ -23,6 +23,68 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/ec2/connect", post(connect_instance))
 }
 
+struct RequiredIamSimulation {
+    action: &'static str,
+    resources: Vec<String>,
+}
+
+fn required_connect_simulations(req: &ConnectRequest) -> Vec<RequiredIamSimulation> {
+    let mut simulations = vec![RequiredIamSimulation {
+        action: "ec2:DescribeInstances",
+        // DescribeInstances does not support instance-level resource
+        // permissions. Simulating it against an instance ARN false-denies
+        // roles that correctly allow the API on "*".
+        resources: vec!["*".to_string()],
+    }];
+
+    match req.method {
+        ConnectMethod::Ssm => {
+            let mut resources = vec![format!(
+                "arn:aws:ec2:{}:{}:instance/{}",
+                req.region, req.account_id, req.instance_id
+            )];
+            if req.os_user.is_some() {
+                resources.push(format!(
+                    "arn:aws:ssm:{}::document/AWS-StartSSHSession",
+                    req.region
+                ));
+            } else {
+                resources.push(format!(
+                    "arn:aws:ssm:{}::document/SSM-SessionManagerRunShell",
+                    req.region
+                ));
+            }
+            simulations.push(RequiredIamSimulation {
+                action: "ssm:StartSession",
+                resources,
+            });
+        }
+        ConnectMethod::Ec2InstanceConnect => {
+            simulations.push(RequiredIamSimulation {
+                action: "ec2-instance-connect:SendSSHPublicKey",
+                resources: vec![format!(
+                    "arn:aws:ec2:{}:{}:instance/{}",
+                    req.region, req.account_id, req.instance_id
+                )],
+            });
+            simulations.push(RequiredIamSimulation {
+                action: "ec2-instance-connect:OpenTunnel",
+                resources: vec![format!(
+                    "arn:aws:ec2:{}:{}:instance-connect-endpoint/*",
+                    req.region, req.account_id
+                )],
+            });
+        }
+        ConnectMethod::Ssh => {}
+    }
+
+    simulations
+}
+
+fn simulated_action_names(simulations: &[RequiredIamSimulation]) -> Vec<&'static str> {
+    simulations.iter().map(|s| s.action).collect()
+}
+
 /// Fetch EC2 instances from real AWS across all allowed account+region pairs.
 async fn fetch_instances_from_aws(
     state: &AppState,
@@ -413,39 +475,11 @@ async fn connect_instance(
             let use_ssh = matches!(req.method, ConnectMethod::Ssh);
             let ssm_os_user_enforced = use_ssm && req.os_user.is_some();
 
-            // Determine which IAM actions AND resources the connect method needs.
-            // Build a complete simulation set so the role chooser proves full access.
-            let mut required_actions = vec!["ec2:DescribeInstances".to_string()];
-            let mut required_resources = vec![format!(
-                "arn:aws:ec2:{}:{}:instance/{}",
-                req.region, req.account_id, req.instance_id
-            )];
-
-            if use_ssm {
-                required_actions.push("ssm:StartSession".to_string());
-                if ssm_os_user_enforced {
-                    required_resources.push(format!(
-                        "arn:aws:ssm:{}::document/AWS-StartSSHSession",
-                        req.region
-                    ));
-                } else {
-                    required_resources.push(format!(
-                        "arn:aws:ssm:{}::document/AWS-StartSSHSession",
-                        req.region
-                    ));
-                    required_resources.push(format!(
-                        "arn:aws:ssm:{}::document/SSM-SessionManagerRunShell",
-                        req.region
-                    ));
-                }
-            } else if use_eic {
-                required_actions.push("ec2-instance-connect:SendSSHPublicKey".to_string());
-                required_actions.push("ec2-instance-connect:OpenTunnel".to_string());
-                required_resources.push(format!(
-                    "arn:aws:ec2:{}:{}:instance-connect-endpoint/*",
-                    req.region, req.account_id
-                ));
-            }
+            // Determine which IAM actions and resources the connect method needs.
+            // Simulate each action only against the resources it actually
+            // supports; cross-product simulation creates false denies for
+            // APIs like ec2:DescribeInstances that only support Resource "*".
+            let required_simulations = required_connect_simulations(&req);
 
             // Pick the first matching account. For direct/profile modes, IAM
             // simulation is not applicable — just use the first match.
@@ -482,41 +516,48 @@ async fn connect_instance(
                         if first_assumable.is_none() {
                             first_assumable = Some(candidate.clone());
                         }
-                        let mut sim = iam_client
-                            .simulate_principal_policy()
-                            .policy_source_arn(&candidate.role_arn);
-                        for resource in &required_resources {
-                            sim = sim.resource_arns(resource);
-                        }
-                        for action in &required_actions {
-                            sim = sim.action_names(action);
-                        }
-                        match sim.send().await {
-                            Ok(sim_resp) => {
-                                all_sim_errored = false;
-                                // All requested actions must be allowed
-                                let allowed = sim_resp.evaluation_results().iter().all(|r| {
-                                    matches!(
+                        let mut candidate_allowed = true;
+                        let mut candidate_sim_errored = false;
+                        for required in &required_simulations {
+                            let mut sim = iam_client
+                                .simulate_principal_policy()
+                                .policy_source_arn(&candidate.role_arn)
+                                .action_names(required.action);
+                            for resource in &required.resources {
+                                sim = sim.resource_arns(resource);
+                            }
+                            match sim.send().await {
+                                Ok(sim_resp) => {
+                                    all_sim_errored = false;
+                                    let allowed = sim_resp.evaluation_results().iter().all(|r| {
+                                        matches!(
                                         r.eval_decision(),
                                         aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed
                                     )
-                                });
-                                if allowed {
-                                    chosen = Some(candidate.clone());
+                                    });
+                                    if !allowed {
+                                        candidate_allowed = false;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    candidate_sim_errored = true;
+                                    tracing::warn!(
+                                        role = %candidate.role_arn,
+                                        action = required.action,
+                                        error = %e,
+                                        "IAM simulation failed, skipping candidate"
+                                    );
                                     break;
                                 }
-                                // Not allowed — try next candidate
                             }
-                            Err(e) => {
-                                // Simulation error is inconclusive — skip this
-                                // candidate and try the next one instead of
-                                // blindly selecting it.
-                                tracing::warn!(
-                                    role = %candidate.role_arn,
-                                    error = %e,
-                                    "IAM simulation failed, skipping candidate"
-                                );
-                            }
+                        }
+                        if candidate_sim_errored {
+                            continue;
+                        }
+                        if candidate_allowed {
+                            chosen = Some(candidate.clone());
+                            break;
                         }
                     }
                     // If all simulations errored (e.g. base identity lacks
@@ -543,7 +584,7 @@ async fn connect_instance(
                                 "None of the {} authorized roles for account {} can perform {:?}",
                                 matching_accounts.len(),
                                 req.account_id,
-                                required_actions
+                                simulated_action_names(&required_simulations)
                             ))),
                             ));
                         }
@@ -864,4 +905,80 @@ async fn connect_instance(
     }
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect_req(method: ConnectMethod, os_user: Option<&str>) -> ConnectRequest {
+        ConnectRequest {
+            instance_id: "i-1234567890abcdef0".into(),
+            account_id: "111111111111".into(),
+            region: "ap-northeast-1".into(),
+            method,
+            os_user: os_user.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn ssm_shell_simulates_only_shell_document() {
+        let simulations = required_connect_simulations(&connect_req(ConnectMethod::Ssm, None));
+        let ssm = simulations
+            .iter()
+            .find(|s| s.action == "ssm:StartSession")
+            .unwrap();
+
+        assert!(ssm
+            .resources
+            .iter()
+            .any(|r| r.ends_with("document/SSM-SessionManagerRunShell")));
+        assert!(!ssm
+            .resources
+            .iter()
+            .any(|r| r.ends_with("document/AWS-StartSSHSession")));
+    }
+
+    #[test]
+    fn ssm_ssh_simulates_only_ssh_document() {
+        let simulations =
+            required_connect_simulations(&connect_req(ConnectMethod::Ssm, Some("ubuntu")));
+        let ssm = simulations
+            .iter()
+            .find(|s| s.action == "ssm:StartSession")
+            .unwrap();
+
+        assert!(ssm
+            .resources
+            .iter()
+            .any(|r| r.ends_with("document/AWS-StartSSHSession")));
+        assert!(!ssm
+            .resources
+            .iter()
+            .any(|r| r.ends_with("document/SSM-SessionManagerRunShell")));
+    }
+
+    #[test]
+    fn direct_ssh_only_simulates_describe_instances() {
+        let simulations = required_connect_simulations(&connect_req(ConnectMethod::Ssh, None));
+
+        assert_eq!(simulations.len(), 1);
+        assert_eq!(simulations[0].action, "ec2:DescribeInstances");
+        assert_eq!(simulations[0].resources, vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn eic_simulates_instance_and_endpoint_actions() {
+        let simulations = required_connect_simulations(&connect_req(
+            ConnectMethod::Ec2InstanceConnect,
+            Some("ubuntu"),
+        ));
+
+        assert!(simulations
+            .iter()
+            .any(|s| s.action == "ec2-instance-connect:SendSSHPublicKey"));
+        assert!(simulations
+            .iter()
+            .any(|s| s.action == "ec2-instance-connect:OpenTunnel"));
+    }
 }

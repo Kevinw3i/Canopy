@@ -28,6 +28,7 @@ pub enum Action {
     LoginPkce,
     LoginDeviceCode,
     Logout,
+    ChangePassword,
     TokenReceived(String),
 
     // EC2

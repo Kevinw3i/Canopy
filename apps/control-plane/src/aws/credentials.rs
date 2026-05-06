@@ -233,10 +233,9 @@ pub fn connect_session_policy(
                 "arn:aws:ssm:{region}::document/AWS-StartSSHSession"
             ));
         } else {
-            resources.extend([
-                format!("arn:aws:ssm:{region}::document/AWS-StartSSHSession"),
-                format!("arn:aws:ssm:{region}::document/SSM-SessionManagerRunShell"),
-            ]);
+            resources.push(format!(
+                "arn:aws:ssm:{region}::document/SSM-SessionManagerRunShell"
+            ));
         }
 
         let mut stmt = serde_json::json!({
@@ -474,7 +473,13 @@ mod tests {
                 .map(|s| s.contains("SSM-SessionManagerRunShell"))
                 .unwrap_or(false)
         });
+        let has_ssh = resources.iter().any(|r| {
+            r.as_str()
+                .map(|s| s.contains("AWS-StartSSHSession"))
+                .unwrap_or(false)
+        });
         assert!(has_shell);
+        assert!(!has_ssh);
         // No Condition key when os_user is None
         assert!(v["Statement"][0].get("Condition").is_none());
     }

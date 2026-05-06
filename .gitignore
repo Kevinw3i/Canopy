@@ -28,3 +28,6 @@ infra/*.tfvars
 !infra/terraform.tfvars.example
 infra/tfplan*
 *.tfplan
+
+# Claude Code 本地 worktree（每個 worktree 是獨立 git 工作樹副本）
+.claude/worktrees/

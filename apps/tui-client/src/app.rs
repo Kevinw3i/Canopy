@@ -53,6 +53,15 @@ pub struct App {
     update_banner: Option<String>,
 }
 
+fn normalized_http_url(url: &str) -> Option<&str> {
+    let url = url.trim();
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Some(url)
+    } else {
+        None
+    }
+}
+
 impl App {
     pub async fn new(config: ClientConfig) -> Result<Self> {
         let api = ApiClient::new(&config.control_plane_url);
@@ -303,6 +312,26 @@ impl App {
                 self.current_screen = Screen::Login;
                 self.screen_stack.clear();
             }
+            Action::ChangePassword => match self.config.change_password_url.as_deref() {
+                Some(raw_url) => match normalized_http_url(raw_url) {
+                    Some(url) => {
+                        if let Err(e) = open::that(url) {
+                            self.error_modal
+                                .show(format!("Failed to open password page: {}\n{}", e, url));
+                        }
+                    }
+                    None => self
+                        .error_modal
+                        .show("Change password URL must start with http:// or https://.".into()),
+                },
+                _ => {
+                    self.error_modal.show(
+                        "Change password URL is not configured. \
+                         Set change_password_url in the TUI config."
+                            .into(),
+                    );
+                }
+            },
             Action::TokenReceived(token) => {
                 self.api.set_token(token.clone());
                 crate::auth::save_token(&token).ok();
@@ -1158,6 +1187,7 @@ impl App {
             auto_update: false,
             update_repo_owner: "test".into(),
             update_repo_name: "test".into(),
+            change_password_url: None,
         }
     }
 
@@ -1440,6 +1470,21 @@ mod tests {
 
         app.error_modal.dismiss();
         assert!(!app.error_modal.is_visible());
+    }
+
+    #[test]
+    fn change_password_url_allows_only_http_schemes() {
+        assert_eq!(
+            normalized_http_url(" https://auth.example.com/forgotPassword "),
+            Some("https://auth.example.com/forgotPassword")
+        );
+        assert_eq!(
+            normalized_http_url("http://localhost:9876/callback"),
+            Some("http://localhost:9876/callback")
+        );
+        assert!(normalized_http_url("file:///etc/passwd").is_none());
+        assert!(normalized_http_url("javascript:alert(1)").is_none());
+        assert!(normalized_http_url("").is_none());
     }
 
     // ── Logout resets state ─────────────────────────────────
