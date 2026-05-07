@@ -11,6 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Default is a placeholder so the script never ships an internal profile
+# name. Override with AWS_PROFILE env var or --profile flag.
 AWS_PROFILE_NAME="${AWS_PROFILE:-your-aws-profile}"
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
 TERRAFORM_DIR="${TERRAFORM_DIR:-infra}"
