@@ -1193,7 +1193,7 @@ impl App {
             start_time,
             end_time,
             next_token: None,
-            limit: 100,
+            limit: 500,
         };
 
         match self.api.filter_log_events(&req).await {
