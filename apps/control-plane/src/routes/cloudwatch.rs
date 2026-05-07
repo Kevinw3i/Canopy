@@ -20,6 +20,31 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cloudwatch/insights/results", post(get_query_results))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_group_arn_variants_include_cloudwatch_describe_suffix() {
+        assert_eq!(
+            log_group_arn_variants("ap-northeast-1", "123456789012", "/ecs/my-service"),
+            vec![
+                "arn:aws:logs:ap-northeast-1:123456789012:log-group:/ecs/my-service".to_string(),
+                "arn:aws:logs:ap-northeast-1:123456789012:log-group:/ecs/my-service:*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn log_group_patterns_match_describe_arn_suffix() {
+        let patterns =
+            vec!["arn:aws:logs:ap-northeast-1:123456789012:log-group:/ecs/my-service:*".to_string()];
+        let variants = log_group_arn_variants("ap-northeast-1", "123456789012", "/ecs/my-service");
+
+        assert!(log_group_matches_patterns(&patterns, &variants));
+    }
+}
+
 /// Try each matching AllowedAccount entry for the given account_id until
 /// AssumeRole succeeds. Returns all successfully-assumed CWL clients so
 /// callers can retry operations across candidate roles when the first
@@ -132,6 +157,19 @@ fn require_audit_healthy(state: &AppState) -> Result<(), (axum::http::StatusCode
     } else {
         Ok(())
     }
+}
+
+fn log_group_arn_variants(region: &str, account_id: &str, log_group_name: &str) -> Vec<String> {
+    let base = format!("arn:aws:logs:{region}:{account_id}:log-group:{log_group_name}");
+    vec![base.clone(), format!("{base}:*")]
+}
+
+fn log_group_matches_patterns(patterns: &[String], arn_variants: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        arn_variants
+            .iter()
+            .any(|arn| crate::services::entitlements::arn_matches_pattern(pattern, arn))
+    })
 }
 
 async fn list_log_groups(
@@ -335,21 +373,25 @@ async fn filter_log_events(
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
-    let filter_lg_arn = format!(
-        "arn:aws:logs:{}:{}:log-group:{}",
-        req.region, req.account_id, req.log_group_name
-    );
-    if !ent_service
-        .has_feature_for_scope(
-            &claims,
-            &req.account_id,
-            Some(&req.region),
-            Some(&filter_lg_arn),
-            None,
-            |f| f.can_use_cloudwatch_search,
-        )
-        .await
-    {
+    let filter_lg_arns = log_group_arn_variants(&req.region, &req.account_id, &req.log_group_name);
+    let mut filter_scope_allowed = false;
+    for arn in &filter_lg_arns {
+        if ent_service
+            .has_feature_for_scope(
+                &claims,
+                &req.account_id,
+                Some(&req.region),
+                Some(arn),
+                None,
+                |f| f.can_use_cloudwatch_search,
+            )
+            .await
+        {
+            filter_scope_allowed = true;
+            break;
+        }
+    }
+    if !filter_scope_allowed {
         let _ = state.audit_service.log_event(
             &claims.sub,
             AuditAction::CloudwatchSearch,
@@ -408,14 +450,7 @@ async fn filter_log_events(
             f.can_use_cloudwatch_search
         })
         .await;
-    let log_group_arn = format!(
-        "arn:aws:logs:{}:{}:log-group:{}",
-        req.region, req.account_id, req.log_group_name
-    );
-    if !scoped_log_arns.is_empty()
-        && !scoped_log_arns.iter().any(|pattern| {
-            crate::services::entitlements::arn_matches_pattern(pattern, &log_group_arn)
-        })
+    if !scoped_log_arns.is_empty() && !log_group_matches_patterns(&scoped_log_arns, &filter_lg_arns)
     {
         let _ = state.audit_service.log_event(
             &claims.sub,
@@ -603,14 +638,8 @@ async fn start_insights_query(
         .await;
     if !scoped_log_arns.is_empty() {
         for lg_name in &req.log_group_names {
-            let lg_arn = format!(
-                "arn:aws:logs:{}:{}:log-group:{}",
-                req.region, req.account_id, lg_name
-            );
-            if !scoped_log_arns
-                .iter()
-                .any(|pattern| crate::services::entitlements::arn_matches_pattern(pattern, &lg_arn))
-            {
+            let lg_arns = log_group_arn_variants(&req.region, &req.account_id, lg_name);
+            if !log_group_matches_patterns(&scoped_log_arns, &lg_arns) {
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
                     Json(ApiError::forbidden(format!(
@@ -768,13 +797,8 @@ async fn get_query_results(
                     .await;
                 if !scoped_arns.is_empty() {
                     for lg_name in &auth.log_group_names {
-                        let lg_arn = format!(
-                            "arn:aws:logs:{}:{}:log-group:{}",
-                            req.region, req.account_id, lg_name
-                        );
-                        if !scoped_arns.iter().any(|pattern| {
-                            crate::services::entitlements::arn_matches_pattern(pattern, &lg_arn)
-                        }) {
+                        let lg_arns = log_group_arn_variants(&req.region, &req.account_id, lg_name);
+                        if !log_group_matches_patterns(&scoped_arns, &lg_arns) {
                             return Err((
                                 axum::http::StatusCode::FORBIDDEN,
                                 Json(ApiError::forbidden(format!(

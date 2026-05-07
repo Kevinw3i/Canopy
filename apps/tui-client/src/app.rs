@@ -1155,16 +1155,18 @@ impl App {
         }
 
         self.cloudwatch_search.set_loading();
-        let now = chrono::Utc::now().timestamp_millis();
-        let one_hour_ago = now - 3_600_000;
+        let (start_time, end_time) = self
+            .cloudwatch_search
+            .time_range
+            .resolve_filter_log_events_window();
 
         let req = shared::dto::cloudwatch::FilterLogEventsRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
             region: self.cloudwatch_search.selected_region.clone(),
             log_group_name: self.cloudwatch_search.selected_log_group.clone(),
             filter_pattern: Some(self.cloudwatch_search.query_input.value.clone()),
-            start_time: one_hour_ago,
-            end_time: now,
+            start_time,
+            end_time,
             next_token: None,
             limit: 100,
         };
@@ -1183,16 +1185,18 @@ impl App {
         }
 
         self.cloudwatch_search.set_loading();
-        let now = chrono::Utc::now().timestamp();
-        let one_hour_ago = now - 3600;
+        let (start_time, end_time) = self
+            .cloudwatch_search
+            .time_range
+            .resolve_insights_window();
 
         let req = shared::dto::cloudwatch::StartInsightsQueryRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
             region: self.cloudwatch_search.selected_region.clone(),
             log_group_names: vec![self.cloudwatch_search.selected_log_group.clone()],
             query_string: self.cloudwatch_search.query_input.value.clone(),
-            start_time: one_hour_ago,
-            end_time: now,
+            start_time,
+            end_time,
         };
 
         match self.api.start_insights_query(&req).await {
