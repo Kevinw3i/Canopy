@@ -6,6 +6,8 @@ use ratatui::{
 use shared::dto::cloudwatch::*;
 use shared::dto::entitlements::UserEntitlements;
 
+use super::time_range::{TimeRange, TimeRangePreset};
+use super::time_range_modal::{ModalOutcome, TimeRangeModal};
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
 use crate::event::{Action, ExportFormat};
 use crate::widgets::input::TextInput;
@@ -56,6 +58,12 @@ pub struct CloudWatchSearchScreen {
     table: SelectableTable,
     selected_event: Option<usize>,
     query_history: Vec<String>,
+    /// Active time-range selection (preset or custom). Drives both Quick
+    /// Search (FilterLogEvents) and Insights query windows.
+    pub time_range: TimeRange,
+    /// Optional custom-range modal overlay. When `Some`, all key events are
+    /// routed to the modal instead of the screen.
+    time_range_modal: Option<TimeRangeModal>,
 }
 
 impl Default for CloudWatchSearchScreen {
@@ -105,6 +113,8 @@ impl CloudWatchSearchScreen {
             ),
             selected_event: None,
             query_history: Vec::new(),
+            time_range: TimeRange::default(),
+            time_range_modal: None,
         }
     }
 
@@ -339,6 +349,44 @@ impl Component for CloudWatchSearchScreen {
             return Action::Quit;
         }
 
+        // Route everything to the custom-range modal when it is open. The
+        // modal owns the key handling until the user submits, cancels, or
+        // resets — even Tab and Esc are intercepted before the screen sees
+        // them.
+        if self.time_range_modal.is_some() {
+            let outcome = self
+                .time_range_modal
+                .as_mut()
+                .expect("modal presence checked above")
+                .handle_key(key);
+            match outcome {
+                ModalOutcome::Continue => {}
+                ModalOutcome::Cancel => {
+                    self.time_range_modal = None;
+                }
+                ModalOutcome::ResetToOneHour => {
+                    self.time_range = TimeRange::Preset(TimeRangePreset::OneHour);
+                    self.time_range_modal = None;
+                }
+                ModalOutcome::Submit {
+                    start_secs,
+                    end_secs,
+                } => {
+                    if let Err(e) = self.time_range.set_custom(start_secs, end_secs) {
+                        // Defensive: validation already ran inside the modal.
+                        // If we somehow reach here, surface the error rather
+                        // than silently dropping the input.
+                        if let Some(m) = self.time_range_modal.as_mut() {
+                            m.error = Some(e.to_string());
+                        }
+                    } else {
+                        self.time_range_modal = None;
+                    }
+                }
+            }
+            return Action::Noop;
+        }
+
         match key.code {
             KeyCode::Esc => match self.focus {
                 CwFocus::LogGroupList => Action::GoBack,
@@ -432,6 +480,22 @@ impl Component for CloudWatchSearchScreen {
                     self.scope_transition = Some(ScopeTransition::new(label));
                     return Action::RefreshLogGroups;
                 }
+                Action::Noop
+            }
+            // `r` (anywhere except text inputs) → cycle preset time range
+            KeyCode::Char('r')
+                if !matches!(self.focus, CwFocus::QueryInput | CwFocus::LogGroupFilter) =>
+            {
+                self.time_range.cycle_preset();
+                Action::Noop
+            }
+            // `R` (Shift+r, anywhere except text inputs, not while loading)
+            // → open the custom-range modal.
+            KeyCode::Char('R')
+                if !matches!(self.focus, CwFocus::QueryInput | CwFocus::LogGroupFilter)
+                    && !self.loading =>
+            {
+                self.time_range_modal = Some(TimeRangeModal::open(&self.time_range));
                 Action::Noop
             }
             // `/` in log group list → activate log group filter
@@ -735,8 +799,9 @@ impl Component for CloudWatchSearchScreen {
                 self.events.len()
             };
             format!(
-                "{} results | Tab: switch panel | /: query | Enter: select/run | Esc: back",
-                count
+                "{} results | range: {} | r: cycle | R: custom | Tab: switch panel | /: query | Enter: select/run | Esc: back",
+                count,
+                self.time_range.footer_label(),
             )
         };
 
@@ -756,6 +821,11 @@ impl Component for CloudWatchSearchScreen {
         // Scope transition overlay
         if let Some(ref t) = self.scope_transition {
             t.render(inner, buf);
+        }
+
+        // Custom-range modal (top-most overlay)
+        if let Some(ref modal) = self.time_range_modal {
+            modal.render(inner, buf);
         }
     }
 
@@ -1125,5 +1195,198 @@ mod tests {
         screen.set_error("timeout".into());
         assert!(!screen.loading);
         assert_eq!(screen.error.as_deref(), Some("timeout"));
+    }
+
+    // ── Time range (B + C) ──
+
+    fn key_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn default_time_range_is_one_hour_preset() {
+        let screen = CloudWatchSearchScreen::new();
+        assert_eq!(screen.time_range, TimeRange::Preset(TimeRangePreset::OneHour));
+    }
+
+    #[test]
+    fn r_cycles_preset_when_focus_is_log_group_list() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+
+        screen.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::ThreeHours)
+        );
+        screen.handle_key(key(KeyCode::Char('r')));
+        screen.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::TwentyFourHours)
+        );
+        screen.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
+    }
+
+    #[test]
+    fn r_ignored_in_query_input_so_user_can_type_r() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::QueryInput;
+        screen.query_input.focused = true;
+
+        screen.handle_key(key(KeyCode::Char('r')));
+        // Range untouched
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
+        // The literal 'r' was forwarded to the query input
+        assert_eq!(screen.query_input.value, "r");
+    }
+
+    #[test]
+    fn r_ignored_in_log_group_filter_so_user_can_type_r() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupFilter;
+        screen.log_group_filter.focused = true;
+
+        screen.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
+        assert_eq!(screen.log_group_filter.value, "r");
+    }
+
+    #[test]
+    fn shift_r_opens_modal_and_esc_closes_it() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+
+        screen.handle_key(key_shift(KeyCode::Char('R')));
+        assert!(screen.time_range_modal.is_some());
+
+        screen.handle_key(key(KeyCode::Esc));
+        assert!(screen.time_range_modal.is_none());
+        // Range was not modified by cancel
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
+    }
+
+    #[test]
+    fn shift_r_ignored_while_loading() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+        screen.loading = true;
+
+        screen.handle_key(key_shift(KeyCode::Char('R')));
+        assert!(screen.time_range_modal.is_none());
+    }
+
+    #[test]
+    fn modal_submit_via_enter_applies_custom_range() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+
+        // Open modal — prefilled with now-1h / now.
+        screen.handle_key(key_shift(KeyCode::Char('R')));
+        // Replace start/end fields explicitly.
+        if let Some(modal) = screen.time_range_modal.as_mut() {
+            modal.start.value = "2026-05-01 00:00".into();
+            modal.start.cursor_pos = modal.start.value.chars().count();
+            modal.end.value = "2026-05-08 00:00".into();
+            modal.end.cursor_pos = modal.end.value.chars().count();
+        }
+
+        // Submit via Enter while modal is open.
+        screen.handle_key(key(KeyCode::Enter));
+        assert!(screen.time_range_modal.is_none(), "modal should close on submit");
+        match screen.time_range {
+            TimeRange::Custom {
+                start_secs,
+                end_secs,
+            } => {
+                assert_eq!(end_secs - start_secs, 7 * 86_400);
+            }
+            other => panic!("expected Custom range, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn modal_ctrl_r_resets_to_one_hour_and_closes() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+        // Start with a Custom range so reset is observable.
+        screen
+            .time_range
+            .set_custom(1_777_989_600, 1_777_989_600 + 86_400)
+            .unwrap();
+
+        screen.handle_key(key_shift(KeyCode::Char('R')));
+        assert!(screen.time_range_modal.is_some());
+
+        let ctrl_r = KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        screen.handle_key(ctrl_r);
+        assert!(screen.time_range_modal.is_none());
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
+    }
+
+    #[test]
+    fn mode_switch_via_tab_preserves_range() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+
+        // Cycle to 6h.
+        screen.handle_key(key(KeyCode::Char('r')));
+        screen.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::SixHours)
+        );
+
+        // Now move to query input and toggle search mode.
+        screen.handle_key(key(KeyCode::Tab)); // → QueryInput
+        screen.handle_key(key(KeyCode::Tab)); // → toggles search_mode
+
+        // Range still 6h after mode flip.
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::SixHours)
+        );
+    }
+
+    #[test]
+    fn cycling_from_custom_returns_to_one_hour() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+        screen
+            .time_range
+            .set_custom(1_777_989_600, 1_777_989_600 + 86_400)
+            .unwrap();
+
+        screen.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
     }
 }

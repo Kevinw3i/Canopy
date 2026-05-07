@@ -7,6 +7,8 @@ pub mod live_tail;
 pub mod loading;
 pub mod login;
 pub mod settings;
+pub mod time_range;
+pub mod time_range_modal;
 
 use crate::event::Action;
 use crossterm::event::KeyEvent;
