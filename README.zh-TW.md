@@ -557,7 +557,7 @@ TUI                     Control Plane              OIDC 提供者
 
 - **伺服器端過濾**：EC2 和 CloudWatch 資料在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **範圍隔離**：功能授權與資源範圍依規則逐一驗證，防止跨群組權限拼接。一個群組的功能不能套用到另一個群組的資源上
-- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 限縮到特定執行個體，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2-instance-connect:osUser`）
+- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 限縮到特定執行個體，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）
 - **帳號身份驗證**：`direct`/`profile:` 和 AssumeRole 憑證透過 `GetCallerIdentity` 驗證，確保與設定的 `account_id` 一致
 - **TUI 無 AWS 長期金鑰**：所有 AWS 存取都經由 Control Plane
 - **稽核失敗則拒絕**：持久化稽核日誌寫入失敗時，所有受保護的 API（包含登入、刷新、權限查詢）回傳 503。暫時性 I/O 錯誤可自行恢復，無需重啟

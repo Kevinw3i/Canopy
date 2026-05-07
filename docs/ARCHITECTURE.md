@@ -267,7 +267,7 @@ the spawned CLI process uses the ambient or profile credentials directly.
 | 3 | Entitlements | Server-side filtering with per-rule scope isolation (no cross-group splicing) |
 | 4 | Connect creds | Inline IAM session policy (per-method, per-instance, OS-user bound) |
 | 5 | SSM os_user | SSH ProxyCommand + IAM condition `ssm:SessionDocumentAccessCheck` |
-| 6 | EIC creds | No ec2:Describe*, OS-user bound via `ec2-instance-connect:osUser` condition |
+| 6 | EIC creds | Allows AWS CLI `ec2:DescribeInstances` preflight only in the target region; OS-user bound via `ec2:osuser` condition |
 | 7 | Audit | Fail-closed on all endpoints (auth, EC2, CW, entitlements). Transient recovery without restart |
 | 8 | Config | dev_mode refuses non-loopback bind; CORS restricted with real AWS; SSM requires explicit allowed_os_users |
 | 9 | Insights token | HMAC-signed query auth (survives restart), rejects empty log_group_names |

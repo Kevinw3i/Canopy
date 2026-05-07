@@ -558,7 +558,7 @@ When the durable audit file is configured and a write fails, the API returns 503
 
 - **Server-side filtering**: EC2 instances and CloudWatch data are filtered by entitlements on the backend before returning to the TUI. The client never sees unauthorized resources.
 - **Scope isolation**: Feature grants and resource scopes are evaluated per-rule to prevent cross-group privilege escalation. A feature from one group cannot be applied to resources from another group.
-- **Short-lived credentials**: STS AssumeRole with session tags. Connect operations use inline session policies scoped to the specific instance, including OS-user binding via IAM conditions (`ssm:SessionDocumentAccessCheck`, `ec2-instance-connect:osUser`).
+- **Short-lived credentials**: STS AssumeRole with session tags. Connect operations use inline session policies scoped to the specific instance, including OS-user binding via IAM conditions (`ssm:SessionDocumentAccessCheck`, `ec2:osuser`).
 - **Account identity verification**: `direct`/`profile:` and AssumeRole credentials are verified via `GetCallerIdentity` to ensure they match the configured `account_id`.
 - **No long-lived AWS keys in the TUI**: All AWS access goes through the control-plane.
 - **Audit fail-closed**: If the durable audit log cannot be written, all protected APIs (including login, refresh, entitlements) return 503. Transient I/O failures self-recover without restart.

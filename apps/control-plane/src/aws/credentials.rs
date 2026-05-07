@@ -258,6 +258,17 @@ pub fn connect_session_policy(
     }
 
     if use_eic {
+        statements.push(serde_json::json!({
+            "Effect": "Allow",
+            "Action": ["ec2:DescribeInstances"],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestedRegion": region
+                }
+            }
+        }));
+
         let eic_resources = vec![
             instance_arn.clone(),
             format!("arn:aws:ec2:{region}:{account_id}:instance-connect-endpoint/*"),
@@ -276,7 +287,7 @@ pub fn connect_session_policy(
         if let Some(user) = os_user {
             stmt["Condition"] = serde_json::json!({
                 "StringEquals": {
-                    "ec2-instance-connect:osUser": user
+                    "ec2:osuser": user
                 }
             });
         }
@@ -438,9 +449,16 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
         let stmts = v["Statement"].as_array().unwrap();
-        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts.len(), 2);
 
-        let actions = stmts[0]["Action"].as_array().unwrap();
+        assert_eq!(stmts[0]["Action"][0], "ec2:DescribeInstances");
+        assert_eq!(stmts[0]["Resource"], "*");
+        assert_eq!(
+            stmts[0]["Condition"]["StringEquals"]["aws:RequestedRegion"],
+            "eu-west-1"
+        );
+
+        let actions = stmts[1]["Action"].as_array().unwrap();
         assert!(actions
             .iter()
             .any(|a| a == "ec2-instance-connect:SendSSHPublicKey"));
@@ -450,7 +468,7 @@ mod tests {
 
         // EIC OS user condition
         assert_eq!(
-            stmts[0]["Condition"]["StringEquals"]["ec2-instance-connect:osUser"],
+            stmts[1]["Condition"]["StringEquals"]["ec2:osuser"],
             "ubuntu"
         );
     }
@@ -497,7 +515,7 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
         let stmts = v["Statement"].as_array().unwrap();
-        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts.len(), 3);
     }
 
     #[test]
