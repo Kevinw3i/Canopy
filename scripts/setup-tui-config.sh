@@ -119,8 +119,8 @@ dev_mode = false
 pkce_callback_port = 9876
 enable_live_tail = false
 show_public_ip = false
-auto_update = false
-# change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
+auto_update = true
+change_password_url = "https://<cognito-domain-prefix>.auth.ap-northeast-1.amazoncognito.com/forgotPassword?client_id=<cognito-app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 TOML
 
 chmod 600 "$CONFIG_PATH" 2>/dev/null || true

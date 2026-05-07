@@ -240,9 +240,11 @@ aws ecr get-login-password --region ap-northeast-1 | \
   docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 VERSION=$(git describe --tags --always)
+ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 
 docker build --platform linux/amd64 \
   -t "$ECR_URL:$VERSION" \
+  --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 
@@ -297,9 +299,11 @@ aws logs tail $(cd infra && terraform output -raw log_group_name) --follow
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 VERSION=$(git describe --tags --always)
+ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 
 docker build --platform linux/amd64 \
   -t "$ECR_URL:$VERSION" \
+  --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 

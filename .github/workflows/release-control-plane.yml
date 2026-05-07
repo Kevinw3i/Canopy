@@ -66,6 +66,13 @@ jobs:
           printf '%s' "${ENTITLEMENTS_TOML_B64}" | base64 -d > entitlements.toml
           test -s entitlements.toml
 
+      - name: Compute entitlements hash
+        id: entitlements
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "sha=$(sha256sum entitlements.toml | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
       - name: Validate entitlements against Terraform variables
         shell: bash
         env:
@@ -124,6 +131,8 @@ jobs:
           file: apps/control-plane/Dockerfile
           platforms: linux/amd64
           push: true
+          build-args: |
+            ENTITLEMENTS_SHA=${{ steps.entitlements.outputs.sha }}
           secret-files: |
             entitlements_toml=entitlements.toml
           tags: |

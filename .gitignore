@@ -15,6 +15,7 @@ entitlements.dev.toml
 entitlements.local-aws.toml
 docs/TODO.md
 docs/LOCAL_CONTROL_PLANE_DEPLOY.md
+DockerBuildFlow.md
 
 # Editor swap files
 *.swp

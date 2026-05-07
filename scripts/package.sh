@@ -78,6 +78,7 @@ refresh_interval_secs = 30
 live_tail_scrollback = 10000
 pkce_callback_port = 9876
 enable_live_tail = false
+auto_update = true
 # change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 EOF
 
@@ -102,7 +103,9 @@ fail() { echo -e "  ${RED}[FAIL]${NC} $1"; }
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_SRC="$INSTALL_DIR/tui-client"
-BIN_DST="/usr/local/bin/canopy"
+BIN_DIR="${CANOPY_BIN_DIR:-$HOME/.local/bin}"
+BIN_DST="$BIN_DIR/canopy"
+RUN_CMD="canopy"
 CONFIG_SRC="$INSTALL_DIR/config.toml"
 
 resolve_config_dir() {
@@ -197,15 +200,24 @@ if [ ! -f "$BIN_SRC" ]; then
     exit 1
 fi
 
-sudo cp "$BIN_SRC" "$BIN_DST"
-sudo chmod +x "$BIN_DST"
+mkdir -p "$BIN_DIR"
+cp "$BIN_SRC" "$BIN_DST"
+chmod +x "$BIN_DST"
 
 # macOS: 移除 Gatekeeper 隔離標記
 if [ "$OS" = "Darwin" ]; then
-    sudo xattr -dr com.apple.quarantine "$BIN_DST" 2>/dev/null || true
+    xattr -dr com.apple.quarantine "$BIN_DST" 2>/dev/null || true
 fi
 
 ok "已安裝到 $BIN_DST"
+
+case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+        RUN_CMD="$BIN_DST"
+        warn "$BIN_DIR 不在 PATH；請加入 PATH，或直接執行 $BIN_DST"
+        ;;
+esac
 
 # ── 2. 建立設定檔 ───────────────────────────────────
 
@@ -364,7 +376,7 @@ check() {
     fi
 }
 
-check "canopy 可執行"         "command -v canopy"
+check "canopy 可執行"         "test -x \"\$BIN_DST\""
 check "設定檔存在"                 "test -f \"\$CONFIG_DST\""
 check "設定檔包含 control_plane_url" "grep -q control_plane_url \"\$CONFIG_DST\""
 check "AWS CLI v2 已安裝"          "aws --version 2>&1 | grep -q 'aws-cli/2'"
@@ -405,7 +417,7 @@ fi
 
 echo ""
 echo "啟動方式："
-echo "  canopy"
+echo "  $RUN_CMD"
 echo ""
 INSTALLER
 
