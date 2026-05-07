@@ -495,13 +495,29 @@ async fn filter_log_events(
         }
 
         let resp = filter.send().await.map_err(|e| {
+            let service_error = e.as_service_error();
+            let is_invalid_parameter = service_error
+                .map(|err| err.is_invalid_parameter_exception())
+                .unwrap_or(false);
+            let invalid_parameter_message = service_error
+                .and_then(|err| err.meta().message())
+                .unwrap_or("invalid filter pattern");
             tracing::error!("filter_log_events failed: {e}");
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(ApiError::internal(format!(
-                    "AWS FilterLogEvents failed: {e}"
-                ))),
-            )
+            if is_invalid_parameter {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(ApiError::bad_request(format!(
+                        "Invalid CloudWatch filter pattern: {invalid_parameter_message}"
+                    ))),
+                )
+            } else {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    Json(ApiError::internal(format!(
+                        "AWS FilterLogEvents failed: {e}"
+                    ))),
+                )
+            }
         })?;
 
         let events: Vec<LogEvent> = resp

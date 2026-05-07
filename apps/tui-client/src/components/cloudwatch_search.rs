@@ -87,7 +87,7 @@ impl CloudWatchSearchScreen {
             selected_log_group: String::new(),
             available_accounts: Vec::new(),
             available_regions: Vec::new(),
-            query_input: TextInput::new("Filter pattern / Insights query"),
+            query_input: TextInput::new("Keyword / Insights query"),
             scope_transition: None,
             loading_spinner: LoadingIndicator::new("Loading log groups..."),
             fetch_generation: 0,
@@ -426,7 +426,7 @@ impl Component for CloudWatchSearchScreen {
                             SearchMode::InsightsQuery => SearchMode::QuickSearch,
                         };
                         self.query_input.label = match self.search_mode {
-                            SearchMode::QuickSearch => "Filter pattern".into(),
+                            SearchMode::QuickSearch => "Keyword".into(),
                             SearchMode::InsightsQuery => "Insights query".into(),
                         };
                     }
@@ -1211,7 +1211,10 @@ mod tests {
     #[test]
     fn default_time_range_is_one_hour_preset() {
         let screen = CloudWatchSearchScreen::new();
-        assert_eq!(screen.time_range, TimeRange::Preset(TimeRangePreset::OneHour));
+        assert_eq!(
+            screen.time_range,
+            TimeRange::Preset(TimeRangePreset::OneHour)
+        );
     }
 
     #[test]
@@ -1311,7 +1314,10 @@ mod tests {
 
         // Submit via Enter while modal is open.
         screen.handle_key(key(KeyCode::Enter));
-        assert!(screen.time_range_modal.is_none(), "modal should close on submit");
+        assert!(
+            screen.time_range_modal.is_none(),
+            "modal should close on submit"
+        );
         match screen.time_range {
             TimeRange::Custom {
                 start_secs,
