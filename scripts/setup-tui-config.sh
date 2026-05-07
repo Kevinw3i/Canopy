@@ -1,25 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_CONTROL_PLANE_URL="https://<your-canopy-domain>"
-CONTROL_PLANE_URL="${CANOPY_CONTROL_PLANE_URL:-$DEFAULT_CONTROL_PLANE_URL}"
+CONTROL_PLANE_URL="${CANOPY_CONTROL_PLANE_URL:-}"
+CHANGE_PASSWORD_URL="${CANOPY_CHANGE_PASSWORD_URL:-}"
 FORCE=0
 
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/setup-tui-config.sh [CONTROL_PLANE_URL]
-  scripts/setup-tui-config.sh --url CONTROL_PLANE_URL [--force]
+  scripts/setup-tui-config.sh [CONTROL_PLANE_URL] [options]
+  scripts/setup-tui-config.sh --url CONTROL_PLANE_URL [options]
+
+Options:
+  --url URL                       Control-plane URL (https://...).
+  --change-password-url URL       Optional self-service password URL
+                                  (typically the Cognito hosted UI).
+  --force                         Overwrite existing config.
+  -h, --help                      Show this help.
 
 Environment:
-  CANOPY_CONTROL_PLANE_URL   Default control-plane URL.
-  CANOPY_CONFIG_DIR          Override the config directory.
-  CANOPY_CONFIG_OVERWRITE=1  Overwrite an existing config file.
+  CANOPY_CONTROL_PLANE_URL        Default control-plane URL.
+  CANOPY_CHANGE_PASSWORD_URL      Default change-password URL.
+  CANOPY_CONFIG_DIR               Override the config directory.
+  CANOPY_CONFIG_OVERWRITE=1       Overwrite an existing config file.
+
+Note:
+  All real domains/IDs must come from env, flag, or a local wrapper
+  (see scripts/setup-tui-config.local.sh.example). The script itself
+  ships no defaults to avoid leaking production hostnames into git.
 
 Examples:
-  scripts/setup-tui-config.sh
-  scripts/setup-tui-config.sh https://<your-canopy-domain>
-  scripts/setup-tui-config.sh --url https://<your-canopy-domain> --force
+  scripts/setup-tui-config.sh https://canopy.your-domain.com
+  scripts/setup-tui-config.sh --url https://canopy.your-domain.com --force
+  CANOPY_CONTROL_PLANE_URL=https://canopy.your-domain.com \
+    CANOPY_CHANGE_PASSWORD_URL='https://<cognito-domain>/forgotPassword?...' \
+    scripts/setup-tui-config.sh
 USAGE
 }
 
@@ -41,6 +56,14 @@ while [ "$#" -gt 0 ]; do
       CONTROL_PLANE_URL="$2"
       shift 2
       ;;
+    --change-password-url)
+      if [ "$#" -lt 2 ]; then
+        echo "ERROR: --change-password-url requires a value" >&2
+        exit 1
+      fi
+      CHANGE_PASSWORD_URL="$2"
+      shift 2
+      ;;
     --*)
       echo "ERROR: unknown option: $1" >&2
       usage >&2
@@ -54,23 +77,32 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -z "$CONTROL_PLANE_URL" ]; then
-  echo "ERROR: control-plane URL cannot be empty" >&2
+  echo "ERROR: control-plane URL is required." >&2
+  echo "Pass it as an argument, --url, or via CANOPY_CONTROL_PLANE_URL." >&2
+  echo "See scripts/setup-tui-config.local.sh.example for a wrapper template." >&2
   exit 1
 fi
 
-CONTROL_PLANE_URL="${CONTROL_PLANE_URL%/}"
-
-case "$CONTROL_PLANE_URL" in
-  http://*|https://*) ;;
-  *)
-    echo "ERROR: control-plane URL must start with http:// or https://" >&2
+validate_http_url() {
+  local label="$1" value="$2"
+  case "$value" in
+    http://*|https://*) ;;
+    *)
+      echo "ERROR: $label must start with http:// or https://" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$value" == *\"* || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "ERROR: $label cannot contain quotes or newlines" >&2
     exit 1
-    ;;
-esac
+  fi
+}
 
-if [[ "$CONTROL_PLANE_URL" == *\"* || "$CONTROL_PLANE_URL" == *$'\n'* || "$CONTROL_PLANE_URL" == *$'\r'* ]]; then
-  echo "ERROR: control-plane URL cannot contain quotes or newlines" >&2
-  exit 1
+CONTROL_PLANE_URL="${CONTROL_PLANE_URL%/}"
+validate_http_url "control-plane URL" "$CONTROL_PLANE_URL"
+
+if [ -n "$CHANGE_PASSWORD_URL" ]; then
+  validate_http_url "change-password URL" "$CHANGE_PASSWORD_URL"
 fi
 
 resolve_config_dir() {
@@ -120,8 +152,13 @@ pkce_callback_port = 9876
 enable_live_tail = false
 show_public_ip = false
 auto_update = true
-change_password_url = "https://<cognito-domain-prefix>.auth.ap-northeast-1.amazoncognito.com/forgotPassword?client_id=<cognito-app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 TOML
+
+if [ -n "$CHANGE_PASSWORD_URL" ]; then
+  printf 'change_password_url = "%s"\n' "$CHANGE_PASSWORD_URL" >> "$CONFIG_PATH"
+else
+  printf '# change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"\n' >> "$CONFIG_PATH"
+fi
 
 chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 

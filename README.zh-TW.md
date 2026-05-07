@@ -249,10 +249,15 @@ group = "platform-engineering"
 
 ### TUI 客戶端設定
 
-建議用腳本建立設定檔，避免不同作業系統路徑不一致：
+建議用腳本建立設定檔，避免不同作業系統路徑不一致。腳本接受位置參數、
+`--url`，或環境變數 `CANOPY_CONTROL_PLANE_URL`。可額外傳
+`--change-password-url`（或 `CANOPY_CHANGE_PASSWORD_URL`）指定 Cognito
+hosted UI 的密碼頁網址。日常使用建議複製
+`scripts/setup-tui-config.local.sh.example` 為 `setup-tui-config.local.sh`
+（已 gitignore）並填入真實值。
 
 ```bash
-scripts/setup-tui-config.sh https://<your-canopy-domain>
+scripts/setup-tui-config.sh https://canopy.your-domain.com
 ```
 
 TUI 會使用作業系統標準 config 目錄：

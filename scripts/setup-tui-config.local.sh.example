@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Local wrapper for setup-tui-config.sh.
+#
+# Copy this file to scripts/setup-tui-config.local.sh and fill in your real
+# environment values. The .local.sh variant is gitignored so it never enters
+# version control. Run it instead of setup-tui-config.sh directly:
+#
+#   scripts/setup-tui-config.local.sh
+#   scripts/setup-tui-config.local.sh --force
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Required: control-plane URL.
+export CANOPY_CONTROL_PLANE_URL="https://canopy.your-domain.com"
+
+# Optional: Cognito hosted UI forgotPassword URL.
+# Replace <cognito-domain> and <app-client-id> with real values.
+export CANOPY_CHANGE_PASSWORD_URL="https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
+
+exec "$SCRIPT_DIR/setup-tui-config.sh" "$@"

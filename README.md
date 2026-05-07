@@ -252,10 +252,15 @@ group = "readonly-ops"
 ### TUI client config
 
 Prefer the setup script so the config is written to the OS-specific path the
-TUI actually reads:
+TUI actually reads. The script accepts the URL as an argument, `--url`, or via
+the `CANOPY_CONTROL_PLANE_URL` env var. Optionally pass
+`--change-password-url` (or `CANOPY_CHANGE_PASSWORD_URL`) for the Cognito
+hosted-UI password page. For day-to-day use copy
+`scripts/setup-tui-config.local.sh.example` to `setup-tui-config.local.sh`
+(gitignored) and fill in your real values.
 
 ```bash
-scripts/setup-tui-config.sh https://<your-canopy-domain>
+scripts/setup-tui-config.sh https://canopy.your-domain.com
 ```
 
 The TUI uses the standard config directory for each OS:

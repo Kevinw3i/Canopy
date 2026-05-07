@@ -35,8 +35,15 @@ cargo build --release -p tui-client
 
 ```bash
 cd ~/Desktop/Canopy
-scripts/setup-tui-config.sh https://<your-canopy-domain>
+scripts/setup-tui-config.sh https://canopy.your-domain.com
 ./target/release/tui-client
+```
+
+或者把您的真實 URL 與 Cognito 設定寫進 `scripts/setup-tui-config.local.sh`
+（從 `setup-tui-config.local.sh.example` 複製，已 gitignore）然後改執行：
+
+```bash
+scripts/setup-tui-config.local.sh
 ```
 
 這個腳本會依照作業系統寫到 TUI 實際讀取的位置：
@@ -50,7 +57,7 @@ scripts/setup-tui-config.sh https://<your-canopy-domain>
 如果設定檔已存在，腳本預設不覆寫。需要重寫時：
 
 ```bash
-scripts/setup-tui-config.sh https://<your-canopy-domain> --force
+scripts/setup-tui-config.sh https://canopy.your-domain.com --force
 ```
 
 ### 3. 執行打包腳本

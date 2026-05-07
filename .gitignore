@@ -32,3 +32,6 @@ infra/tfplan*
 
 # Claude Code 本地 worktree（每個 worktree 是獨立 git 工作樹副本）
 .claude/worktrees/
+
+# Local wrapper for setup-tui-config.sh（內含真實 URL / Cognito 值）
+scripts/setup-tui-config.local.sh
