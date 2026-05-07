@@ -62,6 +62,55 @@ fn normalized_http_url(url: &str) -> Option<&str> {
     }
 }
 
+const SESSION_COUNTDOWN_WIDTH: u64 = 20;
+
+fn format_session_duration(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn render_session_countdown(max_secs: u64, elapsed_secs: u64) -> String {
+    let remaining = max_secs.saturating_sub(elapsed_secs);
+    let filled = if max_secs == 0 {
+        0
+    } else {
+        ((remaining * SESSION_COUNTDOWN_WIDTH) + max_secs - 1) / max_secs
+    }
+    .min(SESSION_COUNTDOWN_WIDTH);
+    let empty = SESSION_COUNTDOWN_WIDTH - filled;
+
+    format!(
+        "[{}{}] {}",
+        "#".repeat(filled as usize),
+        "-".repeat(empty as usize),
+        format_session_duration(remaining)
+    )
+}
+
+fn set_terminal_title(title: &str) {
+    let safe_title: String = title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    print!("\x1b]0;{}\x07", safe_title);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn set_session_countdown_title(instance_id: &str, max_secs: u64, elapsed_secs: u64) {
+    set_terminal_title(&format!(
+        "Canopy {instance_id} {}",
+        render_session_countdown(max_secs, elapsed_secs)
+    ));
+}
+
 impl App {
     pub async fn new(config: ClientConfig) -> Result<Self> {
         let api = ApiClient::new(&config.control_plane_url);
@@ -897,6 +946,9 @@ impl App {
                             resp.command,
                             secs / 60
                         );
+                        println!("Session countdown: {}", render_session_countdown(secs, 0));
+                        println!("Countdown updates in this terminal tab title while connected.\n");
+                        set_session_countdown_title(instance_id, secs, 0);
                     } else {
                         println!(
                             "--- Connecting to {} via {} ---\n",
@@ -971,6 +1023,11 @@ impl App {
                                         if connected {
                                             if let Some(max_secs) = session_limit {
                                                 if elapsed >= max_secs {
+                                                    set_session_countdown_title(
+                                                        instance_id,
+                                                        max_secs,
+                                                        max_secs,
+                                                    );
                                                     eprintln!(
                                                         "\n\nSession timeout ({} min). Disconnecting...\n",
                                                         max_secs / 60
@@ -979,6 +1036,11 @@ impl App {
                                                     let _ = child.wait();
                                                     break;
                                                 }
+                                                set_session_countdown_title(
+                                                    instance_id,
+                                                    max_secs,
+                                                    elapsed,
+                                                );
                                             }
                                         }
 
@@ -1004,6 +1066,10 @@ impl App {
                             };
                             eprintln!("\nError: {}\n", msg);
                         }
+                    }
+
+                    if resp.max_session_seconds.is_some() {
+                        set_terminal_title("Canopy");
                     }
 
                     println!("\nPress Enter to return to the console...");
@@ -1485,6 +1551,33 @@ mod tests {
         assert!(normalized_http_url("file:///etc/passwd").is_none());
         assert!(normalized_http_url("javascript:alert(1)").is_none());
         assert!(normalized_http_url("").is_none());
+    }
+
+    #[test]
+    fn session_countdown_renders_remaining_bar() {
+        assert_eq!(
+            render_session_countdown(3600, 0),
+            "[####################] 1:00:00"
+        );
+        assert_eq!(
+            render_session_countdown(3600, 1800),
+            "[##########----------] 30:00"
+        );
+        assert_eq!(
+            render_session_countdown(3600, 3600),
+            "[--------------------] 00:00"
+        );
+        assert_eq!(
+            render_session_countdown(60, 75),
+            "[--------------------] 00:00"
+        );
+    }
+
+    #[test]
+    fn session_duration_uses_hours_only_when_needed() {
+        assert_eq!(format_session_duration(0), "00:00");
+        assert_eq!(format_session_duration(65), "01:05");
+        assert_eq!(format_session_duration(3661), "1:01:01");
     }
 
     // ── Logout resets state ─────────────────────────────────
