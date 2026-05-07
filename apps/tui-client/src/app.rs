@@ -62,6 +62,29 @@ fn normalized_http_url(url: &str) -> Option<&str> {
     }
 }
 
+fn cloudwatch_quick_search_filter_pattern(query: &str) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+
+    if query.starts_with('"') && query.ends_with('"') && query.len() >= 2 {
+        return Some(query.to_string());
+    }
+
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('"');
+    for ch in query.chars() {
+        match ch {
+            '\\' => pattern.push_str("\\\\"),
+            '"' => pattern.push_str("\\\""),
+            _ => pattern.push(ch),
+        }
+    }
+    pattern.push('"');
+    Some(pattern)
+}
+
 const SESSION_COUNTDOWN_WIDTH: u64 = 20;
 
 fn format_session_duration(secs: u64) -> String {
@@ -1164,7 +1187,9 @@ impl App {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
             region: self.cloudwatch_search.selected_region.clone(),
             log_group_name: self.cloudwatch_search.selected_log_group.clone(),
-            filter_pattern: Some(self.cloudwatch_search.query_input.value.clone()),
+            filter_pattern: cloudwatch_quick_search_filter_pattern(
+                &self.cloudwatch_search.query_input.value,
+            ),
             start_time,
             end_time,
             next_token: None,
@@ -1185,10 +1210,7 @@ impl App {
         }
 
         self.cloudwatch_search.set_loading();
-        let (start_time, end_time) = self
-            .cloudwatch_search
-            .time_range
-            .resolve_insights_window();
+        let (start_time, end_time) = self.cloudwatch_search.time_range.resolve_insights_window();
 
         let req = shared::dto::cloudwatch::StartInsightsQueryRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
@@ -1555,6 +1577,35 @@ mod tests {
         assert!(normalized_http_url("file:///etc/passwd").is_none());
         assert!(normalized_http_url("javascript:alert(1)").is_none());
         assert!(normalized_http_url("").is_none());
+    }
+
+    #[test]
+    fn cloudwatch_quick_search_quotes_literal_paths() {
+        assert_eq!(
+            cloudwatch_quick_search_filter_pattern("/api/merchant/bets"),
+            Some("\"/api/merchant/bets\"".into())
+        );
+        assert_eq!(
+            cloudwatch_quick_search_filter_pattern(" ERROR "),
+            Some("\"ERROR\"".into())
+        );
+    }
+
+    #[test]
+    fn cloudwatch_quick_search_preserves_existing_quotes_and_omits_blank() {
+        assert_eq!(
+            cloudwatch_quick_search_filter_pattern("\"/api/merchant/bets\""),
+            Some("\"/api/merchant/bets\"".into())
+        );
+        assert_eq!(cloudwatch_quick_search_filter_pattern("   "), None);
+    }
+
+    #[test]
+    fn cloudwatch_quick_search_escapes_literal_quotes() {
+        assert_eq!(
+            cloudwatch_quick_search_filter_pattern("request \"failed\""),
+            Some("\"request \\\"failed\\\"\"".into())
+        );
     }
 
     #[test]
