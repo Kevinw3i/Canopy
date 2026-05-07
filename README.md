@@ -169,7 +169,7 @@ client_id = "not-used-in-dev-mode"
 
 # ── JWT ─────────────────────────────────────────────
 [jwt]
-secret = "local-dev-secret-do-not-use-in-production"
+secret = "<local-dev-jwt-secret>"
                       # Signing key for internal JWTs.
                       # Production: use `openssl rand -base64 32`
 expiry_seconds = 7200 # Token lifetime in seconds
@@ -331,11 +331,11 @@ audit_log = "/var/log/canopy/audit.jsonl"
 [oidc]
 issuer_url = "https://accounts.google.com"          # Or your OIDC provider
 client_id = "your-client-id-from-oidc-provider"
-# client_secret = "your-secret"                     # Only if provider requires it
+# client_secret = "<oidc-client-secret>"            # Only if provider requires it
 scopes = ["openid", "profile", "email"]
 
 [jwt]
-secret = "<generated-jwt-secret>"       # From step 1
+secret = "<generated-jwt-secret>"                  # From step 1
 expiry_seconds = 3600
 
 [aws]

@@ -168,7 +168,7 @@ client_id = "not-used-in-dev-mode"
 
 # ── JWT ─────────────────────────────────────────────
 [jwt]
-secret = "local-dev-secret-do-not-use-in-production"
+secret = "<local-dev-jwt-secret>"
                       # 內部 JWT 的簽署金鑰
                       # 生產環境請用：openssl rand -base64 32
 expiry_seconds = 7200 # Token 有效期（秒）
@@ -328,11 +328,11 @@ audit_log = "/var/log/canopy/audit.jsonl"
 [oidc]
 issuer_url = "https://accounts.google.com"          # 或你的 OIDC 提供者
 client_id = "your-client-id-from-oidc-provider"     # 從 OIDC 提供者取得
-# client_secret = "your-secret"                     # 僅在提供者要求時填寫
+# client_secret = "<oidc-client-secret>"            # 僅在提供者要求時填寫
 scopes = ["openid", "profile", "email"]
 
 [jwt]
-secret = "<generated-jwt-secret>"       # 第一步產生的值
+secret = "<generated-jwt-secret>"                  # 第一步產生的值
 expiry_seconds = 3600
 
 [aws]

@@ -173,7 +173,7 @@ aws cognito-idp admin-create-user \
   --user-pool-id us-east-1_AbCdEfGhI \
   --username alice@yourcompany.com \
   --user-attributes Name=email,Value=alice@yourcompany.com Name=name,Value="Alice Chen" \
-  --temporary-password 'TempPass123!' \
+  --temporary-password '<temporary-password>' \
   --message-action SUPPRESS
 
 # 批量建立（從檔案讀取）
@@ -182,7 +182,7 @@ while IFS=, read -r email name; do
     --user-pool-id us-east-1_AbCdEfGhI \
     --username "$email" \
     --user-attributes Name=email,Value="$email" Name=name,Value="$name" \
-    --temporary-password 'TempPass123!' \
+    --temporary-password '<temporary-password>' \
     --message-action SUPPRESS
   echo "Created: $email"
 done << 'USERS'

@@ -382,7 +382,7 @@ client_id = "your-client-id"
 scopes = ["openid", "profile", "email"]
 
 [jwt]
-secret = "your-secret"
+secret = "<generated-jwt-secret>"
 expiry_seconds = 3600
 
 [aws]

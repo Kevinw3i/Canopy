@@ -41,7 +41,7 @@ dev_mode = false                    # 生產環境必須為 false
 [oidc]
 issuer_url = "https://accounts.google.com"   # OIDC Provider 的 issuer URL
 client_id = "your-client-id"                 # 從 OIDC Provider 取得
-# client_secret = "your-secret"              # 公開 PKCE 客戶端可省略
+# client_secret = "<oidc-client-secret>"     # 公開 PKCE 客戶端可省略
 scopes = ["openid", "profile", "email"]
 
 # 可選：手動指定端點（省略時自動從 issuer_url/.well-known 探索）
@@ -53,7 +53,7 @@ scopes = ["openid", "profile", "email"]
 # ── JWT（內部 Token）─────────────────────────────────
 
 [jwt]
-secret = "change-this-in-production"         # 用 openssl rand -base64 32 產生
+secret = "<generated-jwt-secret>"            # 用 openssl rand -base64 32 產生
 expiry_seconds = 3600                        # Token 有效期（秒）
 
 # ── AWS ─────────────────────────────────────────────
