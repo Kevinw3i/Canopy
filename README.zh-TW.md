@@ -337,7 +337,9 @@ client_id = "your-client-id-from-oidc-provider"     # 從 OIDC 提供者取得
 scopes = ["openid", "profile", "email"]
 
 [jwt]
-secret = "<generated-jwt-secret>"                  # 第一步產生的值
+secret = "REPLACE_ME_WITH_OPENSSL_RAND_BASE64_32_OUTPUT"   # 第一步產生的值；
+                                                            # 生產環境絕對不可保留此
+                                                            # 字面值。
 expiry_seconds = 3600
 
 [aws]

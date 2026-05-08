@@ -507,7 +507,10 @@ impl App {
                 self.cloudwatch_search.set_error(err);
             }
             Action::RunFilterSearch => {
-                self.do_filter_search().await;
+                self.do_filter_search(false).await;
+            }
+            Action::LoadMoreFilterResults => {
+                self.do_filter_search(true).await;
             }
             Action::RunInsightsQuery => {
                 self.do_insights_query().await;
@@ -1170,10 +1173,16 @@ impl App {
         });
     }
 
-    async fn do_filter_search(&mut self) {
+    async fn do_filter_search(&mut self, append: bool) {
         if self.cloudwatch_search.selected_log_group.is_empty() {
             self.cloudwatch_search
                 .set_error("No log group is available for the current scope".into());
+            return;
+        }
+
+        // Guard against a stale `LoadMoreFilterResults` arriving when the
+        // previous response already exhausted the result set (no token left).
+        if append && self.cloudwatch_search.last_next_token.is_none() {
             return;
         }
 
@@ -1182,6 +1191,12 @@ impl App {
             .cloudwatch_search
             .time_range
             .resolve_filter_log_events_window();
+
+        let next_token = if append {
+            self.cloudwatch_search.last_next_token.clone()
+        } else {
+            None
+        };
 
         let req = shared::dto::cloudwatch::FilterLogEventsRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
@@ -1192,12 +1207,20 @@ impl App {
             ),
             start_time,
             end_time,
-            next_token: None,
+            next_token,
             limit: 500,
         };
 
         match self.api.filter_log_events(&req).await {
-            Ok(resp) => self.cloudwatch_search.set_events(resp.events),
+            Ok(resp) => {
+                if append {
+                    self.cloudwatch_search
+                        .append_events(resp.events, resp.next_token);
+                } else {
+                    self.cloudwatch_search
+                        .set_events(resp.events, resp.next_token);
+                }
+            }
             Err(e) => self.cloudwatch_search.set_error(e.to_string()),
         }
     }

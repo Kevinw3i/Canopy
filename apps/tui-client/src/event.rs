@@ -46,6 +46,10 @@ pub enum Action {
     LogGroupsLoaded(Vec<shared::dto::cloudwatch::LogGroup>, u64), // log_groups, generation
     LogGroupsFetchFailed(String, u64),                            // error, generation
     RunFilterSearch,
+    /// Load the next page of FilterLogEvents results, appending to the
+    /// existing list. Triggered by `n` in the results table when the
+    /// previous response carried a next_token.
+    LoadMoreFilterResults,
     RunInsightsQuery,
     PollQueryResults(String),
     ExportResults(ExportFormat),

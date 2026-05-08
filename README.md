@@ -340,7 +340,9 @@ client_id = "your-client-id-from-oidc-provider"
 scopes = ["openid", "profile", "email"]
 
 [jwt]
-secret = "<generated-jwt-secret>"                  # From step 1
+secret = "REPLACE_ME_WITH_OPENSSL_RAND_BASE64_32_OUTPUT"   # From step 1 — never
+                                                            # leave this literal in
+                                                            # production.
 expiry_seconds = 3600
 
 [aws]

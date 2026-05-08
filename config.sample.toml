@@ -53,8 +53,9 @@ scopes = ["openid", "profile", "email"]
 # ── JWT（內部 Token）─────────────────────────────────
 
 [jwt]
-secret = "<generated-jwt-secret>"            # 用 openssl rand -base64 32 產生
-expiry_seconds = 3600                        # Token 有效期（秒）
+secret = "REPLACE_ME_WITH_OPENSSL_RAND_BASE64_32_OUTPUT"  # 用 openssl rand -base64 32 產生；
+                                                          # 生產環境絕對不可保留此字面值
+expiry_seconds = 3600                                     # Token 有效期（秒）
 
 # ── AWS ─────────────────────────────────────────────
 
