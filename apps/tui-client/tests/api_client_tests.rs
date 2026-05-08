@@ -13,7 +13,7 @@ use axum::{
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use tui_client::api_client::ApiClient;
+use tui_client::api_client::{ApiClient, ApiClientError};
 
 // ── Mock server helpers ─────────────────────────────────────────────────
 
@@ -73,6 +73,16 @@ async fn dev_login_forbidden() -> impl IntoResponse {
     )
 }
 
+async fn dev_login_unauthorized() -> impl IntoResponse {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "code": "UNAUTHORIZED",
+            "message": "Login rejected"
+        })),
+    )
+}
+
 fn require_bearer(headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
     let auth = headers
         .get("Authorization")
@@ -89,6 +99,16 @@ fn require_bearer(headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> 
             })),
         ))
     }
+}
+
+async fn list_ec2_forbidden() -> impl IntoResponse {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "code": "FORBIDDEN",
+            "message": "not authorized for this account"
+        })),
+    )
 }
 
 async fn list_ec2_handler(headers: HeaderMap, Json(_body): Json<Value>) -> impl IntoResponse {
@@ -183,6 +203,14 @@ fn mock_app_forbidden() -> Router {
     Router::new().route("/auth/dev-login", post(dev_login_forbidden))
 }
 
+fn mock_app_login_unauthorized() -> Router {
+    Router::new().route("/auth/dev-login", post(dev_login_unauthorized))
+}
+
+fn mock_app_ec2_forbidden() -> Router {
+    Router::new().route("/api/ec2/list", post(list_ec2_forbidden))
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -210,6 +238,18 @@ async fn dev_login_error_propagates() {
 }
 
 #[tokio::test]
+async fn auth_route_401_is_not_token_expired() {
+    let base_url = start_mock(mock_app_login_unauthorized()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+
+    let err = client.dev_login("alice").await.unwrap_err();
+    assert!(
+        matches!(err, ApiClientError::Api { status: 401, .. }),
+        "expected normal API 401, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn token_lifecycle_across_requests() {
     let base_url = start_mock(mock_app()).await;
     let mut client = ApiClient::new(&base_url).unwrap();
@@ -227,7 +267,7 @@ async fn token_lifecycle_across_requests() {
         })
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("401"));
+    assert!(matches!(err, ApiClientError::TokenExpired));
 
     // Login and set token
     let login = client.dev_login("bob").await.unwrap();
@@ -259,13 +299,46 @@ async fn get_entitlements_requires_auth() {
 
     // No token -> 401
     let err = client.get_entitlements().await.unwrap_err();
-    assert!(err.to_string().contains("401"));
+    assert!(matches!(err, ApiClientError::TokenExpired));
 
     // With token -> success
     client.set_token("test-token".into());
     let ent = client.get_entitlements().await.unwrap();
     assert_eq!(ent.user_id, "alice");
     assert_eq!(ent.groups, vec!["eng"]);
+}
+
+#[tokio::test]
+async fn authenticated_403_is_not_token_expired() {
+    let base_url = start_mock(mock_app_ec2_forbidden()).await;
+    let mut client = ApiClient::new(&base_url).unwrap();
+    client.set_token("test-token".into());
+
+    let err = client
+        .list_ec2(&shared::dto::ec2::Ec2ListRequest {
+            account_id: None,
+            region: None,
+            name_filter: None,
+            state_filter: None,
+            tag_filters: None,
+            next_token: None,
+            page_size: 50,
+        })
+        .await
+        .unwrap_err();
+
+    match err {
+        ApiClientError::Api {
+            status,
+            code,
+            message,
+        } => {
+            assert_eq!(status, 403);
+            assert_eq!(code, "FORBIDDEN");
+            assert!(message.contains("not authorized"));
+        }
+        other => panic!("expected normal API error, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -304,7 +377,7 @@ async fn clear_token_revokes_access() {
 
     // Now entitlements should fail
     let err = client.get_entitlements().await.unwrap_err();
-    assert!(err.to_string().contains("401"));
+    assert!(matches!(err, ApiClientError::TokenExpired));
 }
 
 #[tokio::test]

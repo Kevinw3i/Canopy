@@ -30,6 +30,7 @@ pub enum Action {
     Logout,
     ChangePassword,
     TokenReceived(String),
+    TokenExpired,
 
     // EC2
     RefreshEc2,

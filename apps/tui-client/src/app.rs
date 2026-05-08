@@ -3,7 +3,7 @@ use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
 use shared::dto::entitlements::UserEntitlements;
 use tokio::sync::mpsc;
 
-use crate::api_client::ApiClient;
+use crate::api_client::{ApiClient, ApiClientError};
 use crate::components::access::AccessScreen;
 use crate::components::cloudwatch_search::CloudWatchSearchScreen;
 use crate::components::dashboard::DashboardScreen;
@@ -52,6 +52,10 @@ pub struct App {
 
     // Auto-update banner message, shown until dismissed
     update_banner: Option<String>,
+
+    // True while the token-expired modal is visible. Dismissing it returns
+    // the user to the login screen.
+    session_expired_pending_login: bool,
 }
 
 fn normalized_http_url(url: &str) -> Option<&str> {
@@ -85,6 +89,9 @@ fn cloudwatch_quick_search_filter_pattern(query: &str) -> Option<String> {
     pattern.push('"');
     Some(pattern)
 }
+
+const TOKEN_EXPIRED_MODAL_MESSAGE: &str =
+    "Your session has expired. Please sign in again.\n\nPress Enter to return to the login screen.";
 
 const SESSION_COUNTDOWN_WIDTH: u64 = 20;
 
@@ -178,6 +185,7 @@ impl App {
             cw_fetch_cancel: None,
             live_tail_cancel: None,
             update_banner: None,
+            session_expired_pending_login: false,
         })
     }
 
@@ -192,19 +200,17 @@ impl App {
                     self.enter_dashboard();
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("UNAUTHORIZED")
-                        || msg.contains("FORBIDDEN")
-                        || msg.contains("401")
-                    {
-                        // Auth failure: token is invalid, clear it
-                        crate::auth::clear_token().ok();
-                        self.api.clear_token();
-                    } else {
-                        // Transient error: keep the token but stay on login
-                        // so the user can retry, rather than stranding them
-                        // on a featureless dashboard.
-                        tracing::warn!("Entitlements fetch failed (keeping token): {}", msg);
+                    match e {
+                        ApiClientError::TokenExpired => {
+                            crate::auth::clear_token().ok();
+                            self.api.clear_token();
+                        }
+                        other => {
+                            // Transient or non-authz error: keep the token but stay on login
+                            // so the user can retry, rather than stranding them
+                            // on a featureless dashboard.
+                            tracing::warn!("Entitlements fetch failed (keeping token): {}", other);
+                        }
                     }
                     // Stay on login screen in both cases — dashboard needs
                     // entitlements to function.
@@ -370,34 +376,10 @@ impl App {
                 }
             }
             Action::Logout => {
-                // Cancel all in-flight background fetches
-                if let Some(token) = self.ec2_fetch_cancel.take() {
-                    token.cancel();
-                }
-                if let Some(token) = self.cw_fetch_cancel.take() {
-                    token.cancel();
-                }
-                if let Some(token) = self.live_tail_cancel.take() {
-                    token.cancel();
-                }
-                self.live_tail.set_disconnected();
-
-                // Reset screen state and advance generation counters so any
-                // queued async results from the prior session are rejected
-                let ec2_gen = self.ec2.fetch_generation + 1;
-                let cw_gen = self.cloudwatch_search.fetch_generation + 1;
-                self.ec2 = Ec2Screen::new();
-                self.ec2.fetch_generation = ec2_gen;
-                self.cloudwatch_search = CloudWatchSearchScreen::new();
-                self.cloudwatch_search.fetch_generation = cw_gen;
-                self.dashboard.public_ip = None;
-                self.dashboard.ip_fetch_generation += 1;
-
-                crate::auth::clear_token().ok();
-                self.api.clear_token();
-                self.entitlements = None;
-                self.current_screen = Screen::Login;
-                self.screen_stack.clear();
+                self.reset_to_login();
+            }
+            Action::TokenExpired => {
+                self.begin_token_expired_flow();
             }
             Action::ChangePassword => match self.config.change_password_url.as_deref() {
                 Some(raw_url) => match normalized_http_url(raw_url) {
@@ -639,9 +621,84 @@ impl App {
             }
             Action::DismissError => {
                 self.error_modal.dismiss();
+                if self.session_expired_pending_login {
+                    self.reset_to_login();
+                    self.login
+                        .set_status("Session expired. Please sign in again.".into());
+                }
             }
 
             Action::Noop => {}
+        }
+    }
+
+    fn cancel_in_flight_work(&mut self) {
+        if let Some(token) = self.ec2_fetch_cancel.take() {
+            token.cancel();
+        }
+        if let Some(token) = self.cw_fetch_cancel.take() {
+            token.cancel();
+        }
+        if let Some(token) = self.live_tail_cancel.take() {
+            token.cancel();
+        }
+        self.live_tail.set_disconnected();
+    }
+
+    fn reset_to_login(&mut self) {
+        self.cancel_in_flight_work();
+
+        // Reset screen state and advance generation counters so queued async
+        // results from the prior session are rejected.
+        let ec2_gen = self.ec2.fetch_generation + 1;
+        let cw_gen = self.cloudwatch_search.fetch_generation + 1;
+        self.ec2 = Ec2Screen::new();
+        self.ec2.fetch_generation = ec2_gen;
+        self.cloudwatch_search = CloudWatchSearchScreen::new();
+        self.cloudwatch_search.fetch_generation = cw_gen;
+        self.dashboard.public_ip = None;
+        self.dashboard.ip_fetch_generation += 1;
+
+        crate::auth::clear_token().ok();
+        self.api.clear_token();
+        self.entitlements = None;
+        self.current_screen = Screen::Login;
+        self.screen_stack.clear();
+        self.session_expired_pending_login = false;
+        self.error_modal.dismiss();
+    }
+
+    fn begin_token_expired_flow(&mut self) {
+        if self.session_expired_pending_login {
+            return;
+        }
+
+        self.cancel_in_flight_work();
+        crate::auth::clear_token().ok();
+        self.api.clear_token();
+        self.entitlements = None;
+        self.session_expired_pending_login = true;
+        self.error_modal
+            .show_with_title(" Session Expired ", TOKEN_EXPIRED_MODAL_MESSAGE.into());
+    }
+
+    fn handle_route_error<F>(&mut self, err: ApiClientError, fallback: F)
+    where
+        F: FnOnce(&mut Self, String),
+    {
+        match err {
+            ApiClientError::TokenExpired => self.begin_token_expired_flow(),
+            other => fallback(self, other.to_string()),
+        }
+    }
+
+    fn route_error_to_action<F>(err: ApiClientError, fallback: F) -> Action
+    where
+        F: FnOnce(String) -> Action,
+    {
+        match err {
+            ApiClientError::TokenExpired => Action::TokenExpired,
+            other => fallback(other.to_string()),
         }
     }
 
@@ -828,8 +885,10 @@ impl App {
                 true
             }
             Err(e) => {
-                self.error_modal
-                    .show(format!("Failed to fetch entitlements: {}", e));
+                self.handle_route_error(e, |app, msg| {
+                    app.error_modal
+                        .show(format!("Failed to fetch entitlements: {}", msg));
+                });
                 false
             }
         }
@@ -879,11 +938,20 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        if all_instances.is_empty() {
-                            let _ = tx.send(Action::Ec2FetchFailed(e.to_string(), generation));
-                            return;
+                        match e {
+                            ApiClientError::TokenExpired => {
+                                let _ = tx.send(Action::TokenExpired);
+                                return;
+                            }
+                            other => {
+                                let msg = other.to_string();
+                                if all_instances.is_empty() {
+                                    let _ = tx.send(Action::Ec2FetchFailed(msg, generation));
+                                    return;
+                                }
+                                failed_scopes.push(format!("Fetch error (partial): {}", msg));
+                            }
                         }
-                        failed_scopes.push(format!("Fetch error (partial): {}", e));
                         break;
                     }
                 }
@@ -1221,7 +1289,9 @@ impl App {
                 }
             }
             Err(e) => {
-                self.error_modal.show(format!("Connect failed: {}", e));
+                self.handle_route_error(e, |app, msg| {
+                    app.error_modal.show(format!("Connect failed: {}", msg));
+                });
             }
         }
     }
@@ -1266,10 +1336,13 @@ impl App {
                     let _ = tx.send(Action::LogGroupsLoaded(resp.log_groups, generation));
                 }
                 Err(e) => {
-                    let _ = tx.send(Action::LogGroupsFetchFailed(
-                        format!("Failed to fetch log groups: {}", e),
-                        generation,
-                    ));
+                    let action = Self::route_error_to_action(e, |msg| {
+                        Action::LogGroupsFetchFailed(
+                            format!("Failed to fetch log groups: {}", msg),
+                            generation,
+                        )
+                    });
+                    let _ = tx.send(action);
                 }
             }
         });
@@ -1323,7 +1396,9 @@ impl App {
                         .set_events(resp.events, resp.next_token);
                 }
             }
-            Err(e) => self.cloudwatch_search.set_error(e.to_string()),
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| app.cloudwatch_search.set_error(msg));
+            }
         }
     }
 
@@ -1351,7 +1426,9 @@ impl App {
                 self.cloudwatch_search.query_id = Some(resp.query_id.clone());
                 let _ = self.action_tx.send(Action::PollQueryResults(resp.query_id));
             }
-            Err(e) => self.cloudwatch_search.set_error(e.to_string()),
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| app.cloudwatch_search.set_error(msg));
+            }
         }
     }
 
@@ -1387,7 +1464,9 @@ impl App {
                     });
                 }
             }
-            Err(e) => self.cloudwatch_search.set_error(e.to_string()),
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| app.cloudwatch_search.set_error(msg));
+            }
         }
     }
 
@@ -1786,6 +1865,83 @@ mod tests {
         assert!(app.screen_stack.is_empty());
         assert!(app.entitlements.is_none());
         assert_eq!(app.ec2.fetch_generation, ec2_gen);
+    }
+
+    #[tokio::test]
+    async fn test_token_expired_flow_shows_modal_before_login_reset() {
+        let mut app = test_app().await;
+        app.api.set_token("expired-token".into());
+        app.set_entitlements(mock_entitlements());
+        app.enter_dashboard();
+
+        app.begin_token_expired_flow();
+
+        assert_eq!(app.current_screen, Screen::Dashboard);
+        assert!(app.error_modal.is_visible());
+        assert!(app.session_expired_pending_login);
+        assert!(!app.api.has_token());
+        assert!(app.entitlements.is_none());
+
+        app.reset_to_login();
+
+        assert_eq!(app.current_screen, Screen::Login);
+        assert!(!app.session_expired_pending_login);
+        assert!(app.screen_stack.is_empty());
+        assert!(!app.error_modal.is_visible());
+    }
+
+    #[tokio::test]
+    async fn test_handle_route_error_token_expired_opens_modal() {
+        let mut app = test_app().await;
+        app.handle_route_error(ApiClientError::TokenExpired, |app, msg| {
+            app.ec2.set_error(msg);
+        });
+
+        assert!(app.error_modal.is_visible());
+        assert!(app.session_expired_pending_login);
+        assert!(app.ec2.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_route_error_non_token_uses_fallback() {
+        let mut app = test_app().await;
+        app.handle_route_error(
+            ApiClientError::Api {
+                status: 403,
+                code: "FORBIDDEN".into(),
+                message: "not authorized".into(),
+            },
+            |app, msg| app.ec2.set_error(msg),
+        );
+
+        assert!(!app.error_modal.is_visible());
+        assert!(!app.session_expired_pending_login);
+        assert!(app
+            .ec2
+            .error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("FORBIDDEN")));
+    }
+
+    #[tokio::test]
+    async fn test_handle_route_error_api_401_uses_fallback() {
+        let mut app = test_app().await;
+        app.handle_route_error(
+            ApiClientError::Api {
+                status: 401,
+                code: "UNAUTHORIZED".into(),
+                message: "auth route rejected login".into(),
+            },
+            |app, msg| app.ec2.set_error(msg),
+        );
+
+        assert!(!app.error_modal.is_visible());
+        assert!(!app.session_expired_pending_login);
+        assert!(app
+            .ec2
+            .error
+            .as_deref()
+            .is_some_and(|msg| msg.contains("UNAUTHORIZED")));
     }
 
     // ── Update banner ───────────────────────────────────────

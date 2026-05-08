@@ -7,22 +7,38 @@ use ratatui::{
 use crate::event::Action;
 
 /// Modal overlay that shows error messages
-#[derive(Default)]
 pub struct ErrorModal {
     pub message: Option<String>,
+    title: String,
+}
+
+impl Default for ErrorModal {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ErrorModal {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            message: None,
+            title: " Error ".into(),
+        }
     }
 
     pub fn show(&mut self, message: String) {
+        self.title = " Error ".into();
+        self.message = Some(message);
+    }
+
+    pub fn show_with_title(&mut self, title: impl Into<String>, message: String) {
+        self.title = title.into();
         self.message = Some(message);
     }
 
     pub fn dismiss(&mut self) {
         self.message = None;
+        self.title = " Error ".into();
     }
 
     pub fn is_visible(&self) -> bool {
@@ -64,7 +80,7 @@ impl ErrorModal {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Error ")
+            .title(self.title.as_str())
             .border_style(Style::default().fg(Color::Red).bold());
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
