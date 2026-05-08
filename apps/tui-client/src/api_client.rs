@@ -1,11 +1,37 @@
 use anyhow::Result;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::{
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+    StatusCode,
+};
+use serde::de::DeserializeOwned;
 use shared::dto::auth::*;
 use shared::dto::cloudwatch::*;
 use shared::dto::ec2::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::errors::ApiError;
 use shared::headers;
+
+pub type ApiResult<T> = std::result::Result<T, ApiClientError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthBehavior {
+    TreatUnauthorizedAsExpired,
+    ReturnUnauthorizedAsApiError,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiClientError {
+    #[error("session expired")]
+    TokenExpired,
+    #[error("[{status}] {code}: {message}")]
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
+    #[error(transparent)]
+    Transport(#[from] reqwest::Error),
+}
 
 /// HTTP client for the control-plane API
 #[derive(Clone)]
@@ -64,9 +90,33 @@ impl ApiClient {
         self.token.as_ref().map(|t| format!("Bearer {}", t))
     }
 
+    async fn decode_response<T: DeserializeOwned>(
+        resp: reqwest::Response,
+        auth_behavior: AuthBehavior,
+    ) -> ApiResult<T> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp.json().await?);
+        }
+
+        if auth_behavior == AuthBehavior::TreatUnauthorizedAsExpired
+            && status == StatusCode::UNAUTHORIZED
+        {
+            return Err(ApiClientError::TokenExpired);
+        }
+
+        let status_code = status.as_u16();
+        let err: ApiError = resp.json().await?;
+        Err(ApiClientError::Api {
+            status: status_code,
+            code: err.code,
+            message: err.message,
+        })
+    }
+
     // ── Auth ────────────────────────────────────────────
 
-    pub async fn dev_login(&self, username: &str) -> Result<DevLoginResponse> {
+    pub async fn dev_login(&self, username: &str) -> ApiResult<DevLoginResponse> {
         let resp = self
             .client
             .post(format!("{}/auth/dev-login", self.base_url))
@@ -76,20 +126,14 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::ReturnUnauthorizedAsApiError).await
     }
 
     pub async fn pkce_start(
         &self,
         code_verifier: &str,
         redirect_uri: &str,
-    ) -> Result<PkceAuthResponse> {
+    ) -> ApiResult<PkceAuthResponse> {
         let resp = self
             .client
             .post(format!("{}/auth/pkce/start", self.base_url))
@@ -100,13 +144,7 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::ReturnUnauthorizedAsApiError).await
     }
 
     pub async fn pkce_exchange(
@@ -115,7 +153,7 @@ impl ApiClient {
         code_verifier: &str,
         state: &str,
         redirect_uri: &str,
-    ) -> Result<TokenResponse> {
+    ) -> ApiResult<TokenResponse> {
         let resp = self
             .client
             .post(format!("{}/auth/pkce/exchange", self.base_url))
@@ -128,16 +166,10 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::ReturnUnauthorizedAsApiError).await
     }
 
-    pub async fn device_code_start(&self) -> Result<DeviceCodeResponse> {
+    pub async fn device_code_start(&self) -> ApiResult<DeviceCodeResponse> {
         let resp = self
             .client
             .post(format!("{}/auth/device-code/start", self.base_url))
@@ -147,16 +179,10 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::ReturnUnauthorizedAsApiError).await
     }
 
-    pub async fn device_code_poll(&self, device_code: &str) -> Result<DeviceCodePollResponse> {
+    pub async fn device_code_poll(&self, device_code: &str) -> ApiResult<DeviceCodePollResponse> {
         let resp = self
             .client
             .post(format!("{}/auth/device-code/poll", self.base_url))
@@ -167,18 +193,12 @@ impl ApiClient {
             .send()
             .await?;
 
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::ReturnUnauthorizedAsApiError).await
     }
 
     // ── Entitlements ────────────────────────────────────
 
-    pub async fn get_entitlements(&self) -> Result<UserEntitlements> {
+    pub async fn get_entitlements(&self) -> ApiResult<UserEntitlements> {
         let mut req = self
             .client
             .get(format!("{}/api/entitlements", self.base_url));
@@ -188,18 +208,12 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 
     // ── EC2 ─────────────────────────────────────────────
 
-    pub async fn list_ec2(&self, request: &Ec2ListRequest) -> Result<Ec2ListResponse> {
+    pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {
         let mut req = self
             .client
             .post(format!("{}/api/ec2/list", self.base_url))
@@ -210,16 +224,10 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 
-    pub async fn connect(&self, request: &ConnectRequest) -> Result<ConnectResponse> {
+    pub async fn connect(&self, request: &ConnectRequest) -> ApiResult<ConnectResponse> {
         let mut req = self
             .client
             .post(format!("{}/api/ec2/connect", self.base_url))
@@ -230,18 +238,15 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 
     // ── CloudWatch ──────────────────────────────────────
 
-    pub async fn list_log_groups(&self, request: &LogGroupsRequest) -> Result<LogGroupsResponse> {
+    pub async fn list_log_groups(
+        &self,
+        request: &LogGroupsRequest,
+    ) -> ApiResult<LogGroupsResponse> {
         let mut req = self
             .client
             .post(format!("{}/api/cloudwatch/log-groups", self.base_url))
@@ -252,19 +257,13 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 
     pub async fn filter_log_events(
         &self,
         request: &FilterLogEventsRequest,
-    ) -> Result<FilterLogEventsResponse> {
+    ) -> ApiResult<FilterLogEventsResponse> {
         let mut req = self
             .client
             .post(format!("{}/api/cloudwatch/filter-events", self.base_url))
@@ -275,19 +274,13 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 
     pub async fn start_insights_query(
         &self,
         request: &StartInsightsQueryRequest,
-    ) -> Result<StartInsightsQueryResponse> {
+    ) -> ApiResult<StartInsightsQueryResponse> {
         let mut req = self
             .client
             .post(format!("{}/api/cloudwatch/insights/start", self.base_url))
@@ -298,19 +291,13 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 
     pub async fn get_query_results(
         &self,
         request: &GetQueryResultsRequest,
-    ) -> Result<GetQueryResultsResponse> {
+    ) -> ApiResult<GetQueryResultsResponse> {
         let mut req = self
             .client
             .post(format!("{}/api/cloudwatch/insights/results", self.base_url))
@@ -321,13 +308,7 @@ impl ApiClient {
         }
 
         let resp = req.send().await?;
-        if resp.status().is_success() {
-            Ok(resp.json().await?)
-        } else {
-            let status = resp.status();
-            let err: ApiError = resp.json().await?;
-            anyhow::bail!("[{}] {}: {}", status.as_u16(), err.code, err.message)
-        }
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
 }
 
