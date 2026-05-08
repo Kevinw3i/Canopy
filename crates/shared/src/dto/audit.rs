@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Audit JSON-lines event.
+///
+/// Keep this enum and event shape in sync with `docs/AUDIT-SCHEMA.md`.
+///
+/// Schema evolution is additive: new fields should be optional and skipped
+/// when absent so flexible downstream consumers keep working. Strict log
+/// shippers or Athena-style tables still need a schema migration when new
+/// fields are added.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub event_id: String,
@@ -10,8 +18,16 @@ pub struct AuditEvent {
     pub account_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
+    /// Resource identifier. EC2 connect uses an instance id; CloudWatch routes
+    /// use a log group ARN/name or session/query id when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_resource: Option<String>,
+    /// Human-readable label for `target_resource` when one is known.
+    ///
+    /// For EC2 connect events this is the instance Name tag. Other event types
+    /// usually omit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_resource_name: Option<String>,
     pub outcome: AuditOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -88,6 +104,7 @@ mod tests {
             account_id: None,
             region: None,
             target_resource: None,
+            target_resource_name: None,
             outcome: AuditOutcome::Success,
             error_message: None,
             metadata: None,
@@ -96,6 +113,7 @@ mod tests {
         assert!(!json.contains("account_id"));
         assert!(!json.contains("region"));
         assert!(!json.contains("target_resource"));
+        assert!(!json.contains("target_resource_name"));
         assert!(!json.contains("error_message"));
         assert!(!json.contains("metadata"));
     }
@@ -110,6 +128,7 @@ mod tests {
             account_id: Some("123".into()),
             region: Some("us-east-1".into()),
             target_resource: Some("i-abc".into()),
+            target_resource_name: Some("web-01".into()),
             outcome: AuditOutcome::Denied,
             error_message: Some("forbidden".into()),
             metadata: Some(json!({"key": "value"})),
@@ -118,5 +137,6 @@ mod tests {
         let back: AuditEvent = serde_json::from_value(json).unwrap();
         assert_eq!(back.actor, "bob");
         assert_eq!(back.account_id.as_deref(), Some("123"));
+        assert_eq!(back.target_resource_name.as_deref(), Some("web-01"));
     }
 }

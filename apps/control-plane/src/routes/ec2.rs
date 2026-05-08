@@ -1,11 +1,12 @@
 use aws_credential_types::provider::ProvideCredentials;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use std::sync::Arc;
 
 use crate::aws::clients::AwsClients;
 use crate::aws::credentials::{assume_role_scoped, connect_session_policy, SessionContext};
 use crate::aws::ec2_convert::convert_sdk_instance;
 use crate::middleware::auth::AuthenticatedUser;
+use crate::services::audit::AuditRequestContext;
 use crate::services::ec2::{
     apply_user_filters, build_connect_command, filter_instances_by_entitlements, mock_instances,
     AssumedRoleCredentials,
@@ -83,6 +84,32 @@ fn required_connect_simulations(req: &ConnectRequest) -> Vec<RequiredIamSimulati
 
 fn simulated_action_names(simulations: &[RequiredIamSimulation]) -> Vec<&'static str> {
     simulations.iter().map(|s| s.action).collect()
+}
+
+fn ec2_list_metadata(
+    ctx: &AuditRequestContext,
+    req: &Ec2ListRequest,
+    returned_count: Option<usize>,
+    total_count: Option<usize>,
+    failed_scopes: &[String],
+) -> serde_json::Value {
+    ctx.metadata(serde_json::json!({
+        "name_filter": req.name_filter.as_deref(),
+        "state_filter": &req.state_filter,
+        "tag_filters": &req.tag_filters,
+        "has_next_token": req.next_token.is_some(),
+        "page_size": req.page_size,
+        "returned_count": returned_count,
+        "total_count": total_count,
+        "failed_scopes": failed_scopes,
+    }))
+}
+
+fn ec2_connect_metadata(ctx: &AuditRequestContext, req: &ConnectRequest) -> serde_json::Value {
+    ctx.metadata(serde_json::json!({
+        "method": &req.method,
+        "os_user": req.os_user.as_deref(),
+    }))
 }
 
 /// Fetch EC2 instances from real AWS across all allowed account+region pairs.
@@ -248,6 +275,7 @@ async fn fetch_instances_from_aws(
 async fn list_instances(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
     Json(req): Json<Ec2ListRequest>,
 ) -> Result<Json<Ec2ListResponse>, (axum::http::StatusCode, Json<ApiError>)> {
     if !state.audit_service.is_healthy() {
@@ -256,19 +284,19 @@ async fn list_instances(
             Json(ApiError::internal("Audit logging unavailable")),
         ));
     }
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
     if !entitlements.features.can_view_ec2 {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::Ec2List,
-            AuditOutcome::Denied,
-            req.account_id.as_deref(),
-            req.region.as_deref(),
-            None,
-            Some("EC2 view not authorized"),
-        );
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::Ec2List, AuditOutcome::Denied)
+            .account(req.account_id.as_deref())
+            .region(req.region.as_deref())
+            .error(Some("EC2 view not authorized"))
+            .optional_metadata(Some(ec2_list_metadata(&audit_ctx, &req, None, None, &[])))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("EC2 view not authorized")),
@@ -284,14 +312,28 @@ async fn list_instances(
     let (all_instances, failed_scopes) = if state.config.use_mock_aws() {
         (mock_instances(), vec![])
     } else {
-        fetch_instances_from_aws(
+        match fetch_instances_from_aws(
             &state,
             &entitlements,
             &scoped_tuples,
             req.account_id.as_deref(),
             req.region.as_deref(),
         )
-        .await?
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                state
+                    .audit_service
+                    .event(&claims.sub, AuditAction::Ec2List, AuditOutcome::Failure)
+                    .account(req.account_id.as_deref())
+                    .region(req.region.as_deref())
+                    .error(Some(&err.1 .0.message))
+                    .optional_metadata(Some(ec2_list_metadata(&audit_ctx, &req, None, None, &[])))
+                    .commit_best_effort();
+                return Err(err);
+            }
+        }
     };
 
     // CRITICAL: Server-side entitlement filtering before any client filters.
@@ -327,15 +369,17 @@ async fn list_instances(
 
     state
         .audit_service
-        .log_event(
-            &claims.sub,
-            AuditAction::Ec2List,
-            AuditOutcome::Success,
-            req.account_id.as_deref(),
-            req.region.as_deref(),
-            None,
-            None,
-        )
+        .event(&claims.sub, AuditAction::Ec2List, AuditOutcome::Success)
+        .account(req.account_id.as_deref())
+        .region(req.region.as_deref())
+        .optional_metadata(Some(ec2_list_metadata(
+            &audit_ctx,
+            &req,
+            Some(page.len()),
+            Some(total_count),
+            &failed_scopes,
+        )))
+        .commit_or_fail()
         .map_err(|_| {
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -356,6 +400,7 @@ async fn list_instances(
 async fn connect_instance(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
     Json(req): Json<ConnectRequest>,
 ) -> Result<Json<ConnectResponse>, (axum::http::StatusCode, Json<ApiError>)> {
     // Fail-closed: block connect if durable audit sink is broken
@@ -367,6 +412,7 @@ async fn connect_instance(
             )),
         ));
     }
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
 
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
@@ -391,15 +437,17 @@ async fn connect_instance(
         )
         .await
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::Ec2Connect,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.instance_id),
-            Some("Connect not authorized for this scope (cross-group check)"),
-        );
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.instance_id))
+            .error(Some(
+                "Connect not authorized for this scope (cross-group check)",
+            ))
+            .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Connect not authorized for this scope")),
@@ -408,12 +456,13 @@ async fn connect_instance(
 
     // Look up the target instance to get its tags for tag-selector enforcement.
     // In production this queries the EC2 API; with mock data use stubs.
-    let (instance_tags, credentials, eic_endpoint_id, selected_account) =
+    let (instance_tags, target_instance_name, credentials, eic_endpoint_id, selected_account) =
         if state.config.use_mock_aws() {
             let all_instances = mock_instances();
             let inst = all_instances
                 .iter()
                 .find(|i| i.instance_id == req.instance_id);
+            let instance_name = inst.and_then(|i| i.name.clone());
             let mut tags = inst.map(|i| i.tags.clone()).unwrap_or_default();
             // Pass IPs as pseudo-tags for SSH direct connect
             if let Some(i) = inst {
@@ -437,7 +486,7 @@ async fn connect_instance(
                 role_arn: "direct".into(),
                 account_name: "mock".into(),
             };
-            (tags, creds, None::<String>, mock_account)
+            (tags, instance_name, creds, None::<String>, mock_account)
         } else {
             // Use scope-aware rules to find accounts: only consider entries
             // from rules that grant the connect feature for this account/region,
@@ -455,15 +504,15 @@ async fn connect_instance(
                 .collect();
 
             if matching_accounts.is_empty() {
-                let _ = state.audit_service.log_event(
-                    &claims.sub,
-                    AuditAction::Ec2Connect,
-                    AuditOutcome::Denied,
-                    Some(&req.account_id),
-                    Some(&req.region),
-                    Some(&req.instance_id),
-                    Some("Account not in entitlements"),
-                );
+                state
+                    .audit_service
+                    .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.instance_id))
+                    .error(Some("Account not in entitlements"))
+                    .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
                     Json(ApiError::forbidden("Account not authorized")),
@@ -578,6 +627,15 @@ async fn connect_instance(
                     match chosen.or(local_fallback) {
                         Some(a) => a,
                         None => {
+                            state
+                                .audit_service
+                                .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                                .account(Some(&req.account_id))
+                                .region(Some(&req.region))
+                                .target(Some(&req.instance_id))
+                                .error(Some("No authorized role can perform connect action"))
+                                .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+                                .commit_best_effort();
                             return Err((
                                 axum::http::StatusCode::FORBIDDEN,
                                 Json(ApiError::forbidden(format!(
@@ -595,6 +653,15 @@ async fn connect_instance(
             // Check region entitlement BEFORE any AWS calls to avoid
             // leaking instance existence via 404 vs 403 timing.
             if !entitlements.allowed_regions.contains(&req.region) {
+                state
+                    .audit_service
+                    .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.instance_id))
+                    .error(Some("Region not authorized"))
+                    .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
                     Json(ApiError::forbidden(format!(
@@ -631,6 +698,15 @@ async fn connect_instance(
             .await
             .map_err(|e| {
                 tracing::error!("AWS config failed for {}: {}", account.role_arn, e);
+                state
+                    .audit_service
+                    .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Failure)
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.instance_id))
+                    .error(Some("Failed to get credentials for target account"))
+                    .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal(
@@ -650,6 +726,15 @@ async fn connect_instance(
                 .map_err(|e| {
                     // Normalize to 403 to avoid leaking instance existence
                     tracing::error!("DescribeInstances failed for {}: {}", req.instance_id, e);
+                    state
+                        .audit_service
+                        .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.instance_id))
+                        .error(Some("DescribeInstances failed or target not authorized"))
+                        .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+                        .commit_best_effort();
                     (
                         axum::http::StatusCode::FORBIDDEN,
                         Json(ApiError::forbidden("Connect not authorized")),
@@ -662,9 +747,10 @@ async fn connect_instance(
                 .and_then(|r| r.instances().first());
 
             // Extract VPC ID for EIC endpoint resolution, and tags for auth
-            let (tags, instance_vpc_id) = match sdk_instance {
+            let (tags, instance_vpc_id, target_instance_name) = match sdk_instance {
                 Some(inst) => {
                     let converted = convert_sdk_instance(inst, &account.account_id, &req.region);
+                    let name = converted.name.clone();
                     let mut tags = converted.tags;
                     // Pass IPs as pseudo-tags for SSH direct connect
                     if let Some(ref ip) = converted.private_ip {
@@ -673,21 +759,21 @@ async fn connect_instance(
                     if let Some(ref ip) = converted.public_ip {
                         tags.insert("__public_ip".into(), ip.clone());
                     }
-                    (tags, converted.vpc_id)
+                    (tags, converted.vpc_id, name)
                 }
                 None => {
                     // Return 403 (not 404) to prevent instance-existence oracle.
                     // Callers with account/region access but no connect permission
                     // must not be able to distinguish missing from forbidden.
-                    let _ = state.audit_service.log_event(
-                        &claims.sub,
-                        AuditAction::Ec2Connect,
-                        AuditOutcome::Denied,
-                        Some(&req.account_id),
-                        Some(&req.region),
-                        Some(&req.instance_id),
-                        Some("Instance not found or not authorized"),
-                    );
+                    state
+                        .audit_service
+                        .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.instance_id))
+                        .error(Some("Instance not found or not authorized"))
+                        .optional_metadata(Some(ec2_connect_metadata(&audit_ctx, &req)))
+                        .commit_best_effort();
                     return Err((
                         axum::http::StatusCode::FORBIDDEN,
                         Json(ApiError::forbidden("Connect not authorized")),
@@ -700,17 +786,18 @@ async fn connect_instance(
             // shorter than 900s. Rather than silently widening, fail closed.
             if let Some(cap) = entitlements.max_session_seconds {
                 if cap > 0 && cap < 900 && !use_ssh {
-                    let _ = state.audit_service.log_event(
-                        &claims.sub,
-                        AuditAction::Ec2Connect,
-                        AuditOutcome::Denied,
-                        Some(&req.account_id),
-                        Some(&req.region),
-                        Some(&req.instance_id),
-                        Some(&format!(
+                    state
+                        .audit_service
+                        .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.instance_id))
+                        .target_name(target_instance_name.as_deref())
+                        .error(Some(&format!(
                             "max_session_seconds ({cap}s) is below STS minimum (900s)"
-                        )),
-                    );
+                        )))
+                        .metadata(ec2_connect_metadata(&audit_ctx, &req))
+                        .commit_best_effort();
                     return Err((
                         axum::http::StatusCode::FORBIDDEN,
                         Json(ApiError::forbidden(format!(
@@ -728,15 +815,18 @@ async fn connect_instance(
                 account.role_arn == "direct" || account.role_arn.starts_with("profile:");
 
             if is_local_mode && !use_ssh {
-                let _ = state.audit_service.log_event(
-                &claims.sub,
-                AuditAction::Ec2Connect,
-                AuditOutcome::Denied,
-                Some(&req.account_id),
-                Some(&req.region),
-                Some(&req.instance_id),
-                Some("SSM/EIC connect requires an AssumeRole ARN, not direct/profile credentials"),
-            );
+                state
+                    .audit_service
+                    .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Denied)
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.instance_id))
+                    .target_name(target_instance_name.as_deref())
+                    .error(Some(
+                        "SSM/EIC connect requires an AssumeRole ARN, not direct/profile credentials",
+                    ))
+                    .metadata(ec2_connect_metadata(&audit_ctx, &req))
+                    .commit_best_effort();
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
                     Json(ApiError::forbidden(
@@ -770,6 +860,16 @@ async fn connect_instance(
                 .await
                 .map_err(|e| {
                     tracing::error!("Scoped AssumeRole failed: {}", e);
+                    state
+                        .audit_service
+                        .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Failure)
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.instance_id))
+                        .target_name(target_instance_name.as_deref())
+                        .error(Some("Failed to create scoped credentials for connect"))
+                        .metadata(ec2_connect_metadata(&audit_ctx, &req))
+                        .commit_best_effort();
                     (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ApiError::internal(
@@ -779,6 +879,16 @@ async fn connect_instance(
                 })?;
 
                 let creds_provider = scoped_config.credentials_provider().ok_or_else(|| {
+                    state
+                        .audit_service
+                        .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Failure)
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.instance_id))
+                        .target_name(target_instance_name.as_deref())
+                        .error(Some("Scoped config missing credentials"))
+                        .metadata(ec2_connect_metadata(&audit_ctx, &req))
+                        .commit_best_effort();
                     (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ApiError::internal("Scoped config missing credentials")),
@@ -787,6 +897,16 @@ async fn connect_instance(
 
                 let resolved_creds = creds_provider.provide_credentials().await.map_err(|e| {
                     tracing::error!("Failed to resolve scoped credentials: {}", e);
+                    state
+                        .audit_service
+                        .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Failure)
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.instance_id))
+                        .target_name(target_instance_name.as_deref())
+                        .error(Some("Failed to resolve scoped credentials"))
+                        .metadata(ec2_connect_metadata(&audit_ctx, &req))
+                        .commit_best_effort();
                     (
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ApiError::internal("Failed to resolve scoped credentials")),
@@ -844,7 +964,7 @@ async fn connect_instance(
                 None
             };
 
-            (tags, creds, eic_ep, account)
+            (tags, target_instance_name, creds, eic_ep, account)
         };
 
     let connect_rule_scopes = ent_service
@@ -877,15 +997,17 @@ async fn connect_instance(
     };
 
     // Fail-closed: block the response if the audit write fails
-    if let Err(audit_err) = state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::Ec2Connect,
-        outcome,
-        Some(&req.account_id),
-        Some(&req.region),
-        Some(&req.instance_id),
-        response.error.as_deref(),
-    ) {
+    if let Err(audit_err) = state
+        .audit_service
+        .event(&claims.sub, AuditAction::Ec2Connect, outcome)
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .target(Some(&req.instance_id))
+        .target_name(target_instance_name.as_deref())
+        .error(response.error.as_deref())
+        .metadata(ec2_connect_metadata(&audit_ctx, &req))
+        .commit_or_fail()
+    {
         return Err((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError::internal(format!(

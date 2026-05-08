@@ -533,6 +533,10 @@ Every action is logged with structured tracing **and** to a durable JSON-lines f
 - Connect actions
 - Each log includes: event_id, actor, timestamp, account, region, target, outcome
 
+Audit schema changes are additive. New top-level fields are optional and omitted
+when absent; strict downstream schemas should be migrated before relying on new
+fields such as `target_resource_name`. See [Audit Log Schema](docs/AUDIT-SCHEMA.md).
+
 When the durable audit file is configured and a write fails, the API returns 503 (fail-closed).
 
 ## Keyboard shortcuts

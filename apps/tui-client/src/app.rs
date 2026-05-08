@@ -151,7 +151,7 @@ fn prompt_yes_no(prompt: &str) -> bool {
 
 impl App {
     pub async fn new(config: ClientConfig) -> Result<Self> {
-        let api = ApiClient::new(&config.control_plane_url);
+        let api = ApiClient::new(&config.control_plane_url)?;
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
         let scrollback = config.live_tail_scrollback;

@@ -411,7 +411,7 @@ pub fn build_connect_command(
 pub fn mock_instances() -> Vec<Ec2Instance> {
     vec![
         Ec2Instance {
-            instance_id: "i-0abc1234def56789a".into(),
+            instance_id: "i-0123456789abcdef0".into(),
             account_id: "111111111111".into(),
             region: "us-east-1".into(),
             name: Some("web-prod-01".into()),
@@ -728,7 +728,7 @@ mod tests {
         let ent = platform_eng_entitlements();
         let tags = prod_instance_tags();
         let req = ConnectRequest {
-            instance_id: "i-0abc1234def56789a".into(),
+            instance_id: "i-0123456789abcdef0".into(),
             account_id: "111111111111".into(),
             region: "us-east-1".into(),
             method: ConnectMethod::Ssm,
@@ -762,7 +762,7 @@ mod tests {
         let ent = readonly_entitlements();
         let tags = prod_instance_tags();
         let req = ConnectRequest {
-            instance_id: "i-0abc1234def56789a".into(),
+            instance_id: "i-0123456789abcdef0".into(),
             account_id: "111111111111".into(),
             region: "us-east-1".into(),
             method: ConnectMethod::Ssm,
@@ -814,7 +814,7 @@ mod tests {
         let ent = platform_eng_entitlements();
         let tags = prod_instance_tags();
         let req = ConnectRequest {
-            instance_id: "i-0abc1234def56789a".into(),
+            instance_id: "i-0123456789abcdef0".into(),
             account_id: "111111111111".into(),
             region: "us-east-1".into(),
             method: ConnectMethod::Ec2InstanceConnect,
@@ -838,7 +838,7 @@ mod tests {
             session_token: "token123".into(),
         };
         let req = ConnectRequest {
-            instance_id: "i-0abc1234def56789a".into(),
+            instance_id: "i-0123456789abcdef0".into(),
             account_id: "111111111111".into(),
             region: "us-east-1".into(),
             method: ConnectMethod::Ssm,

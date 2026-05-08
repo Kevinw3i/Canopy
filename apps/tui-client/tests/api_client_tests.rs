@@ -28,7 +28,26 @@ async fn start_mock(app: Router) -> String {
 
 // ── Mock handlers ───────────────────────────────────────────────────────
 
-async fn dev_login_handler(Json(body): Json<Value>) -> impl IntoResponse {
+async fn dev_login_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tui_version = headers
+        .get("X-Canopy-TUI-Version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if user_agent != ApiClient::user_agent() || tui_version != ApiClient::tui_version() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "missing canopy client headers"
+            })),
+        )
+            .into_response();
+    }
+
     let username = body["username"].as_str().unwrap_or("unknown");
     Json(json!({
         "access_token": format!("tok-{}", username),
@@ -41,6 +60,7 @@ async fn dev_login_handler(Json(body): Json<Value>) -> impl IntoResponse {
             "email_verified": true
         }
     }))
+    .into_response()
 }
 
 async fn dev_login_forbidden() -> impl IntoResponse {
@@ -170,7 +190,7 @@ fn mock_app_forbidden() -> Router {
 #[tokio::test]
 async fn dev_login_returns_token() {
     let base_url = start_mock(mock_app()).await;
-    let client = ApiClient::new(&base_url);
+    let client = ApiClient::new(&base_url).unwrap();
 
     let resp = client.dev_login("alice").await.unwrap();
     assert_eq!(resp.access_token, "tok-alice");
@@ -181,7 +201,7 @@ async fn dev_login_returns_token() {
 #[tokio::test]
 async fn dev_login_error_propagates() {
     let base_url = start_mock(mock_app_forbidden()).await;
-    let client = ApiClient::new(&base_url);
+    let client = ApiClient::new(&base_url).unwrap();
 
     let err = client.dev_login("alice").await.unwrap_err();
     let msg = err.to_string();
@@ -192,7 +212,7 @@ async fn dev_login_error_propagates() {
 #[tokio::test]
 async fn token_lifecycle_across_requests() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url);
+    let mut client = ApiClient::new(&base_url).unwrap();
 
     // Without token, listing EC2 should fail (server returns 401)
     let err = client
@@ -235,7 +255,7 @@ async fn token_lifecycle_across_requests() {
 #[tokio::test]
 async fn get_entitlements_requires_auth() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url);
+    let mut client = ApiClient::new(&base_url).unwrap();
 
     // No token -> 401
     let err = client.get_entitlements().await.unwrap_err();
@@ -251,7 +271,7 @@ async fn get_entitlements_requires_auth() {
 #[tokio::test]
 async fn list_log_groups_success() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url);
+    let mut client = ApiClient::new(&base_url).unwrap();
     client.set_token("test-token".into());
 
     let resp = client
@@ -270,7 +290,7 @@ async fn list_log_groups_success() {
 #[tokio::test]
 async fn clear_token_revokes_access() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url);
+    let mut client = ApiClient::new(&base_url).unwrap();
 
     client.set_token("my-token".into());
     assert!(client.has_token());
@@ -290,7 +310,7 @@ async fn clear_token_revokes_access() {
 #[tokio::test]
 async fn base_url_trailing_slash_handled() {
     let base_url = start_mock(mock_app()).await;
-    let client = ApiClient::new(&format!("{}/", base_url));
+    let client = ApiClient::new(&format!("{}/", base_url)).unwrap();
     let resp = client.dev_login("test").await.unwrap();
     assert_eq!(resp.access_token, "tok-test");
 }
