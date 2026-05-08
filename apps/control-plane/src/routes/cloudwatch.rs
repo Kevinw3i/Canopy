@@ -1,9 +1,10 @@
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use std::sync::Arc;
 
 use crate::aws::clients::AwsClients;
 use crate::aws::credentials::SessionContext;
 use crate::middleware::auth::AuthenticatedUser;
+use crate::services::audit::AuditRequestContext;
 use crate::services::cloudwatch::{mock_log_events, mock_log_groups};
 use crate::services::entitlements::EntitlementService;
 use crate::services::AppState;
@@ -18,31 +19,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/cloudwatch/filter-events", post(filter_log_events))
         .route("/api/cloudwatch/insights/start", post(start_insights_query))
         .route("/api/cloudwatch/insights/results", post(get_query_results))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn log_group_arn_variants_include_cloudwatch_describe_suffix() {
-        assert_eq!(
-            log_group_arn_variants("ap-northeast-1", "643830916390", "/ecs/pro-api"),
-            vec![
-                "arn:aws:logs:ap-northeast-1:643830916390:log-group:/ecs/pro-api".to_string(),
-                "arn:aws:logs:ap-northeast-1:643830916390:log-group:/ecs/pro-api:*".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn log_group_patterns_match_describe_arn_suffix() {
-        let patterns =
-            vec!["arn:aws:logs:ap-northeast-1:643830916390:log-group:/ecs/pro-api:*".to_string()];
-        let variants = log_group_arn_variants("ap-northeast-1", "643830916390", "/ecs/pro-api");
-
-        assert!(log_group_matches_patterns(&patterns, &variants));
-    }
 }
 
 /// Try each matching AllowedAccount entry for the given account_id until
@@ -172,12 +148,58 @@ fn log_group_matches_patterns(patterns: &[String], arn_variants: &[String]) -> b
     })
 }
 
+fn log_groups_metadata(ctx: &AuditRequestContext, req: &LogGroupsRequest) -> serde_json::Value {
+    ctx.metadata(serde_json::json!({
+        "prefix": req.prefix.as_deref(),
+    }))
+}
+
+fn filter_events_metadata(
+    ctx: &AuditRequestContext,
+    req: &FilterLogEventsRequest,
+) -> serde_json::Value {
+    // Filter/query text is intentionally logged in full for auditability.
+    // Treat audit logs as sensitive.
+    ctx.metadata(serde_json::json!({
+        "filter_pattern": req.filter_pattern.as_deref(),
+        "start_time": req.start_time,
+        "end_time": req.end_time,
+        "limit": req.limit,
+        "has_next_token": req.next_token.is_some(),
+    }))
+}
+
+fn insights_query_metadata(
+    ctx: &AuditRequestContext,
+    req: &StartInsightsQueryRequest,
+) -> serde_json::Value {
+    // Filter/query text is intentionally logged in full for auditability.
+    // Treat audit logs as sensitive.
+    ctx.metadata(serde_json::json!({
+        "query_string": &req.query_string,
+        "start_time": req.start_time,
+        "end_time": req.end_time,
+        "log_group_names": &req.log_group_names,
+    }))
+}
+
+fn query_results_metadata(
+    ctx: &AuditRequestContext,
+    req: &GetQueryResultsRequest,
+) -> serde_json::Value {
+    ctx.metadata(serde_json::json!({
+        "query_id": &req.query_id,
+    }))
+}
+
 async fn list_log_groups(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
     Json(req): Json<LogGroupsRequest>,
 ) -> Result<Json<LogGroupsResponse>, (axum::http::StatusCode, Json<ApiError>)> {
     require_audit_healthy(&state)?;
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
@@ -194,15 +216,14 @@ async fn list_log_groups(
         )
         .await
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::LogGroupList,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            Some("CloudWatch search not authorized"),
-        );
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("CloudWatch search not authorized"))
+            .optional_metadata(Some(log_groups_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("CloudWatch search not authorized")),
@@ -215,15 +236,14 @@ async fn list_log_groups(
         .iter()
         .any(|a| a.account_id == req.account_id)
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::LogGroupList,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            Some("Account not authorized"),
-        );
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("Account not authorized"))
+            .optional_metadata(Some(log_groups_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Account not authorized")),
@@ -232,15 +252,14 @@ async fn list_log_groups(
 
     // Enforce region entitlement
     if !entitlements.allowed_regions.contains(&req.region) {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::LogGroupList,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            Some("Region not authorized"),
-        );
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("Region not authorized"))
+            .optional_metadata(Some(log_groups_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Region not authorized")),
@@ -301,6 +320,18 @@ async fn list_log_groups(
 
             let resp = describe.send().await.map_err(|e| {
                 tracing::error!("describe_log_groups failed: {e}");
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::LogGroupList,
+                        AuditOutcome::Failure,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .error(Some("AWS DescribeLogGroups failed"))
+                    .optional_metadata(Some(log_groups_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 (
                     axum::http::StatusCode::BAD_GATEWAY,
                     Json(ApiError::internal(format!(
@@ -341,15 +372,15 @@ async fn list_log_groups(
     // Audit after all checks pass and data is ready — fail-closed on write failure
     state
         .audit_service
-        .log_event(
+        .event(
             &claims.sub,
             AuditAction::LogGroupList,
             AuditOutcome::Success,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            None,
         )
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .optional_metadata(Some(log_groups_metadata(&audit_ctx, &req)))
+        .commit_or_fail()
         .map_err(|_| {
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -367,9 +398,11 @@ async fn list_log_groups(
 async fn filter_log_events(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
     Json(req): Json<FilterLogEventsRequest>,
 ) -> Result<Json<FilterLogEventsResponse>, (axum::http::StatusCode, Json<ApiError>)> {
     require_audit_healthy(&state)?;
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
@@ -392,15 +425,19 @@ async fn filter_log_events(
         }
     }
     if !filter_scope_allowed {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchSearch,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.log_group_name),
-            Some("CloudWatch search not authorized for this scope"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchSearch,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.log_group_name))
+            .error(Some("CloudWatch search not authorized for this scope"))
+            .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("CloudWatch search not authorized")),
@@ -412,15 +449,19 @@ async fn filter_log_events(
         .iter()
         .any(|a| a.account_id == req.account_id)
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchSearch,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.log_group_name),
-            Some("Account not authorized"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchSearch,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.log_group_name))
+            .error(Some("Account not authorized"))
+            .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Account not authorized")),
@@ -429,15 +470,19 @@ async fn filter_log_events(
 
     // Enforce region entitlement
     if !entitlements.allowed_regions.contains(&req.region) {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchSearch,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.log_group_name),
-            Some("Region not authorized"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchSearch,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.log_group_name))
+            .error(Some("Region not authorized"))
+            .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Region not authorized")),
@@ -452,15 +497,19 @@ async fn filter_log_events(
         .await;
     if !scoped_log_arns.is_empty() && !log_group_matches_patterns(&scoped_log_arns, &filter_lg_arns)
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchSearch,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.log_group_name),
-            Some("Log group not authorized"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchSearch,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.log_group_name))
+            .error(Some("Log group not authorized"))
+            .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Log group not authorized")),
@@ -504,6 +553,19 @@ async fn filter_log_events(
                 .unwrap_or("invalid filter pattern");
             tracing::error!("filter_log_events failed: {e}");
             if is_invalid_parameter {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchSearch,
+                        AuditOutcome::Failure,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.log_group_name))
+                    .error(Some("Invalid CloudWatch filter pattern"))
+                    .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 (
                     axum::http::StatusCode::BAD_REQUEST,
                     Json(ApiError::bad_request(format!(
@@ -511,6 +573,19 @@ async fn filter_log_events(
                     ))),
                 )
             } else {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchSearch,
+                        AuditOutcome::Failure,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.log_group_name))
+                    .error(Some("AWS FilterLogEvents failed"))
+                    .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 (
                     axum::http::StatusCode::BAD_GATEWAY,
                     Json(ApiError::internal(format!(
@@ -539,15 +614,16 @@ async fn filter_log_events(
     // Audit after the operation succeeds — fail-closed on write failure
     state
         .audit_service
-        .log_event(
+        .event(
             &claims.sub,
             AuditAction::CloudwatchSearch,
             AuditOutcome::Success,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.log_group_name),
-            None,
         )
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .target(Some(&req.log_group_name))
+        .optional_metadata(Some(filter_events_metadata(&audit_ctx, &req)))
+        .commit_or_fail()
         .map_err(|_| {
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -566,9 +642,11 @@ async fn filter_log_events(
 async fn start_insights_query(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
     Json(req): Json<StartInsightsQueryRequest>,
 ) -> Result<Json<StartInsightsQueryResponse>, (axum::http::StatusCode, Json<ApiError>)> {
     require_audit_healthy(&state)?;
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
@@ -583,15 +661,18 @@ async fn start_insights_query(
         )
         .await
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchInsightsQuery,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            Some("CloudWatch search not authorized"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("CloudWatch search not authorized"))
+            .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("CloudWatch search not authorized")),
@@ -604,15 +685,18 @@ async fn start_insights_query(
         .iter()
         .any(|a| a.account_id == req.account_id)
     {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchInsightsQuery,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            Some("Account not authorized"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("Account not authorized"))
+            .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Account not authorized")),
@@ -621,15 +705,18 @@ async fn start_insights_query(
 
     // Enforce region entitlement
     if !entitlements.allowed_regions.contains(&req.region) {
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchInsightsQuery,
-            AuditOutcome::Denied,
-            Some(&req.account_id),
-            Some(&req.region),
-            None,
-            Some("Region not authorized"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("Region not authorized"))
+            .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Region not authorized")),
@@ -639,6 +726,18 @@ async fn start_insights_query(
     // Enforce log-group ARN entitlements using scope-aware patterns
     // Reject empty log_group_names to prevent bypass via SOURCE in query_string
     if req.log_group_names.is_empty() {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Failure,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .error(Some("log_group_names must not be empty"))
+            .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             Json(ApiError::bad_request(
@@ -656,6 +755,19 @@ async fn start_insights_query(
         for lg_name in &req.log_group_names {
             let lg_arns = log_group_arn_variants(&req.region, &req.account_id, lg_name);
             if !log_group_matches_patterns(&scoped_log_arns, &lg_arns) {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchInsightsQuery,
+                        AuditOutcome::Denied,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(lg_name))
+                    .error(Some("Log group not authorized"))
+                    .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
                     Json(ApiError::forbidden(format!(
@@ -670,15 +782,16 @@ async fn start_insights_query(
     // Write audit BEFORE launching StartQuery to prevent orphaned unaudited queries
     state
         .audit_service
-        .log_event(
+        .event(
             &claims.sub,
             AuditAction::CloudwatchInsightsQuery,
             AuditOutcome::Success,
-            Some(&req.account_id),
-            Some(&req.region),
-            Some(&req.log_group_names.join(",")),
-            None,
         )
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .target(Some(&req.log_group_names.join(",")))
+        .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+        .commit_or_fail()
         .map_err(|_| {
             (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -713,6 +826,19 @@ async fn start_insights_query(
 
         let resp = start.send().await.map_err(|e| {
             tracing::error!("start_query failed: {e}");
+            state
+                .audit_service
+                .event(
+                    &claims.sub,
+                    AuditAction::CloudwatchInsightsQuery,
+                    AuditOutcome::Failure,
+                )
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.log_group_names.join(",")))
+                .error(Some("AWS StartQuery failed"))
+                .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+                .commit_best_effort();
             (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(ApiError::internal(format!("AWS StartQuery failed: {e}"))),
@@ -721,6 +847,19 @@ async fn start_insights_query(
 
         resp.query_id()
             .ok_or_else(|| {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchInsightsQuery,
+                        AuditOutcome::Failure,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.log_group_names.join(",")))
+                    .error(Some("AWS StartQuery returned no query_id"))
+                    .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError::internal("AWS StartQuery returned no query_id")),
@@ -746,9 +885,11 @@ async fn start_insights_query(
 async fn get_query_results(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
     Json(req): Json<GetQueryResultsRequest>,
 ) -> Result<Json<GetQueryResultsResponse>, (axum::http::StatusCode, Json<ApiError>)> {
     require_audit_healthy(&state)?;
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let ent_service = EntitlementService::new(state.entitlement_store.clone());
     let entitlements = ent_service.evaluate(&claims).await;
 
@@ -763,6 +904,19 @@ async fn get_query_results(
         )
         .await
     {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.query_id))
+            .error(Some("CloudWatch search not authorized for this scope"))
+            .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden(
@@ -776,6 +930,19 @@ async fn get_query_results(
         .iter()
         .any(|a| a.account_id == req.account_id)
     {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.query_id))
+            .error(Some("Account not authorized"))
+            .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Account not authorized")),
@@ -783,6 +950,19 @@ async fn get_query_results(
     }
 
     if !entitlements.allowed_regions.contains(&req.region) {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchInsightsQuery,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.query_id))
+            .error(Some("Region not authorized"))
+            .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+            .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden("Region not authorized")),
@@ -800,6 +980,19 @@ async fn get_query_results(
         match crate::services::verify_query_token(&req.query_id, &state.config.jwt.secret) {
             Some((aws_qid, auth)) => {
                 if auth.user_id != claims.sub {
+                    state
+                        .audit_service
+                        .event(
+                            &claims.sub,
+                            AuditAction::CloudwatchInsightsQuery,
+                            AuditOutcome::Denied,
+                        )
+                        .account(Some(&req.account_id))
+                        .region(Some(&req.region))
+                        .target(Some(&req.query_id))
+                        .error(Some("Query was started by a different user"))
+                        .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+                        .commit_best_effort();
                     return Err((
                         axum::http::StatusCode::FORBIDDEN,
                         Json(ApiError::forbidden("Query was started by a different user")),
@@ -815,6 +1008,19 @@ async fn get_query_results(
                     for lg_name in &auth.log_group_names {
                         let lg_arns = log_group_arn_variants(&req.region, &req.account_id, lg_name);
                         if !log_group_matches_patterns(&scoped_arns, &lg_arns) {
+                            state
+                                .audit_service
+                                .event(
+                                    &claims.sub,
+                                    AuditAction::CloudwatchInsightsQuery,
+                                    AuditOutcome::Denied,
+                                )
+                                .account(Some(&req.account_id))
+                                .region(Some(&req.region))
+                                .target(Some(lg_name))
+                                .error(Some("Access to log group has been revoked"))
+                                .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+                                .commit_best_effort();
                             return Err((
                                 axum::http::StatusCode::FORBIDDEN,
                                 Json(ApiError::forbidden(format!(
@@ -828,6 +1034,19 @@ async fn get_query_results(
                 aws_qid
             }
             None => {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchInsightsQuery,
+                        AuditOutcome::Denied,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.query_id))
+                    .error(Some("Invalid or tampered query authorization token"))
+                    .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 return Err((
                     axum::http::StatusCode::FORBIDDEN,
                     Json(ApiError::forbidden(
@@ -888,6 +1107,19 @@ async fn get_query_results(
             .await
             .map_err(|e| {
                 tracing::error!("get_query_results failed: {e}");
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchInsightsQuery,
+                        AuditOutcome::Failure,
+                    )
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.query_id))
+                    .error(Some("AWS GetQueryResults failed"))
+                    .optional_metadata(Some(query_results_metadata(&audit_ctx, &req)))
+                    .commit_best_effort();
                 (
                     axum::http::StatusCode::BAD_GATEWAY,
                     Json(ApiError::internal(format!(
@@ -933,5 +1165,31 @@ async fn get_query_results(
             results,
             statistics,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_group_arn_variants_include_cloudwatch_describe_suffix() {
+        assert_eq!(
+            log_group_arn_variants("ap-northeast-1", "123456789012", "/app/web-service"),
+            vec![
+                "arn:aws:logs:ap-northeast-1:123456789012:log-group:/app/web-service".to_string(),
+                "arn:aws:logs:ap-northeast-1:123456789012:log-group:/app/web-service:*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn log_group_patterns_match_describe_arn_suffix() {
+        let patterns = vec![
+            "arn:aws:logs:ap-northeast-1:123456789012:log-group:/app/web-service:*".to_string(),
+        ];
+        let variants = log_group_arn_variants("ap-northeast-1", "123456789012", "/app/web-service");
+
+        assert!(log_group_matches_patterns(&patterns, &variants));
     }
 }

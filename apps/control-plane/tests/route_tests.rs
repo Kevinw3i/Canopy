@@ -10,6 +10,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -56,9 +57,12 @@ fn dev_config() -> AppConfig {
 }
 
 fn build_state(config: AppConfig) -> Arc<AppState> {
+    build_state_with_audit_service(config, AuditService::new())
+}
+
+fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
-    let audit_service = AuditService::new();
 
     // Build a minimal SdkConfig without hitting real AWS
     let base_aws_config = aws_config::SdkConfig::builder()
@@ -73,6 +77,47 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
         base_aws_config,
         ready: std::sync::atomic::AtomicBool::new(true),
     })
+}
+
+struct AuditFile {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl AuditFile {
+    fn new(name: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "canopy-route-audit-{name}-{}-{nanos}",
+            std::process::id(),
+        ));
+        let path = dir.join("audit.jsonl");
+        Self { dir, path }
+    }
+}
+
+impl Drop for AuditFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn build_state_with_audit_file(config: AppConfig, path: &Path) -> Arc<AppState> {
+    build_state_with_audit_service(
+        config,
+        AuditService::with_file(path.to_str().unwrap()).unwrap(),
+    )
+}
+
+fn read_audit_events(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 /// Build the full app router (public + protected) exactly like main.rs.
@@ -413,6 +458,54 @@ async fn cloudwatch_filter_events_returns_mock_data() {
 }
 
 #[tokio::test]
+async fn cloudwatch_filter_events_audit_includes_query_and_client_metadata() {
+    let audit = AuditFile::new("filter-events");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "\"/api/merchant/bets\"",
+        "start_time": 0,
+        "end_time": 9999999999999_i64,
+        "limit": 25
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/filter-events")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("X-Forwarded-For", "203.0.113.8, 10.0.0.10")
+                .header("User-Agent", "canopy-tui/9.9.9")
+                .header("X-Canopy-TUI-Version", "9.9.9")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let events = read_audit_events(&audit.path);
+    let event = events.last().unwrap();
+    assert_eq!(event["action"], "cloudwatch_search");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["metadata"]["actor_email"], "dev-admin@dev.local");
+    assert_eq!(event["metadata"]["actor_email_verified"], true);
+    assert_eq!(event["metadata"]["client_ip"], "10.0.0.10");
+    assert_eq!(event["metadata"]["user_agent"], "canopy-tui/9.9.9");
+    assert_eq!(event["metadata"]["tui_version"], "9.9.9");
+    assert_eq!(
+        event["metadata"]["filter_pattern"],
+        "\"/api/merchant/bets\""
+    );
+    assert_eq!(event["metadata"]["limit"], 25);
+}
+
+#[tokio::test]
 async fn cloudwatch_insights_start_and_results() {
     let config = dev_config();
     let token = issue_test_token(&config);
@@ -497,6 +590,48 @@ async fn cloudwatch_insights_rejects_empty_log_groups() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn cloudwatch_insights_bad_request_is_audited_with_query_string() {
+    let audit = AuditFile::new("insights-bad-request");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_names": [],
+        "query_string": "fields @timestamp, @message | limit 10",
+        "start_time": 0,
+        "end_time": 9999999999999_i64
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/insights/start")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("X-Forwarded-For", "198.51.100.3")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let events = read_audit_events(&audit.path);
+    let event = events.last().unwrap();
+    assert_eq!(event["action"], "cloudwatch_insights_query");
+    assert_eq!(event["outcome"], "failure");
+    assert_eq!(event["metadata"]["actor_email"], "dev-admin@dev.local");
+    assert_eq!(event["metadata"]["actor_email_verified"], true);
+    assert_eq!(event["metadata"]["client_ip"], "198.51.100.3");
+    assert_eq!(
+        event["metadata"]["query_string"],
+        "fields @timestamp, @message | limit 10"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Authorization / entitlement enforcement
 // ═══════════════════════════════════════════════════════════════════════
@@ -557,6 +692,44 @@ async fn cloudwatch_denied_for_unauthorized_account() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn cloudwatch_log_group_denied_is_audited_with_client_metadata() {
+    let audit = AuditFile::new("log-groups-denied");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "999999999999",
+        "region": "us-east-1",
+        "prefix": "/ecs/"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("X-Forwarded-For", "203.0.113.20")
+                .header("User-Agent", "canopy-tui/1.2.3")
+                .header("X-Canopy-TUI-Version", "1.2.3")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let events = read_audit_events(&audit.path);
+    let event = events.last().unwrap();
+    assert_eq!(event["action"], "log_group_list");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["error_message"], "CloudWatch search not authorized");
+    assert_eq!(event["metadata"]["actor_email"], "dev-admin@dev.local");
+    assert_eq!(event["metadata"]["client_ip"], "203.0.113.20");
+    assert_eq!(event["metadata"]["prefix"], "/ecs/");
 }
 
 #[tokio::test]
@@ -671,10 +844,10 @@ async fn ec2_connect_ssm_succeeds_in_mock_mode() {
     let state = build_state(config);
     let app = build_app(state);
 
-    // i-0abc1234def56789a is a mock instance in account 111111111111, us-east-1
+    // i-0123456789abcdef0 is a mock instance in account 111111111111, us-east-1
     // SSM connect requires an explicit os_user (entitlements allow ec2-user, ubuntu)
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "111111111111",
         "region": "us-east-1",
         "method": "ssm",
@@ -698,6 +871,43 @@ async fn ec2_connect_ssm_succeeds_in_mock_mode() {
 }
 
 #[tokio::test]
+async fn ec2_connect_audit_includes_target_resource_name() {
+    let audit = AuditFile::new("ec2-connect-target-name");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "method": "ssm",
+        "os_user": "ec2-user"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/ec2/connect")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_connect")
+        .expect("ec2 connect audit event");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["target_resource_name"], "web-prod-01");
+}
+
+#[tokio::test]
 async fn ec2_connect_denied_for_readonly_user() {
     // readonly-ops group has can_use_ssm=false
     let config = dev_config();
@@ -714,7 +924,7 @@ async fn ec2_connect_denied_for_readonly_user() {
     let app = build_app(state);
 
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "222222222222",
         "region": "us-east-1",
         "method": "ssm"
@@ -746,7 +956,7 @@ async fn ec2_connect_blocked_when_audit_unavailable() {
 
     // SSH connect requires an explicit os_user
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "111111111111",
         "region": "us-east-1",
         "method": "ssh",
@@ -857,11 +1067,12 @@ async fn cloudwatch_insights_results_rejects_tampered_query_token() {
 
 #[tokio::test]
 async fn cloudwatch_insights_results_rejects_tampered_token_prod_path() {
+    let audit = AuditFile::new("insights-results-tampered");
     let mut config = dev_config();
     // Keep dev_mode for auth but disable mock AWS for the query token check
     config.mock_aws_data = Some(false);
     let token = issue_test_token(&config);
-    let state = build_state(config);
+    let state = build_state_with_audit_file(config, &audit.path);
     let app = build_app(state);
 
     let body = json!({
@@ -883,6 +1094,16 @@ async fn cloudwatch_insights_results_rejects_tampered_token_prod_path() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp.into_body()).await;
     assert!(json["message"].as_str().unwrap().contains("tampered"));
+
+    let events = read_audit_events(&audit.path);
+    let event = events.last().unwrap();
+    assert_eq!(event["action"], "cloudwatch_insights_query");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["error_message"],
+        "Invalid or tampered query authorization token"
+    );
+    assert_eq!(event["metadata"]["actor_email"], "dev-admin@dev.local");
 }
 
 #[tokio::test]
@@ -1087,7 +1308,7 @@ async fn ec2_connect_denied_for_unauthorized_account() {
     let app = build_app(state);
 
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "999999999999",
         "region": "us-east-1",
         "method": "ssm",
@@ -1116,7 +1337,7 @@ async fn ec2_connect_denied_for_unauthorized_os_user() {
 
     // "root" is not in the allowed_os_users for dev-admin
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "111111111111",
         "region": "us-east-1",
         "method": "ssm",
@@ -1149,7 +1370,7 @@ async fn ec2_connect_ssh_succeeds_in_mock_mode() {
     let app = build_app(state);
 
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "111111111111",
         "region": "us-east-1",
         "method": "ssh",
@@ -1242,7 +1463,7 @@ async fn ec2_connect_eic_succeeds_in_mock_mode() {
     let app = build_app(state);
 
     let body = json!({
-        "instance_id": "i-0abc1234def56789a",
+        "instance_id": "i-0123456789abcdef0",
         "account_id": "111111111111",
         "region": "us-east-1",
         "method": "ec2_instance_connect",

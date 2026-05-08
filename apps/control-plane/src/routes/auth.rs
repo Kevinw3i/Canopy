@@ -53,15 +53,11 @@ async fn dev_login(
         Ok(resp) => {
             state
                 .audit_service
-                .log_event(
-                    &req.username,
-                    AuditAction::Login,
-                    AuditOutcome::Success,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                .event(&req.username, AuditAction::Login, AuditOutcome::Success)
+                .optional_metadata(Some(serde_json::json!({
+                    "actor_email": &resp.identity.email,
+                })))
+                .commit_or_fail()
                 .map_err(|_| {
                     (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -71,15 +67,11 @@ async fn dev_login(
             Ok(Json(resp))
         }
         Err(e) => {
-            let _ = state.audit_service.log_event(
-                &req.username,
-                AuditAction::Login,
-                AuditOutcome::Failure,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-            );
+            state
+                .audit_service
+                .event(&req.username, AuditAction::Login, AuditOutcome::Failure)
+                .error(Some(&e.to_string()))
+                .commit_best_effort();
             Err((
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError::internal(e.to_string())),
@@ -159,15 +151,11 @@ async fn pkce_exchange(
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "PKCE code exchange failed");
-            let _ = state.audit_service.log_event(
-                "unknown",
-                AuditAction::Login,
-                AuditOutcome::Failure,
-                None,
-                None,
-                None,
-                Some(&e.to_string()),
-            );
+            state
+                .audit_service
+                .event("unknown", AuditAction::Login, AuditOutcome::Failure)
+                .error(Some(&e.to_string()))
+                .commit_best_effort();
             (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(ApiError::bad_request(format!(
@@ -181,15 +169,12 @@ async fn pkce_exchange(
     if let Ok(claims) = auth_service.validate_token(&token.access_token) {
         state
             .audit_service
-            .log_event(
-                &claims.sub,
-                AuditAction::Login,
-                AuditOutcome::Success,
-                None,
-                None,
-                None,
-                Some("pkce"),
-            )
+            .event(&claims.sub, AuditAction::Login, AuditOutcome::Success)
+            .error(Some("pkce"))
+            .optional_metadata(Some(serde_json::json!({
+                "actor_email": &claims.email,
+            })))
+            .commit_or_fail()
             .map_err(|_| {
                 (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -339,15 +324,12 @@ async fn device_code_poll(
 
                 state
                     .audit_service
-                    .log_event(
-                        &oidc_claims.sub,
-                        AuditAction::Login,
-                        AuditOutcome::Success,
-                        None,
-                        None,
-                        None,
-                        Some("device_code"),
-                    )
+                    .event(&oidc_claims.sub, AuditAction::Login, AuditOutcome::Success)
+                    .error(Some("device_code"))
+                    .optional_metadata(Some(serde_json::json!({
+                        "actor_email": &identity.email,
+                    })))
+                    .commit_or_fail()
                     .map_err(|_| {
                         (
                             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -462,15 +444,12 @@ async fn refresh_token(
         // Audit the refresh — fail-closed
         state
             .audit_service
-            .log_event(
-                &oidc_claims.sub,
-                AuditAction::Login,
-                AuditOutcome::Success,
-                None,
-                None,
-                None,
-                Some("refresh"),
-            )
+            .event(&oidc_claims.sub, AuditAction::Login, AuditOutcome::Success)
+            .error(Some("refresh"))
+            .optional_metadata(Some(serde_json::json!({
+                "actor_email": &identity.email,
+            })))
+            .commit_or_fail()
             .map_err(|_| {
                 (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,

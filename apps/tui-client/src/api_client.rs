@@ -1,9 +1,11 @@
 use anyhow::Result;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use shared::dto::auth::*;
 use shared::dto::cloudwatch::*;
 use shared::dto::ec2::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::errors::ApiError;
+use shared::headers;
 
 /// HTTP client for the control-plane API
 #[derive(Clone)]
@@ -14,12 +16,32 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    pub fn new(base_url: &str) -> Self {
-        Self {
+    pub fn new(base_url: &str) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("canopy-tui/", env!("CARGO_PKG_VERSION"))),
+        );
+        headers.insert(
+            headers::CANOPY_TUI_VERSION,
+            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+        );
+
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .default_headers(headers)
+                .build()?,
             token: None,
-        }
+        })
+    }
+
+    pub fn tui_version() -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    pub fn user_agent() -> &'static str {
+        concat!("canopy-tui/", env!("CARGO_PKG_VERSION"))
     }
 
     pub fn set_token(&mut self, token: String) {
@@ -323,13 +345,13 @@ mod tests {
 
     #[test]
     fn test_new_strips_trailing_slash() {
-        let client = ApiClient::new("http://localhost:8443/");
+        let client = ApiClient::new("http://localhost:8443/").unwrap();
         assert_eq!(client.base_url, "http://localhost:8443");
     }
 
     #[test]
     fn test_token_lifecycle() {
-        let mut client = ApiClient::new("http://localhost:8443");
+        let mut client = ApiClient::new("http://localhost:8443").unwrap();
         assert!(!client.has_token());
         assert!(client.get_token().is_none());
         assert!(client.auth_header().is_none());

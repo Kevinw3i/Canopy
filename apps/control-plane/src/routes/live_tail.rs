@@ -3,12 +3,14 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::HeaderMap,
     response::IntoResponse,
     routing::get,
     Router,
 };
 use std::sync::Arc;
 
+use crate::services::audit::AuditRequestContext;
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::cloudwatch::*;
@@ -19,6 +21,7 @@ pub fn router() -> Router<Arc<AppState>> {
 
 async fn live_tail_ws(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     // Live tail is a beta feature — only available in dev_mode for now.
@@ -30,11 +33,11 @@ async fn live_tail_ws(
             .into_response();
     }
 
-    ws.on_upgrade(move |socket| handle_live_tail(socket, state))
+    ws.on_upgrade(move |socket| handle_live_tail(socket, state, headers))
         .into_response()
 }
 
-async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>, headers: HeaderMap) {
     // First message should be auth token + start request
     let start_req = match socket.recv().await {
         Some(Ok(Message::Text(text))) => {
@@ -72,6 +75,7 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     };
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
 
     // Verify entitlements
     let ent_service =
@@ -79,6 +83,19 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
     let entitlements = ent_service.evaluate(&claims).await;
 
     if !entitlements.features.can_use_cloudwatch_tail {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchLiveTailStart,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&start_req.request.account_id))
+            .region(Some(&start_req.request.region))
+            .target(Some(&start_req.request.log_group_arns.join(",")))
+            .error(Some("Live tail not authorized"))
+            .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+            .commit_best_effort();
         let _ = socket
             .send(Message::Text(
                 serde_json::to_string(&LiveTailMessage::Error {
@@ -96,6 +113,19 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
         .iter()
         .any(|a| a.account_id == start_req.request.account_id)
     {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchLiveTailStart,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&start_req.request.account_id))
+            .region(Some(&start_req.request.region))
+            .target(Some(&start_req.request.log_group_arns.join(",")))
+            .error(Some("Account not authorized"))
+            .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+            .commit_best_effort();
         let _ = socket
             .send(Message::Text(
                 serde_json::to_string(&LiveTailMessage::Error {
@@ -112,6 +142,19 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
         .allowed_regions
         .contains(&start_req.request.region)
     {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchLiveTailStart,
+                AuditOutcome::Denied,
+            )
+            .account(Some(&start_req.request.account_id))
+            .region(Some(&start_req.request.region))
+            .target(Some(&start_req.request.log_group_arns.join(",")))
+            .error(Some("Region not authorized"))
+            .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+            .commit_best_effort();
         let _ = socket
             .send(Message::Text(
                 serde_json::to_string(&LiveTailMessage::Error {
@@ -131,6 +174,19 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
                 .iter()
                 .any(|pattern| crate::services::entitlements::arn_matches_pattern(pattern, lg_arn))
             {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::CloudwatchLiveTailStart,
+                        AuditOutcome::Denied,
+                    )
+                    .account(Some(&start_req.request.account_id))
+                    .region(Some(&start_req.request.region))
+                    .target(Some(lg_arn))
+                    .error(Some("Log group not authorized"))
+                    .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+                    .commit_best_effort();
                 let _ = socket
                     .send(Message::Text(
                         serde_json::to_string(&LiveTailMessage::Error {
@@ -144,15 +200,18 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    let _ = state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::CloudwatchLiveTailStart,
-        AuditOutcome::Success,
-        Some(&start_req.request.account_id),
-        Some(&start_req.request.region),
-        Some(&start_req.request.log_group_arns.join(",")),
-        None,
-    );
+    state
+        .audit_service
+        .event(
+            &claims.sub,
+            AuditAction::CloudwatchLiveTailStart,
+            AuditOutcome::Success,
+        )
+        .account(Some(&start_req.request.account_id))
+        .region(Some(&start_req.request.region))
+        .target(Some(&start_req.request.log_group_arns.join(",")))
+        .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+        .commit_best_effort();
 
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -181,15 +240,19 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
                 .unwrap(),
             ))
             .await;
-        let _ = state.audit_service.log_event(
-            &claims.sub,
-            AuditAction::CloudwatchLiveTailStop,
-            AuditOutcome::Failure,
-            Some(&start_req.request.account_id),
-            Some(&start_req.request.region),
-            Some(&session_id),
-            Some("real-AWS live tail not yet implemented"),
-        );
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::CloudwatchLiveTailStop,
+                AuditOutcome::Failure,
+            )
+            .account(Some(&start_req.request.account_id))
+            .region(Some(&start_req.request.region))
+            .target(Some(&session_id))
+            .error(Some("real-AWS live tail not yet implemented"))
+            .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+            .commit_best_effort();
         return;
     }
 
@@ -244,15 +307,28 @@ async fn handle_live_tail(mut socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    let _ = state.audit_service.log_event(
-        &claims.sub,
-        AuditAction::CloudwatchLiveTailStop,
-        AuditOutcome::Success,
-        Some(&start_req.request.account_id),
-        Some(&start_req.request.region),
-        Some(&session_id),
-        None,
-    );
+    state
+        .audit_service
+        .event(
+            &claims.sub,
+            AuditAction::CloudwatchLiveTailStop,
+            AuditOutcome::Success,
+        )
+        .account(Some(&start_req.request.account_id))
+        .region(Some(&start_req.request.region))
+        .target(Some(&session_id))
+        .optional_metadata(Some(live_tail_metadata(&audit_ctx, &start_req.request)))
+        .commit_best_effort();
+}
+
+fn live_tail_metadata(
+    audit_ctx: &AuditRequestContext,
+    request: &StartLiveTailRequest,
+) -> serde_json::Value {
+    audit_ctx.metadata(serde_json::json!({
+        "filter_pattern": request.filter_pattern.as_deref(),
+        "log_group_arns": &request.log_group_arns,
+    }))
 }
 
 /// Internal message format for starting a live tail over WebSocket

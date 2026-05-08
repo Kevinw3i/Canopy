@@ -10,6 +10,7 @@
 #   tui-client    — 二進位檔
 #   config.toml   — 客戶端設定（URL 已寫入）
 #   install.sh    — 維運人員的一鍵安裝腳本
+#   Canopy.command — macOS 雙擊啟動腳本
 # ============================================================
 set -e
 
@@ -82,7 +83,52 @@ auto_update = true
 # change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 EOF
 
-# ── 5. 產生安裝腳本 ─────────────────────────────────
+# ── 5. 產生 macOS 雙擊啟動腳本 ───────────────────────
+
+cat > "$DIST_DIR/Canopy.command" << 'LAUNCHER'
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALLED_CANOPY="${HOME}/.local/bin/canopy"
+LOCAL_CANOPY="${SCRIPT_DIR}/tui-client"
+LOCAL_CONFIG="${SCRIPT_DIR}/config.toml"
+CONFIG_DIR="${HOME}/Library/Application Support/canopy"
+CONFIG_DST="${CONFIG_DIR}/config.toml"
+
+show_launcher_error() {
+    local message="Canopy executable not found.\n\nRun install.sh first, or keep Canopy.command next to tui-client."
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e 'display dialog "Canopy executable not found.\n\nRun install.sh first, or keep Canopy.command next to tui-client." buttons {"OK"} with icon caution' >/dev/null || true
+    else
+        printf "%b\n" "$message"
+        echo ""
+        read -r -p "Press Enter to close..."
+    fi
+    exit 1
+}
+
+if [ -f "$LOCAL_CONFIG" ] && [ ! -f "$CONFIG_DST" ]; then
+    mkdir -p "$CONFIG_DIR"
+    cp "$LOCAL_CONFIG" "$CONFIG_DST"
+fi
+
+if [ -x "$INSTALLED_CANOPY" ]; then
+    exec "$INSTALLED_CANOPY"
+fi
+
+if [ -f "$LOCAL_CANOPY" ]; then
+    chmod +x "$LOCAL_CANOPY" 2>/dev/null || true
+    xattr -dr com.apple.quarantine "$LOCAL_CANOPY" 2>/dev/null || true
+    exec "$LOCAL_CANOPY"
+fi
+
+show_launcher_error
+LAUNCHER
+
+chmod +x "$DIST_DIR/Canopy.command"
+
+# ── 6. 產生安裝腳本 ─────────────────────────────────
 
 cat > "$DIST_DIR/install.sh" << 'INSTALLER'
 #!/bin/bash
@@ -206,7 +252,7 @@ chmod +x "$BIN_DST"
 
 # macOS: 移除 Gatekeeper 隔離標記
 if [ "$OS" = "Darwin" ]; then
-    xattr -dr com.apple.quarantine "$BIN_DST" 2>/dev/null || true
+    xattr -dr com.apple.quarantine "$BIN_DST" "$INSTALL_DIR"/* 2>/dev/null || true
 fi
 
 ok "已安裝到 $BIN_DST"
@@ -418,6 +464,9 @@ fi
 echo ""
 echo "啟動方式："
 echo "  $RUN_CMD"
+if [ "$(uname -s)" = "Darwin" ] && [ -f "$INSTALL_DIR/Canopy.command" ]; then
+    echo "  或雙擊 $INSTALL_DIR/Canopy.command"
+fi
 echo ""
 INSTALLER
 

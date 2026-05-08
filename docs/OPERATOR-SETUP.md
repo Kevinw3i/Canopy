@@ -147,10 +147,10 @@ install.sh
 
 ### Q: macOS 顯示 "cannot be opened because the developer cannot be verified"
 
-安裝腳本會自動處理。如果手動安裝，執行：
+安裝腳本會自動處理已安裝的 binary 與同資料夾內的啟動檔。如果是先直接雙擊 `Canopy.command` 被 Gatekeeper 擋下，請先右鍵 → Open 一次，或對整個解壓縮後的資料夾清除 quarantine。
 
 ```bash
-xattr -d com.apple.quarantine /usr/local/bin/canopy
+xattr -dr com.apple.quarantine /path/to/canopy-dist
 ```
 
 ### Q: 啟動後顯示 "Failed to fetch entitlements"

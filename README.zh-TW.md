@@ -532,6 +532,8 @@ TUI                     Control Plane              OIDC 提供者
 
 每筆記錄包含：event_id、actor、timestamp、account、region、target、outcome。
 
+稽核 schema 採用 additive 方式演進。新增 top-level 欄位會是 optional，沒有值時會省略；如果下游有嚴格 schema（例如 Athena table 或 SIEM mapping），在使用 `target_resource_name` 這類新欄位前需要先做 schema migration。詳細欄位見 [Audit Log Schema](docs/AUDIT-SCHEMA.md)。
+
 當持久化稽核檔案寫入失敗時，API 會回傳 503（fail-closed 策略）。
 
 ## 鍵盤快捷鍵
