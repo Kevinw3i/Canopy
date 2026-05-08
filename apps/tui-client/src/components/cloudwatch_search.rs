@@ -64,6 +64,13 @@ pub struct CloudWatchSearchScreen {
     /// Optional custom-range modal overlay. When `Some`, all key events are
     /// routed to the modal instead of the screen.
     time_range_modal: Option<TimeRangeModal>,
+    /// `next_token` returned by the most recent FilterLogEvents response.
+    /// `Some(_)` means there are more pages available; `None` means the
+    /// last response exhausted the result set (or no search has run yet).
+    pub last_next_token: Option<String>,
+    /// Convenience mirror of `last_next_token.is_some()` so render code can
+    /// branch without `as_ref().is_some()` boilerplate.
+    pub has_more: bool,
 }
 
 impl Default for CloudWatchSearchScreen {
@@ -115,6 +122,8 @@ impl CloudWatchSearchScreen {
             query_history: Vec::new(),
             time_range: TimeRange::default(),
             time_range_modal: None,
+            last_next_token: None,
+            has_more: false,
         }
     }
 
@@ -181,6 +190,8 @@ impl CloudWatchSearchScreen {
         self.query_status = None;
         self.table.set_row_count(0);
         self.selected_event = None;
+        self.last_next_token = None;
+        self.has_more = false;
     }
 
     fn cycle_account(&mut self, forward: bool) -> bool {
@@ -247,13 +258,28 @@ impl CloudWatchSearchScreen {
         }
     }
 
-    pub fn set_events(&mut self, events: Vec<LogEvent>) {
+    /// Replace the current event list with a fresh search response.
+    /// Resets pagination state from the new `next_token`.
+    pub fn set_events(&mut self, events: Vec<LogEvent>, next_token: Option<String>) {
         self.table.set_row_count(events.len());
         self.events = events;
+        self.last_next_token = next_token;
+        self.has_more = self.last_next_token.is_some();
         // Clear stale Insights results so exports and rendering don't
         // accidentally use old query_results instead of the new events.
         self.query_results.clear();
         self.query_id = None;
+        self.loading = false;
+        self.error = None;
+    }
+
+    /// Append the next page of events to the current list. Updates the
+    /// pagination state from the new `next_token`.
+    pub fn append_events(&mut self, events: Vec<LogEvent>, next_token: Option<String>) {
+        self.events.extend(events);
+        self.table.set_row_count(self.events.len());
+        self.last_next_token = next_token;
+        self.has_more = self.last_next_token.is_some();
         self.loading = false;
         self.error = None;
     }
@@ -265,6 +291,10 @@ impl CloudWatchSearchScreen {
         // Clear stale quick-search events so detail pane and export
         // don't accidentally use old FilterLogEvents data.
         self.events.clear();
+        // Pagination state belongs to FilterLogEvents — reset when we
+        // switch into Insights so a stale token can't drive a wrong page.
+        self.last_next_token = None;
+        self.has_more = false;
         self.loading = false;
         self.error = None;
     }
@@ -553,6 +583,16 @@ impl Component for CloudWatchSearchScreen {
             KeyCode::Char('x') if matches!(self.focus, CwFocus::ResultsTable) => {
                 Action::ExportResults(ExportFormat::Json)
             }
+            // `n` in results table → load next page of FilterLogEvents
+            // results. Only fires when there is a pending next_token and no
+            // request is in-flight.
+            KeyCode::Char('n')
+                if matches!(self.focus, CwFocus::ResultsTable)
+                    && self.has_more
+                    && !self.loading =>
+            {
+                Action::LoadMoreFilterResults
+            }
             _ => {
                 match self.focus {
                     CwFocus::LogGroupFilter => {
@@ -793,15 +833,22 @@ impl Component for CloudWatchSearchScreen {
         } else if let Some(ref err) = self.error {
             format!("Error: {}", err)
         } else {
-            let count = if use_insights {
-                self.query_results.len()
+            // Pagination markers only apply to Quick Search (FilterLogEvents).
+            // Insights query has its own result-set semantics.
+            let (count_label, page_hint) = if use_insights {
+                (self.query_results.len().to_string(), "")
+            } else if self.has_more {
+                (format!("{}+", self.events.len()), " | n: load more")
+            } else if !self.events.is_empty() {
+                (format!("{} (end)", self.events.len()), "")
             } else {
-                self.events.len()
+                (self.events.len().to_string(), "")
             };
             format!(
-                "{} results | range: {} | r: cycle | R: custom | Tab: switch panel | /: query | Enter: select/run | Esc: back",
-                count,
+                "{} results | range: {}{} | r: cycle | R: custom | Tab: switch panel | /: query | Enter: select/run | Esc: back",
+                count_label,
                 self.time_range.footer_label(),
+                page_hint,
             )
         };
 
@@ -1123,13 +1170,16 @@ mod tests {
             value: "v".into(),
         }]];
 
-        screen.set_events(vec![LogEvent {
-            timestamp: 1000,
-            message: "hello".into(),
-            log_stream_name: None,
-            ingestion_time: None,
-            event_id: None,
-        }]);
+        screen.set_events(
+            vec![LogEvent {
+                timestamp: 1000,
+                message: "hello".into(),
+                log_stream_name: None,
+                ingestion_time: None,
+                event_id: None,
+            }],
+            None,
+        );
 
         assert_eq!(screen.events.len(), 1);
         assert!(screen.query_results.is_empty());
@@ -1394,5 +1444,128 @@ mod tests {
             screen.time_range,
             TimeRange::Preset(TimeRangePreset::OneHour)
         );
+    }
+
+    // ── Pagination ──
+
+    fn ev(ts: i64, msg: &str) -> LogEvent {
+        LogEvent {
+            timestamp: ts,
+            message: msg.into(),
+            log_stream_name: None,
+            ingestion_time: None,
+            event_id: None,
+        }
+    }
+
+    #[test]
+    fn set_events_with_next_token_marks_has_more() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+        assert!(screen.has_more);
+        assert_eq!(screen.last_next_token.as_deref(), Some("tok-1"));
+    }
+
+    #[test]
+    fn set_events_without_next_token_clears_has_more() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.last_next_token = Some("stale".into());
+        screen.has_more = true;
+
+        screen.set_events(vec![ev(1, "a")], None);
+        assert!(!screen.has_more);
+        assert!(screen.last_next_token.is_none());
+    }
+
+    #[test]
+    fn append_events_extends_existing_and_updates_token() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_events(vec![ev(1, "a"), ev(2, "b")], Some("tok-1".into()));
+        assert_eq!(screen.events.len(), 2);
+
+        screen.append_events(vec![ev(3, "c")], Some("tok-2".into()));
+        assert_eq!(screen.events.len(), 3);
+        assert_eq!(screen.last_next_token.as_deref(), Some("tok-2"));
+        assert!(screen.has_more);
+    }
+
+    #[test]
+    fn append_events_with_no_next_token_marks_end() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+        screen.append_events(vec![ev(2, "b")], None);
+        assert!(!screen.has_more);
+        assert!(screen.last_next_token.is_none());
+        assert_eq!(screen.events.len(), 2);
+    }
+
+    #[test]
+    fn n_key_returns_load_more_when_focus_results_and_has_more() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::ResultsTable;
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+
+        let action = screen.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(action, Action::LoadMoreFilterResults));
+    }
+
+    #[test]
+    fn n_key_ignored_when_no_more_pages() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::ResultsTable;
+        screen.set_events(vec![ev(1, "a")], None);
+
+        let action = screen.handle_key(key(KeyCode::Char('n')));
+        // Falls through to SelectableTable, not LoadMore.
+        assert!(!matches!(action, Action::LoadMoreFilterResults));
+    }
+
+    #[test]
+    fn n_key_ignored_in_log_group_list() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::LogGroupList;
+        // Even with has_more=true, focus must be ResultsTable to load more.
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+
+        let action = screen.handle_key(key(KeyCode::Char('n')));
+        assert!(!matches!(action, Action::LoadMoreFilterResults));
+    }
+
+    #[test]
+    fn n_key_ignored_while_loading() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::ResultsTable;
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+        screen.set_loading();
+
+        let action = screen.handle_key(key(KeyCode::Char('n')));
+        assert!(!matches!(action, Action::LoadMoreFilterResults));
+    }
+
+    #[test]
+    fn cycle_account_resets_pagination() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_entitlements(test_entitlements());
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+        assert!(screen.has_more);
+
+        screen.cycle_account(true);
+        assert!(!screen.has_more);
+        assert!(screen.last_next_token.is_none());
+    }
+
+    #[test]
+    fn set_query_results_resets_pagination() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+        assert!(screen.has_more);
+
+        screen.set_query_results(GetQueryResultsResponse {
+            status: QueryStatus::Complete,
+            results: vec![],
+            statistics: None,
+        });
+        assert!(!screen.has_more);
+        assert!(screen.last_next_token.is_none());
     }
 }
