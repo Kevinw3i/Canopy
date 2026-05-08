@@ -55,7 +55,10 @@ impl TimeRangePreset {
 pub enum TimeRange {
     Preset(TimeRangePreset),
     /// Custom window stored as UTC Unix-epoch seconds.
-    Custom { start_secs: i64, end_secs: i64 },
+    Custom {
+        start_secs: i64,
+        end_secs: i64,
+    },
 }
 
 impl Default for TimeRange {
@@ -79,11 +82,9 @@ impl std::fmt::Display for TimeRangeError {
         match self {
             Self::EndBeforeStart => write!(f, "End must be after start"),
             Self::RangeTooLong => write!(f, "Range must not exceed 30 days"),
-            Self::ParseError(field) => write!(
-                f,
-                "Invalid date in {}; use YYYY-MM-DD HH:MM (UTC)",
-                field
-            ),
+            Self::ParseError(field) => {
+                write!(f, "Invalid date in {}; use YYYY-MM-DD HH:MM (UTC)", field)
+            }
         }
     }
 }
@@ -211,7 +212,10 @@ mod tests {
         let ts = parse_utc_datetime("2026-05-01 14:00", "start").unwrap();
         // sanity: roundtrip back to the same string
         let dt = Utc.timestamp_opt(ts, 0).single().unwrap();
-        assert_eq!(dt.format(CUSTOM_DATETIME_FMT).to_string(), "2026-05-01 14:00");
+        assert_eq!(
+            dt.format(CUSTOM_DATETIME_FMT).to_string(),
+            "2026-05-01 14:00"
+        );
     }
 
     #[test]
@@ -244,7 +248,8 @@ mod tests {
         let mut r = TimeRange::default();
         let start = 1_700_000_000_i64;
         let end = start + MAX_CUSTOM_RANGE_SECS; // exactly 30 days
-        r.set_custom(start, end).expect("30 days inclusive should be ok");
+        r.set_custom(start, end)
+            .expect("30 days inclusive should be ok");
         assert_eq!(
             r,
             TimeRange::Custom {
@@ -332,7 +337,10 @@ mod tests {
 
     #[test]
     fn footer_label_custom_includes_utc_marker() {
-        let start = Utc.with_ymd_and_hms(2026, 5, 1, 14, 0, 0).unwrap().timestamp();
+        let start = Utc
+            .with_ymd_and_hms(2026, 5, 1, 14, 0, 0)
+            .unwrap()
+            .timestamp();
         let r = TimeRange::Custom {
             start_secs: start,
             end_secs: start + 86_400, // +1 day

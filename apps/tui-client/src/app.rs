@@ -15,6 +15,7 @@ use crate::components::settings::SettingsScreen;
 use crate::components::Component;
 use crate::config::ClientConfig;
 use crate::event::{Action, Event, EventReader, Screen};
+use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRunner};
 use crate::tui::Tui;
 
 pub struct App {
@@ -104,7 +105,7 @@ fn render_session_countdown(max_secs: u64, elapsed_secs: u64) -> String {
     let filled = if max_secs == 0 {
         0
     } else {
-        ((remaining * SESSION_COUNTDOWN_WIDTH) + max_secs - 1) / max_secs
+        (remaining * SESSION_COUNTDOWN_WIDTH).div_ceil(max_secs)
     }
     .min(SESSION_COUNTDOWN_WIDTH);
     let empty = SESSION_COUNTDOWN_WIDTH - filled;
@@ -132,6 +133,20 @@ fn set_session_countdown_title(instance_id: &str, max_secs: u64, elapsed_secs: u
         "Canopy {instance_id} {}",
         render_session_countdown(max_secs, elapsed_secs)
     ));
+}
+
+fn prompt_yes_no(prompt: &str) -> bool {
+    use std::io::Write;
+
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 impl App {
@@ -878,6 +893,71 @@ impl App {
         });
     }
 
+    fn suspend_for_external_command(&mut self) {
+        self.event_reader_paused
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::tui::suspend().ok();
+    }
+
+    fn resume_after_external_command(&mut self, terminal: &mut Tui) {
+        self.event_reader_paused
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        match crate::tui::resume() {
+            Ok(new_terminal) => *terminal = new_terminal,
+            Err(e) => eprintln!("Failed to resume terminal: {}", e),
+        }
+    }
+
+    fn resolve_connect_dependencies<R: local_deps::CommandRunner>(
+        &mut self,
+        required_deps: &[LocalDependency],
+        mut issues: Vec<DependencyIssue>,
+        runner: &R,
+    ) -> Result<(), String> {
+        let mut attempted = std::collections::BTreeSet::new();
+
+        loop {
+            println!("\n== Local dependency check ==");
+            println!("The selected connect method needs additional local tools:\n");
+            for issue in &issues {
+                println!("  - {}: {}", issue.dependency.label(), issue.reason);
+            }
+
+            let installable: Vec<LocalDependency> = issues
+                .iter()
+                .map(|issue| issue.dependency)
+                .filter(|dep| dep.can_auto_install() && !attempted.contains(dep))
+                .collect();
+
+            if installable.is_empty() {
+                return Err(format!(
+                    "Missing required local dependencies:\n{}",
+                    local_deps::format_dependency_issues(&issues)
+                ));
+            }
+
+            for dependency in installable {
+                attempted.insert(dependency);
+                if !prompt_yes_no(dependency.install_prompt()) {
+                    return Err(format!(
+                        "{} is required for this connect method. Install manually: {}",
+                        dependency.label(),
+                        dependency.manual_install_url()
+                    ));
+                }
+
+                println!("\nInstalling {}...", dependency.label());
+                local_deps::install_dependency(dependency, runner)?;
+            }
+
+            issues = local_deps::check_required_dependencies(required_deps, runner);
+            if issues.is_empty() {
+                println!("\nLocal dependencies are ready. Continuing connection...\n");
+                return Ok(());
+            }
+        }
+    }
+
     async fn do_connect_with_user(
         &mut self,
         instance_id: &str,
@@ -898,19 +978,41 @@ impl App {
         match self.api.connect(&req).await {
             Ok(resp) => {
                 if resp.authorized {
-                    // Suspend TUI, run external command, then resume
                     tracing::info!(
                         command = %resp.command,
                         args = ?resp.args,
                         "Spawning connect command"
                     );
 
-                    // Pause event reader so it doesn't compete for stdin
-                    self.event_reader_paused
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let runner = SystemCommandRunner;
+                    let required_deps = local_deps::required_dependencies_for_connect(&resp);
+                    let dependency_issues =
+                        local_deps::check_required_dependencies(&required_deps, &runner);
+                    let mut terminal_suspended = false;
 
-                    // Suspend TUI
-                    crate::tui::suspend().ok();
+                    if !dependency_issues.is_empty() {
+                        self.suspend_for_external_command();
+                        terminal_suspended = true;
+
+                        if let Err(msg) = self.resolve_connect_dependencies(
+                            &required_deps,
+                            dependency_issues,
+                            &runner,
+                        ) {
+                            eprintln!("\nError: {}\n", msg);
+                            println!("Press Enter to return to the console...");
+                            let _ = std::io::stdin().read_line(&mut String::new());
+
+                            self.resume_after_external_command(terminal);
+                            self.error_modal.show(msg);
+                            return;
+                        }
+                    }
+
+                    // Suspend TUI, run external command, then resume.
+                    if !terminal_suspended {
+                        self.suspend_for_external_command();
+                    }
 
                     // Run the command
                     let mut cmd = std::process::Command::new(&resp.command);

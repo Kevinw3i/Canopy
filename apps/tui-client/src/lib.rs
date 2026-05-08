@@ -8,6 +8,7 @@ pub mod components;
 pub mod config;
 pub mod event;
 pub mod live_tail_ws;
+pub mod local_deps;
 pub mod tui;
 pub mod updater;
 pub mod widgets;
