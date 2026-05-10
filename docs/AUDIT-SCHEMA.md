@@ -42,12 +42,18 @@ Current actions:
 - `logout`
 - `ec2_list`
 - `ec2_connect`
+- `ec2_power`
 - `cloudwatch_search`
 - `cloudwatch_insights_query`
 - `cloudwatch_live_tail_start`
 - `cloudwatch_live_tail_stop`
 - `log_group_list`
 - `entitlements_view`
+
+<!-- PHASE2-REMOVE-START -->
+`ec2_power` is schema-reserved for EC2 power actions. The server does not emit
+this action until the Phase 2 control-plane route ships.
+<!-- PHASE2-REMOVE-END -->
 
 ## Common Metadata Fields
 
@@ -91,6 +97,18 @@ EC2 metadata can include:
 - `method`
 - `os_user`
 
+EC2 power metadata (`action: "ec2_power"`) can include:
+
+- `power_action` — `start` / `stop` / `reboot`
+- `previous_state` — instance state observed via DescribeInstances immediately
+  before the AWS power call (e.g. `running`, `stopped`)
+- `requested_state` — state AWS reported in the StartInstances /
+  StopInstances / RebootInstances response (often a transient state like
+  `pending` or `stopping`)
+- `confirmation_present` — boolean. The TUI requires the user to type the
+  instance id before submitting; this field records that the safeguard
+  fired but never stores the typed value.
+
 Entitlements metadata usually contains the common request context fields only.
 
 ## Examples
@@ -111,4 +129,28 @@ Failure during log group listing:
 
 ```json
 {"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e3333","timestamp":"2026-05-08T02:17:30Z","actor":"example-cognito-sub","action":"log_group_list","account_id":"123456789012","region":"ap-northeast-1","outcome":"failure","error_message":"AWS DescribeLogGroups failed","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","prefix":"/app/"}}
+```
+
+Successful EC2 power action (stop):
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e4444","timestamp":"2026-05-08T02:18:30Z","actor":"example-cognito-sub","action":"ec2_power","account_id":"123456789012","region":"ap-northeast-1","target_resource":"i-0123456789abcdef0","target_resource_name":"web-prod-01","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","power_action":"stop","previous_state":"running","requested_state":"stopping","confirmation_present":true}}
+```
+
+Denied EC2 power action (entitlement / scope rejection):
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e5555","timestamp":"2026-05-08T02:19:30Z","actor":"example-cognito-sub","action":"ec2_power","account_id":"123456789012","region":"ap-northeast-1","target_resource":"i-0123456789abcdef0","outcome":"denied","error_message":"instance excluded by tag policy","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","power_action":"stop","confirmation_present":true}}
+```
+
+State-machine conflict (e.g. `start` while pending):
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e6666","timestamp":"2026-05-08T02:20:30Z","actor":"example-cognito-sub","action":"ec2_power","account_id":"123456789012","region":"ap-northeast-1","target_resource":"i-0123456789abcdef0","outcome":"denied","error_message":"already_in_target_or_transition","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","power_action":"start","previous_state":"pending","confirmation_present":true}}
+```
+
+AWS SDK failure during power call:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e7777","timestamp":"2026-05-08T02:21:30Z","actor":"example-cognito-sub","action":"ec2_power","account_id":"123456789012","region":"ap-northeast-1","target_resource":"i-0123456789abcdef0","target_resource_name":"web-prod-01","outcome":"failure","error_message":"AWS StopInstances failed: rate exceeded","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","power_action":"stop","previous_state":"running","confirmation_present":true}}
 ```

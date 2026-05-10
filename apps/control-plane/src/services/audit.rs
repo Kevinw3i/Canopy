@@ -436,6 +436,7 @@ mod tests {
             AuditAction::Logout,
             AuditAction::Ec2List,
             AuditAction::Ec2Connect,
+            AuditAction::Ec2Power,
             AuditAction::CloudwatchSearch,
             AuditAction::CloudwatchInsightsQuery,
             AuditAction::CloudwatchLiveTailStart,

@@ -148,6 +148,63 @@ pub struct ConnectResponse {
     pub max_session_seconds: Option<u64>,
 }
 
+// ── Power actions (start / stop / reboot) ──────────────────────────────
+
+/// Power-action verb for an EC2 instance.
+///
+/// Serialized as snake_case to match the rest of the shared API enums and stay
+/// future-proof for multi-word actions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Ec2PowerAction {
+    Start,
+    Stop,
+    Reboot,
+}
+
+impl std::fmt::Display for Ec2PowerAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start => write!(f, "start"),
+            Self::Stop => write!(f, "stop"),
+            Self::Reboot => write!(f, "reboot"),
+        }
+    }
+}
+
+/// Request a power action against a single EC2 instance.
+///
+/// `confirmation_instance_id` is a UX safeguard, NOT an authentication
+/// boundary. The TUI prompts the user to type the full instance id before
+/// sending; the control-plane string-equals it against `instance_id` and
+/// rejects with 400 on mismatch. Audit metadata records only
+/// `confirmation_present: true` — the typed value itself is never stored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ec2PowerRequest {
+    pub instance_id: String,
+    pub account_id: String,
+    pub region: String,
+    pub action: Ec2PowerAction,
+    /// User-typed confirmation string. Server requires this to equal
+    /// `instance_id`.
+    pub confirmation_instance_id: String,
+}
+
+/// Response for a successful power action.
+///
+/// `previous_state` is the instance state observed via DescribeInstances
+/// immediately before the AWS power call. `requested_state` is whatever
+/// AWS reported in the StartInstances/StopInstances/RebootInstances
+/// response (typically a transient state like `pending` / `stopping`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ec2PowerResponse {
+    pub instance_id: String,
+    pub action: Ec2PowerAction,
+    pub previous_state: InstanceState,
+    pub requested_state: InstanceState,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +336,83 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("error"));
         assert!(!json.contains("max_session_seconds"));
+    }
+
+    // ── Power-action tests ─────────────────────────────────────────────
+
+    #[test]
+    fn ec2_power_action_snake_case_serde() {
+        assert_eq!(
+            serde_json::to_value(Ec2PowerAction::Start).unwrap(),
+            "start"
+        );
+        assert_eq!(serde_json::to_value(Ec2PowerAction::Stop).unwrap(), "stop");
+        assert_eq!(
+            serde_json::to_value(Ec2PowerAction::Reboot).unwrap(),
+            "reboot"
+        );
+
+        let parsed: Ec2PowerAction = serde_json::from_value(json!("reboot")).unwrap();
+        assert_eq!(parsed, Ec2PowerAction::Reboot);
+    }
+
+    #[test]
+    fn ec2_power_action_display_matches_serde() {
+        assert_eq!(Ec2PowerAction::Start.to_string(), "start");
+        assert_eq!(Ec2PowerAction::Stop.to_string(), "stop");
+        assert_eq!(Ec2PowerAction::Reboot.to_string(), "reboot");
+    }
+
+    #[test]
+    fn ec2_power_request_requires_confirmation_field() {
+        // Missing `confirmation_instance_id` must fail to deserialize —
+        // ensures the server can rely on its presence for the safeguard.
+        let json = json!({
+            "instance_id": "i-abc",
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "action": "stop",
+        });
+        let err = serde_json::from_value::<Ec2PowerRequest>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("confirmation_instance_id"),
+            "expected error to mention missing field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ec2_power_request_roundtrip() {
+        let req = Ec2PowerRequest {
+            instance_id: "i-abc".into(),
+            account_id: "111111111111".into(),
+            region: "us-east-1".into(),
+            action: Ec2PowerAction::Start,
+            confirmation_instance_id: "i-abc".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["action"], "start");
+        let back: Ec2PowerRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.instance_id, "i-abc");
+        assert_eq!(back.confirmation_instance_id, "i-abc");
+        assert_eq!(back.action, Ec2PowerAction::Start);
+    }
+
+    #[test]
+    fn ec2_power_response_roundtrip() {
+        let resp = Ec2PowerResponse {
+            instance_id: "i-abc".into(),
+            action: Ec2PowerAction::Stop,
+            previous_state: InstanceState::Running,
+            requested_state: InstanceState::Stopping,
+            message: "Stop initiated".into(),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["previous_state"], "running");
+        assert_eq!(json["requested_state"], "stopping");
+        assert_eq!(json["action"], "stop");
+        let back: Ec2PowerResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.previous_state, InstanceState::Running);
+        assert_eq!(back.requested_state, InstanceState::Stopping);
+        assert_eq!(back.action, Ec2PowerAction::Stop);
     }
 }

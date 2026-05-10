@@ -32,6 +32,15 @@ pub struct FeatureFlags {
     pub can_use_cloudwatch_tail: bool,
     pub can_use_ssm: bool,
     pub can_use_ec2_instance_connect: bool,
+    /// Power-action flags. `#[serde(default)]` keeps existing
+    /// entitlements.toml files (and any persisted JSON) backward-compatible:
+    /// if these keys are absent the flag is simply false.
+    #[serde(default)]
+    pub can_start_ec2: bool,
+    #[serde(default)]
+    pub can_stop_ec2: bool,
+    #[serde(default)]
+    pub can_reboot_ec2: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +52,11 @@ pub struct AllowedAccount {
 
 /// Tag selector for EC2 instance filtering
 /// Instances must match ALL specified tags to be visible
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Equality is intentionally order-sensitive for each tag's allowed values
+/// because values are stored as `Vec<String>`. Entitlement authors should keep
+/// value ordering canonical when they expect duplicate selectors to deduplicate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TagSelector {
     pub tags: HashMap<String, Vec<String>>,
 }
@@ -159,6 +172,10 @@ mod tests {
         assert!(!flags.can_use_cloudwatch_tail);
         assert!(!flags.can_use_ssm);
         assert!(!flags.can_use_ec2_instance_connect);
+        // Power-action flags default to false (least-privilege).
+        assert!(!flags.can_start_ec2);
+        assert!(!flags.can_stop_ec2);
+        assert!(!flags.can_reboot_ec2);
     }
 
     #[test]
@@ -169,13 +186,42 @@ mod tests {
             can_use_cloudwatch_tail: false,
             can_use_ssm: true,
             can_use_ec2_instance_connect: false,
+            can_start_ec2: true,
+            can_stop_ec2: true,
+            can_reboot_ec2: false,
         };
         let json = serde_json::to_value(&flags).unwrap();
         assert_eq!(json["can_view_ec2"], true);
         assert_eq!(json["can_use_ssm"], true);
+        assert_eq!(json["can_start_ec2"], true);
+        assert_eq!(json["can_stop_ec2"], true);
+        assert_eq!(json["can_reboot_ec2"], false);
         let back: FeatureFlags = serde_json::from_value(json).unwrap();
         assert!(back.can_view_ec2);
         assert!(!back.can_use_ec2_instance_connect);
+        assert!(back.can_start_ec2);
+        assert!(back.can_stop_ec2);
+        assert!(!back.can_reboot_ec2);
+    }
+
+    /// Existing entitlements.toml / persisted JSON without the new
+    /// power flags must still parse — `#[serde(default)]` ensures the
+    /// missing keys decode as `false`, never as a deserialization error.
+    #[test]
+    fn feature_flags_backward_compat_without_power_keys() {
+        let json = serde_json::json!({
+            "can_view_ec2": true,
+            "can_use_cloudwatch_search": false,
+            "can_use_cloudwatch_tail": false,
+            "can_use_ssm": true,
+            "can_use_ec2_instance_connect": false,
+        });
+        let flags: FeatureFlags = serde_json::from_value(json).unwrap();
+        assert!(flags.can_view_ec2);
+        assert!(flags.can_use_ssm);
+        assert!(!flags.can_start_ec2);
+        assert!(!flags.can_stop_ec2);
+        assert!(!flags.can_reboot_ec2);
     }
 
     #[test]
@@ -232,6 +278,7 @@ mod tests {
                 can_use_cloudwatch_tail: true,
                 can_use_ssm: true,
                 can_use_ec2_instance_connect: false,
+                ..Default::default()
             },
             allowed_accounts: vec![AllowedAccount {
                 account_id: "111".into(),

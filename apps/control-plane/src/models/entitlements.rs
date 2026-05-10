@@ -56,6 +56,24 @@ impl EntitlementStore {
             features.can_use_cloudwatch_tail |= rule.features.can_use_cloudwatch_tail;
             features.can_use_ssm |= rule.features.can_use_ssm;
             features.can_use_ec2_instance_connect |= rule.features.can_use_ec2_instance_connect;
+            // Power-action flags follow the same additive rule: if any
+            // matching group grants it, the user has it.
+            //
+            // IMPORTANT: the power route MUST NOT rely solely on the
+            // merged `features.can_*_ec2` view (or on
+            // `has_feature_for_scope`, which only checks
+            // feature/account/region/log-group/os-user). Per-instance
+            // `instance_tag_selectors` and `excluded_tag_selectors` are
+            // NOT enforced by `has_feature_for_scope` and would let a
+            // user with a tag-limited rule operate on out-of-scope
+            // instances in the same account+region. The power-action
+            // route must DescribeInstances first, then re-validate the
+            // target instance's tags against the matching rule's
+            // selectors before any AWS power call (mirroring the
+            // EC2 list/connect tag boundary).
+            features.can_start_ec2 |= rule.features.can_start_ec2;
+            features.can_stop_ec2 |= rule.features.can_stop_ec2;
+            features.can_reboot_ec2 |= rule.features.can_reboot_ec2;
 
             for acct in &rule.allowed_accounts {
                 // Dedup by (account_id, role_arn) so that two groups
@@ -81,8 +99,16 @@ impl EntitlementStore {
                 }
             }
 
-            instance_tag_selectors.extend(rule.instance_tag_selectors.clone());
-            excluded_tag_selectors.extend(rule.excluded_tag_selectors.clone());
+            for selector in &rule.instance_tag_selectors {
+                if !instance_tag_selectors.contains(selector) {
+                    instance_tag_selectors.push(selector.clone());
+                }
+            }
+            for selector in &rule.excluded_tag_selectors {
+                if !excluded_tag_selectors.contains(selector) {
+                    excluded_tag_selectors.push(selector.clone());
+                }
+            }
 
             for user in &rule.allowed_os_users {
                 if !allowed_os_users.contains(user) {
@@ -282,6 +308,7 @@ impl EntitlementStore {
                         can_use_cloudwatch_tail: true,
                         can_use_ssm: true,
                         can_use_ec2_instance_connect: true,
+                        ..Default::default()
                     },
                     allowed_accounts: vec![
                         AllowedAccount {
@@ -315,6 +342,43 @@ impl EntitlementStore {
                     max_session_seconds: None, // no limit for admin
                 },
                 EntitlementRule {
+                    id: "rule-platform-eng-power".into(),
+                    group: "platform-engineering".into(),
+                    features: FeatureFlags {
+                        can_start_ec2: true,
+                        can_stop_ec2: true,
+                        can_reboot_ec2: true,
+                        ..Default::default()
+                    },
+                    allowed_accounts: vec![
+                        AllowedAccount {
+                            account_id: "111111111111".into(),
+                            account_name: "production".into(),
+                            role_arn: "arn:aws:iam::111111111111:role/CanopyOperatorRole".into(),
+                        },
+                        AllowedAccount {
+                            account_id: "222222222222".into(),
+                            account_name: "staging".into(),
+                            role_arn: "arn:aws:iam::222222222222:role/CanopyOperatorRole".into(),
+                        },
+                    ],
+                    allowed_regions: vec![
+                        "us-east-1".into(),
+                        "us-west-2".into(),
+                        "eu-west-1".into(),
+                    ],
+                    allowed_log_group_arns: vec![],
+                    instance_tag_selectors: vec![TagSelector {
+                        tags: HashMap::from([(
+                            "Environment".into(),
+                            vec!["production".into(), "staging".into()],
+                        )]),
+                    }],
+                    excluded_tag_selectors: vec![],
+                    allowed_os_users: vec![],
+                    max_session_seconds: None,
+                },
+                EntitlementRule {
                     id: "rule-readonly".into(),
                     group: "readonly-ops".into(),
                     features: FeatureFlags {
@@ -323,6 +387,7 @@ impl EntitlementStore {
                         can_use_cloudwatch_tail: false,
                         can_use_ssm: false,
                         can_use_ec2_instance_connect: false,
+                        ..Default::default()
                     },
                     allowed_accounts: vec![AllowedAccount {
                         account_id: "222222222222".into(),
@@ -372,7 +437,10 @@ mod tests {
         assert!(ent.features.can_use_cloudwatch_tail);
         assert!(ent.features.can_use_ssm);
         assert!(ent.features.can_use_ec2_instance_connect);
-        assert_eq!(ent.allowed_accounts.len(), 2);
+        assert!(ent.features.can_start_ec2);
+        assert!(ent.features.can_stop_ec2);
+        assert!(ent.features.can_reboot_ec2);
+        assert_eq!(ent.allowed_accounts.len(), 4);
         assert_eq!(ent.allowed_regions.len(), 3);
     }
 
@@ -385,6 +453,9 @@ mod tests {
         assert!(!ent.features.can_use_cloudwatch_tail);
         assert!(!ent.features.can_use_ssm);
         assert!(!ent.features.can_use_ec2_instance_connect);
+        assert!(!ent.features.can_start_ec2);
+        assert!(!ent.features.can_stop_ec2);
+        assert!(!ent.features.can_reboot_ec2);
         assert_eq!(ent.allowed_accounts.len(), 1);
         assert_eq!(ent.allowed_regions.len(), 1);
     }
@@ -410,9 +481,12 @@ mod tests {
         // Should now have all features from both groups
         assert!(ent.features.can_use_ssm);
         assert!(ent.features.can_use_ec2_instance_connect);
-        // 3 account entries: 111111111111/CanopyRole, 222222222222/CanopyRole,
-        // 222222222222/CanopyReadOnly (distinct role ARNs are preserved)
-        assert_eq!(ent.allowed_accounts.len(), 3);
+        assert!(ent.features.can_start_ec2);
+        assert!(ent.features.can_stop_ec2);
+        assert!(ent.features.can_reboot_ec2);
+        // 5 account entries: two read/connect roles, two operator roles,
+        // plus the readonly staging role (distinct role ARNs are preserved).
+        assert_eq!(ent.allowed_accounts.len(), 5);
     }
 
     // ── Boundary tests ─────────────────────────────────
@@ -466,10 +540,10 @@ mod tests {
             .collect();
         assert_eq!(
             staging_entries.len(),
-            2,
-            "Account 222222222222 with two distinct role ARNs should appear twice"
+            3,
+            "Account 222222222222 with three distinct role ARNs should appear three times"
         );
-        // Verify the two entries have different role ARNs
+        // Verify at least two entries have different role ARNs.
         assert_ne!(staging_entries[0].role_arn, staging_entries[1].role_arn);
     }
 
@@ -535,6 +609,44 @@ mod tests {
         let ent = store.evaluate("dev-admin", "admin@example.com", "Admin", true);
         // platform-engineering has 1 tag selector, readonly-ops has 1 → 2 total
         assert_eq!(ent.instance_tag_selectors.len(), 2);
+    }
+
+    #[test]
+    fn test_tag_selectors_dedup_across_groups() {
+        let mut store = test_store();
+        let duplicate_selector = TagSelector {
+            tags: HashMap::from([(
+                "Environment".into(),
+                vec!["production".into(), "staging".into()],
+            )]),
+        };
+        store.rules.push(EntitlementRule {
+            id: "rule-duplicate-selector".into(),
+            group: "duplicate-selector".into(),
+            features: FeatureFlags::default(),
+            allowed_accounts: vec![],
+            allowed_regions: vec![],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![duplicate_selector],
+            excluded_tag_selectors: vec![],
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "duplicate-selector".into(),
+        });
+
+        let ent = store.evaluate("dev-admin", "admin@example.com", "Admin", true);
+        let prod_selector_count = ent
+            .instance_tag_selectors
+            .iter()
+            .filter(|selector| {
+                selector.tags.get("Environment")
+                    == Some(&vec!["production".into(), "staging".into()])
+            })
+            .count();
+        assert_eq!(prod_selector_count, 1);
     }
 
     #[test]

@@ -1031,6 +1031,7 @@ mod tests {
                 can_use_cloudwatch_tail: false,
                 can_use_ssm: true,
                 can_use_ec2_instance_connect: true,
+                ..Default::default()
             },
             allowed_accounts: vec![
                 AllowedAccount {

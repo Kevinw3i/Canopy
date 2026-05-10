@@ -1575,10 +1575,11 @@ mod tests {
             groups: vec!["platform-engineering".into()],
             features: FeatureFlags {
                 can_view_ec2: true,
-                can_use_ssm: true,
-                can_use_ec2_instance_connect: false,
                 can_use_cloudwatch_search: true,
                 can_use_cloudwatch_tail: false,
+                can_use_ssm: true,
+                can_use_ec2_instance_connect: false,
+                ..Default::default()
             },
             allowed_accounts: vec![AllowedAccount {
                 account_id: "111111111111".into(),

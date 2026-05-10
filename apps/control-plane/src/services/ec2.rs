@@ -555,6 +555,7 @@ mod tests {
                 can_use_cloudwatch_tail: true,
                 can_use_ssm: true,
                 can_use_ec2_instance_connect: true,
+                ..Default::default()
             },
             allowed_accounts: vec![
                 AllowedAccount {
@@ -594,6 +595,7 @@ mod tests {
                 can_use_cloudwatch_tail: false,
                 can_use_ssm: false,
                 can_use_ec2_instance_connect: false,
+                ..Default::default()
             },
             allowed_accounts: vec![AllowedAccount {
                 account_id: "222222222222".into(),
