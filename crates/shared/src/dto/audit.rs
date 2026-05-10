@@ -42,12 +42,35 @@ pub enum AuditAction {
     Logout,
     Ec2List,
     Ec2Connect,
+    /// Start / Stop / Reboot a single instance. Power-action specifics
+    /// (start vs stop vs reboot) live in the `power_action` metadata
+    /// field rather than encoding three separate audit actions, which
+    /// keeps downstream consumers and Athena schemas simpler.
+    Ec2Power,
     CloudwatchSearch,
     CloudwatchInsightsQuery,
     CloudwatchLiveTailStart,
     CloudwatchLiveTailStop,
     LogGroupList,
     EntitlementsView,
+}
+
+impl AuditAction {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Logout => "logout",
+            Self::Ec2List => "ec2_list",
+            Self::Ec2Connect => "ec2_connect",
+            Self::Ec2Power => "ec2_power",
+            Self::CloudwatchSearch => "cloudwatch_search",
+            Self::CloudwatchInsightsQuery => "cloudwatch_insights_query",
+            Self::CloudwatchLiveTailStart => "cloudwatch_live_tail_start",
+            Self::CloudwatchLiveTailStop => "cloudwatch_live_tail_stop",
+            Self::LogGroupList => "log_group_list",
+            Self::EntitlementsView => "entitlements_view",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,17 +88,41 @@ mod tests {
 
     #[test]
     fn audit_action_serializes_snake_case() {
-        let json = serde_json::to_value(AuditAction::Ec2Connect).unwrap();
-        assert_eq!(json, "ec2_connect");
-
-        let json = serde_json::to_value(AuditAction::CloudwatchLiveTailStart).unwrap();
-        assert_eq!(json, "cloudwatch_live_tail_start");
+        for action in [
+            AuditAction::Login,
+            AuditAction::Logout,
+            AuditAction::Ec2List,
+            AuditAction::Ec2Connect,
+            AuditAction::Ec2Power,
+            AuditAction::CloudwatchSearch,
+            AuditAction::CloudwatchInsightsQuery,
+            AuditAction::CloudwatchLiveTailStart,
+            AuditAction::CloudwatchLiveTailStop,
+            AuditAction::LogGroupList,
+            AuditAction::EntitlementsView,
+        ] {
+            let json = serde_json::to_value(&action).unwrap();
+            assert_eq!(json, serde_json::Value::String(action.wire_name().into()));
+        }
     }
 
     #[test]
     fn audit_action_deserializes_snake_case() {
         let val: AuditAction = serde_json::from_value(json!("log_group_list")).unwrap();
         assert!(matches!(val, AuditAction::LogGroupList));
+    }
+
+    #[test]
+    fn audit_action_ec2_power_roundtrip() {
+        // The wire form must be `ec2_power` (not `ec2-power` or
+        // separate `ec2_start` / `ec2_stop` / `ec2_reboot`). The
+        // start/stop/reboot distinction is carried in `metadata.power_action`.
+        let json = serde_json::to_value(AuditAction::Ec2Power).unwrap();
+        assert_eq!(json, "ec2_power");
+        assert_eq!(AuditAction::Ec2Power.wire_name(), "ec2_power");
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::Ec2Power));
     }
 
     #[test]

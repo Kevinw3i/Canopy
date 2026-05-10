@@ -33,6 +33,13 @@ can_use_cloudwatch_search = true
 can_use_cloudwatch_tail = true
 can_use_ssm = true
 can_use_ec2_instance_connect = true
+# ── Power actions（start / stop / reboot）─────────────
+# 預設 false。若要授權，建議用下方獨立 rule + 獨立
+# `CanopyOperatorRole`，**不要**直接在這個 read/connect
+# rule 加。詳見群組 1B。
+# can_start_ec2 = false
+# can_stop_ec2 = false
+# can_reboot_ec2 = false
 
 [[rules.allowed_accounts]]
 account_id = "<ACCOUNT_ID>"                    # ← 改成你的 AWS 帳號 ID
@@ -54,6 +61,43 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # [[rules.excluded_tag_selectors]]
 # [rules.excluded_tag_selectors.tags]
 # Sensitivity = ["high"]
+
+
+# ── 群組 1B：平台工程 power-action（高風險，獨立 role）────────
+#
+# Start / Stop / Reboot 屬於高風險操作，建議遵循 least-privilege：
+#   1. 用獨立 IAM role `CanopyOperatorRole`（與 read-only
+#      `CanopyRole` 分離）
+#   2. 用 instance_tag_selectors 限縮可操作的機器範圍
+#   3. 同 group 的 user 同時 match read rule + power rule，
+#      control-plane 會按操作類型自動挑選對應 role
+#
+# 觸發每次 power action 都會寫一筆 `ec2_power` audit log，含
+# previous_state / requested_state / power_action / confirmation_present
+# （詳見 docs/AUDIT-SCHEMA.md）。
+#
+# ⚠ 此 rule 寫好之後，要等 Phase 2 control-plane `/api/ec2/power`
+#   endpoint 上線才會真正生效（在那之前只是準備權限資料）。
+
+# [[rules]]
+# id = "rule-platform-eng-power"
+# group = "platform-engineering"
+# allowed_regions = ["ap-northeast-1"]
+#
+# [rules.features]
+# can_start_ec2 = true
+# can_stop_ec2 = true
+# can_reboot_ec2 = true
+#
+# [[rules.allowed_accounts]]
+# account_id = "<ACCOUNT_ID>"
+# account_name = "production"
+# role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyOperatorRole"  # ← 新 role
+#
+# # 強烈建議：用 tag 限縮可被 power 的機器（例：只允許 staging）
+# [[rules.instance_tag_selectors]]
+# [rules.instance_tag_selectors.tags]
+# Environment = ["staging"]
 
 
 # ── 群組 2：唯讀維運 ────────────────────────────────
