@@ -266,55 +266,65 @@ impl App {
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
+        let mut connect_cursor = None;
 
-        // Render current screen
-        let buf = frame.buffer_mut();
-        match self.current_screen {
-            Screen::Login => self.login.render(area, buf),
-            Screen::Dashboard => self.dashboard.render(area, buf),
-            Screen::Ec2Inventory => self.ec2.render(area, buf),
-            Screen::CloudWatchSearch => self.cloudwatch_search.render(area, buf),
-            Screen::LiveTail => self.live_tail.render(area, buf),
-            Screen::Access => self.access.render(area, buf),
-            Screen::Settings => self.settings.render(area, buf),
-            Screen::ConnectSession => {
-                if let Some(session) = self.connect_session.as_ref() {
-                    session.render(area, buf);
+        {
+            // Render current screen
+            let buf = frame.buffer_mut();
+            match self.current_screen {
+                Screen::Login => self.login.render(area, buf),
+                Screen::Dashboard => self.dashboard.render(area, buf),
+                Screen::Ec2Inventory => self.ec2.render(area, buf),
+                Screen::CloudWatchSearch => self.cloudwatch_search.render(area, buf),
+                Screen::LiveTail => self.live_tail.render(area, buf),
+                Screen::Access => self.access.render(area, buf),
+                Screen::Settings => self.settings.render(area, buf),
+                Screen::ConnectSession => {
+                    if let Some(session) = self.connect_session.as_ref() {
+                        session.render(area, buf);
+                        connect_cursor = session.cursor_position(area);
+                    }
                 }
+            }
+
+            // Render update banner (non-blocking, top of screen)
+            if let Some(ref msg) = self.update_banner {
+                use ratatui::prelude::*;
+                use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+                let banner_h = 3u16.min(area.height);
+                let banner_area = Rect {
+                    x: area.x,
+                    y: area.y,
+                    width: area.width,
+                    height: banner_h,
+                };
+                Clear.render(banner_area, buf);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green));
+                let inner = block.inner(banner_area);
+                block.render(banner_area, buf);
+
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ↑ ", Style::default().fg(Color::Green).bold()),
+                    Span::styled(msg.as_str(), Style::default().fg(Color::Green).bold()),
+                    Span::styled("  (Ctrl+D: dismiss)", Style::default().fg(Color::DarkGray)),
+                ]))
+                .render(inner, buf);
+                connect_cursor = None;
+            }
+
+            // Render error modal on top
+            if self.error_modal.is_visible() {
+                self.error_modal.render(area, buf);
+                connect_cursor = None;
             }
         }
 
-        // Render update banner (non-blocking, top of screen)
-        if let Some(ref msg) = self.update_banner {
-            use ratatui::prelude::*;
-            use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-
-            let banner_h = 3u16.min(area.height);
-            let banner_area = Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: banner_h,
-            };
-            Clear.render(banner_area, buf);
-
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green));
-            let inner = block.inner(banner_area);
-            block.render(banner_area, buf);
-
-            Paragraph::new(Line::from(vec![
-                Span::styled(" ↑ ", Style::default().fg(Color::Green).bold()),
-                Span::styled(msg.as_str(), Style::default().fg(Color::Green).bold()),
-                Span::styled("  (Ctrl+D: dismiss)", Style::default().fg(Color::DarkGray)),
-            ]))
-            .render(inner, buf);
-        }
-
-        // Render error modal on top
-        if self.error_modal.is_visible() {
-            self.error_modal.render(area, buf);
+        if let Some(position) = connect_cursor {
+            frame.set_cursor_position(position);
         }
     }
 

@@ -12,6 +12,7 @@ use crate::event::Action;
 
 const STATUS_RIGHT_PADDING: u16 = 1;
 const STATUS_GAP: u16 = 2;
+const STATUS_BAR_HEIGHT: u16 = 1;
 const READ_CHUNK_BYTES: usize = 8192;
 const MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
 // Some shells or commands are quiet after PTY spawn. After this grace period,
@@ -323,15 +324,15 @@ impl ConnectSessionScreen {
             x: area.x,
             y: area.y,
             width: area.width,
-            height: 1,
+            height: STATUS_BAR_HEIGHT,
         };
         self.render_status_bar(status_area, buf);
 
         let terminal_area = Rect {
             x: area.x,
-            y: area.y.saturating_add(1),
+            y: area.y.saturating_add(STATUS_BAR_HEIGHT),
             width: area.width,
-            height: area.height.saturating_sub(1),
+            height: area.height.saturating_sub(STATUS_BAR_HEIGHT),
         };
         self.render_terminal(terminal_area, buf);
 
@@ -353,6 +354,24 @@ impl ConnectSessionScreen {
                     .set_style(Style::default().fg(Color::Yellow).bold());
             }
         }
+    }
+
+    pub(crate) fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
+        if self.is_terminal() || area.width == 0 || area.height <= STATUS_BAR_HEIGHT {
+            return None;
+        }
+
+        let screen = self.parser.screen();
+        if screen.hide_cursor() {
+            return None;
+        }
+
+        let (row, col) = screen.cursor_position();
+        let terminal_height = area.height.saturating_sub(STATUS_BAR_HEIGHT);
+        Some((
+            area.x + col.min(area.width.saturating_sub(1)),
+            area.y + STATUS_BAR_HEIGHT + row.min(terminal_height.saturating_sub(1)),
+        ))
     }
 
     fn render_status_bar(&self, area: Rect, buf: &mut Buffer) {
@@ -892,6 +911,51 @@ mod tests {
         assert_eq!(session.status, ConnectSessionStatus::Connecting);
         session.process_output(b"hello");
         assert_eq!(session.status, ConnectSessionStatus::Connected);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_position_tracks_remote_cursor_with_status_bar_offset() {
+        let mut session = spawn_sleeping_session();
+        session.process_output(b"abc");
+        assert_eq!(
+            session.cursor_position(Rect::new(10, 5, 40, 12)),
+            Some((13, 6))
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_position_respects_remote_hide_cursor_mode() {
+        let mut session = spawn_sleeping_session();
+        session.process_output(b"\x1b[?25l");
+        assert_eq!(session.cursor_position(Rect::new(0, 0, 40, 12)), None);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_position_is_hidden_for_terminal_sessions_or_empty_area() {
+        let mut session = spawn_sleeping_session();
+        assert_eq!(session.cursor_position(Rect::new(0, 0, 0, 12)), None);
+        assert_eq!(session.cursor_position(Rect::new(0, 0, 40, 1)), None);
+
+        session.disconnect();
+        assert_eq!(session.cursor_position(Rect::new(0, 0, 40, 12)), None);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_position_clamps_to_terminal_area() {
+        let mut session = spawn_sleeping_session();
+        session.process_output(b"\x1b[999;999H");
+        assert_eq!(
+            session.cursor_position(Rect::new(10, 5, 20, 6)),
+            Some((29, 10))
+        );
         cleanup_session(session);
     }
 
