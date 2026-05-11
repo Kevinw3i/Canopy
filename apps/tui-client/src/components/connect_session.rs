@@ -15,6 +15,7 @@ const STATUS_GAP: u16 = 2;
 const STATUS_BAR_HEIGHT: u16 = 1;
 const READ_CHUNK_BYTES: usize = 8192;
 const MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
+const SCROLLBACK_PAGE_OVERLAP_ROWS: u16 = 1;
 // Some shells or commands are quiet after PTY spawn. After this grace period,
 // show the session as connected instead of leaving the status bar on Connecting.
 const CONNECT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -300,6 +301,12 @@ impl ConnectSessionScreen {
             return Action::ConnectSessionUserDisconnect;
         }
 
+        if self.handle_local_scrollback_key(&key) {
+            return Action::Noop;
+        }
+
+        self.reset_scrollback();
+
         if let Some(bytes) = self.key_to_pty_bytes(key) {
             let write_result = match self.writer.lock() {
                 Ok(mut writer) => writer.write_all(&bytes).and_then(|_| writer.flush()),
@@ -381,6 +388,9 @@ impl ConnectSessionScreen {
         }
 
         let screen = self.parser.screen();
+        if screen.scrollback() > 0 {
+            return None;
+        }
         if screen.hide_cursor() {
             return None;
         }
@@ -495,7 +505,13 @@ impl ConnectSessionScreen {
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED),
             ),
             ConnectSessionStatus::Connecting | ConnectSessionStatus::Connected => {
-                countdown_status(self.remaining_secs())
+                let (timer, style) = countdown_status(self.remaining_secs());
+                let scrollback = self.parser.screen().scrollback();
+                if scrollback > 0 {
+                    (format!("SCROLL +{scrollback}  {timer}"), style)
+                } else {
+                    (timer, style)
+                }
             }
         }
     }
@@ -521,6 +537,47 @@ impl ConnectSessionScreen {
 
     fn key_to_pty_bytes(&self, key: KeyEvent) -> Option<Vec<u8>> {
         key_to_pty_bytes(key, self.parser.screen().application_cursor())
+    }
+
+    fn handle_local_scrollback_key(&mut self, key: &KeyEvent) -> bool {
+        if self.parser.screen().alternate_screen() {
+            return false;
+        }
+
+        let current = self.parser.screen().scrollback();
+        let page_rows = self.scroll_page_rows();
+        let target = match key.code {
+            KeyCode::PageUp => Some(current.saturating_add(page_rows)),
+            KeyCode::PageDown if current > 0 => Some(current.saturating_sub(page_rows)),
+            KeyCode::End if current > 0 => Some(0),
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => Some(usize::MAX),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(current.saturating_add(1))
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) && current > 0 => {
+                Some(current.saturating_sub(1))
+            }
+            _ => None,
+        };
+
+        let Some(target) = target else {
+            return false;
+        };
+
+        self.parser.screen_mut().set_scrollback(target);
+        true
+    }
+
+    fn reset_scrollback(&mut self) {
+        if self.parser.screen().scrollback() > 0 {
+            self.parser.screen_mut().set_scrollback(0);
+        }
+    }
+
+    fn scroll_page_rows(&self) -> usize {
+        self.pty_rows
+            .saturating_sub(SCROLLBACK_PAGE_OVERLAP_ROWS)
+            .max(1) as usize
     }
 }
 
@@ -825,6 +882,23 @@ mod tests {
         let _ = session.child.wait();
     }
 
+    #[cfg(unix)]
+    fn feed_scrollback_lines(session: &mut ConnectSessionScreen, count: usize) {
+        let mut output = String::new();
+        for i in 0..count {
+            output.push_str(&format!("line-{i}\r\n"));
+        }
+        session.process_output(output.as_bytes());
+    }
+
+    #[cfg(unix)]
+    fn feed_enough_scrollback_lines(session: &mut ConnectSessionScreen) {
+        feed_scrollback_lines(session, usize::from(session.pty_rows) * 4);
+        session.parser.screen_mut().set_scrollback(usize::MAX);
+        assert!(session.parser.screen().scrollback() > 0);
+        session.parser.screen_mut().set_scrollback(0);
+    }
+
     #[test]
     fn countdown_duration_formats_hours_and_minutes() {
         assert_eq!(format_countdown_duration(3600), "1:00:00");
@@ -1067,6 +1141,51 @@ mod tests {
             session.cursor_position(Rect::new(10, 5, 20, 6)),
             Some((29, 10))
         );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_keys_scroll_local_scrollback() {
+        let mut session = spawn_sleeping_session();
+        feed_enough_scrollback_lines(&mut session);
+
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        assert!(matches!(
+            session.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Action::Noop
+        ));
+        assert!(session.parser.screen().scrollback() > 0);
+
+        assert!(matches!(
+            session.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typing_while_scrolled_returns_to_live_view() {
+        let mut session = spawn_sleeping_session();
+        feed_enough_scrollback_lines(&mut session);
+        let _ = session.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(session.parser.screen().scrollback() > 0);
+
+        let _ = session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_is_hidden_while_scrolled_back() {
+        let mut session = spawn_sleeping_session();
+        feed_enough_scrollback_lines(&mut session);
+        let _ = session.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+
+        assert_eq!(session.cursor_position(Rect::new(0, 0, 80, 24)), None);
         cleanup_session(session);
     }
 
