@@ -4,6 +4,22 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Row, Table, TableState},
 };
 
+pub(crate) const SELECTED_ROW_SYMBOL: &str = "> ";
+
+pub(crate) fn selected_row_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+}
+
+pub(crate) fn table_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Yellow).bold()
+    } else {
+        Style::default().fg(Color::Cyan)
+    }
+}
+
 /// Reusable table widget with keyboard navigation
 pub struct SelectableTable {
     pub state: TableState,
@@ -81,12 +97,26 @@ impl SelectableTable {
         }
     }
 
+    /// Thin wrapper for call sites that do not track focus yet. Prefer
+    /// `render_with_rows_focused` for new code so the table border can reflect
+    /// active focus consistently.
     pub fn render_with_rows<'a>(
         &mut self,
         rows: impl Iterator<Item = Row<'a>>,
         title: &str,
         area: Rect,
         buf: &mut Buffer,
+    ) {
+        self.render_with_rows_focused(rows, title, area, buf, false);
+    }
+
+    pub fn render_with_rows_focused<'a>(
+        &mut self,
+        rows: impl Iterator<Item = Row<'a>>,
+        title: &str,
+        area: Rect,
+        buf: &mut Buffer,
+        focused: bool,
     ) {
         let header = Row::new(
             self.headers
@@ -101,15 +131,10 @@ impl SelectableTable {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {} ", title))
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(table_border_style(focused)),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Indexed(236)) // subtle dark gray background
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ");
+            .highlight_style(selected_row_style())
+            .highlight_symbol(SELECTED_ROW_SYMBOL);
 
         StatefulWidget::render(table, area, buf, &mut self.state);
     }

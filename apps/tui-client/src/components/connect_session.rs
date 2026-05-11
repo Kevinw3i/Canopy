@@ -25,7 +25,7 @@ const MAX_COPY_CAPTURE_BYTES: usize = MAX_COPY_FILE_BYTES * 2;
 // Some shells or commands are quiet after PTY spawn. After this grace period,
 // show the session as connected instead of leaving the status bar on Connecting.
 const CONNECT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
-const SESSION_HINTS: &str = "Ctrl+H help | F2 copy file | Ctrl+] / Ctrl+5 disconnect";
+const SESSION_HINTS: &str = "Ctrl+H help";
 
 trait ClipboardWriter: Send + Sync {
     fn write_clipboard(&self, bytes: &[u8]) -> Result<(), String>;

@@ -1048,8 +1048,13 @@ impl Ec2Screen {
         } else {
             format!("Instances [{}]", self.state_filter.label())
         };
-        self.table
-            .render_with_rows(rows.into_iter(), &title, area, buf);
+        self.table.render_with_rows_focused(
+            rows.into_iter(),
+            &title,
+            area,
+            buf,
+            matches!(self.focus, Ec2Focus::Table),
+        );
     }
 }
 
