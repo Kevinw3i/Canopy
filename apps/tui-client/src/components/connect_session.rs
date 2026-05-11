@@ -17,10 +17,11 @@ const MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
 // Some shells or commands are quiet after PTY spawn. After this grace period,
 // show the session as connected instead of leaving the status bar on Connecting.
 const CONNECT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
-const DISCONNECT_HINT: &str = "Ctrl+] disconnect";
+const DISCONNECT_HINT: &str = "Ctrl+] / Ctrl+5 disconnect";
 
 pub(crate) struct ConnectSessionLaunch {
     pub instance_id: String,
+    pub instance_name: Option<String>,
     pub account_id: String,
     pub region: String,
     pub method: ConnectMethod,
@@ -78,6 +79,7 @@ impl OutputBuffer {
 
 pub(crate) struct ConnectSessionScreen {
     instance_id: String,
+    instance_name: Option<String>,
     account_id: String,
     region: String,
     method: ConnectMethod,
@@ -159,6 +161,7 @@ impl ConnectSessionScreen {
 
         Ok(Self {
             instance_id: launch.instance_id,
+            instance_name: launch.instance_name,
             account_id: launch.account_id,
             region: launch.region,
             method: launch.method,
@@ -412,14 +415,15 @@ impl ConnectSessionScreen {
     }
 
     fn left_status_text(&self) -> String {
+        let instance = instance_label(&self.instance_id, self.instance_name.as_deref());
         match self.status {
             ConnectSessionStatus::Connecting => format!(
                 "Canopy SSH  Connecting...  {}  {}/{}  [{}]",
-                self.instance_id, self.account_id, self.region, DISCONNECT_HINT
+                instance, self.account_id, self.region, DISCONNECT_HINT
             ),
             _ => format!(
                 "Canopy SSH  {}  {}  {}/{}  [{}]",
-                self.instance_id,
+                instance,
                 method_label(&self.method),
                 self.account_id,
                 self.region,
@@ -492,6 +496,13 @@ fn method_label(method: &ConnectMethod) -> &'static str {
         ConnectMethod::Ssm => "SSM",
         ConnectMethod::Ec2InstanceConnect => "EIC",
         ConnectMethod::Ssh => "SSH",
+    }
+}
+
+fn instance_label(instance_id: &str, instance_name: Option<&str>) -> String {
+    match instance_name.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{instance_id}  {name}"),
+        None => instance_id.to_string(),
     }
 }
 
@@ -577,10 +588,20 @@ fn status_bar_layout(width: u16, left: &str, right: &str) -> StatusBarLayout {
 }
 
 fn is_local_disconnect_key(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL)
+    match key.code {
+        // Many Unix terminals send Ctrl+] as ASCII GS (0x1d), which crossterm
+        // reports as Ctrl+5. Accept both forms so the documented shortcut works.
+        KeyCode::Char('\u{1d}') => true,
+        KeyCode::Char(']') | KeyCode::Char('5') => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
 }
 
 fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    if is_local_disconnect_key(&key) {
+        return None;
+    }
+
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let mut bytes = Vec::new();
@@ -601,8 +622,7 @@ fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                     '3' => bytes.push(0x1b),
                     '\\' => bytes.push(0x1c),
                     '4' => bytes.push(0x1c),
-                    ']' => return None,
-                    '5' => bytes.push(0x1d),
+                    ']' | '5' => return None,
                     '^' => bytes.push(0x1e),
                     '6' => bytes.push(0x1e),
                     '_' => bytes.push(0x1f),
@@ -716,6 +736,7 @@ mod tests {
         ConnectSessionScreen::spawn(
             ConnectSessionLaunch {
                 instance_id: "i-0123456789abcdef0".into(),
+                instance_name: Some("web-prod-01".into()),
                 account_id: "123456789012".into(),
                 region: "ap-northeast-1".into(),
                 method: ConnectMethod::Ssh,
@@ -806,6 +827,30 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL);
         assert!(is_local_disconnect_key(&key));
         assert_eq!(key_to_pty_bytes(key), None);
+
+        let key = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL);
+        assert!(is_local_disconnect_key(&key));
+        assert_eq!(key_to_pty_bytes(key), None);
+
+        let key = KeyEvent::new(KeyCode::Char('\u{1d}'), KeyModifiers::NONE);
+        assert!(is_local_disconnect_key(&key));
+        assert_eq!(key_to_pty_bytes(key), None);
+    }
+
+    #[test]
+    fn instance_label_includes_name_when_available() {
+        assert_eq!(
+            instance_label("i-0123456789abcdef0", Some("web-prod-01")),
+            "i-0123456789abcdef0  web-prod-01"
+        );
+        assert_eq!(
+            instance_label("i-0123456789abcdef0", Some("  ")),
+            "i-0123456789abcdef0"
+        );
+        assert_eq!(
+            instance_label("i-0123456789abcdef0", None),
+            "i-0123456789abcdef0"
+        );
     }
 
     #[test]

@@ -151,6 +151,15 @@ fn wrapper_session_limit(max_session_seconds: Option<u64>) -> Option<u64> {
     max_session_seconds.filter(|secs| *secs > 0)
 }
 
+struct ConnectTarget<'a> {
+    instance_id: &'a str,
+    instance_name: Option<&'a str>,
+    account_id: &'a str,
+    region: &'a str,
+    method: ConnectMethod,
+    os_user: Option<&'a str>,
+}
+
 fn prompt_yes_no(prompt: &str) -> bool {
     use std::io::Write;
 
@@ -479,35 +488,62 @@ impl App {
             Action::SelectInstance(_idx) => {
                 // handled in component
             }
-            Action::ConnectSsm(instance_id, account_id, region, os_user) => {
+            Action::ConnectSsm {
+                instance_id,
+                instance_name,
+                account_id,
+                region,
+                os_user,
+            } => {
                 self.do_connect_with_user(
-                    &instance_id,
-                    &account_id,
-                    &region,
-                    ConnectMethod::Ssm,
-                    os_user.as_deref(),
+                    ConnectTarget {
+                        instance_id: &instance_id,
+                        instance_name: instance_name.as_deref(),
+                        account_id: &account_id,
+                        region: &region,
+                        method: ConnectMethod::Ssm,
+                        os_user: os_user.as_deref(),
+                    },
                     terminal,
                 )
                 .await;
             }
-            Action::ConnectEic(instance_id, account_id, region, os_user) => {
+            Action::ConnectEic {
+                instance_id,
+                instance_name,
+                account_id,
+                region,
+                os_user,
+            } => {
                 self.do_connect_with_user(
-                    &instance_id,
-                    &account_id,
-                    &region,
-                    ConnectMethod::Ec2InstanceConnect,
-                    os_user.as_deref(),
+                    ConnectTarget {
+                        instance_id: &instance_id,
+                        instance_name: instance_name.as_deref(),
+                        account_id: &account_id,
+                        region: &region,
+                        method: ConnectMethod::Ec2InstanceConnect,
+                        os_user: os_user.as_deref(),
+                    },
                     terminal,
                 )
                 .await;
             }
-            Action::ConnectSsh(instance_id, account_id, region, os_user) => {
+            Action::ConnectSsh {
+                instance_id,
+                instance_name,
+                account_id,
+                region,
+                os_user,
+            } => {
                 self.do_connect_with_user(
-                    &instance_id,
-                    &account_id,
-                    &region,
-                    ConnectMethod::Ssh,
-                    os_user.as_deref(),
+                    ConnectTarget {
+                        instance_id: &instance_id,
+                        instance_name: instance_name.as_deref(),
+                        account_id: &account_id,
+                        region: &region,
+                        method: ConnectMethod::Ssh,
+                        os_user: os_user.as_deref(),
+                    },
                     terminal,
                 )
                 .await;
@@ -1087,21 +1123,13 @@ impl App {
         }
     }
 
-    async fn do_connect_with_user(
-        &mut self,
-        instance_id: &str,
-        account_id: &str,
-        region: &str,
-        method: ConnectMethod,
-        os_user: Option<&str>,
-        terminal: &mut Tui,
-    ) {
+    async fn do_connect_with_user(&mut self, target: ConnectTarget<'_>, terminal: &mut Tui) {
         let req = ConnectRequest {
-            instance_id: instance_id.to_string(),
-            account_id: account_id.to_string(),
-            region: region.to_string(),
-            method: method.clone(),
-            os_user: os_user.map(String::from),
+            instance_id: target.instance_id.to_string(),
+            account_id: target.account_id.to_string(),
+            region: target.region.to_string(),
+            method: target.method.clone(),
+            os_user: target.os_user.map(String::from),
         };
 
         match self.api.connect(&req).await {
@@ -1150,10 +1178,11 @@ impl App {
                             .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
                         match ConnectSessionScreen::spawn(
                             ConnectSessionLaunch {
-                                instance_id: instance_id.to_string(),
-                                account_id: account_id.to_string(),
-                                region: region.to_string(),
-                                method,
+                                instance_id: target.instance_id.to_string(),
+                                instance_name: target.instance_name.map(String::from),
+                                account_id: target.account_id.to_string(),
+                                region: target.region.to_string(),
+                                method: target.method,
                                 command: resp.command,
                                 args: resp.args,
                                 env_vars: resp.env_vars,
@@ -1236,17 +1265,17 @@ impl App {
                     if let Some(secs) = resp.max_session_seconds {
                         println!(
                             "--- Connecting to {} via {} (max {} min) ---\n",
-                            instance_id,
+                            target.instance_id,
                             resp.command,
                             secs / 60
                         );
                         println!("Session countdown: {}", render_session_countdown(secs, 0));
                         println!("Countdown updates in this terminal tab title while connected.\n");
-                        set_session_countdown_title(instance_id, secs, 0);
+                        set_session_countdown_title(target.instance_id, secs, 0);
                     } else {
                         println!(
                             "--- Connecting to {} via {} ---\n",
-                            instance_id, resp.command
+                            target.instance_id, resp.command
                         );
                     }
 
@@ -1318,7 +1347,7 @@ impl App {
                                             if let Some(max_secs) = session_limit {
                                                 if elapsed >= max_secs {
                                                     set_session_countdown_title(
-                                                        instance_id,
+                                                        target.instance_id,
                                                         max_secs,
                                                         max_secs,
                                                     );
@@ -1331,7 +1360,7 @@ impl App {
                                                     break;
                                                 }
                                                 set_session_countdown_title(
-                                                    instance_id,
+                                                    target.instance_id,
                                                     max_secs,
                                                     elapsed,
                                                 );
