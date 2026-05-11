@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 pub enum Event {
     /// Terminal key press
     Key(KeyEvent),
+    /// Bracketed paste payload from the terminal
+    Paste(String),
     /// Terminal resize
     Resize(u16, u16),
     /// Periodic tick for animations and polling
@@ -69,12 +71,39 @@ pub enum Action {
     LogGroupsLoaded(Vec<shared::dto::cloudwatch::LogGroup>, u64), // log_groups, generation
     LogGroupsFetchFailed(String, u64),                            // error, generation
     RunFilterSearch,
+    FilterEventsLoaded {
+        events: Vec<shared::dto::cloudwatch::LogEvent>,
+        next_token: Option<String>,
+        append: bool,
+        generation: u64,
+    },
+    FilterEventsFetchFailed(String, u64),
     /// Load the next page of FilterLogEvents results, appending to the
     /// existing list. Triggered by `n` in the results table when the
     /// previous response carried a next_token.
     LoadMoreFilterResults,
+    CancelCloudWatchRequest,
     RunInsightsQuery,
-    PollQueryResults(String),
+    InsightsQueryStarted {
+        query_id: String,
+        generation: u64,
+    },
+    InsightsQueryStartFailed {
+        error: String,
+        generation: u64,
+    },
+    PollQueryResults {
+        query_id: String,
+        generation: u64,
+    },
+    InsightsQueryResultsLoaded {
+        response: shared::dto::cloudwatch::GetQueryResultsResponse,
+        generation: u64,
+    },
+    InsightsQueryResultsFailed {
+        error: String,
+        generation: u64,
+    },
     ExportResults(ExportFormat),
 
     // Live Tail
@@ -159,6 +188,11 @@ impl EventReader {
                     match event::read() {
                         Ok(CrosstermEvent::Key(key)) => {
                             if tx.send(Event::Key(key)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(CrosstermEvent::Paste(text)) => {
+                            if tx.send(Event::Paste(text)).is_err() {
                                 break;
                             }
                         }

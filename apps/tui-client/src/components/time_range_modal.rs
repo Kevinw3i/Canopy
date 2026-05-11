@@ -159,6 +159,16 @@ impl TimeRangeModal {
         }
     }
 
+    pub fn handle_paste(&mut self, text: &str) -> ModalOutcome {
+        self.error = None;
+        let text = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
+        match self.active {
+            ModalField::Start => self.start.insert_str(&text),
+            ModalField::End => self.end.insert_str(&text),
+        }
+        ModalOutcome::Continue
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let modal_width = 64u16.min(area.width.saturating_sub(4));
         let modal_height = 12u16.min(area.height.saturating_sub(4));
@@ -366,6 +376,18 @@ mod tests {
         modal.handle_key(key(KeyCode::Enter)); // produces error
         assert!(modal.error.is_some());
         type_str(&mut modal, "x");
+        assert!(modal.error.is_none());
+    }
+
+    #[test]
+    fn paste_updates_active_field_and_clears_error() {
+        let mut modal = TimeRangeModal::open(&TimeRange::default());
+        modal.start.clear();
+        modal.error = Some("old error".into());
+
+        modal.handle_paste("2026-05-11 00:00\nignored");
+
+        assert_eq!(modal.start.value, "2026-05-11 00:00 ignored");
         assert!(modal.error.is_none());
     }
 }

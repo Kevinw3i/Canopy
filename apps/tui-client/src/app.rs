@@ -1,4 +1,5 @@
 use anyhow::Result;
+use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
 use shared::dto::entitlements::UserEntitlements;
 use tokio::sync::mpsc;
@@ -18,6 +19,8 @@ use crate::config::ClientConfig;
 use crate::event::{Action, Event, EventReader, Screen};
 use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRunner};
 use crate::tui::Tui;
+
+const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
 
 pub struct App {
     config: ClientConfig,
@@ -90,6 +93,24 @@ fn cloudwatch_quick_search_filter_pattern(query: &str) -> Option<String> {
     }
     pattern.push('"');
     Some(pattern)
+}
+
+fn should_auto_continue_empty_filter_page(
+    events_len: usize,
+    next_token: Option<&str>,
+    empty_pages_scanned: usize,
+) -> bool {
+    events_len == 0
+        && next_token.is_some()
+        && empty_pages_scanned < FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT
+}
+
+fn should_retry_api_error(err: &ApiClientError) -> bool {
+    match err {
+        ApiClientError::TokenExpired => false,
+        ApiClientError::Api { status, .. } => *status >= 500,
+        ApiClientError::Transport(_) => true,
+    }
 }
 
 const TOKEN_EXPIRED_MODAL_MESSAGE: &str =
@@ -364,6 +385,26 @@ impl App {
                 };
                 let _ = self.action_tx.send(action);
             }
+            Event::Paste(text) => {
+                if self.error_modal.is_visible() {
+                    return;
+                }
+
+                let action = match self.current_screen {
+                    Screen::Login => self.login.handle_paste(&text),
+                    Screen::Dashboard => self.dashboard.handle_paste(&text),
+                    Screen::Ec2Inventory => self.ec2.handle_paste(&text),
+                    Screen::CloudWatchSearch => self.cloudwatch_search.handle_paste(&text),
+                    Screen::LiveTail => self.live_tail.handle_paste(&text),
+                    Screen::Access => self.access.handle_paste(&text),
+                    Screen::Settings => self.settings.handle_paste(&text),
+                    Screen::ConnectSession => self
+                        .connect_session
+                        .as_mut()
+                        .map_or(Action::Noop, |session| session.handle_paste(&text)),
+                };
+                let _ = self.action_tx.send(action);
+            }
             Event::Tick => match self.current_screen {
                 Screen::Ec2Inventory => self.ec2.on_tick(),
                 Screen::CloudWatchSearch => self.cloudwatch_search.on_tick(),
@@ -595,16 +636,93 @@ impl App {
                 self.cloudwatch_search.set_error(err);
             }
             Action::RunFilterSearch => {
-                self.do_filter_search(false).await;
+                self.spawn_filter_search(false);
+            }
+            Action::FilterEventsLoaded {
+                events,
+                next_token,
+                append,
+                generation,
+            } => {
+                if generation != self.cloudwatch_search.fetch_generation {
+                    return;
+                }
+                if append {
+                    self.cloudwatch_search.append_events(events, next_token);
+                } else {
+                    self.cloudwatch_search.set_events(events, next_token);
+                }
+            }
+            Action::FilterEventsFetchFailed(err, generation) => {
+                if generation != self.cloudwatch_search.fetch_generation {
+                    return;
+                }
+                self.cloudwatch_search.set_error(err);
             }
             Action::LoadMoreFilterResults => {
-                self.do_filter_search(true).await;
+                self.spawn_filter_search(true);
+            }
+            Action::CancelCloudWatchRequest => {
+                self.cancel_cloudwatch_request();
             }
             Action::RunInsightsQuery => {
-                self.do_insights_query().await;
+                self.spawn_insights_query();
             }
-            Action::PollQueryResults(query_id) => {
-                self.do_poll_query(&query_id).await;
+            Action::InsightsQueryStarted {
+                query_id,
+                generation,
+            } => {
+                if generation != self.cloudwatch_search.fetch_generation {
+                    return;
+                }
+                self.cloudwatch_search.query_id = Some(query_id.clone());
+                self.cloudwatch_search
+                    .set_loading(CloudWatchLoadingKind::WaitingForInsightsResults);
+                let _ = self.action_tx.send(Action::PollQueryResults {
+                    query_id,
+                    generation,
+                });
+            }
+            Action::InsightsQueryStartFailed { error, generation } => {
+                if generation != self.cloudwatch_search.fetch_generation {
+                    return;
+                }
+                self.cloudwatch_search.set_error(error);
+            }
+            Action::PollQueryResults {
+                query_id,
+                generation,
+            } => {
+                self.spawn_poll_query(query_id, generation);
+            }
+            Action::InsightsQueryResultsLoaded {
+                response,
+                generation,
+            } => {
+                if generation != self.cloudwatch_search.fetch_generation {
+                    return;
+                }
+                let should_poll_again = !response.status.is_terminal();
+                self.cloudwatch_search.set_query_results(response);
+                if should_poll_again {
+                    let Some(query_id) = self.cloudwatch_search.query_id.clone() else {
+                        return;
+                    };
+                    let tx = self.action_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let _ = tx.send(Action::PollQueryResults {
+                            query_id,
+                            generation,
+                        });
+                    });
+                }
+            }
+            Action::InsightsQueryResultsFailed { error, generation } => {
+                if generation != self.cloudwatch_search.fetch_generation {
+                    return;
+                }
+                self.cloudwatch_search.set_error(error);
             }
             Action::ExportResults(format) => {
                 self.do_export_results(&format);
@@ -738,6 +856,14 @@ impl App {
             session.disconnect();
         }
         self.connect_session = None;
+    }
+
+    fn cancel_cloudwatch_request(&mut self) {
+        if let Some(token) = self.cw_fetch_cancel.take() {
+            token.cancel();
+        }
+        self.cloudwatch_search.advance_fetch_generation();
+        self.cloudwatch_search.cancel_loading();
     }
 
     fn reset_to_login(&mut self) {
@@ -884,6 +1010,7 @@ impl App {
                 cancel.cancel();
             }
             self.cloudwatch_search.fetch_generation += 1;
+            self.cloudwatch_search.on_leave();
         }
         if matches!(self.current_screen, Screen::LiveTail) {
             if let Some(cancel) = self.live_tail_cancel.take() {
@@ -1486,7 +1613,7 @@ impl App {
         });
     }
 
-    async fn do_filter_search(&mut self, append: bool) {
+    fn spawn_filter_search(&mut self, append: bool) {
         if self.cloudwatch_search.selected_log_group.is_empty() {
             self.cloudwatch_search
                 .set_error("No log group is available for the current scope".into());
@@ -1504,6 +1631,13 @@ impl App {
         } else {
             CloudWatchLoadingKind::SearchingLogs
         });
+        if let Some(token) = self.cw_fetch_cancel.take() {
+            token.cancel();
+        }
+        self.cloudwatch_search.advance_fetch_generation();
+        let generation = self.cloudwatch_search.fetch_generation;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.cw_fetch_cancel = Some(cancel.clone());
         let (start_time, end_time) = self
             .cloudwatch_search
             .time_range
@@ -1515,7 +1649,7 @@ impl App {
             None
         };
 
-        let req = shared::dto::cloudwatch::FilterLogEventsRequest {
+        let req = FilterLogEventsRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
             region: self.cloudwatch_search.selected_region.clone(),
             log_group_name: self.cloudwatch_search.selected_log_group.clone(),
@@ -1525,26 +1659,68 @@ impl App {
             start_time,
             end_time,
             next_token,
-            limit: 500,
+            limit: 1000,
         };
 
-        match self.api.filter_log_events(&req).await {
-            Ok(resp) => {
-                if append {
-                    self.cloudwatch_search
-                        .append_events(resp.events, resp.next_token);
-                } else {
-                    self.cloudwatch_search
-                        .set_events(resp.events, resp.next_token);
-                }
-            }
-            Err(e) => {
-                self.handle_route_error(e, |app, msg| app.cloudwatch_search.set_error(msg));
-            }
-        }
+        self.spawn_filter_search_request(req, append, generation, cancel);
     }
 
-    async fn do_insights_query(&mut self) {
+    fn spawn_filter_search_request(
+        &self,
+        req: FilterLogEventsRequest,
+        append: bool,
+        generation: u64,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let mut req = req;
+            let mut empty_pages_scanned = 0usize;
+
+            loop {
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = api.filter_log_events(&req) => result,
+                };
+
+                match result {
+                    Ok(resp) => {
+                        let next_token = resp.next_token;
+                        let events_len = resp.events.len();
+                        let should_continue = should_auto_continue_empty_filter_page(
+                            events_len,
+                            next_token.as_deref(),
+                            empty_pages_scanned,
+                        );
+
+                        if should_continue {
+                            empty_pages_scanned += 1;
+                            req.next_token = next_token;
+                            continue;
+                        }
+
+                        let _ = tx.send(Action::FilterEventsLoaded {
+                            events: resp.events,
+                            next_token,
+                            append,
+                            generation,
+                        });
+                        break;
+                    }
+                    Err(e) => {
+                        let action = Self::route_error_to_action(e, |msg| {
+                            Action::FilterEventsFetchFailed(msg, generation)
+                        });
+                        let _ = tx.send(action);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn spawn_insights_query(&mut self) {
         if self.cloudwatch_search.selected_log_group.is_empty() {
             self.cloudwatch_search
                 .set_error("No log group is available for the current scope".into());
@@ -1553,60 +1729,97 @@ impl App {
 
         self.cloudwatch_search
             .set_loading(CloudWatchLoadingKind::StartingInsightsQuery);
+        self.cloudwatch_search.advance_fetch_generation();
+        let generation = self.cloudwatch_search.fetch_generation;
         let (start_time, end_time) = self.cloudwatch_search.time_range.resolve_insights_window();
 
         let req = shared::dto::cloudwatch::StartInsightsQueryRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
             region: self.cloudwatch_search.selected_region.clone(),
             log_group_names: vec![self.cloudwatch_search.selected_log_group.clone()],
-            query_string: self.cloudwatch_search.query_input.value.clone(),
+            query_string: self.cloudwatch_search.insights_query_text().to_string(),
             start_time,
             end_time,
         };
 
-        match self.api.start_insights_query(&req).await {
-            Ok(resp) => {
-                self.cloudwatch_search.query_id = Some(resp.query_id.clone());
-                self.cloudwatch_search
-                    .set_loading(CloudWatchLoadingKind::WaitingForInsightsResults);
-                let _ = self.action_tx.send(Action::PollQueryResults(resp.query_id));
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match api.start_insights_query(&req).await {
+                Ok(resp) => {
+                    let _ = tx.send(Action::InsightsQueryStarted {
+                        query_id: resp.query_id,
+                        generation,
+                    });
+                }
+                Err(e) => {
+                    let action =
+                        Self::route_error_to_action(e, |msg| Action::InsightsQueryStartFailed {
+                            error: msg,
+                            generation,
+                        });
+                    let _ = tx.send(action);
+                }
             }
-            Err(e) => {
-                self.handle_route_error(e, |app, msg| app.cloudwatch_search.set_error(msg));
-            }
-        }
+        });
     }
 
-    async fn do_poll_query(&mut self, query_id: &str) {
-        // Ignore stale poll results from a previous query
-        if self.cloudwatch_search.query_id.as_deref() != Some(query_id) {
+    fn spawn_poll_query(&mut self, query_id: String, generation: u64) {
+        if generation != self.cloudwatch_search.fetch_generation {
+            return;
+        }
+
+        // Generation covers normal query refreshes; query_id is a defensive
+        // guard against any stale action that survived without a generation
+        // bump.
+        if self.cloudwatch_search.query_id.as_deref() != Some(query_id.as_str()) {
             return;
         }
 
         let req = shared::dto::cloudwatch::GetQueryResultsRequest {
             account_id: self.cloudwatch_search.selected_account_id.clone(),
             region: self.cloudwatch_search.selected_region.clone(),
-            query_id: query_id.to_string(),
+            query_id,
         };
 
-        match self.api.get_query_results(&req).await {
-            Ok(resp) => {
-                let is_complete = resp.status.is_terminal();
-                self.cloudwatch_search.set_query_results(resp);
-                if !is_complete {
-                    // Poll again after delay
-                    let tx = self.action_tx.clone();
-                    let qid = query_id.to_string();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let _ = tx.send(Action::PollQueryResults(qid));
-                    });
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let mut last_error = None;
+            for attempt in 0..3 {
+                match api.get_query_results(&req).await {
+                    Ok(resp) => {
+                        let _ = tx.send(Action::InsightsQueryResultsLoaded {
+                            response: resp,
+                            generation,
+                        });
+                        return;
+                    }
+                    Err(e) => {
+                        let should_retry = should_retry_api_error(&e);
+                        last_error = Some(e);
+                        if should_retry && attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                300 * (1 << attempt),
+                            ))
+                            .await;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
-            Err(e) => {
-                self.handle_route_error(e, |app, msg| app.cloudwatch_search.set_error(msg));
-            }
-        }
+
+            let Some(err) = last_error else {
+                return;
+            };
+            let action =
+                Self::route_error_to_action(err, |msg| Action::InsightsQueryResultsFailed {
+                    error: msg,
+                    generation,
+                });
+            let _ = tx.send(action);
+        });
     }
 
     #[cfg(test)]
@@ -1950,6 +2163,56 @@ mod tests {
             cloudwatch_quick_search_filter_pattern("request \"failed\""),
             Some("\"request \\\"failed\\\"\"".into())
         );
+    }
+
+    #[test]
+    fn cloudwatch_empty_filter_page_auto_continue_is_bounded() {
+        assert!(should_auto_continue_empty_filter_page(0, Some("tok-1"), 0));
+        assert!(should_auto_continue_empty_filter_page(
+            0,
+            Some("tok-1"),
+            FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT - 1
+        ));
+        assert!(!should_auto_continue_empty_filter_page(
+            0,
+            Some("tok-1"),
+            FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT
+        ));
+        assert!(!should_auto_continue_empty_filter_page(1, Some("tok-1"), 0));
+        assert!(!should_auto_continue_empty_filter_page(0, None, 0));
+    }
+
+    #[test]
+    fn api_retry_policy_skips_auth_and_client_errors() {
+        assert!(!should_retry_api_error(&ApiClientError::TokenExpired));
+        assert!(!should_retry_api_error(&ApiClientError::Api {
+            status: 403,
+            code: "FORBIDDEN".into(),
+            message: "not authorized".into(),
+        }));
+        assert!(should_retry_api_error(&ApiClientError::Api {
+            status: 502,
+            code: "INTERNAL_ERROR".into(),
+            message: "temporary upstream failure".into(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn cancel_cloudwatch_request_invalidates_generation_and_clears_loading() {
+        let mut app = test_app().await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let old_generation = app.cloudwatch_search.fetch_generation;
+
+        app.cw_fetch_cancel = Some(token.clone());
+        app.cloudwatch_search
+            .set_loading(CloudWatchLoadingKind::SearchingLogs);
+
+        app.cancel_cloudwatch_request();
+
+        assert!(token.is_cancelled());
+        assert!(app.cw_fetch_cancel.is_none());
+        assert_eq!(app.cloudwatch_search.fetch_generation, old_generation + 1);
+        assert!(!app.cloudwatch_search.is_loading());
     }
 
     #[test]

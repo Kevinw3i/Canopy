@@ -127,6 +127,14 @@ impl Component for LoginScreen {
         }
     }
 
+    fn handle_paste(&mut self, text: &str) -> Action {
+        if self.dev_mode && self.focus == LoginFocus::Username {
+            self.username_input
+                .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+        }
+        Action::Noop
+    }
+
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let outer = Block::default()
             .borders(Borders::ALL)
@@ -323,6 +331,16 @@ mod tests {
             screen.status_message.as_deref(),
             Some("Username is required")
         );
+    }
+
+    #[test]
+    fn dev_mode_paste_inserts_username_text() {
+        let mut screen = LoginScreen::new(true);
+        screen.username_input.clear();
+
+        screen.handle_paste("alice@example.com\nignored");
+
+        assert_eq!(screen.username_input.value, "alice@example.com ignored");
     }
 
     #[test]

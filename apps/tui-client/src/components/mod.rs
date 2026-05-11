@@ -20,6 +20,11 @@ pub trait Component {
     /// Handle a key event, return an action if one should be dispatched
     fn handle_key(&mut self, key: KeyEvent) -> Action;
 
+    /// Handle bracketed paste text. Screens with text inputs can override this.
+    fn handle_paste(&mut self, _text: &str) -> Action {
+        Action::Noop
+    }
+
     /// Render the component
     fn render(&mut self, area: Rect, buf: &mut Buffer);
 
