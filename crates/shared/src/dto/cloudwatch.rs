@@ -102,6 +102,15 @@ pub enum QueryStatus {
     Unknown,
 }
 
+impl QueryStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Failed | Self::Cancelled | Self::Timeout
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResultField {
     pub field: String,
@@ -191,6 +200,26 @@ mod tests {
 
         let val: QueryStatus = serde_json::from_value(json!("Failed")).unwrap();
         assert_eq!(val, QueryStatus::Failed);
+    }
+
+    #[test]
+    fn query_status_terminal_states() {
+        for status in [
+            QueryStatus::Complete,
+            QueryStatus::Failed,
+            QueryStatus::Cancelled,
+            QueryStatus::Timeout,
+        ] {
+            assert!(status.is_terminal());
+        }
+
+        for status in [
+            QueryStatus::Scheduled,
+            QueryStatus::Running,
+            QueryStatus::Unknown,
+        ] {
+            assert!(!status.is_terminal());
+        }
     }
 
     #[test]
