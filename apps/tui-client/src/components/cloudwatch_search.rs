@@ -11,7 +11,9 @@ use super::time_range_modal::{ModalOutcome, TimeRangeModal};
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
 use crate::event::{Action, ExportFormat};
 use crate::widgets::input::{TextAreaInput, TextInput};
-use crate::widgets::table::SelectableTable;
+use crate::widgets::table::{
+    selected_row_style, table_border_style, SelectableTable, SELECTED_ROW_SYMBOL,
+};
 
 const INSIGHTS_KEYWORD_PLACEHOLDER: &str = "[keyword輸入在這裡]";
 const DEFAULT_INSIGHTS_QUERY_TEMPLATE: &str = "fields @timestamp, @logStream, @message\n| filter @message like /[keyword輸入在這裡]/\n| sort @timestamp asc\n| limit 500";
@@ -40,6 +42,108 @@ fn default_insights_query(keyword: &str) -> String {
         "fields @timestamp, @logStream, @message\n| filter @message like /{}/\n| sort @timestamp asc\n| limit 500",
         needle
     )
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// Strip terminal control sequences before rendering CloudWatch log text.
+///
+/// Rules:
+/// - CSI sequences (`ESC [` ... final byte) are removed.
+/// - OSC sequences (`ESC ]` ... BEL/ST) are removed.
+/// - DCS/SOS/PM-style strings (`ESC P`, `ESC _`, `ESC ^` ... ST) are removed.
+/// - Other single-character ESC sequences are removed.
+/// - Non-printing control chars are removed, except `\n` and `\t` for readability.
+/// - `\r` is normalized to a newline for CR-only logs, while CRLF stays a single newline.
+fn sanitize_log_text_for_tui(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && matches!(chars.peek(), Some('\\')) {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some('P' | '_' | '^') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x1b' && matches!(chars.peek(), Some('\\')) {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+
+        if ch.is_control() {
+            match ch {
+                '\n' => out.push('\n'),
+                '\r' => {
+                    if !matches!(chars.peek(), Some('\n')) {
+                        out.push('\n');
+                    }
+                }
+                '\t' => out.push('\t'),
+                _ => {}
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
+/// Sanitized one-line table preview capped to the message column budget.
+fn sanitize_log_preview_for_tui(text: &str) -> String {
+    sanitize_log_text_for_tui(text).chars().take(200).collect()
+}
+
+/// Sanitized full detail text for an Insights row, preserving all returned fields.
+fn query_result_detail_text(row: &[QueryResultField]) -> String {
+    row.iter()
+        .map(|f| format!("{}: {}", f.field, sanitize_log_text_for_tui(&f.value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Sanitized `@message` preview for the Insights results table.
+fn query_result_message_preview(row: &[QueryResultField]) -> String {
+    row.iter()
+        .find(|f| f.field == "@message")
+        .map(|f| sanitize_log_preview_for_tui(&f.value))
+        .unwrap_or_else(|| "-".into())
 }
 
 enum CwFocus {
@@ -89,6 +193,10 @@ pub struct CloudWatchSearchScreen {
     pub log_groups: Vec<LogGroup>,
     pub events: Vec<LogEvent>,
     pub query_results: Vec<Vec<QueryResultField>>,
+    event_detail_texts: Vec<String>,
+    event_preview_texts: Vec<String>,
+    query_result_detail_texts: Vec<String>,
+    query_result_preview_texts: Vec<String>,
     pub query_status: Option<QueryStatus>,
     pub query_id: Option<String>,
     loading: Option<CloudWatchLoadingKind>,
@@ -146,6 +254,10 @@ impl CloudWatchSearchScreen {
             log_groups: Vec::new(),
             events: Vec::new(),
             query_results: Vec::new(),
+            event_detail_texts: Vec::new(),
+            event_preview_texts: Vec::new(),
+            query_result_detail_texts: Vec::new(),
+            query_result_preview_texts: Vec::new(),
             query_status: None,
             query_id: None,
             loading: None,
@@ -321,6 +433,10 @@ impl CloudWatchSearchScreen {
         self.log_group_filter.clear();
         self.events.clear();
         self.query_results.clear();
+        self.event_detail_texts.clear();
+        self.event_preview_texts.clear();
+        self.query_result_detail_texts.clear();
+        self.query_result_preview_texts.clear();
         self.query_id = None;
         self.query_status = None;
         self.table.set_row_count(0);
@@ -396,6 +512,15 @@ impl CloudWatchSearchScreen {
     /// Replace the current event list with a fresh search response.
     /// Resets pagination state from the new `next_token`.
     pub fn set_events(&mut self, events: Vec<LogEvent>, next_token: Option<String>) {
+        self.event_detail_texts = events
+            .iter()
+            .map(|event| sanitize_log_text_for_tui(&event.message))
+            .collect();
+        self.event_preview_texts = self
+            .event_detail_texts
+            .iter()
+            .map(|message| message.chars().take(200).collect())
+            .collect();
         self.table.set_row_count(events.len());
         self.events = events;
         self.last_next_token = next_token;
@@ -403,6 +528,8 @@ impl CloudWatchSearchScreen {
         // Clear stale Insights results so exports and rendering don't
         // accidentally use old query_results instead of the new events.
         self.query_results.clear();
+        self.query_result_detail_texts.clear();
+        self.query_result_preview_texts.clear();
         self.query_id = None;
         self.loading = None;
         self.error = None;
@@ -411,10 +538,24 @@ impl CloudWatchSearchScreen {
     /// Append the next page of events to the current list. Updates the
     /// pagination state from the new `next_token`.
     pub fn append_events(&mut self, events: Vec<LogEvent>, next_token: Option<String>) {
+        let new_detail_texts: Vec<_> = events
+            .iter()
+            .map(|event| sanitize_log_text_for_tui(&event.message))
+            .collect();
+        let new_preview_texts: Vec<_> = new_detail_texts
+            .iter()
+            .map(|message| message.chars().take(200).collect())
+            .collect();
+        self.event_detail_texts.extend(new_detail_texts);
+        self.event_preview_texts.extend(new_preview_texts);
         self.events.extend(events);
         self.table.set_row_count(self.events.len());
         self.last_next_token = next_token;
         self.has_more = self.last_next_token.is_some();
+        self.query_results.clear();
+        self.query_result_detail_texts.clear();
+        self.query_result_preview_texts.clear();
+        self.query_id = None;
         self.loading = None;
         self.error = None;
     }
@@ -423,10 +564,22 @@ impl CloudWatchSearchScreen {
         let is_terminal = results.status.is_terminal();
         self.query_status = Some(results.status);
         self.table.set_row_count(results.results.len());
+        self.query_result_detail_texts = results
+            .results
+            .iter()
+            .map(|row| query_result_detail_text(row))
+            .collect();
+        self.query_result_preview_texts = results
+            .results
+            .iter()
+            .map(|row| query_result_message_preview(row))
+            .collect();
         self.query_results = results.results;
         // Clear stale quick-search events so detail pane and export
         // don't accidentally use old FilterLogEvents data.
         self.events.clear();
+        self.event_detail_texts.clear();
+        self.event_preview_texts.clear();
         // Pagination state belongs to FilterLogEvents — reset when we
         // switch into Insights so a stale token can't drive a wrong page.
         self.last_next_token = None;
@@ -478,31 +631,99 @@ impl CloudWatchSearchScreen {
         }
     }
 
+    fn footer_status_text(&self, use_insights: bool) -> String {
+        if let Some(kind) = self.loading {
+            return kind.status_text(self.query_status.as_ref());
+        }
+        if let Some(ref err) = self.error {
+            return format!("Error: {}", truncate_chars(err, 80));
+        }
+
+        // Pagination markers only apply to Quick Search (FilterLogEvents).
+        // Insights query has its own result-set semantics.
+        let (count_label, page_hint) = if use_insights {
+            (self.query_results.len().to_string(), "")
+        } else if self.has_more {
+            (format!("{}+", self.events.len()), " | n: more")
+        } else if !self.events.is_empty() {
+            (format!("{} (end)", self.events.len()), "")
+        } else {
+            (self.events.len().to_string(), "")
+        };
+
+        format!(
+            "{} results | range: {}{}",
+            count_label,
+            self.time_range.footer_label(),
+            page_hint,
+        )
+    }
+
+    fn footer_hint_text(&self, use_insights: bool) -> &'static str {
+        match self.focus {
+            CwFocus::LogGroupList => {
+                "[] account | {} region | / filter | Enter query | Tab panel | Esc back"
+            }
+            CwFocus::LogGroupFilter => "Type filter | Enter accept | Esc clear",
+            CwFocus::QueryInput => match self.search_mode {
+                SearchMode::QuickSearch => "Enter search | Tab Insights | Esc log groups",
+                SearchMode::InsightsQuery => {
+                    "Enter run | Ctrl+J newline | Tab Quick Search | Esc log groups"
+                }
+            },
+            CwFocus::ResultsTable if use_insights => {
+                "Enter detail | x export | r/R range | / query | Esc log groups"
+            }
+            CwFocus::ResultsTable => {
+                "n more | Enter detail | x export | r/R range | / query | Esc log groups"
+            }
+            CwFocus::EventDetail => "Esc results | Up/Down move selected event",
+        }
+    }
+
+    fn render_status_footer(&self, area: Rect, buf: &mut Buffer, use_insights: bool) {
+        let status_style = if self.error.is_some() {
+            Style::default().fg(Color::Red)
+        } else if self.loading.is_some() {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let lines = vec![
+            Line::styled(self.footer_status_text(use_insights), status_style),
+            Line::styled(
+                self.footer_hint_text(use_insights),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        Paragraph::new(lines).render(area, buf);
+    }
+
     fn render_event_detail(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Event Detail ")
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(table_border_style(matches!(
+                self.focus,
+                CwFocus::EventDetail
+            )));
         let inner = block.inner(area);
         block.render(area, buf);
 
         if let Some(idx) = self.table.selected() {
             // Show detail from FilterLogEvents or Insights query results
             let detail_text = if let Some(event) = self.events.get(idx) {
-                Some(event.message.clone())
-            } else if let Some(row) = self.query_results.get(idx) {
-                // Format Insights result row as key=value pairs
-                Some(
-                    row.iter()
-                        .map(|f| format!("{}: {}", f.field, f.value))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
+                self.event_detail_texts
+                    .get(idx)
+                    .map(String::as_str)
+                    .or(Some(event.message.as_str()))
+            } else if self.query_results.get(idx).is_some() {
+                self.query_result_detail_texts.get(idx).map(String::as_str)
             } else {
                 None
             };
 
-            if let Some(ref message) = detail_text {
+            if let Some(message) = detail_text {
                 let style = if message.contains("\"ERROR\"")
                     || message.contains("\"level\":\"ERROR\"")
                 {
@@ -513,7 +734,7 @@ impl CloudWatchSearchScreen {
                     Style::default().fg(Color::White)
                 };
 
-                Paragraph::new(message.as_str())
+                Paragraph::new(message)
                     .style(style)
                     .wrap(Wrap { trim: false })
                     .render(inner, buf);
@@ -902,12 +1123,7 @@ impl Component for CloudWatchSearchScreen {
         self.log_group_filter.render(left_chunks[1], buf);
 
         // Log group table (use filtered_indices)
-        let lg_border_color =
-            if matches!(self.focus, CwFocus::LogGroupList | CwFocus::LogGroupFilter) {
-                Color::Green
-            } else {
-                Color::Cyan
-            };
+        let lg_focused = matches!(self.focus, CwFocus::LogGroupList | CwFocus::LogGroupFilter);
         let selected_lg = self.selected_log_group.clone();
         let lg_rows = self.filtered_indices.iter().filter_map(|&i| {
             let lg = self.log_groups.get(i)?;
@@ -920,7 +1136,7 @@ impl Component for CloudWatchSearchScreen {
                 .map(Self::format_bytes)
                 .unwrap_or_else(|| "-".into());
             let style = if lg.name == selected_lg {
-                Style::default().fg(Color::Green)
+                selected_row_style()
             } else {
                 Style::default()
             };
@@ -948,15 +1164,10 @@ impl Component for CloudWatchSearchScreen {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {} ", lg_title))
-                    .border_style(Style::default().fg(lg_border_color)),
+                    .border_style(table_border_style(lg_focused)),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Indexed(236))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ");
+            .highlight_style(selected_row_style())
+            .highlight_symbol(SELECTED_ROW_SYMBOL);
         ratatui::widgets::StatefulWidget::render(
             lg_table,
             left_chunks[2],
@@ -1006,16 +1217,20 @@ impl Component for CloudWatchSearchScreen {
             matches!(self.search_mode, SearchMode::InsightsQuery) && self.query_id.is_some();
 
         if use_insights {
-            let rows = self.query_results.iter().map(|fields| {
+            let rows = self.query_results.iter().enumerate().map(|(idx, fields)| {
                 let ts = fields
                     .iter()
                     .find(|f| f.field == "@timestamp")
                     .map(|f| f.value.as_str())
                     .unwrap_or("-");
-                let msg = fields
+                let raw_msg = fields
                     .iter()
                     .find(|f| f.field == "@message")
-                    .map(|f| f.value.as_str())
+                    .map(|f| f.value.as_str());
+                let msg_display = self
+                    .query_result_preview_texts
+                    .get(idx)
+                    .map(String::as_str)
                     .unwrap_or("-");
                 let stream = fields
                     .iter()
@@ -1023,9 +1238,9 @@ impl Component for CloudWatchSearchScreen {
                     .map(|f| f.value.as_str())
                     .unwrap_or("-");
 
-                let msg_style = if msg.contains("ERROR") {
+                let msg_style = if raw_msg.is_some_and(|msg| msg.contains("ERROR")) {
                     Style::default().fg(Color::Red)
-                } else if msg.contains("WARN") {
+                } else if raw_msg.is_some_and(|msg| msg.contains("WARN")) {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
@@ -1034,13 +1249,18 @@ impl Component for CloudWatchSearchScreen {
                 Row::new(vec![
                     Cell::from(ts.to_string()),
                     Cell::from(stream.to_string()),
-                    Cell::from(msg.chars().take(200).collect::<String>()).style(msg_style),
+                    Cell::from(msg_display).style(msg_style),
                 ])
             });
-            self.table
-                .render_with_rows(rows, "Insights Results", result_chunks[0], buf);
+            self.table.render_with_rows_focused(
+                rows,
+                "Insights Results",
+                result_chunks[0],
+                buf,
+                matches!(self.focus, CwFocus::ResultsTable),
+            );
         } else {
-            let rows = self.events.iter().map(|ev| {
+            let rows = self.events.iter().enumerate().map(|(idx, ev)| {
                 let ts = chrono::DateTime::from_timestamp_millis(ev.timestamp)
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
                     .unwrap_or_else(|| ev.timestamp.to_string());
@@ -1056,48 +1276,29 @@ impl Component for CloudWatchSearchScreen {
                 Row::new(vec![
                     Cell::from(ts),
                     Cell::from(ev.log_stream_name.as_deref().unwrap_or("-")),
-                    Cell::from(ev.message.chars().take(200).collect::<String>()).style(msg_style),
+                    Cell::from(
+                        self.event_preview_texts
+                            .get(idx)
+                            .map(String::as_str)
+                            .unwrap_or("-"),
+                    )
+                    .style(msg_style),
                 ])
             });
-            self.table
-                .render_with_rows(rows, "Results", result_chunks[0], buf);
+            self.table.render_with_rows_focused(
+                rows,
+                "Results",
+                result_chunks[0],
+                buf,
+                matches!(self.focus, CwFocus::ResultsTable),
+            );
         }
 
         // Event detail
         self.render_event_detail(result_chunks[1], buf);
 
         // Status bar
-        let status = if let Some(kind) = self.loading {
-            kind.status_text(self.query_status.as_ref())
-        } else if let Some(ref err) = self.error {
-            format!("Error: {}", err)
-        } else {
-            // Pagination markers only apply to Quick Search (FilterLogEvents).
-            // Insights query has its own result-set semantics.
-            let (count_label, page_hint) = if use_insights {
-                (self.query_results.len().to_string(), "")
-            } else if self.has_more {
-                (format!("{}+", self.events.len()), " | n: load more")
-            } else if !self.events.is_empty() {
-                (format!("{} (end)", self.events.len()), "")
-            } else {
-                (self.events.len().to_string(), "")
-            };
-            format!(
-                "{} results | range: {}{} | r: cycle | R: custom | Tab: switch panel | /: query | Enter: select/run | Esc: back",
-                count_label,
-                self.time_range.footer_label(),
-                page_hint,
-            )
-        };
-
-        Paragraph::new(status)
-            .style(if self.error.is_some() {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::Gray)
-            })
-            .render(right_chunks[3], buf);
+        self.render_status_footer(right_chunks[3], buf, use_insights);
 
         // Loading overlay for log-group fetches, searches, pagination, and Insights polling.
         if self.loading.is_some() {
@@ -1546,6 +1747,52 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_ansi_sequences_before_tui_rendering() {
+        let raw = "\x1b[36mMaster Load\x1b[0m \x1b[34mSELECT\x1b[0m\r\nnext\x1b]0;title\x07";
+
+        assert_eq!(sanitize_log_text_for_tui(raw), "Master Load SELECT\nnext");
+    }
+
+    #[test]
+    fn sanitizer_preserves_crlf_and_cr_only_line_breaks() {
+        assert_eq!(sanitize_log_text_for_tui("a\r\nb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn set_events_caches_sanitized_display_text() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_events(
+            vec![LogEvent {
+                timestamp: 1000,
+                message: "\x1b[36mMaster Load\x1b[0m".into(),
+                log_stream_name: None,
+                ingestion_time: None,
+                event_id: None,
+            }],
+            None,
+        );
+
+        assert_eq!(screen.event_detail_texts, vec!["Master Load"]);
+        assert_eq!(screen.event_preview_texts, vec!["Master Load"]);
+    }
+
+    #[test]
+    fn sanitizes_ansi_sequences_inside_query_result_details() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_query_results(GetQueryResultsResponse {
+            status: QueryStatus::Complete,
+            results: vec![vec![QueryResultField {
+                field: "@message".into(),
+                value: "\x1b[36mSQL\x1b[0m".into(),
+            }]],
+            statistics: None,
+        });
+
+        assert_eq!(screen.query_result_detail_texts, vec!["@message: SQL"]);
+        assert_eq!(screen.query_result_preview_texts, vec!["SQL"]);
+    }
+
+    #[test]
     fn x_in_results_table_exports_json() {
         let mut screen = CloudWatchSearchScreen::new();
         screen.focus = CwFocus::ResultsTable;
@@ -1908,6 +2155,33 @@ mod tests {
 
         let action = screen.handle_key(key(KeyCode::Char('n')));
         assert!(matches!(action, Action::LoadMoreFilterResults));
+    }
+
+    #[test]
+    fn footer_splits_status_from_key_hints() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::ResultsTable;
+        screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
+
+        let status = screen.footer_status_text(false);
+        let hints = screen.footer_hint_text(false);
+
+        assert_eq!(status, "1+ results | range: 1h | n: more");
+        assert!(hints.contains("Enter detail"));
+        assert!(!status.contains("Enter"));
+        assert!(!status.contains("Esc"));
+    }
+
+    #[test]
+    fn footer_error_is_truncated() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_error("x".repeat(120));
+
+        let status = screen.footer_status_text(false);
+
+        assert!(status.starts_with("Error: "));
+        assert!(status.ends_with('…'));
+        assert!(status.chars().count() <= "Error: ".chars().count() + 81);
     }
 
     #[test]
