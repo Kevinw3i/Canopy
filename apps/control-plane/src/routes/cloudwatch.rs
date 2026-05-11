@@ -825,6 +825,13 @@ async fn start_insights_query(
         }
 
         let resp = start.send().await.map_err(|e| {
+            let service_error = e.as_service_error();
+            let is_invalid_parameter = service_error
+                .map(|err| err.is_invalid_parameter_exception())
+                .unwrap_or(false);
+            let aws_message = service_error
+                .and_then(|err| err.meta().message())
+                .unwrap_or("service error");
             tracing::error!("start_query failed: {e}");
             state
                 .audit_service
@@ -836,13 +843,28 @@ async fn start_insights_query(
                 .account(Some(&req.account_id))
                 .region(Some(&req.region))
                 .target(Some(&req.log_group_names.join(",")))
-                .error(Some("AWS StartQuery failed"))
+                .error(Some(if is_invalid_parameter {
+                    "Invalid CloudWatch Insights query"
+                } else {
+                    "AWS StartQuery failed"
+                }))
                 .optional_metadata(Some(insights_query_metadata(&audit_ctx, &req)))
                 .commit_best_effort();
-            (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(ApiError::internal(format!("AWS StartQuery failed: {e}"))),
-            )
+            if is_invalid_parameter {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(ApiError::bad_request(format!(
+                        "Invalid CloudWatch Insights query: {aws_message}"
+                    ))),
+                )
+            } else {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    Json(ApiError::internal(format!(
+                        "AWS StartQuery failed: {aws_message}"
+                    ))),
+                )
+            }
         })?;
 
         resp.query_id()

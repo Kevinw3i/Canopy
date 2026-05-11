@@ -794,6 +794,14 @@ impl Component for Ec2Screen {
         }
     }
 
+    fn handle_paste(&mut self, text: &str) -> Action {
+        if matches!(self.focus, Ec2Focus::SearchBox) {
+            self.search_input
+                .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+        }
+        Action::Noop
+    }
+
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let outer = Block::default()
             .borders(Borders::ALL)
@@ -1245,6 +1253,16 @@ mod tests {
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, Action::SearchEc2(ref q) if q == "web-server"));
         assert_eq!(screen.test_focus(), "Table");
+    }
+
+    #[test]
+    fn paste_in_search_box_inserts_search_text() {
+        let mut screen = Ec2Screen::new();
+        screen.handle_key(key(KeyCode::Char('/')));
+
+        screen.handle_paste("web\napi");
+
+        assert_eq!(screen.search_input.value, "web api");
     }
 
     // ── Key actions ──

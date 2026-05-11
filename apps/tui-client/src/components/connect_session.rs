@@ -300,7 +300,7 @@ impl ConnectSessionScreen {
             return Action::ConnectSessionUserDisconnect;
         }
 
-        if let Some(bytes) = key_to_pty_bytes(key) {
+        if let Some(bytes) = self.key_to_pty_bytes(key) {
             let write_result = match self.writer.lock() {
                 Ok(mut writer) => writer.write_all(&bytes).and_then(|_| writer.flush()),
                 Err(e) => {
@@ -311,6 +311,25 @@ impl ConnectSessionScreen {
             if let Err(e) = write_result {
                 return Action::ConnectSessionFailure(format!("Write to PTY failed: {e}"));
             }
+        }
+        Action::Noop
+    }
+
+    pub(crate) fn handle_paste(&mut self, text: &str) -> Action {
+        if self.is_terminal() || text.is_empty() {
+            return Action::Noop;
+        }
+
+        let bytes = bracketed_paste_bytes(text);
+        let write_result = match self.writer.lock() {
+            Ok(mut writer) => writer.write_all(&bytes).and_then(|_| writer.flush()),
+            Err(e) => {
+                tracing::error!(error = %e, "PTY writer mutex poisoned");
+                return Action::ConnectSessionFailure(format!("PTY writer unavailable: {e}"));
+            }
+        };
+        if let Err(e) = write_result {
+            return Action::ConnectSessionFailure(format!("Write to PTY failed: {e}"));
         }
         Action::Noop
     }
@@ -499,6 +518,10 @@ impl ConnectSessionScreen {
     fn kill_child(&mut self) -> std::io::Result<()> {
         self.child.kill()
     }
+
+    fn key_to_pty_bytes(&self, key: KeyEvent) -> Option<Vec<u8>> {
+        key_to_pty_bytes(key, self.parser.screen().application_cursor())
+    }
 }
 
 fn pty_size(rows: u16, cols: u16) -> PtySize {
@@ -523,6 +546,15 @@ fn instance_label(instance_id: &str, instance_name: Option<&str>) -> String {
         Some(name) => format!("{instance_id}  {name}"),
         None => instance_id.to_string(),
     }
+}
+
+fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+    let payload = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut bytes = Vec::with_capacity(payload.len() + "\x1b[200~\x1b[201~".len());
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(payload.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 fn format_countdown_duration(secs: u64) -> String {
@@ -616,7 +648,7 @@ fn is_local_disconnect_key(key: &KeyEvent) -> bool {
     }
 }
 
-fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+fn key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     if is_local_disconnect_key(&key) {
         return None;
     }
@@ -660,10 +692,26 @@ fn key_to_pty_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Backspace => bytes.push(0x7f),
         KeyCode::Tab => bytes.push(b'\t'),
         KeyCode::Esc => bytes.push(0x1b),
-        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
-        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
-        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
-        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+        KeyCode::Up => bytes.extend_from_slice(if application_cursor {
+            b"\x1bOA"
+        } else {
+            b"\x1b[A"
+        }),
+        KeyCode::Down => bytes.extend_from_slice(if application_cursor {
+            b"\x1bOB"
+        } else {
+            b"\x1b[B"
+        }),
+        KeyCode::Right => bytes.extend_from_slice(if application_cursor {
+            b"\x1bOC"
+        } else {
+            b"\x1b[C"
+        }),
+        KeyCode::Left => bytes.extend_from_slice(if application_cursor {
+            b"\x1bOD"
+        } else {
+            b"\x1b[D"
+        }),
         KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
         KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
         KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
@@ -812,32 +860,87 @@ mod tests {
     #[test]
     fn key_mapping_forwards_common_terminal_keys() {
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            key_to_pty_bytes(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                false
+            ),
             Some(vec![3])
         );
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
             Some(vec![b'\r'])
         );
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), false),
             Some(b"\x1b[A".to_vec())
         );
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+            key_to_pty_bytes(
+                KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                false
+            ),
             Some(vec![0x1c])
         );
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL)),
+            key_to_pty_bytes(
+                KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
+                false
+            ),
             Some(vec![0x1f])
         );
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL)),
+            key_to_pty_bytes(
+                KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+                false
+            ),
             Some(vec![0x1b])
         );
         assert_eq!(
-            key_to_pty_bytes(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::CONTROL)),
+            key_to_pty_bytes(
+                KeyEvent::new(KeyCode::Char('8'), KeyModifiers::CONTROL),
+                false
+            ),
             Some(vec![0x7f])
+        );
+    }
+
+    #[test]
+    fn key_mapping_uses_application_cursor_mode_for_arrows() {
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), true),
+            Some(b"\x1bOA".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), true),
+            Some(b"\x1bOB".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), true),
+            Some(b"\x1bOC".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), true),
+            Some(b"\x1bOD".to_vec())
+        );
+    }
+
+    #[test]
+    fn key_mapping_uses_normal_cursor_mode_for_arrows() {
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), false),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), false),
+            Some(b"\x1b[B".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), false),
+            Some(b"\x1b[C".to_vec())
+        );
+        assert_eq!(
+            key_to_pty_bytes(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), false),
+            Some(b"\x1b[D".to_vec())
         );
     }
 
@@ -845,15 +948,23 @@ mod tests {
     fn local_disconnect_key_is_not_forwarded() {
         let key = KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL);
         assert!(is_local_disconnect_key(&key));
-        assert_eq!(key_to_pty_bytes(key), None);
+        assert_eq!(key_to_pty_bytes(key, false), None);
 
         let key = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL);
         assert!(is_local_disconnect_key(&key));
-        assert_eq!(key_to_pty_bytes(key), None);
+        assert_eq!(key_to_pty_bytes(key, false), None);
 
         let key = KeyEvent::new(KeyCode::Char('\u{1d}'), KeyModifiers::NONE);
         assert!(is_local_disconnect_key(&key));
-        assert_eq!(key_to_pty_bytes(key), None);
+        assert_eq!(key_to_pty_bytes(key, true), None);
+    }
+
+    #[test]
+    fn paste_payload_is_forwarded_with_bracketed_paste_markers() {
+        assert_eq!(
+            bracketed_paste_bytes("echo one\nls\r\npwd"),
+            b"\x1b[200~echo one\nls\npwd\x1b[201~".to_vec()
+        );
     }
 
     #[test]

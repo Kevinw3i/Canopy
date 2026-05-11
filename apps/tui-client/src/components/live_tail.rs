@@ -166,6 +166,14 @@ impl Component for LiveTailScreen {
         }
     }
 
+    fn handle_paste(&mut self, text: &str) -> Action {
+        if self.filter_active {
+            self.filter_input
+                .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+        }
+        Action::Noop
+    }
+
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let outer = Block::default()
             .borders(Borders::ALL)
@@ -438,6 +446,16 @@ mod tests {
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(!screen.filter_active);
         assert!(matches!(action, Action::Noop));
+    }
+
+    #[test]
+    fn paste_in_filter_mode_inserts_filter_text() {
+        let mut screen = LiveTailScreen::new(100);
+        screen.handle_key(key(KeyCode::Char('/')));
+
+        screen.handle_paste("ERROR\nWARN");
+
+        assert_eq!(screen.filter_input.value, "ERROR WARN");
     }
 
     #[test]

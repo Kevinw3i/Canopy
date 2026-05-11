@@ -10,8 +10,37 @@ use super::time_range::{TimeRange, TimeRangePreset};
 use super::time_range_modal::{ModalOutcome, TimeRangeModal};
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
 use crate::event::{Action, ExportFormat};
-use crate::widgets::input::TextInput;
+use crate::widgets::input::{TextAreaInput, TextInput};
 use crate::widgets::table::SelectableTable;
+
+const INSIGHTS_KEYWORD_PLACEHOLDER: &str = "[keyword輸入在這裡]";
+const DEFAULT_INSIGHTS_QUERY_TEMPLATE: &str = "fields @timestamp, @logStream, @message\n| filter @message like /[keyword輸入在這裡]/\n| sort @timestamp asc\n| limit 500";
+
+fn normalize_pasted_single_line_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace(['\r', '\n'], " ")
+}
+
+fn normalize_pasted_multiline_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn escape_insights_regex_literal(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('/', "\\/")
+}
+
+fn default_insights_query(keyword: &str) -> String {
+    let keyword = keyword.trim();
+    let needle = if keyword.is_empty() {
+        INSIGHTS_KEYWORD_PLACEHOLDER.to_string()
+    } else {
+        escape_insights_regex_literal(keyword)
+    };
+
+    format!(
+        "fields @timestamp, @logStream, @message\n| filter @message like /{}/\n| sort @timestamp asc\n| limit 500",
+        needle
+    )
+}
 
 enum CwFocus {
     LogGroupList,
@@ -54,10 +83,6 @@ impl CloudWatchLoadingKind {
             _ => self.message().into(),
         }
     }
-
-    fn uses_overlay(self) -> bool {
-        !matches!(self, Self::LoadingMoreEvents)
-    }
 }
 
 pub struct CloudWatchSearchScreen {
@@ -79,6 +104,8 @@ pub struct CloudWatchSearchScreen {
     pub available_regions: Vec<String>,
 
     pub query_input: TextInput,
+    insights_query_input: TextAreaInput,
+    insights_query_customized: bool,
     scope_transition: Option<ScopeTransition>,
     loading_spinner: LoadingIndicator,
     /// Generation counter for log-group fetches (separate from query loading)
@@ -115,7 +142,7 @@ impl Default for CloudWatchSearchScreen {
 
 impl CloudWatchSearchScreen {
     pub fn new() -> Self {
-        Self {
+        let mut screen = Self {
             log_groups: Vec::new(),
             events: Vec::new(),
             query_results: Vec::new(),
@@ -128,7 +155,12 @@ impl CloudWatchSearchScreen {
             selected_log_group: String::new(),
             available_accounts: Vec::new(),
             available_regions: Vec::new(),
-            query_input: TextInput::new("Keyword / Insights query"),
+            query_input: TextInput::new("Keyword"),
+            insights_query_input: TextAreaInput::with_value(
+                "Insights query",
+                DEFAULT_INSIGHTS_QUERY_TEMPLATE,
+            ),
+            insights_query_customized: false,
             scope_transition: None,
             loading_spinner: LoadingIndicator::new("Loading log groups..."),
             fetch_generation: 0,
@@ -158,7 +190,76 @@ impl CloudWatchSearchScreen {
             time_range_modal: None,
             last_next_token: None,
             has_more: false,
+        };
+        screen
+            .insights_query_input
+            .set_cursor_to_first_match(INSIGHTS_KEYWORD_PLACEHOLDER);
+        screen
+    }
+
+    fn sync_query_focus(&mut self) {
+        let focused = matches!(self.focus, CwFocus::QueryInput);
+        self.query_input.focused = focused && matches!(self.search_mode, SearchMode::QuickSearch);
+        self.insights_query_input.focused =
+            focused && matches!(self.search_mode, SearchMode::InsightsQuery);
+    }
+
+    fn set_focus(&mut self, focus: CwFocus) {
+        self.focus = focus;
+        self.sync_query_focus();
+    }
+
+    fn refresh_default_insights_query_from_keyword(&mut self) {
+        if self.insights_query_customized {
+            return;
         }
+
+        let query = default_insights_query(&self.query_input.value);
+        self.insights_query_input.set_value(query);
+        if self.query_input.value.trim().is_empty() {
+            self.insights_query_input
+                .set_cursor_to_first_match(INSIGHTS_KEYWORD_PLACEHOLDER);
+        }
+    }
+
+    fn replace_insights_placeholder_with(&mut self, replacement: &str) {
+        let Some(byte_idx) = self
+            .insights_query_input
+            .value
+            .find(INSIGHTS_KEYWORD_PLACEHOLDER)
+        else {
+            self.insights_query_input.insert_str(replacement);
+            self.insights_query_customized = true;
+            return;
+        };
+
+        let replacement_end = byte_idx + INSIGHTS_KEYWORD_PLACEHOLDER.len();
+        let prefix_chars = self.insights_query_input.value[..byte_idx].chars().count();
+        self.insights_query_input
+            .value
+            .replace_range(byte_idx..replacement_end, replacement);
+        self.insights_query_input.cursor_pos = prefix_chars + replacement.chars().count();
+        self.insights_query_customized = true;
+    }
+
+    fn replace_default_insights_query_with_paste(&mut self, text: String) {
+        self.insights_query_input.set_value(text);
+        self.insights_query_customized = true;
+    }
+
+    fn toggle_search_mode(&mut self) {
+        self.search_mode = match self.search_mode {
+            SearchMode::QuickSearch => {
+                self.refresh_default_insights_query_from_keyword();
+                SearchMode::InsightsQuery
+            }
+            SearchMode::InsightsQuery => SearchMode::QuickSearch,
+        };
+        self.sync_query_focus();
+    }
+
+    pub(crate) fn insights_query_text(&self) -> &str {
+        &self.insights_query_input.value
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {
@@ -344,6 +445,10 @@ impl CloudWatchSearchScreen {
         self.error = None;
     }
 
+    pub(crate) fn cancel_loading(&mut self) {
+        self.loading = None;
+    }
+
     pub(crate) fn is_loading(&self) -> bool {
         self.loading.is_some()
     }
@@ -469,43 +574,37 @@ impl Component for CloudWatchSearchScreen {
                     self.log_group_filter.clear();
                     self.log_group_filter.focused = false;
                     self.refilter_log_groups();
-                    self.focus = CwFocus::LogGroupList;
+                    self.set_focus(CwFocus::LogGroupList);
                     Action::Noop
                 }
                 CwFocus::QueryInput => {
-                    self.focus = CwFocus::LogGroupList;
-                    self.query_input.focused = false;
+                    self.set_focus(CwFocus::LogGroupList);
                     Action::Noop
                 }
                 CwFocus::EventDetail => {
-                    self.focus = CwFocus::ResultsTable;
+                    self.set_focus(CwFocus::ResultsTable);
                     Action::Noop
                 }
                 CwFocus::ResultsTable => {
-                    self.focus = CwFocus::LogGroupList;
-                    Action::Noop
+                    self.set_focus(CwFocus::LogGroupList);
+                    if self.is_loading() {
+                        Action::CancelCloudWatchRequest
+                    } else {
+                        Action::Noop
+                    }
                 }
             },
             KeyCode::Tab => {
                 match self.focus {
                     CwFocus::LogGroupList | CwFocus::LogGroupFilter => {
                         self.log_group_filter.focused = false;
-                        self.focus = CwFocus::QueryInput;
-                        self.query_input.focused = true;
+                        self.set_focus(CwFocus::QueryInput);
                     }
                     CwFocus::QueryInput => {
-                        // Toggle search mode
-                        self.search_mode = match self.search_mode {
-                            SearchMode::QuickSearch => SearchMode::InsightsQuery,
-                            SearchMode::InsightsQuery => SearchMode::QuickSearch,
-                        };
-                        self.query_input.label = match self.search_mode {
-                            SearchMode::QuickSearch => "Keyword".into(),
-                            SearchMode::InsightsQuery => "Insights query".into(),
-                        };
+                        self.toggle_search_mode();
                     }
                     CwFocus::ResultsTable | CwFocus::EventDetail => {
-                        self.focus = CwFocus::LogGroupList;
+                        self.set_focus(CwFocus::LogGroupList);
                     }
                 }
                 Action::Noop
@@ -574,7 +673,7 @@ impl Component for CloudWatchSearchScreen {
             }
             // `/` in log group list → activate log group filter
             KeyCode::Char('/') if matches!(self.focus, CwFocus::LogGroupList) => {
-                self.focus = CwFocus::LogGroupFilter;
+                self.set_focus(CwFocus::LogGroupFilter);
                 self.log_group_filter.focused = true;
                 Action::Noop
             }
@@ -582,15 +681,40 @@ impl Component for CloudWatchSearchScreen {
             KeyCode::Char('/')
                 if !matches!(self.focus, CwFocus::QueryInput | CwFocus::LogGroupFilter) =>
             {
-                self.focus = CwFocus::QueryInput;
-                self.query_input.focused = true;
+                self.set_focus(CwFocus::QueryInput);
+                Action::Noop
+            }
+            KeyCode::Char('j')
+                if matches!(self.focus, CwFocus::QueryInput)
+                    && matches!(self.search_mode, SearchMode::InsightsQuery)
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if !self.insights_query_customized {
+                    self.replace_insights_placeholder_with("\n");
+                } else {
+                    self.insights_query_input
+                        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+                }
+                Action::Noop
+            }
+            KeyCode::Enter
+                if matches!(self.focus, CwFocus::QueryInput)
+                    && matches!(self.search_mode, SearchMode::InsightsQuery)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                if !self.insights_query_customized {
+                    self.replace_insights_placeholder_with("\n");
+                } else {
+                    self.insights_query_input
+                        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+                }
                 Action::Noop
             }
             KeyCode::Enter => match self.focus {
                 CwFocus::LogGroupFilter => {
                     // Accept filter and go back to list navigation
                     self.log_group_filter.focused = false;
-                    self.focus = CwFocus::LogGroupList;
+                    self.set_focus(CwFocus::LogGroupList);
                     Action::Noop
                 }
                 CwFocus::LogGroupList => {
@@ -602,17 +726,18 @@ impl Component for CloudWatchSearchScreen {
                             }
                         }
                     }
-                    self.focus = CwFocus::QueryInput;
-                    self.query_input.focused = true;
+                    self.set_focus(CwFocus::QueryInput);
                     Action::Noop
                 }
                 CwFocus::QueryInput => {
-                    let query = self.query_input.value.clone();
+                    let query = match self.search_mode {
+                        SearchMode::QuickSearch => self.query_input.value.clone(),
+                        SearchMode::InsightsQuery => self.insights_query_input.value.clone(),
+                    };
                     if !query.is_empty() {
                         self.query_history.push(query);
                     }
-                    self.focus = CwFocus::ResultsTable;
-                    self.query_input.focused = false;
+                    self.set_focus(CwFocus::ResultsTable);
                     match self.search_mode {
                         SearchMode::QuickSearch => Action::RunFilterSearch,
                         SearchMode::InsightsQuery => Action::RunInsightsQuery,
@@ -654,9 +779,31 @@ impl Component for CloudWatchSearchScreen {
                             }
                         }
                     }
-                    CwFocus::QueryInput => {
-                        self.query_input.handle_key(key);
-                    }
+                    CwFocus::QueryInput => match self.search_mode {
+                        SearchMode::QuickSearch => {
+                            self.query_input.handle_key(key);
+                        }
+                        SearchMode::InsightsQuery => {
+                            if !self.insights_query_customized {
+                                match key.code {
+                                    KeyCode::Char(c) => {
+                                        self.replace_insights_placeholder_with(&c.to_string());
+                                    }
+                                    KeyCode::Backspace | KeyCode::Delete => {
+                                        self.replace_insights_placeholder_with("");
+                                    }
+                                    _ => {
+                                        let before = self.insights_query_input.value.clone();
+                                        self.insights_query_input.handle_key(key);
+                                        self.insights_query_customized =
+                                            before != self.insights_query_input.value;
+                                    }
+                                }
+                            } else {
+                                self.insights_query_input.handle_key(key);
+                            }
+                        }
+                    },
                     CwFocus::ResultsTable | CwFocus::EventDetail => {
                         self.table.handle_key(key);
                     }
@@ -664,6 +811,48 @@ impl Component for CloudWatchSearchScreen {
                 Action::Noop
             }
         }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Action {
+        if let Some(modal) = self.time_range_modal.as_mut() {
+            modal.handle_paste(text);
+            return Action::Noop;
+        }
+
+        match self.focus {
+            CwFocus::QueryInput => match self.search_mode {
+                SearchMode::QuickSearch => {
+                    let text = normalize_pasted_single_line_text(text);
+                    self.query_input.insert_str(&text);
+                }
+                SearchMode::InsightsQuery => {
+                    let text = normalize_pasted_multiline_text(text);
+                    let trimmed = text.trim_start();
+                    if !self.insights_query_customized
+                        && (text.contains('\n') || trimmed.starts_with("fields "))
+                    {
+                        self.replace_default_insights_query_with_paste(text);
+                    } else if !self.insights_query_customized
+                        && self
+                            .insights_query_input
+                            .value
+                            .contains(INSIGHTS_KEYWORD_PLACEHOLDER)
+                    {
+                        self.replace_insights_placeholder_with(&text);
+                    } else {
+                        self.insights_query_customized = true;
+                        self.insights_query_input.insert_str(&text);
+                    }
+                }
+            },
+            CwFocus::LogGroupFilter => {
+                let text = normalize_pasted_single_line_text(text);
+                self.log_group_filter.insert_str(&text);
+                self.refilter_log_groups();
+            }
+            _ => {}
+        }
+        Action::Noop
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -776,27 +965,36 @@ impl Component for CloudWatchSearchScreen {
         );
 
         // ── Right panel: mode + query + results + status ──
+        let query_height = match self.search_mode {
+            SearchMode::QuickSearch => 3,
+            SearchMode::InsightsQuery => 7,
+        };
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1), // Mode indicator
-                Constraint::Length(3), // Query input
-                Constraint::Min(5),    // Results
-                Constraint::Length(2), // Status
+                Constraint::Length(1),            // Mode indicator
+                Constraint::Length(query_height), // Query input/editor
+                Constraint::Min(5),               // Results
+                Constraint::Length(2),            // Status
             ])
             .split(panels[1]);
 
         // Mode indicator
         let mode_text = match self.search_mode {
             SearchMode::QuickSearch => "[Quick Search (FilterLogEvents)] Tab to switch mode",
-            SearchMode::InsightsQuery => "[Insights Query (StartQuery)]    Tab to switch mode",
+            SearchMode::InsightsQuery => {
+                "[Insights Query (StartQuery)]    Tab to switch mode | Enter: run | Ctrl+J: newline"
+            }
         };
         Paragraph::new(mode_text)
             .style(Style::default().fg(Color::Cyan))
             .render(right_chunks[0], buf);
 
         // Query input
-        self.query_input.render(right_chunks[1], buf);
+        match self.search_mode {
+            SearchMode::QuickSearch => self.query_input.render(right_chunks[1], buf),
+            SearchMode::InsightsQuery => self.insights_query_input.render(right_chunks[1], buf),
+        }
 
         // Results
         let result_chunks = Layout::default()
@@ -902,11 +1100,7 @@ impl Component for CloudWatchSearchScreen {
             .render(right_chunks[3], buf);
 
         // Loading overlay for log-group fetches, searches, pagination, and Insights polling.
-        if self
-            .loading
-            .map(CloudWatchLoadingKind::uses_overlay)
-            .unwrap_or(false)
-        {
+        if self.loading.is_some() {
             self.loading_spinner.render_overlay(inner, buf);
         }
 
@@ -933,8 +1127,7 @@ impl Component for CloudWatchSearchScreen {
     }
 
     fn on_enter(&mut self) -> Vec<Action> {
-        self.query_input.focused = false;
-        self.focus = CwFocus::LogGroupList;
+        self.set_focus(CwFocus::LogGroupList);
         vec![Action::RefreshLogGroups]
     }
 }
@@ -1198,12 +1391,87 @@ mod tests {
     #[test]
     fn enter_in_query_insights_mode_runs_insights() {
         let mut screen = CloudWatchSearchScreen::new();
-        screen.focus = CwFocus::QueryInput;
         screen.search_mode = SearchMode::InsightsQuery;
-        screen.query_input.value = "fields @timestamp".into();
+        screen.set_focus(CwFocus::QueryInput);
+        screen
+            .insights_query_input
+            .set_value("fields @timestamp".into());
 
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, Action::RunInsightsQuery));
+    }
+
+    #[test]
+    fn paste_multiline_insights_query_preserves_lines() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.search_mode = SearchMode::InsightsQuery;
+        screen.set_focus(CwFocus::QueryInput);
+        screen.insights_query_input.clear();
+
+        screen.handle_paste(
+            "fields @timestamp, @logStream, @message\n| filter @message like /order/\n| limit 500",
+        );
+
+        assert_eq!(
+            screen.insights_query_input.value,
+            "fields @timestamp, @logStream, @message\n| filter @message like /order/\n| limit 500"
+        );
+    }
+
+    #[test]
+    fn switching_to_insights_prefills_template_from_keyword() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_focus(CwFocus::QueryInput);
+        screen.query_input.value = "A7051".into();
+
+        screen.handle_key(key(KeyCode::Tab));
+
+        assert!(matches!(screen.search_mode, SearchMode::InsightsQuery));
+        assert!(screen.insights_query_input.focused);
+        assert_eq!(
+            screen.insights_query_input.value,
+            "fields @timestamp, @logStream, @message\n| filter @message like /A7051/\n| sort @timestamp asc\n| limit 500"
+        );
+    }
+
+    #[test]
+    fn default_insights_editor_contains_keyword_placeholder() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_focus(CwFocus::QueryInput);
+        screen.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(
+            screen.insights_query_input.value,
+            DEFAULT_INSIGHTS_QUERY_TEMPLATE
+        );
+    }
+
+    #[test]
+    fn typing_in_pristine_insights_template_replaces_placeholder() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_focus(CwFocus::QueryInput);
+        screen.handle_key(key(KeyCode::Tab));
+
+        screen.handle_key(key(KeyCode::Char('o')));
+
+        assert_eq!(
+            screen.insights_query_input.value,
+            "fields @timestamp, @logStream, @message\n| filter @message like /o/\n| sort @timestamp asc\n| limit 500"
+        );
+    }
+
+    #[test]
+    fn pasting_full_query_replaces_pristine_insights_template() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_focus(CwFocus::QueryInput);
+        screen.handle_key(key(KeyCode::Tab));
+
+        screen.handle_paste("fields @timestamp\n| limit 20");
+
+        assert_eq!(
+            screen.insights_query_input.value,
+            "fields @timestamp\n| limit 20"
+        );
     }
 
     #[test]
@@ -1331,7 +1599,7 @@ mod tests {
     }
 
     #[test]
-    fn load_more_loading_keeps_existing_events_and_uses_status_bar_only() {
+    fn load_more_loading_keeps_existing_events_and_renders_overlay() {
         let mut screen = CloudWatchSearchScreen::new();
         screen.set_log_groups(test_log_groups());
         screen.set_events(vec![ev(1, "existing")], Some("tok-1".into()));
@@ -1341,7 +1609,7 @@ mod tests {
         assert_eq!(screen.events.len(), 1);
         let rendered = rendered_text(&mut screen);
         assert!(rendered.contains("Loading more events..."));
-        assert!(!rendered.contains("[=   ] Loading more events..."));
+        assert!(rendered.contains("[    ] Loading more events..."));
     }
 
     #[test]
@@ -1673,6 +1941,18 @@ mod tests {
 
         let action = screen.handle_key(key(KeyCode::Char('n')));
         assert!(!matches!(action, Action::LoadMoreFilterResults));
+    }
+
+    #[test]
+    fn esc_from_loading_results_cancels_cloudwatch_request() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.focus = CwFocus::ResultsTable;
+        screen.set_loading(CloudWatchLoadingKind::SearchingLogs);
+
+        let action = screen.handle_key(key(KeyCode::Esc));
+
+        assert!(matches!(action, Action::CancelCloudWatchRequest));
+        assert!(matches!(screen.focus, CwFocus::LogGroupList));
     }
 
     #[test]
