@@ -1,12 +1,16 @@
+use base64::{engine::general_purpose, Engine as _};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use shared::dto::ec2::ConnectMethod;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::event::Action;
 
@@ -16,10 +20,70 @@ const STATUS_BAR_HEIGHT: u16 = 1;
 const READ_CHUNK_BYTES: usize = 8192;
 const MAX_BUFFERED_OUTPUT_BYTES: usize = 1024 * 1024;
 const SCROLLBACK_PAGE_OVERLAP_ROWS: u16 = 1;
+const MAX_COPY_FILE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_COPY_CAPTURE_BYTES: usize = MAX_COPY_FILE_BYTES * 2;
 // Some shells or commands are quiet after PTY spawn. After this grace period,
 // show the session as connected instead of leaving the status bar on Connecting.
 const CONNECT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
-const DISCONNECT_HINT: &str = "Ctrl+] / Ctrl+5 disconnect";
+const SESSION_HINTS: &str = "Ctrl+H help | F2 copy file | Ctrl+] / Ctrl+5 disconnect";
+
+trait ClipboardWriter: Send + Sync {
+    fn write_clipboard(&self, bytes: &[u8]) -> Result<(), String>;
+}
+
+struct SystemClipboardWriter;
+
+impl ClipboardWriter for SystemClipboardWriter {
+    fn write_clipboard(&self, bytes: &[u8]) -> Result<(), String> {
+        write_system_clipboard(bytes)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectOverlay {
+    Help,
+    CopyPrompt {
+        input: String,
+        cursor: usize,
+        error: Option<String>,
+    },
+    CopyMessage {
+        title: String,
+        message: String,
+        is_error: bool,
+        dismissible: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyCaptureMode {
+    AwaitMarker,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct CopyCapture {
+    path: String,
+    begin_marker: Vec<u8>,
+    error_marker: Vec<u8>,
+    end_marker: Vec<u8>,
+    buffer: Vec<u8>,
+    mode: CopyCaptureMode,
+}
+
+impl CopyCapture {
+    fn new(path: String, id: &str) -> Self {
+        Self {
+            path,
+            begin_marker: format!("__CANOPY_COPY_BEGIN_{id}__").into_bytes(),
+            error_marker: format!("__CANOPY_COPY_ERROR_{id}__").into_bytes(),
+            end_marker: format!("__CANOPY_COPY_END_{id}__").into_bytes(),
+            buffer: Vec::new(),
+            mode: CopyCaptureMode::AwaitMarker,
+        }
+    }
+}
 
 pub(crate) struct ConnectSessionLaunch {
     pub instance_id: String,
@@ -94,6 +158,9 @@ pub(crate) struct ConnectSessionScreen {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send + Sync>,
     terminal_message: Option<String>,
+    overlay: Option<ConnectOverlay>,
+    copy_capture: Option<CopyCapture>,
+    clipboard: Arc<dyn ClipboardWriter>,
     pty_cols: u16,
     pty_rows: u16,
 }
@@ -176,6 +243,9 @@ impl ConnectSessionScreen {
             writer,
             child,
             terminal_message: None,
+            overlay: None,
+            copy_capture: None,
+            clipboard: Arc::new(SystemClipboardWriter),
             pty_cols,
             pty_rows,
         })
@@ -209,7 +279,15 @@ impl ConnectSessionScreen {
     }
 
     fn process_output(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        let bytes = match self.capture_copy_output(bytes) {
+            Some(bytes) => bytes,
+            None => return,
+        };
+        if bytes.is_empty() {
+            return;
+        }
+
+        self.parser.process(&bytes);
         if self.status == ConnectSessionStatus::Connecting {
             self.status = ConnectSessionStatus::Connected;
         }
@@ -297,6 +375,23 @@ impl ConnectSessionScreen {
             };
         }
 
+        if self.handle_overlay_key(key) {
+            return Action::Noop;
+        }
+
+        if is_help_key(&key) {
+            self.overlay = Some(ConnectOverlay::Help);
+            return Action::Noop;
+        }
+
+        if self.handle_copy_shortcut(&key) {
+            return Action::Noop;
+        }
+
+        if self.copy_capture.is_some() {
+            return Action::Noop;
+        }
+
         if is_local_disconnect_key(&key) {
             return Action::ConnectSessionUserDisconnect;
         }
@@ -323,7 +418,11 @@ impl ConnectSessionScreen {
     }
 
     pub(crate) fn handle_paste(&mut self, text: &str) -> Action {
-        if self.is_terminal() || text.is_empty() {
+        if self.is_terminal()
+            || text.is_empty()
+            || self.overlay.is_some()
+            || self.copy_capture.is_some()
+        {
             return Action::Noop;
         }
 
@@ -379,6 +478,10 @@ impl ConnectSessionScreen {
                     .set_char(ch)
                     .set_style(Style::default().fg(Color::Yellow).bold());
             }
+        }
+
+        if let Some(overlay) = &self.overlay {
+            self.render_overlay(overlay, area, buf);
         }
     }
 
@@ -462,12 +565,158 @@ impl ConnectSessionScreen {
         }
     }
 
+    fn render_overlay(&self, overlay: &ConnectOverlay, area: Rect, buf: &mut Buffer) {
+        match overlay {
+            ConnectOverlay::Help => self.render_help_overlay(area, buf),
+            ConnectOverlay::CopyPrompt {
+                input,
+                cursor,
+                error,
+            } => self.render_copy_prompt(input, *cursor, error.as_deref(), area, buf),
+            ConnectOverlay::CopyMessage {
+                title,
+                message,
+                is_error,
+                dismissible,
+            } => self.render_copy_message(title, message, *is_error, *dismissible, area, buf),
+        }
+    }
+
+    fn render_help_overlay(&self, area: Rect, buf: &mut Buffer) {
+        let modal_area = centered_rect(area, 74, 12);
+        Clear.render(modal_area, buf);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Connect Session Help ")
+            .border_style(Style::default().fg(Color::Cyan).bold());
+        let inner = block.inner(modal_area);
+        block.render(modal_area, buf);
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("PageUp", Style::default().fg(Color::Yellow).bold()),
+                Span::raw("        scroll up one page"),
+            ]),
+            Line::from(vec![
+                Span::styled("PageDown", Style::default().fg(Color::Yellow).bold()),
+                Span::raw("      scroll down one page"),
+            ]),
+            Line::from(vec![
+                Span::styled("Shift+Up", Style::default().fg(Color::Yellow).bold()),
+                Span::raw("      scroll up one line"),
+            ]),
+            Line::from(vec![
+                Span::styled("Shift+Down", Style::default().fg(Color::Yellow).bold()),
+                Span::raw("    scroll down one line"),
+            ]),
+            Line::from(vec![
+                Span::styled("End", Style::default().fg(Color::Yellow).bold()),
+                Span::raw("           return to live view"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("F2", Style::default().fg(Color::Green).bold()),
+                Span::raw("            copy remote file to local clipboard"),
+            ]),
+            Line::from(vec![
+                Span::styled("Ctrl+] / Ctrl+5", Style::default().fg(Color::Red).bold()),
+                Span::raw(" disconnect"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Esc / Enter closes this help.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+
+    fn render_copy_prompt(
+        &self,
+        input: &str,
+        cursor: usize,
+        error: Option<&str>,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let modal_area = centered_rect(area, 78, 9);
+        Clear.render(modal_area, buf);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Copy remote file ")
+            .border_style(Style::default().fg(Color::Green).bold());
+        let inner = block.inner(modal_area);
+        block.render(modal_area, buf);
+
+        let input_line = copy_prompt_line(input, cursor);
+        let mut lines = vec![
+            Line::from("Remote file path"),
+            input_line,
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter: copy to clipboard  Esc: cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        if let Some(error) = error {
+            lines.insert(
+                3,
+                Line::from(Span::styled(error, Style::default().fg(Color::Red))),
+            );
+        }
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
+    }
+
+    fn render_copy_message(
+        &self,
+        title: &str,
+        message: &str,
+        is_error: bool,
+        dismissible: bool,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let modal_area = centered_rect(area, 70, 7);
+        Clear.render(modal_area, buf);
+
+        let color = if is_error { Color::Red } else { Color::Green };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(color).bold());
+        let inner = block.inner(modal_area);
+        block.render(modal_area, buf);
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(message, Style::default().fg(color))),
+            Line::from(""),
+        ];
+        if dismissible {
+            lines.push(Line::from(Span::styled(
+                "Press Esc or Enter to dismiss.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
+    }
+
     fn left_status_text(&self) -> String {
         let instance = instance_label(&self.instance_id, self.instance_name.as_deref());
         match self.status {
             ConnectSessionStatus::Connecting => format!(
                 "Canopy SSH  Connecting...  {}  {}/{}  [{}]",
-                instance, self.account_id, self.region, DISCONNECT_HINT
+                instance, self.account_id, self.region, SESSION_HINTS
             ),
             _ => format!(
                 "Canopy SSH  {}  {}  {}/{}  [{}]",
@@ -475,7 +724,7 @@ impl ConnectSessionScreen {
                 method_label(&self.method),
                 self.account_id,
                 self.region,
-                DISCONNECT_HINT
+                SESSION_HINTS
             ),
         }
     }
@@ -507,8 +756,11 @@ impl ConnectSessionScreen {
             ConnectSessionStatus::Connecting | ConnectSessionStatus::Connected => {
                 let (timer, style) = countdown_status(self.remaining_secs());
                 let scrollback = self.parser.screen().scrollback();
+                let copying = self.copy_capture.is_some();
                 if scrollback > 0 {
                     (format!("SCROLL +{scrollback}  {timer}"), style)
+                } else if copying {
+                    (format!("COPYING  {timer}"), style)
                 } else {
                     (timer, style)
                 }
@@ -537,6 +789,285 @@ impl ConnectSessionScreen {
 
     fn key_to_pty_bytes(&self, key: KeyEvent) -> Option<Vec<u8>> {
         key_to_pty_bytes(key, self.parser.screen().application_cursor())
+    }
+
+    fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
+        let Some(overlay) = self.overlay.take() else {
+            return false;
+        };
+
+        match overlay {
+            ConnectOverlay::Help => match key.code {
+                KeyCode::Esc | KeyCode::Enter => true,
+                _ if is_help_key(&key) => true,
+                _ => {
+                    self.overlay = Some(ConnectOverlay::Help);
+                    true
+                }
+            },
+            ConnectOverlay::CopyMessage {
+                title,
+                message,
+                is_error,
+                dismissible,
+            } => {
+                if dismissible && matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                    true
+                } else {
+                    self.overlay = Some(ConnectOverlay::CopyMessage {
+                        title,
+                        message,
+                        is_error,
+                        dismissible,
+                    });
+                    true
+                }
+            }
+            ConnectOverlay::CopyPrompt {
+                mut input,
+                mut cursor,
+                error,
+            } => match key.code {
+                KeyCode::Esc => true,
+                KeyCode::Enter => {
+                    let path = input.trim().to_string();
+                    match validate_copy_path(&path) {
+                        Ok(()) => {
+                            if let Err(message) = self.start_remote_file_copy(path) {
+                                self.overlay = Some(ConnectOverlay::CopyMessage {
+                                    title: " Copy remote file ".into(),
+                                    message,
+                                    is_error: true,
+                                    dismissible: true,
+                                });
+                            }
+                            true
+                        }
+                        Err(message) => {
+                            self.overlay = Some(ConnectOverlay::CopyPrompt {
+                                input,
+                                cursor,
+                                error: Some(message),
+                            });
+                            true
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if cursor > 0 {
+                        cursor -= 1;
+                        let byte_pos = char_to_byte(&input, cursor);
+                        input.remove(byte_pos);
+                    }
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+                KeyCode::Delete => {
+                    let char_count = input.chars().count();
+                    if cursor < char_count {
+                        let byte_pos = char_to_byte(&input, cursor);
+                        input.remove(byte_pos);
+                    }
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+                KeyCode::Left => {
+                    cursor = cursor.saturating_sub(1);
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+                KeyCode::Right => {
+                    cursor = cursor.saturating_add(1).min(input.chars().count());
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+                KeyCode::Home => {
+                    cursor = 0;
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+                KeyCode::End => {
+                    cursor = input.chars().count();
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let byte_pos = char_to_byte(&input, cursor);
+                    input.insert(byte_pos, c);
+                    cursor += 1;
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error: None,
+                    });
+                    true
+                }
+                _ => {
+                    self.overlay = Some(ConnectOverlay::CopyPrompt {
+                        input,
+                        cursor,
+                        error,
+                    });
+                    true
+                }
+            },
+        }
+    }
+
+    fn handle_copy_shortcut(&mut self, key: &KeyEvent) -> bool {
+        if !matches!(key.code, KeyCode::F(2)) || self.parser.screen().alternate_screen() {
+            return false;
+        }
+
+        self.reset_scrollback();
+        self.overlay = Some(ConnectOverlay::CopyPrompt {
+            input: String::new(),
+            cursor: 0,
+            error: None,
+        });
+        true
+    }
+
+    fn start_remote_file_copy(&mut self, path: String) -> Result<(), String> {
+        let id = Uuid::new_v4().simple().to_string();
+        let command = remote_copy_command(&path, &id);
+        let write_result = match self.writer.lock() {
+            Ok(mut writer) => writer
+                .write_all(command.as_bytes())
+                .and_then(|_| writer.write_all(b"\r"))
+                .and_then(|_| writer.flush()),
+            Err(e) => {
+                tracing::error!(error = %e, "PTY writer mutex poisoned");
+                return Err(format!("PTY writer unavailable: {e}"));
+            }
+        };
+        if let Err(e) = write_result {
+            return Err(format!("Write to PTY failed: {e}"));
+        }
+
+        self.copy_capture = Some(CopyCapture::new(path.clone(), &id));
+        self.overlay = Some(ConnectOverlay::CopyMessage {
+            title: " Copy remote file ".into(),
+            message: format!("Copying {path}..."),
+            is_error: false,
+            dismissible: false,
+        });
+        Ok(())
+    }
+
+    fn capture_copy_output(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let Some(capture) = self.copy_capture.as_mut() else {
+            return Some(bytes.to_vec());
+        };
+        capture.buffer.extend_from_slice(bytes);
+
+        if capture.mode == CopyCaptureMode::AwaitMarker {
+            let begin = find_bytes(&capture.buffer, &capture.begin_marker);
+            let error = find_bytes(&capture.buffer, &capture.error_marker);
+
+            let marker = match (begin, error) {
+                (Some(begin), Some(error)) if begin <= error => {
+                    Some((begin, capture.begin_marker.len(), CopyCaptureMode::Success))
+                }
+                (Some(_), Some(error)) => {
+                    Some((error, capture.error_marker.len(), CopyCaptureMode::Error))
+                }
+                (Some(begin), None) => {
+                    Some((begin, capture.begin_marker.len(), CopyCaptureMode::Success))
+                }
+                (None, Some(error)) => {
+                    Some((error, capture.error_marker.len(), CopyCaptureMode::Error))
+                }
+                (None, None) => None,
+            };
+
+            if let Some((idx, marker_len, mode)) = marker {
+                capture.buffer.drain(..idx + marker_len);
+                trim_leading_line_breaks(&mut capture.buffer);
+                capture.mode = mode;
+            } else {
+                if capture.buffer.len() > MAX_COPY_CAPTURE_BYTES {
+                    self.finish_copy_error(
+                        "Copy output did not contain Canopy markers; aborting copy.".into(),
+                    );
+                }
+                return None;
+            }
+        }
+
+        let end = find_bytes(&capture.buffer, &capture.end_marker)?;
+        let payload = capture.buffer[..end].to_vec();
+        let trailing = capture.buffer[end + capture.end_marker.len()..].to_vec();
+        let path = capture.path.clone();
+        let mode = capture.mode.clone();
+        self.copy_capture = None;
+
+        match mode {
+            CopyCaptureMode::Success => self.finish_copy_success(&path, &payload),
+            CopyCaptureMode::Error => {
+                self.finish_copy_error(remote_error_message(&payload, "Remote copy failed"));
+            }
+            CopyCaptureMode::AwaitMarker => {
+                self.finish_copy_error("Remote copy failed before data marker.".into());
+            }
+        }
+
+        Some(trailing)
+    }
+
+    fn finish_copy_success(&mut self, path: &str, payload: &[u8]) {
+        match decode_copy_payload(payload).and_then(|bytes| {
+            let len = bytes.len();
+            self.clipboard.write_clipboard(&bytes).map(|_| len)
+        }) {
+            Ok(len) => {
+                self.overlay = Some(ConnectOverlay::CopyMessage {
+                    title: " Copy remote file ".into(),
+                    message: format!("Copied {len} bytes from {path} to clipboard."),
+                    is_error: false,
+                    dismissible: true,
+                });
+            }
+            Err(message) => self.finish_copy_error(message),
+        }
+    }
+
+    fn finish_copy_error(&mut self, message: String) {
+        self.copy_capture = None;
+        self.overlay = Some(ConnectOverlay::CopyMessage {
+            title: " Copy remote file ".into(),
+            message,
+            is_error: true,
+            dismissible: true,
+        });
     }
 
     fn handle_local_scrollback_key(&mut self, key: &KeyEvent) -> bool {
@@ -612,6 +1143,224 @@ fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
     bytes.extend_from_slice(payload.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(4)).max(1);
+    let height = height.min(area.height.saturating_sub(4)).max(1);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn copy_prompt_line(input: &str, cursor: usize) -> Line<'static> {
+    let cursor = cursor.min(input.chars().count());
+    let byte_split = char_to_byte(input, cursor);
+    let (before, after) = input.split_at(byte_split);
+    let cursor_char_len = after.chars().next().map(char::len_utf8).unwrap_or(0);
+
+    Line::from(vec![
+        Span::raw(before.to_string()),
+        Span::styled(
+            if cursor_char_len == 0 {
+                " ".to_string()
+            } else {
+                after[..cursor_char_len].to_string()
+            },
+            Style::default().bg(Color::White).fg(Color::Black),
+        ),
+        Span::raw(if cursor_char_len < after.len() {
+            after[cursor_char_len..].to_string()
+        } else {
+            String::new()
+        }),
+    ])
+}
+
+fn char_to_byte(value: &str, char_idx: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_idx)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(value.len())
+}
+
+// Keep validation intentionally permissive: shell_single_quote handles shell
+// metacharacters, and users may need to copy any readable path on the host.
+fn validate_copy_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("Remote file path is required.".into());
+    }
+    if path.chars().any(char::is_control) {
+        return Err("Remote file path cannot contain newlines or control characters.".into());
+    }
+    Ok(())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_copy_command(path: &str, id: &str) -> String {
+    let path = shell_single_quote(path);
+    let id = shell_single_quote(id);
+    format!(
+        concat!(
+            "__canopy_id={id}; ",
+            "__canopy_path={path}; ",
+            "__canopy_max={max}; ",
+            "__canopy_begin=\"__CANOPY_COPY_BEGIN_${{__canopy_id}}__\"; ",
+            "__canopy_error=\"__CANOPY_COPY_ERROR_${{__canopy_id}}__\"; ",
+            "__canopy_end=\"__CANOPY_COPY_END_${{__canopy_id}}__\"; ",
+            "if ! command -v base64 >/dev/null 2>&1; then ",
+            "printf '%s\\n%s\\n%s\\n' \"$__canopy_error\" 'base64 command not found on remote host' \"$__canopy_end\"; ",
+            "elif ! command -v wc >/dev/null 2>&1; then ",
+            "printf '%s\\n%s\\n%s\\n' \"$__canopy_error\" 'wc command not found on remote host' \"$__canopy_end\"; ",
+            "elif [ ! -f \"$__canopy_path\" ]; then ",
+            "printf '%s\\n%s\\n%s\\n' \"$__canopy_error\" 'not a regular file' \"$__canopy_end\"; ",
+            "elif [ ! -r \"$__canopy_path\" ]; then ",
+            "printf '%s\\n%s\\n%s\\n' \"$__canopy_error\" 'file is not readable' \"$__canopy_end\"; ",
+            "else ",
+            "__canopy_size=$(wc -c < \"$__canopy_path\" 2>/dev/null | tr -d '[:space:]'); ",
+            "if [ -z \"$__canopy_size\" ]; then ",
+            "printf '%s\\n%s\\n%s\\n' \"$__canopy_error\" 'unable to determine file size' \"$__canopy_end\"; ",
+            "elif [ \"$__canopy_size\" -gt \"$__canopy_max\" ]; then ",
+            "printf '%s\\n%s\\n%s\\n' \"$__canopy_error\" \"file is too large ($__canopy_size bytes, max $__canopy_max)\" \"$__canopy_end\"; ",
+            "else ",
+            "printf '%s\\n' \"$__canopy_begin\"; ",
+            "base64 < \"$__canopy_path\"; ",
+            "printf '\\n%s\\n' \"$__canopy_end\"; ",
+            "fi; ",
+            "fi; ",
+            "unset __canopy_id __canopy_path __canopy_max __canopy_begin __canopy_error __canopy_end __canopy_size"
+        ),
+        id = id,
+        path = path,
+        max = MAX_COPY_FILE_BYTES
+    )
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn trim_leading_line_breaks(bytes: &mut Vec<u8>) {
+    let trim = bytes
+        .iter()
+        .take_while(|byte| matches!(byte, b'\r' | b'\n'))
+        .count();
+    if trim > 0 {
+        bytes.drain(..trim);
+    }
+}
+
+fn trim_line_breaks(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b'\r' | b'\n'))
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\r' | b'\n'))
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn remote_error_message(payload: &[u8], fallback: &str) -> String {
+    let message = String::from_utf8_lossy(trim_line_breaks(payload))
+        .trim()
+        .to_string();
+    if message.is_empty() {
+        fallback.into()
+    } else {
+        message
+    }
+}
+
+fn decode_copy_payload(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let encoded: Vec<u8> = payload
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("Failed to decode copied file payload: {e}"))
+}
+
+fn write_system_clipboard(bytes: &[u8]) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        write_to_clipboard_command("pbcopy", &[], bytes).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "pbcopy was not found; cannot write to clipboard.".into()
+            } else {
+                format!("pbcopy failed: {e}")
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let candidates: &[(&str, &[&str])] = &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        let mut saw_command = false;
+        let mut last_error = None;
+        for (program, args) in candidates {
+            match write_to_clipboard_command(program, args, bytes) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    saw_command = true;
+                    last_error = Some(format!("{program} failed: {e}"));
+                }
+            }
+        }
+        if saw_command {
+            Err(last_error.unwrap_or_else(|| "Clipboard command failed.".into()))
+        } else {
+            Err("No clipboard command found. Install wl-copy, xclip, or xsel.".into())
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = bytes;
+        Err("Clipboard copy is only supported on macOS and Linux.".into())
+    }
+}
+
+fn write_to_clipboard_command(program: &str, args: &[&str], bytes: &[u8]) -> std::io::Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(bytes)?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "{program} exited with status {status}"
+        )))
+    }
 }
 
 fn format_countdown_duration(secs: u64) -> String {
@@ -703,6 +1452,11 @@ fn is_local_disconnect_key(key: &KeyEvent) -> bool {
         KeyCode::Char(']') | KeyCode::Char('5') => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
+}
+
+fn is_help_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn key_to_pty_bytes(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
@@ -848,6 +1602,23 @@ fn vt_color(color: vt100::Color) -> Color {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeClipboard {
+        bytes: Mutex<Vec<u8>>,
+        error: Mutex<Option<String>>,
+    }
+
+    impl ClipboardWriter for FakeClipboard {
+        fn write_clipboard(&self, bytes: &[u8]) -> Result<(), String> {
+            if let Some(error) = self.error.lock().expect("fake clipboard lock").clone() {
+                return Err(error);
+            }
+            *self.bytes.lock().expect("fake clipboard lock") = bytes.to_vec();
+            Ok(())
+        }
+    }
 
     #[cfg(unix)]
     fn spawn_sleeping_session() -> ConnectSessionScreen {
@@ -1041,6 +1812,78 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_h_toggles_help_overlay_and_dismisses() {
+        let mut session = spawn_sleeping_session();
+        let action = session.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(matches!(action, Action::Noop));
+        assert!(matches!(session.overlay, Some(ConnectOverlay::Help)));
+
+        let action = session.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(action, Action::Noop));
+        assert!(session.overlay.is_none());
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f2_opens_copy_prompt_outside_alternate_screen() {
+        let mut session = spawn_sleeping_session();
+        let action = session.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::Noop));
+        assert!(matches!(
+            session.overlay,
+            Some(ConnectOverlay::CopyPrompt { .. })
+        ));
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f2_is_not_intercepted_in_alternate_screen() {
+        let mut session = spawn_sleeping_session();
+        session.process_output(b"\x1b[?1049h");
+        assert!(session.parser.screen().alternate_screen());
+
+        assert!(!session.handle_copy_shortcut(&KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)));
+        assert!(session.overlay.is_none());
+        cleanup_session(session);
+    }
+
+    #[test]
+    fn copy_path_validation_rejects_empty_and_control_chars() {
+        assert!(validate_copy_path("").is_err());
+        assert!(validate_copy_path("/tmp/a\nb").is_err());
+        assert!(validate_copy_path("/tmp/app.log").is_ok());
+    }
+
+    #[test]
+    fn shell_quote_and_remote_command_do_not_expose_full_markers() {
+        assert_eq!(shell_single_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+
+        let cmd = remote_copy_command("/tmp/a'b", "abc123");
+        assert!(cmd.contains("__canopy_id='abc123'"));
+        assert!(cmd.contains("__canopy_path='/tmp/a'\\''b'"));
+        assert!(cmd.contains("base64 < \"$__canopy_path\""));
+        assert!(cmd.contains(&MAX_COPY_FILE_BYTES.to_string()));
+        assert!(!cmd.contains("__CANOPY_COPY_BEGIN_abc123__"));
+        assert!(!cmd.contains("__CANOPY_COPY_END_abc123__"));
+    }
+
+    #[test]
+    fn remote_copy_command_shell_escapes_metacharacters() {
+        let path = "/tmp/foo'; rm -rf /; echo '";
+        let quoted = shell_single_quote(path);
+        let cmd = remote_copy_command(path, "copyid");
+
+        assert!(validate_copy_path(path).is_ok());
+        assert!(cmd.contains(&format!("__canopy_path={quoted};")));
+        assert!(!cmd.contains("__canopy_path='/tmp/foo'; rm -rf /; echo '';"));
+        assert!(cmd.contains("command -v wc"));
+    }
+
     #[test]
     fn instance_label_includes_name_when_available() {
         assert_eq!(
@@ -1186,6 +2029,76 @@ mod tests {
         let _ = session.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
 
         assert_eq!(session.cursor_position(Rect::new(0, 0, 80, 24)), None);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_marker_success_writes_clipboard_and_hides_payload_from_terminal() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new("/tmp/app.log".into(), "copyid"));
+
+        let encoded = general_purpose::STANDARD.encode("hello from remote");
+        let output = format!(
+            "echoed command\r\n__CANOPY_COPY_BEGIN_copyid__\r\n{encoded}\r\n__CANOPY_COPY_END_copyid__\r\nPROMPT> "
+        );
+        session.process_output(output.as_bytes());
+
+        assert_eq!(
+            clipboard
+                .bytes
+                .lock()
+                .expect("fake clipboard lock")
+                .as_slice(),
+            b"hello from remote"
+        );
+        assert!(matches!(
+            session.overlay,
+            Some(ConnectOverlay::CopyMessage {
+                is_error: false,
+                dismissible: true,
+                ..
+            })
+        ));
+        let contents = session.parser.screen().contents();
+        assert!(contents.contains("PROMPT"));
+        assert!(!contents.contains(&encoded));
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_marker_error_shows_message_and_does_not_write_clipboard() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new("/tmp/missing.log".into(), "copyid"));
+
+        session.process_output(
+            b"__CANOPY_COPY_ERROR_copyid__\r\nnot a regular file\r\n__CANOPY_COPY_END_copyid__\r\n",
+        );
+
+        assert!(clipboard
+            .bytes
+            .lock()
+            .expect("fake clipboard lock")
+            .is_empty());
+        assert!(matches!(
+            session.overlay,
+            Some(ConnectOverlay::CopyMessage {
+                is_error: true,
+                dismissible: true,
+                ..
+            })
+        ));
+        match &session.overlay {
+            Some(ConnectOverlay::CopyMessage { message, .. }) => {
+                assert!(message.contains("not a regular file"));
+            }
+            _ => panic!("expected copy message overlay"),
+        }
         cleanup_session(session);
     }
 
