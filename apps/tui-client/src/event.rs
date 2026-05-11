@@ -41,6 +41,10 @@ pub enum Action {
     ConnectSsm(String, String, String, Option<String>), // instance_id, account_id, region, os_user
     ConnectEic(String, String, String, Option<String>), // instance_id, account_id, region, os_user
     ConnectSsh(String, String, String, Option<String>), // instance_id, account_id, region, os_user
+    ConnectSessionStdoutReady,
+    ConnectSessionFailure(String),
+    ConnectSessionUserDisconnect,
+    ConnectSessionExit,
 
     // CloudWatch
     RefreshLogGroups,
@@ -86,6 +90,7 @@ pub enum Screen {
     LiveTail,
     Access,
     Settings,
+    ConnectSession,
 }
 
 #[derive(Debug, Clone)]

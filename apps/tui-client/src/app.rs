@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use crate::api_client::{ApiClient, ApiClientError};
 use crate::components::access::AccessScreen;
 use crate::components::cloudwatch_search::CloudWatchSearchScreen;
+use crate::components::connect_session::{ConnectSessionLaunch, ConnectSessionScreen};
 use crate::components::dashboard::DashboardScreen;
 use crate::components::ec2::Ec2Screen;
 use crate::components::error_modal::ErrorModal;
@@ -34,6 +35,7 @@ pub struct App {
     live_tail: LiveTailScreen,
     access: AccessScreen,
     settings: SettingsScreen,
+    connect_session: Option<ConnectSessionScreen>,
     error_modal: ErrorModal,
 
     // Async action channel
@@ -142,6 +144,13 @@ fn set_session_countdown_title(instance_id: &str, max_secs: u64, elapsed_secs: u
     ));
 }
 
+/// Use the in-TUI PTY wrapper only when the server gave us a hard session cap.
+/// Uncapped sessions keep the legacy suspend/resume path because the wrapper's
+/// primary job is enforcing and showing the remaining session time.
+fn wrapper_session_limit(max_session_seconds: Option<u64>) -> Option<u64> {
+    max_session_seconds.filter(|secs| *secs > 0)
+}
+
 fn prompt_yes_no(prompt: &str) -> bool {
     use std::io::Write;
 
@@ -171,6 +180,7 @@ impl App {
             live_tail: LiveTailScreen::new(scrollback),
             access: AccessScreen::new(),
             settings: SettingsScreen::new(config.clone()),
+            connect_session: None,
             error_modal: ErrorModal::new(),
             config,
             api,
@@ -258,6 +268,11 @@ impl App {
             Screen::LiveTail => self.live_tail.render(area, buf),
             Screen::Access => self.access.render(area, buf),
             Screen::Settings => self.settings.render(area, buf),
+            Screen::ConnectSession => {
+                if let Some(session) = self.connect_session.as_ref() {
+                    session.render(area, buf);
+                }
+            }
         }
 
         // Render update banner (non-blocking, top of screen)
@@ -323,16 +338,27 @@ impl App {
                     Screen::LiveTail => self.live_tail.handle_key(key),
                     Screen::Access => self.access.handle_key(key),
                     Screen::Settings => self.settings.handle_key(key),
+                    Screen::ConnectSession => self
+                        .connect_session
+                        .as_mut()
+                        .map_or(Action::Noop, |session| session.handle_key(key)),
                 };
                 let _ = self.action_tx.send(action);
             }
             Event::Tick => match self.current_screen {
                 Screen::Ec2Inventory => self.ec2.on_tick(),
                 Screen::CloudWatchSearch => self.cloudwatch_search.on_tick(),
+                Screen::ConnectSession => {
+                    if let Some(session) = self.connect_session.as_mut() {
+                        session.tick();
+                    }
+                }
                 _ => {}
             },
-            Event::Resize(_, _) => {
-                // Terminal will re-render automatically
+            Event::Resize(w, h) => {
+                if let Some(session) = self.connect_session.as_mut() {
+                    session.resize(w, h);
+                }
             }
             Event::Error(msg) => {
                 let _ = self.action_tx.send(Action::ShowError(msg));
@@ -485,6 +511,25 @@ impl App {
                     terminal,
                 )
                 .await;
+            }
+            Action::ConnectSessionStdoutReady => {
+                if let Some(session) = self.connect_session.as_mut() {
+                    session.process_pending_output();
+                }
+            }
+            Action::ConnectSessionFailure(message) => {
+                if let Some(session) = self.connect_session.as_mut() {
+                    session.fail(message);
+                }
+            }
+            Action::ConnectSessionUserDisconnect => {
+                if let Some(session) = self.connect_session.as_mut() {
+                    session.disconnect();
+                }
+            }
+            Action::ConnectSessionExit => {
+                self.connect_session = None;
+                self.current_screen = Screen::Ec2Inventory;
             }
 
             // CloudWatch
@@ -643,6 +688,10 @@ impl App {
             token.cancel();
         }
         self.live_tail.set_disconnected();
+        if let Some(session) = self.connect_session.as_mut() {
+            session.disconnect();
+        }
+        self.connect_session = None;
     }
 
     fn reset_to_login(&mut self) {
@@ -741,6 +790,11 @@ impl App {
             }
             Screen::Access => self.access.on_leave(),
             Screen::Settings => self.settings.on_leave(),
+            Screen::ConnectSession => {
+                if let Some(session) = self.connect_session.as_mut() {
+                    session.disconnect();
+                }
+            }
         }
 
         self.screen_stack.push(self.current_screen.clone());
@@ -755,6 +809,7 @@ impl App {
             Screen::LiveTail => self.live_tail.on_enter(),
             Screen::Access => self.access.on_enter(),
             Screen::Settings => self.settings.on_enter(),
+            Screen::ConnectSession => vec![],
         };
 
         for action in actions {
@@ -790,6 +845,11 @@ impl App {
             }
             self.live_tail.set_disconnected();
         }
+        if matches!(self.current_screen, Screen::ConnectSession) {
+            if let Some(session) = self.connect_session.as_mut() {
+                session.disconnect();
+            }
+        }
         if let Some(prev) = self.screen_stack.pop() {
             self.current_screen = prev.clone();
             // Fire on_enter for the screen we're returning to
@@ -801,6 +861,7 @@ impl App {
                 Screen::Access => self.access.on_enter(),
                 Screen::Settings => self.settings.on_enter(),
                 Screen::Login => self.login.on_enter(),
+                Screen::ConnectSession => vec![],
             };
             for action in actions {
                 let _ = self.action_tx.send(action);
@@ -1039,7 +1100,7 @@ impl App {
             instance_id: instance_id.to_string(),
             account_id: account_id.to_string(),
             region: region.to_string(),
-            method,
+            method: method.clone(),
             os_user: os_user.map(String::from),
         };
 
@@ -1075,6 +1136,43 @@ impl App {
                             self.error_modal.show(msg);
                             return;
                         }
+                    }
+
+                    if let Some(max_session_seconds) =
+                        wrapper_session_limit(resp.max_session_seconds)
+                    {
+                        if terminal_suspended {
+                            self.resume_after_external_command(terminal);
+                        }
+
+                        let size = terminal
+                            .size()
+                            .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
+                        match ConnectSessionScreen::spawn(
+                            ConnectSessionLaunch {
+                                instance_id: instance_id.to_string(),
+                                account_id: account_id.to_string(),
+                                region: region.to_string(),
+                                method,
+                                command: resp.command,
+                                args: resp.args,
+                                env_vars: resp.env_vars,
+                                max_session_seconds,
+                                cols: size.width,
+                                rows: size.height,
+                            },
+                            self.action_tx.clone(),
+                        ) {
+                            Ok(session) => {
+                                self.connect_session = Some(session);
+                                self.current_screen = Screen::ConnectSession;
+                            }
+                            Err(e) => {
+                                self.error_modal
+                                    .show(format!("Failed to start SSH wrapper: {e}"));
+                            }
+                        }
+                        return;
                     }
 
                     // Suspend TUI, run external command, then resume.
@@ -1838,6 +1936,13 @@ mod tests {
         assert_eq!(format_session_duration(0), "00:00");
         assert_eq!(format_session_duration(65), "01:05");
         assert_eq!(format_session_duration(3661), "1:01:01");
+    }
+
+    #[test]
+    fn wrapper_session_limit_only_uses_positive_caps() {
+        assert_eq!(wrapper_session_limit(Some(3600)), Some(3600));
+        assert_eq!(wrapper_session_limit(Some(0)), None);
+        assert_eq!(wrapper_session_limit(None), None);
     }
 
     // ── Logout resets state ─────────────────────────────────
