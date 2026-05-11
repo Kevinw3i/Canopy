@@ -26,13 +26,47 @@ enum SearchMode {
     InsightsQuery,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloudWatchLoadingKind {
+    LogGroups,
+    SearchingLogs,
+    LoadingMoreEvents,
+    StartingInsightsQuery,
+    WaitingForInsightsResults,
+}
+
+impl CloudWatchLoadingKind {
+    fn message(self) -> &'static str {
+        match self {
+            Self::LogGroups => "Loading log groups...",
+            Self::SearchingLogs => "Searching CloudWatch logs...",
+            Self::LoadingMoreEvents => "Loading more events...",
+            Self::StartingInsightsQuery => "Starting Insights query...",
+            Self::WaitingForInsightsResults => "Waiting for Insights results...",
+        }
+    }
+
+    fn status_text(self, query_status: Option<&QueryStatus>) -> String {
+        match (self, query_status) {
+            (Self::WaitingForInsightsResults, Some(status)) => {
+                format!("Query status: {status:?}")
+            }
+            _ => self.message().into(),
+        }
+    }
+
+    fn uses_overlay(self) -> bool {
+        !matches!(self, Self::LoadingMoreEvents)
+    }
+}
+
 pub struct CloudWatchSearchScreen {
     pub log_groups: Vec<LogGroup>,
     pub events: Vec<LogEvent>,
     pub query_results: Vec<Vec<QueryResultField>>,
     pub query_status: Option<QueryStatus>,
     pub query_id: Option<String>,
-    pub loading: bool,
+    loading: Option<CloudWatchLoadingKind>,
     pub error: Option<String>,
 
     // Entitlement-derived scope for CloudWatch queries
@@ -87,7 +121,7 @@ impl CloudWatchSearchScreen {
             query_results: Vec::new(),
             query_status: None,
             query_id: None,
-            loading: false,
+            loading: None,
             error: None,
             selected_account_id: String::new(),
             selected_region: String::new(),
@@ -171,7 +205,7 @@ impl CloudWatchSearchScreen {
         }
         self.log_groups = groups;
         self.refilter_log_groups();
-        self.loading = false;
+        self.loading = None;
         self.error = None;
     }
 
@@ -269,7 +303,7 @@ impl CloudWatchSearchScreen {
         // accidentally use old query_results instead of the new events.
         self.query_results.clear();
         self.query_id = None;
-        self.loading = false;
+        self.loading = None;
         self.error = None;
     }
 
@@ -280,11 +314,12 @@ impl CloudWatchSearchScreen {
         self.table.set_row_count(self.events.len());
         self.last_next_token = next_token;
         self.has_more = self.last_next_token.is_some();
-        self.loading = false;
+        self.loading = None;
         self.error = None;
     }
 
     pub fn set_query_results(&mut self, results: GetQueryResultsResponse) {
+        let is_terminal = results.status.is_terminal();
         self.query_status = Some(results.status);
         self.table.set_row_count(results.results.len());
         self.query_results = results.results;
@@ -295,13 +330,22 @@ impl CloudWatchSearchScreen {
         // switch into Insights so a stale token can't drive a wrong page.
         self.last_next_token = None;
         self.has_more = false;
-        self.loading = false;
+        if is_terminal {
+            self.loading = None;
+        } else {
+            self.set_loading(CloudWatchLoadingKind::WaitingForInsightsResults);
+        }
         self.error = None;
     }
 
-    pub fn set_loading(&mut self) {
-        self.loading = true;
+    pub(crate) fn set_loading(&mut self, kind: CloudWatchLoadingKind) {
+        self.loading = Some(kind);
+        self.loading_spinner.set_message(kind.message());
         self.error = None;
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading.is_some()
     }
 
     /// Bump log-group fetch generation. Called only when starting a log-group refresh.
@@ -310,7 +354,7 @@ impl CloudWatchSearchScreen {
     }
 
     pub fn set_error(&mut self, err: String) {
-        self.loading = false;
+        self.loading = None;
         self.error = Some(err);
     }
 
@@ -523,7 +567,7 @@ impl Component for CloudWatchSearchScreen {
             // → open the custom-range modal.
             KeyCode::Char('R')
                 if !matches!(self.focus, CwFocus::QueryInput | CwFocus::LogGroupFilter)
-                    && !self.loading =>
+                    && !self.is_loading() =>
             {
                 self.time_range_modal = Some(TimeRangeModal::open(&self.time_range));
                 Action::Noop
@@ -589,7 +633,7 @@ impl Component for CloudWatchSearchScreen {
             KeyCode::Char('n')
                 if matches!(self.focus, CwFocus::ResultsTable)
                     && self.has_more
-                    && !self.loading =>
+                    && !self.is_loading() =>
             {
                 Action::LoadMoreFilterResults
             }
@@ -825,11 +869,8 @@ impl Component for CloudWatchSearchScreen {
         self.render_event_detail(result_chunks[1], buf);
 
         // Status bar
-        let status = if self.loading {
-            match &self.query_status {
-                Some(qs) => format!("Query status: {:?}", qs),
-                None => "Searching...".into(),
-            }
+        let status = if let Some(kind) = self.loading {
+            kind.status_text(self.query_status.as_ref())
         } else if let Some(ref err) = self.error {
             format!("Error: {}", err)
         } else {
@@ -860,8 +901,12 @@ impl Component for CloudWatchSearchScreen {
             })
             .render(right_chunks[3], buf);
 
-        // Loading overlay (first load, no data yet)
-        if self.loading && self.log_groups.is_empty() {
+        // Loading overlay for log-group fetches, searches, pagination, and Insights polling.
+        if self
+            .loading
+            .map(CloudWatchLoadingKind::uses_overlay)
+            .unwrap_or(false)
+        {
             self.loading_spinner.render_overlay(inner, buf);
         }
 
@@ -877,7 +922,7 @@ impl Component for CloudWatchSearchScreen {
     }
 
     fn on_tick(&mut self) {
-        if self.loading {
+        if self.is_loading() {
             self.loading_spinner.tick();
         }
         if let Some(ref mut t) = self.scope_transition {
@@ -898,6 +943,7 @@ impl Component for CloudWatchSearchScreen {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use ratatui::prelude::{Buffer, Rect};
     use shared::dto::entitlements::*;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -960,6 +1006,26 @@ mod tests {
         ]
     }
 
+    fn rendered_text(screen: &mut CloudWatchSearchScreen) -> String {
+        let area = Rect::new(0, 0, 120, 32);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut out = String::new();
+        for cell in &buf.content {
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
+    fn query_response(status: QueryStatus) -> GetQueryResultsResponse {
+        GetQueryResultsResponse {
+            status,
+            results: vec![],
+            statistics: None,
+        }
+    }
+
     // ── Entitlements ──
 
     #[test]
@@ -983,7 +1049,7 @@ mod tests {
 
         assert_eq!(screen.selected_log_group, "/app/web-service");
         assert_eq!(screen.filtered_indices.len(), 3);
-        assert!(!screen.loading);
+        assert!(!screen.is_loading());
     }
 
     #[test]
@@ -1183,7 +1249,7 @@ mod tests {
 
         assert_eq!(screen.events.len(), 1);
         assert!(screen.query_results.is_empty());
-        assert!(!screen.loading);
+        assert!(!screen.is_loading());
     }
 
     #[test]
@@ -1238,13 +1304,80 @@ mod tests {
     fn loading_and_error_state() {
         let mut screen = CloudWatchSearchScreen::new();
 
-        screen.set_loading();
-        assert!(screen.loading);
+        screen.set_loading(CloudWatchLoadingKind::SearchingLogs);
+        assert_eq!(screen.loading, Some(CloudWatchLoadingKind::SearchingLogs));
         assert!(screen.error.is_none());
 
         screen.set_error("timeout".into());
-        assert!(!screen.loading);
+        assert!(!screen.is_loading());
         assert_eq!(screen.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn search_loading_overlay_renders_message() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_log_groups(test_log_groups());
+        screen.set_loading(CloudWatchLoadingKind::SearchingLogs);
+
+        assert!(rendered_text(&mut screen).contains("Searching CloudWatch logs..."));
+    }
+
+    #[test]
+    fn log_group_loading_overlay_still_renders_message() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_loading(CloudWatchLoadingKind::LogGroups);
+
+        assert!(rendered_text(&mut screen).contains("Loading log groups..."));
+    }
+
+    #[test]
+    fn load_more_loading_keeps_existing_events_and_uses_status_bar_only() {
+        let mut screen = CloudWatchSearchScreen::new();
+        screen.set_log_groups(test_log_groups());
+        screen.set_events(vec![ev(1, "existing")], Some("tok-1".into()));
+
+        screen.set_loading(CloudWatchLoadingKind::LoadingMoreEvents);
+
+        assert_eq!(screen.events.len(), 1);
+        let rendered = rendered_text(&mut screen);
+        assert!(rendered.contains("Loading more events..."));
+        assert!(!rendered.contains("[=   ] Loading more events..."));
+    }
+
+    #[test]
+    fn insights_non_terminal_status_keeps_loading() {
+        for status in [
+            QueryStatus::Scheduled,
+            QueryStatus::Running,
+            QueryStatus::Unknown,
+        ] {
+            let mut screen = CloudWatchSearchScreen::new();
+            screen.set_loading(CloudWatchLoadingKind::WaitingForInsightsResults);
+
+            screen.set_query_results(query_response(status));
+
+            assert_eq!(
+                screen.loading,
+                Some(CloudWatchLoadingKind::WaitingForInsightsResults)
+            );
+        }
+    }
+
+    #[test]
+    fn insights_terminal_status_stops_loading() {
+        for status in [
+            QueryStatus::Complete,
+            QueryStatus::Failed,
+            QueryStatus::Cancelled,
+            QueryStatus::Timeout,
+        ] {
+            let mut screen = CloudWatchSearchScreen::new();
+            screen.set_loading(CloudWatchLoadingKind::WaitingForInsightsResults);
+
+            screen.set_query_results(query_response(status));
+
+            assert!(!screen.is_loading());
+        }
     }
 
     // ── Time range (B + C) ──
@@ -1341,7 +1474,7 @@ mod tests {
     fn shift_r_ignored_while_loading() {
         let mut screen = CloudWatchSearchScreen::new();
         screen.focus = CwFocus::LogGroupList;
-        screen.loading = true;
+        screen.set_loading(CloudWatchLoadingKind::SearchingLogs);
 
         screen.handle_key(key_shift(KeyCode::Char('R')));
         assert!(screen.time_range_modal.is_none());
@@ -1536,7 +1669,7 @@ mod tests {
         let mut screen = CloudWatchSearchScreen::new();
         screen.focus = CwFocus::ResultsTable;
         screen.set_events(vec![ev(1, "a")], Some("tok-1".into()));
-        screen.set_loading();
+        screen.set_loading(CloudWatchLoadingKind::LoadingMoreEvents);
 
         let action = screen.handle_key(key(KeyCode::Char('n')));
         assert!(!matches!(action, Action::LoadMoreFilterResults));

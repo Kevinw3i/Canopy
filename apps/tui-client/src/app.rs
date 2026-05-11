@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::api_client::{ApiClient, ApiClientError};
 use crate::components::access::AccessScreen;
-use crate::components::cloudwatch_search::CloudWatchSearchScreen;
+use crate::components::cloudwatch_search::{CloudWatchLoadingKind, CloudWatchSearchScreen};
 use crate::components::connect_session::{ConnectSessionLaunch, ConnectSessionScreen};
 use crate::components::dashboard::DashboardScreen;
 use crate::components::ec2::Ec2Screen;
@@ -1438,7 +1438,8 @@ impl App {
             token.cancel();
         }
 
-        self.cloudwatch_search.set_loading();
+        self.cloudwatch_search
+            .set_loading(CloudWatchLoadingKind::LogGroups);
         self.cloudwatch_search.advance_fetch_generation();
         let api = self.api.clone();
         let tx = self.action_tx.clone();
@@ -1488,7 +1489,11 @@ impl App {
             return;
         }
 
-        self.cloudwatch_search.set_loading();
+        self.cloudwatch_search.set_loading(if append {
+            CloudWatchLoadingKind::LoadingMoreEvents
+        } else {
+            CloudWatchLoadingKind::SearchingLogs
+        });
         let (start_time, end_time) = self
             .cloudwatch_search
             .time_range
@@ -1536,7 +1541,8 @@ impl App {
             return;
         }
 
-        self.cloudwatch_search.set_loading();
+        self.cloudwatch_search
+            .set_loading(CloudWatchLoadingKind::StartingInsightsQuery);
         let (start_time, end_time) = self.cloudwatch_search.time_range.resolve_insights_window();
 
         let req = shared::dto::cloudwatch::StartInsightsQueryRequest {
@@ -1551,6 +1557,8 @@ impl App {
         match self.api.start_insights_query(&req).await {
             Ok(resp) => {
                 self.cloudwatch_search.query_id = Some(resp.query_id.clone());
+                self.cloudwatch_search
+                    .set_loading(CloudWatchLoadingKind::WaitingForInsightsResults);
                 let _ = self.action_tx.send(Action::PollQueryResults(resp.query_id));
             }
             Err(e) => {
@@ -1573,13 +1581,7 @@ impl App {
 
         match self.api.get_query_results(&req).await {
             Ok(resp) => {
-                let is_complete = matches!(
-                    resp.status,
-                    shared::dto::cloudwatch::QueryStatus::Complete
-                        | shared::dto::cloudwatch::QueryStatus::Failed
-                        | shared::dto::cloudwatch::QueryStatus::Cancelled
-                        | shared::dto::cloudwatch::QueryStatus::Timeout
-                );
+                let is_complete = resp.status.is_terminal();
                 self.cloudwatch_search.set_query_results(resp);
                 if !is_complete {
                     // Poll again after delay

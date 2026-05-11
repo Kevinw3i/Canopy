@@ -5,7 +5,7 @@ use ratatui::{
 
 /// Loading spinner animation
 pub struct LoadingIndicator {
-    pub message: String,
+    message: String,
     frame: usize,
 }
 
@@ -23,6 +23,10 @@ impl LoadingIndicator {
 
     pub fn tick(&mut self) {
         self.frame = (self.frame + 1) % SPINNER_FRAMES.len();
+    }
+
+    pub fn set_message(&mut self, message: &str) {
+        self.message = message.into();
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
