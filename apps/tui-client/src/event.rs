@@ -38,9 +38,27 @@ pub enum Action {
     Ec2Loaded(Vec<shared::dto::ec2::Ec2Instance>, Vec<String>, u64), // instances, failed_scopes, generation
     Ec2FetchFailed(String, u64),                                     // error message, generation
     SelectInstance(usize),
-    ConnectSsm(String, String, String, Option<String>), // instance_id, account_id, region, os_user
-    ConnectEic(String, String, String, Option<String>), // instance_id, account_id, region, os_user
-    ConnectSsh(String, String, String, Option<String>), // instance_id, account_id, region, os_user
+    ConnectSsm {
+        instance_id: String,
+        instance_name: Option<String>,
+        account_id: String,
+        region: String,
+        os_user: Option<String>,
+    },
+    ConnectEic {
+        instance_id: String,
+        instance_name: Option<String>,
+        account_id: String,
+        region: String,
+        os_user: Option<String>,
+    },
+    ConnectSsh {
+        instance_id: String,
+        instance_name: Option<String>,
+        account_id: String,
+        region: String,
+        os_user: Option<String>,
+    },
     ConnectSessionStdoutReady,
     ConnectSessionFailure(String),
     ConnectSessionUserDisconnect,

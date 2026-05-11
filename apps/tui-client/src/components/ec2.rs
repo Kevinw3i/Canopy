@@ -22,6 +22,7 @@ enum Ec2Focus {
 /// Pending connect action waiting for OS user selection
 struct PendingConnect {
     instance_id: String,
+    instance_name: Option<String>,
     account_id: String,
     region: String,
     /// Which connect method triggered this (Ssm, Ec2InstanceConnect, Ssh)
@@ -30,6 +31,14 @@ struct PendingConnect {
     users: Vec<String>,
     /// Currently highlighted user index
     selected: usize,
+}
+
+struct ConnectDispatchTarget {
+    instance_id: String,
+    instance_name: Option<String>,
+    account_id: String,
+    region: String,
+    os_user: Option<String>,
 }
 
 /// Which instances to show based on state
@@ -455,23 +464,43 @@ impl Ec2Screen {
             .unwrap_or_default();
 
         let instance_id = inst.instance_id.clone();
+        let instance_name = inst.name.clone();
         let account_id = inst.account_id.clone();
         let region = inst.region.clone();
 
         if users.is_empty() {
             // No OS users configured — connect without one (SSM shell only)
-            return self.dispatch_connect(method, instance_id, account_id, region, None);
+            return self.dispatch_connect(
+                method,
+                ConnectDispatchTarget {
+                    instance_id,
+                    instance_name,
+                    account_id,
+                    region,
+                    os_user: None,
+                },
+            );
         }
 
         if users.len() == 1 {
             // Only one choice — skip popup
             let user = users[0].clone();
-            return self.dispatch_connect(method, instance_id, account_id, region, Some(user));
+            return self.dispatch_connect(
+                method,
+                ConnectDispatchTarget {
+                    instance_id,
+                    instance_name,
+                    account_id,
+                    region,
+                    os_user: Some(user),
+                },
+            );
         }
 
         // Multiple users — show selection popup
         self.pending_connect = Some(PendingConnect {
             instance_id,
+            instance_name,
             account_id,
             region,
             method,
@@ -552,21 +581,30 @@ impl Ec2Screen {
     fn dispatch_connect(
         &self,
         method: shared::dto::ec2::ConnectMethod,
-        instance_id: String,
-        account_id: String,
-        region: String,
-        os_user: Option<String>,
+        target: ConnectDispatchTarget,
     ) -> Action {
         match method {
-            shared::dto::ec2::ConnectMethod::Ssm => {
-                Action::ConnectSsm(instance_id, account_id, region, os_user)
-            }
-            shared::dto::ec2::ConnectMethod::Ec2InstanceConnect => {
-                Action::ConnectEic(instance_id, account_id, region, os_user)
-            }
-            shared::dto::ec2::ConnectMethod::Ssh => {
-                Action::ConnectSsh(instance_id, account_id, region, os_user)
-            }
+            shared::dto::ec2::ConnectMethod::Ssm => Action::ConnectSsm {
+                instance_id: target.instance_id,
+                instance_name: target.instance_name,
+                account_id: target.account_id,
+                region: target.region,
+                os_user: target.os_user,
+            },
+            shared::dto::ec2::ConnectMethod::Ec2InstanceConnect => Action::ConnectEic {
+                instance_id: target.instance_id,
+                instance_name: target.instance_name,
+                account_id: target.account_id,
+                region: target.region,
+                os_user: target.os_user,
+            },
+            shared::dto::ec2::ConnectMethod::Ssh => Action::ConnectSsh {
+                instance_id: target.instance_id,
+                instance_name: target.instance_name,
+                account_id: target.account_id,
+                region: target.region,
+                os_user: target.os_user,
+            },
         }
     }
 }
@@ -606,6 +644,7 @@ impl Component for Ec2Screen {
                         let user = pending.users[pending.selected].clone();
                         let method = pending.method.clone();
                         let instance_id = pending.instance_id.clone();
+                        let instance_name = pending.instance_name.clone();
                         let account_id = pending.account_id.clone();
                         let region = pending.region.clone();
                         self.pending_connect = None;
@@ -616,10 +655,13 @@ impl Component for Ec2Screen {
                         };
                         return self.dispatch_connect(
                             method,
-                            instance_id,
-                            account_id,
-                            region,
-                            Some(user),
+                            ConnectDispatchTarget {
+                                instance_id,
+                                instance_name,
+                                account_id,
+                                region,
+                                os_user: Some(user),
+                            },
                         );
                     }
                     _ => return Action::Noop,
