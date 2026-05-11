@@ -1,5 +1,6 @@
 pub mod access;
 pub mod cloudwatch_search;
+pub mod connect_session;
 pub mod dashboard;
 pub mod ec2;
 pub mod error_modal;
