@@ -143,6 +143,65 @@ impl OutputBuffer {
     }
 }
 
+#[derive(Debug, Default)]
+struct TerminalResponseCallbacks {
+    responses: Vec<u8>,
+}
+
+impl TerminalResponseCallbacks {
+    fn take_responses(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.responses)
+    }
+
+    fn push_cursor_position_report(&mut self, screen: &vt100::Screen, private: bool) {
+        let (row, col) = screen.cursor_position();
+        if private {
+            self.responses.extend_from_slice(
+                format!("\x1b[?{};{}R", row.saturating_add(1), col.saturating_add(1)).as_bytes(),
+            );
+        } else {
+            self.responses.extend_from_slice(
+                format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1)).as_bytes(),
+            );
+        }
+    }
+}
+
+impl vt100::Callbacks for TerminalResponseCallbacks {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        i1: Option<u8>,
+        i2: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        if i2.is_some() {
+            return;
+        }
+
+        let first_param = csi_first_param(params);
+        match (i1, c, first_param) {
+            // Reline/readline asks for the current cursor position with DSR.
+            // Without this response, Rails console can block after drawing the prompt.
+            (None, 'n', 5) => self.responses.extend_from_slice(b"\x1b[0n"),
+            (None, 'n', 6) => self.push_cursor_position_report(screen, false),
+            (Some(b'?'), 'n', 6) => self.push_cursor_position_report(screen, true),
+            (None, 'c', 0) => self.responses.extend_from_slice(b"\x1b[?1;2c"),
+            (Some(b'>'), 'c', 0) => self.responses.extend_from_slice(b"\x1b[>0;0;0c"),
+            _ => {}
+        }
+    }
+}
+
+fn csi_first_param(params: &[&[u16]]) -> u16 {
+    params
+        .first()
+        .and_then(|param| param.first())
+        .copied()
+        .unwrap_or(0)
+}
+
 pub(crate) struct ConnectSessionScreen {
     instance_id: String,
     instance_name: Option<String>,
@@ -152,7 +211,7 @@ pub(crate) struct ConnectSessionScreen {
     max_session_seconds: u64,
     started_at: Instant,
     status: ConnectSessionStatus,
-    parser: vt100::Parser,
+    parser: vt100::Parser<TerminalResponseCallbacks>,
     output_buffer: Arc<Mutex<OutputBuffer>>,
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -237,7 +296,12 @@ impl ConnectSessionScreen {
             max_session_seconds: launch.max_session_seconds,
             started_at: Instant::now(),
             status: ConnectSessionStatus::Connecting,
-            parser: vt100::Parser::new(pty_rows, pty_cols, 1000),
+            parser: vt100::Parser::new_with_callbacks(
+                pty_rows,
+                pty_cols,
+                1000,
+                TerminalResponseCallbacks::default(),
+            ),
             output_buffer,
             master: pair.master,
             writer,
@@ -288,6 +352,13 @@ impl ConnectSessionScreen {
         }
 
         self.parser.process(&bytes);
+        let terminal_responses = self.parser.callbacks_mut().take_responses();
+        if !terminal_responses.is_empty() {
+            if let Err(e) = self.write_to_pty(&terminal_responses) {
+                self.fail(e);
+                return;
+            }
+        }
         if self.status == ConnectSessionStatus::Connecting {
             self.status = ConnectSessionStatus::Connected;
         }
@@ -403,15 +474,8 @@ impl ConnectSessionScreen {
         self.reset_scrollback();
 
         if let Some(bytes) = self.key_to_pty_bytes(key) {
-            let write_result = match self.writer.lock() {
-                Ok(mut writer) => writer.write_all(&bytes).and_then(|_| writer.flush()),
-                Err(e) => {
-                    tracing::error!(error = %e, "PTY writer mutex poisoned");
-                    return Action::ConnectSessionFailure(format!("PTY writer unavailable: {e}"));
-                }
-            };
-            if let Err(e) = write_result {
-                return Action::ConnectSessionFailure(format!("Write to PTY failed: {e}"));
+            if let Err(e) = self.write_to_pty(&bytes) {
+                return Action::ConnectSessionFailure(e);
             }
         }
         Action::Noop
@@ -427,15 +491,8 @@ impl ConnectSessionScreen {
         }
 
         let bytes = bracketed_paste_bytes(text);
-        let write_result = match self.writer.lock() {
-            Ok(mut writer) => writer.write_all(&bytes).and_then(|_| writer.flush()),
-            Err(e) => {
-                tracing::error!(error = %e, "PTY writer mutex poisoned");
-                return Action::ConnectSessionFailure(format!("PTY writer unavailable: {e}"));
-            }
-        };
-        if let Err(e) = write_result {
-            return Action::ConnectSessionFailure(format!("Write to PTY failed: {e}"));
+        if let Err(e) = self.write_to_pty(&bytes) {
+            return Action::ConnectSessionFailure(e);
         }
         Action::Noop
     }
@@ -789,6 +846,19 @@ impl ConnectSessionScreen {
 
     fn key_to_pty_bytes(&self, key: KeyEvent) -> Option<Vec<u8>> {
         key_to_pty_bytes(key, self.parser.screen().application_cursor())
+    }
+
+    fn write_to_pty(&self, bytes: &[u8]) -> Result<(), String> {
+        match self.writer.lock() {
+            Ok(mut writer) => writer
+                .write_all(bytes)
+                .and_then(|_| writer.flush())
+                .map_err(|e| format!("Write to PTY failed: {e}")),
+            Err(e) => {
+                tracing::error!(error = %e, "PTY writer mutex poisoned");
+                Err(format!("PTY writer unavailable: {e}"))
+            }
+        }
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
@@ -1786,6 +1856,32 @@ mod tests {
         assert_eq!(
             key_to_pty_bytes(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), false),
             Some(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn terminal_response_callbacks_reply_to_cursor_position_report() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, TerminalResponseCallbacks::default());
+
+        parser.process(b"abc\x1b[6n");
+
+        assert_eq!(
+            parser.callbacks_mut().take_responses(),
+            b"\x1b[1;4R".to_vec()
+        );
+    }
+
+    #[test]
+    fn terminal_response_callbacks_reply_to_device_status_and_attributes() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 1000, TerminalResponseCallbacks::default());
+
+        parser.process(b"\x1b[5n\x1b[c\x1b[>c");
+
+        assert_eq!(
+            parser.callbacks_mut().take_responses(),
+            b"\x1b[0n\x1b[?1;2c\x1b[>0;0;0c".to_vec()
         );
     }
 
