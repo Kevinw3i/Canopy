@@ -33,6 +33,25 @@ can_use_cloudwatch_search = true
 can_use_cloudwatch_tail = true
 can_use_ssm = true
 can_use_ec2_instance_connect = true
+# ── MCP / AI tools ─────────────────────────────────
+# can_use_mcp 是 MCP 總開關。開啟後使用者可在 TUI 的
+# "MCP / AI Tools" 頁面啟動本機 MCP server，並連接 Codex CLI
+# 或 Claude Code。
+#
+# Product Phase 1 提供 MCP 基礎工具：
+#   - canopy_describe_capabilities
+#   - canopy_get_guidance
+# 並可在 can_use_mcp_database=true 且 database_scopes 授權時
+# 啟用 MCP Database v1。
+#
+# CloudWatch / EC2 MCP data tools 是後續 phase；不要因為使用者
+# 有 TUI CloudWatch 權限就自動開 MCP CloudWatch。
+can_use_mcp = true
+can_use_mcp_cloudwatch = false
+can_use_mcp_ec2 = false
+# MCP Database v1 是獨立權限。開啟後仍需要下方
+# [[rules.database_scopes]] 授權具體 connection / schema / table。
+can_use_mcp_database = false
 # ── Power actions（start / stop / reboot）─────────────
 # 預設 false。若要授權，建議用下方獨立 rule + 獨立
 # `CanopyOperatorRole`，**不要**直接在這個 read/connect
@@ -51,6 +70,70 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # account_id = "<ACCOUNT_ID_2>"
 # account_name = "staging"
 # role_arn = "arn:aws:iam::<ACCOUNT_ID_2>:role/CanopyRole"
+
+# MCP Database v1 範例（取消註解前，必須先在 config.toml 或 Terraform
+# database_connections_toml 設定同名 connection，並讓 ECS task role 可讀
+# 該 Secrets Manager secret）。
+#
+# Also set `can_use_mcp_database = true` in this rule's [rules.features].
+#
+# [[rules.database_scopes]]
+# name = "orders_prod_readonly"
+# connection = "orders_prod"
+# environment = "production"
+# # IMPORTANT: allowed_schemas / allowed_tables must be lowercase ASCII.
+# # The control-plane rejects mixed-case identifiers from MCP queries up
+# # front to avoid silently conflating e.g. `orders` and `Orders` on MySQL
+# # deployments with lower_case_table_names=0.
+# # Leaving allowed_schemas = [] still enforces the connection's default
+# # database — explicit cross-database qualifiers are denied.
+# allowed_schemas = ["orders"]
+# allowed_tables = ["orders", "order_items"]
+# allowed_actions = ["select"]
+# max_rows = 100
+# statement_timeout_ms = 5000
+# require_explain = true
+# max_examined_rows = 10000
+# allow_full_table_scan = false
+#
+# # OPT-IN: allow MCP queries to read VIEW objects in this scope.
+# #
+# # Default behavior (`allow_views = false`): the MDL-protected query
+# # pipeline acquires `MDL_SHARED_READ` on every referenced object,
+# # reads `information_schema.tables` on the same connection, and
+# # REJECTS the query if any referenced object is not `BASE TABLE`.
+# # The reason: a view can
+# #   1. expand into base tables OUTSIDE this scope's allowed_schemas,
+# #   2. run under a privileged DEFINER (bypassing the readonly user),
+# #   3. hide a query plan that bypasses EXPLAIN row-cap / full-scan
+# #      guards (because EXPLAIN reports the view's outer access type,
+# #      not the rewritten base-table plan).
+# #
+# # Behavior with `allow_views = true`: every scope still goes through
+# # the SAME MDL-protected pipeline — EXPLAIN and the user SELECT run
+# # on one connection inside one transaction, blocking concurrent DDL
+# # between them. The only thing the flag changes is the offender
+# # check at the end of the type-resolve step: VIEW / SYSTEM VIEW
+# # results no longer trigger a rejection. Information_schema is still
+# # queried so the audit record can report which objects were touched.
+# #
+# # Set `allow_views = true` ONLY after the operator has:
+# #   * reviewed every view that this scope can reach,
+# #   * confirmed each view's DEFINER does not exceed the readonly user,
+# #   * confirmed the view's base tables stay inside this scope's
+# #     allowed_schemas (or are themselves intended for query access),
+# #   * documented why the view is preferred over querying the base
+# #     tables directly.
+# #
+# # Hard cap, independent of this flag: at most
+# # `MAX_VIEW_TARGETS_PER_QUERY = 32` distinct (schema, table) pairs
+# # may appear in a single SELECT. A query that joins more than 32
+# # tables/views will be refused before any database round-trip.
+# #
+# # The audit record for every query against this scope will include
+# # `views_allowed = true`, so reviewers can grep the audit stream to
+# # find scopes that took the opt-in.
+# allow_views = false
 
 # 只顯示特定 tag 的機器（取消註解啟用）：
 # [[rules.instance_tag_selectors]]
@@ -117,6 +200,10 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # can_use_cloudwatch_tail = false
 # can_use_ssm = false
 # can_use_ec2_instance_connect = false
+# can_use_mcp = false
+# can_use_mcp_cloudwatch = false
+# can_use_mcp_ec2 = false
+# can_use_mcp_database = false
 #
 # [[rules.allowed_accounts]]
 # account_id = "<ACCOUNT_ID>"

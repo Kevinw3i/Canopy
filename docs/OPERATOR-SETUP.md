@@ -112,6 +112,159 @@ cd canopy-dist
 canopy
 ```
 
+### 使用 MCP / AI Tools
+
+若管理員在 `entitlements.toml` 中授權：
+
+```toml
+[rules.features]
+can_use_mcp = true
+```
+
+使用者登入 TUI 後會看到 `MCP / AI Tools` 頁面。
+
+操作流程：
+
+1. 進入 `MCP / AI Tools`
+2. 按 `e` 啟動本機 MCP server
+3. TUI 會先檢查 `/healthz`
+4. health check 成功後選擇 `Codex CLI` 或 `Claude Code`
+5. TUI 會開一個新的 macOS Terminal 視窗啟動對應 AI client
+
+目前 Product Phase 1 提供 MCP 基礎工具：
+
+- `canopy_describe_capabilities`
+- `canopy_get_guidance`
+
+並可在明確啟用時提供 MCP Database v1。CloudWatch / EC2 data tools 尚未開放。即使使用者有
+`can_use_cloudwatch_search = true`，也不會自動取得 MCP CloudWatch
+查詢權限；後續會由獨立的 `can_use_mcp_cloudwatch` 與 control-plane MCP
+專用 route 控制。
+
+MCP Database v1 若啟用，會多兩個工具：
+
+- `canopy_list_database_scopes`
+- `canopy_query_database`
+
+啟用條件：
+
+```toml
+[rules.features]
+can_use_mcp = true
+can_use_mcp_database = true
+
+[[rules.database_scopes]]
+name = "orders_prod_readonly"
+connection = "orders_prod"
+environment = "production"
+allowed_schemas = ["orders"]
+allowed_tables = ["orders", "order_items"]
+allowed_actions = ["select"]
+max_rows = 100
+statement_timeout_ms = 5000
+require_explain = true
+max_examined_rows = 10000
+allow_full_table_scan = false
+allow_views = false  # 預設拒絕 VIEW；opt-in 之前請看下方 checklist
+```
+
+connection 本身設定在 control-plane `config.toml` 或 Terraform
+`database_connections_toml`。密碼只放 Secrets Manager，secret JSON 固定：
+
+```json
+{"username":"canopy_readonly","password":"..."}
+```
+
+執行查詢前 control-plane 會先做 SELECT-only SQL validation，接著跑
+`EXPLAIN FORMAT=JSON`。若沒有合理索引路徑、掃描量超過 scope 限制、
+或 EXPLAIN 失敗，真正的 SELECT 不會執行。raw SQL 會進 audit，audit
+讀取權限要視為敏感權限。
+
+---
+
+## MCP Database operator hardening
+
+啟用 `can_use_mcp_database = true` 之前，建議完成以下設定。
+
+### 1. 在唯讀 DB role 上加 `wait_timeout`（強烈建議）
+
+Control-plane 內部已對每個請求做 wall-clock bounding（caller 端最壞
+~23 秒：semaphore queue + connect + work + cleanup），但 mysql_async
+的 `Drop for Conn` 會 spawn 背景 cleanup task，**server-side MDL 可能
+在 caller 已 return 後仍被持有少量時間**。把唯讀 DB role 的 session
+`wait_timeout` 設低可以鎖死這個殘餘窗口：
+
+```sql
+-- MySQL 8.x 或相容版本
+CREATE USER 'canopy_readonly'@'%' IDENTIFIED BY '...';
+GRANT SELECT ON orders.* TO 'canopy_readonly'@'%';
+GRANT SELECT ON information_schema.tables TO 'canopy_readonly'@'%';
+
+-- 建議值：60–120 秒。預設 28800（8 小時）對自動清理無幫助。
+ALTER USER 'canopy_readonly'@'%' WITH MAX_USER_CONNECTIONS 16;
+SET PERSIST_ONLY init_connect = 'SET SESSION wait_timeout = 120';
+```
+
+`MAX_USER_CONNECTIONS` 也建議設一個保守上限，這樣 MySQL 在飽和時會
+回 1203 (`ER_TOO_MANY_USER_CONNECTIONS`)，Canopy 會把它翻成
+**HTTP 503 + `database_connection_unavailable`**（不是 500）。
+client/SDK 看到 503 應做指數退避，不要當應用 bug 派人。
+
+### 2. `max_connections` 設保守
+
+Connection 池上限在 control-plane `config.toml` 的
+`database_connections_toml` 設定：
+
+```toml
+[orders_prod]
+host = "..."
+database = "orders"
+secret_arn = "..."
+readonly = true
+max_connections = 8          # per control-plane process
+connect_timeout_ms = 3000    # 同時是 503 queue/connect timeout 預算
+statement_timeout_ms = 5000
+explain_timeout_ms = 3000
+```
+
+超過 `max_connections` 的請求會排隊 `connect_timeout_ms`，超過後回
+**HTTP 503 + `connection_queue_full`**。
+
+### 3. TLS 絕對不要關
+
+預設 `require_tls = true`。`accept_invalid_tls_certs` /
+`skip_tls_hostname_verification` 兩個 flag **只用於本機開發**。production
+配置碰任一就應該被 review reject。
+
+### 4. `allow_views = true` opt-in checklist
+
+只有在以下都成立才把 scope 的 `allow_views` 設 `true`：
+
+- [ ] 已列出這個 scope 透過 `allowed_tables` 可觸及的所有 VIEW
+- [ ] 每個 VIEW 的 `DEFINER` user **不**超過 `canopy_readonly` 權限
+- [ ] 每個 VIEW 的 base tables **都**落在 scope 的 `allowed_schemas` 內，
+      或這些 base tables 本來就允許查
+- [ ] 文件化「為什麼用 VIEW 不直接 query base tables」
+- [ ] 在 audit 監控加一條規則：`views_allowed=true` 的查詢加重審
+
+注意：即使 `allow_views=true`，view-guard pipeline 仍然執行（MDL 保護、
+EXPLAIN 評估、SELECT 在同一個 transaction），只是不會在 information_schema
+看到 VIEW 時 reject。每個查詢的 (schema, table) 對數仍受
+`MAX_VIEW_TARGETS_PER_QUERY = 32` 上限。
+
+### 5. Audit 監控訊號
+
+關鍵 `mcp_outcome_kind` 值（更多請看 `docs/AUDIT-SCHEMA.md`）：
+
+| Outcome kind | HTTP | 應對 |
+|---|---|---|
+| `connection_queue_full` | 503 | Client 應指數退避；可能要調 `max_connections` |
+| `database_connection_unavailable` | 503 | MySQL/RDS Proxy 飽和（1037/1040/1041/1203）；查 server-side 容量 |
+| `view_not_allowed_by_scope` | 400 | 使用者試圖查 view 而 scope 沒開 |
+| `view_swap_detected_between_checks` | 400 | 罕見；意味查詢期間有 DDL；查 migration 時間表 |
+| `full_table_scan` / `max_examined_rows` | 400 | 缺索引或查詢太寬；不是 bug |
+| `database_execution_failed` | 500 | 真實錯誤；要派人 |
+
 ---
 
 ## 安裝腳本做了什麼

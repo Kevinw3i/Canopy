@@ -48,6 +48,8 @@ impl EntitlementStore {
         let mut excluded_tag_selectors: Vec<TagSelector> = Vec::new();
         let mut allowed_os_users: Vec<String> = Vec::new();
         let mut max_session_seconds: Option<u64> = None;
+        let mut database_scopes: Vec<DatabaseScope> = Vec::new();
+        let mut ambiguous_database_scope_keys: Vec<DatabaseScopeKey> = Vec::new();
 
         for rule in &matching_rules {
             // Additive merge for feature flags
@@ -74,6 +76,10 @@ impl EntitlementStore {
             features.can_start_ec2 |= rule.features.can_start_ec2;
             features.can_stop_ec2 |= rule.features.can_stop_ec2;
             features.can_reboot_ec2 |= rule.features.can_reboot_ec2;
+            features.can_use_mcp |= rule.features.can_use_mcp;
+            features.can_use_mcp_cloudwatch |= rule.features.can_use_mcp_cloudwatch;
+            features.can_use_mcp_ec2 |= rule.features.can_use_mcp_ec2;
+            features.can_use_mcp_database |= rule.features.can_use_mcp_database;
 
             for acct in &rule.allowed_accounts {
                 // Dedup by (account_id, role_arn) so that two groups
@@ -123,6 +129,16 @@ impl EntitlementStore {
                         Some(max_session_seconds.map_or(secs, |existing| existing.min(secs)));
                 }
             }
+
+            if rule.features.can_use_mcp && rule.features.can_use_mcp_database {
+                for scope in &rule.database_scopes {
+                    push_unambiguous_database_scope(
+                        &mut database_scopes,
+                        &mut ambiguous_database_scope_keys,
+                        scope,
+                    );
+                }
+            }
         }
 
         UserEntitlements {
@@ -138,7 +154,82 @@ impl EntitlementStore {
             excluded_tag_selectors,
             allowed_os_users,
             max_session_seconds,
+            database_scopes,
         }
+    }
+
+    pub fn matching_database_scope(
+        &self,
+        user_id: &str,
+        email: &str,
+        email_verified: bool,
+        scope_name: &str,
+        connection: Option<&str>,
+        environment: Option<&str>,
+    ) -> Option<DatabaseScope> {
+        let user_groups: Vec<String> = self
+            .memberships
+            .iter()
+            .filter(|m| m.user_id == user_id || (email_verified && m.user_id == email))
+            .map(|m| m.group.clone())
+            .collect();
+
+        let matches = self
+            .rules
+            .iter()
+            .filter(|rule| {
+                user_groups.contains(&rule.group)
+                    && rule.features.can_use_mcp
+                    && rule.features.can_use_mcp_database
+            })
+            .flat_map(|rule| rule.database_scopes.iter())
+            .filter(|scope| {
+                scope.name == scope_name
+                    && connection.is_none_or(|value| scope.connection == value)
+                    && environment.is_none_or(|value| scope.environment == value)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut unique_matches = Vec::new();
+        for scope in matches {
+            if !unique_matches.contains(&scope) {
+                unique_matches.push(scope);
+            }
+        }
+
+        if unique_matches.len() == 1 {
+            unique_matches.pop()
+        } else {
+            None
+        }
+    }
+
+    pub fn database_scopes_for_user(
+        &self,
+        user_id: &str,
+        email: &str,
+        email_verified: bool,
+    ) -> Vec<DatabaseScope> {
+        let user_groups: Vec<String> = self
+            .memberships
+            .iter()
+            .filter(|m| m.user_id == user_id || (email_verified && m.user_id == email))
+            .map(|m| m.group.clone())
+            .collect();
+
+        let mut scopes = Vec::new();
+        let mut ambiguous_scope_keys = Vec::new();
+        for rule in self.rules.iter().filter(|rule| {
+            user_groups.contains(&rule.group)
+                && rule.features.can_use_mcp
+                && rule.features.can_use_mcp_database
+        }) {
+            for scope in &rule.database_scopes {
+                push_unambiguous_database_scope(&mut scopes, &mut ambiguous_scope_keys, scope);
+            }
+        }
+        scopes
     }
 
     /// Check if a user has a *single rule* that grants the given feature
@@ -290,6 +381,9 @@ impl EntitlementStore {
                     rule.group
                 );
             }
+            for scope in &rule.database_scopes {
+                validate_database_scope_identifiers(&rule.id, scope)?;
+            }
         }
 
         Ok(store)
@@ -308,6 +402,9 @@ impl EntitlementStore {
                         can_use_cloudwatch_tail: true,
                         can_use_ssm: true,
                         can_use_ec2_instance_connect: true,
+                        can_use_mcp: true,
+                        can_use_mcp_cloudwatch: true,
+                        can_use_mcp_database: true,
                         ..Default::default()
                     },
                     allowed_accounts: vec![
@@ -340,6 +437,20 @@ impl EntitlementStore {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec!["ec2-user".into(), "ubuntu".into()],
                     max_session_seconds: None, // no limit for admin
+                    database_scopes: vec![DatabaseScope {
+                        name: "orders_prod_readonly".into(),
+                        connection: "orders_prod".into(),
+                        environment: "production".into(),
+                        allowed_schemas: vec!["orders".into()],
+                        allowed_tables: vec!["orders".into(), "order_items".into()],
+                        allowed_actions: vec!["select".into()],
+                        max_rows: 100,
+                        statement_timeout_ms: 5000,
+                        require_explain: true,
+                        max_examined_rows: 10000,
+                        allow_full_table_scan: false,
+                        allow_views: false,
+                    }],
                 },
                 EntitlementRule {
                     id: "rule-platform-eng-power".into(),
@@ -377,6 +488,7 @@ impl EntitlementStore {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec![],
                     max_session_seconds: None,
+                    database_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-readonly".into(),
@@ -387,6 +499,8 @@ impl EntitlementStore {
                         can_use_cloudwatch_tail: false,
                         can_use_ssm: false,
                         can_use_ec2_instance_connect: false,
+                        can_use_mcp: true,
+                        can_use_mcp_cloudwatch: true,
                         ..Default::default()
                     },
                     allowed_accounts: vec![AllowedAccount {
@@ -404,6 +518,7 @@ impl EntitlementStore {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec![],
                     max_session_seconds: Some(3600), // 60 min for readonly
+                    database_scopes: vec![],
                 },
             ],
             memberships: vec![
@@ -418,6 +533,74 @@ impl EntitlementStore {
             ],
         }
     }
+}
+
+/// Refuse to load an entitlement file whose database scope identifiers are
+/// not lowercase ASCII. The query-side validator already rejects mixed-case
+/// table/schema references; symmetrically rejecting them on the entitlement
+/// side closes the gap where `allowed_tables = ["Orders"]` would be silently
+/// normalized to `orders` and let a lowercase `orders` query through on
+/// case-sensitive MySQL servers.
+fn validate_database_scope_identifiers(rule_id: &str, scope: &DatabaseScope) -> anyhow::Result<()> {
+    fn check(kind: &str, rule_id: &str, scope: &DatabaseScope, ident: &str) -> anyhow::Result<()> {
+        if ident.chars().any(|c| c.is_ascii_uppercase()) {
+            anyhow::bail!(
+                "Rule '{rule_id}' database scope '{scope_name}' has {kind} '{ident}' \
+                 with uppercase characters. Identifiers must be lowercase ASCII so the \
+                 control-plane never silently conflates case-sensitive MySQL table names.",
+                scope_name = scope.name
+            );
+        }
+        Ok(())
+    }
+    for schema in &scope.allowed_schemas {
+        check("allowed_schema", rule_id, scope, schema)?;
+    }
+    for table in &scope.allowed_tables {
+        check("allowed_table", rule_id, scope, table)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DatabaseScopeKey {
+    name: String,
+    connection: String,
+    environment: String,
+}
+
+impl From<&DatabaseScope> for DatabaseScopeKey {
+    fn from(scope: &DatabaseScope) -> Self {
+        Self {
+            name: scope.name.clone(),
+            connection: scope.connection.clone(),
+            environment: scope.environment.clone(),
+        }
+    }
+}
+
+fn push_unambiguous_database_scope(
+    scopes: &mut Vec<DatabaseScope>,
+    ambiguous_keys: &mut Vec<DatabaseScopeKey>,
+    scope: &DatabaseScope,
+) {
+    let key = DatabaseScopeKey::from(scope);
+    if ambiguous_keys.contains(&key) {
+        return;
+    }
+
+    if let Some(existing_index) = scopes
+        .iter()
+        .position(|existing| DatabaseScopeKey::from(existing) == key)
+    {
+        if scopes[existing_index] != *scope {
+            scopes.remove(existing_index);
+            ambiguous_keys.push(key);
+        }
+        return;
+    }
+
+    scopes.push(scope.clone());
 }
 
 #[cfg(test)]
@@ -440,6 +623,11 @@ mod tests {
         assert!(ent.features.can_start_ec2);
         assert!(ent.features.can_stop_ec2);
         assert!(ent.features.can_reboot_ec2);
+        assert!(ent.features.can_use_mcp);
+        assert!(ent.features.can_use_mcp_cloudwatch);
+        assert!(!ent.features.can_use_mcp_ec2);
+        assert!(ent.features.can_use_mcp_database);
+        assert_eq!(ent.database_scopes.len(), 1);
         assert_eq!(ent.allowed_accounts.len(), 4);
         assert_eq!(ent.allowed_regions.len(), 3);
     }
@@ -456,6 +644,10 @@ mod tests {
         assert!(!ent.features.can_start_ec2);
         assert!(!ent.features.can_stop_ec2);
         assert!(!ent.features.can_reboot_ec2);
+        assert!(ent.features.can_use_mcp);
+        assert!(ent.features.can_use_mcp_cloudwatch);
+        assert!(!ent.features.can_use_mcp_ec2);
+        assert!(!ent.features.can_use_mcp_database);
         assert_eq!(ent.allowed_accounts.len(), 1);
         assert_eq!(ent.allowed_regions.len(), 1);
     }
@@ -484,6 +676,9 @@ mod tests {
         assert!(ent.features.can_start_ec2);
         assert!(ent.features.can_stop_ec2);
         assert!(ent.features.can_reboot_ec2);
+        assert!(ent.features.can_use_mcp);
+        assert!(ent.features.can_use_mcp_cloudwatch);
+        assert!(ent.features.can_use_mcp_database);
         // 5 account entries: two read/connect roles, two operator roles,
         // plus the readonly staging role (distinct role ARNs are preserved).
         assert_eq!(ent.allowed_accounts.len(), 5);
@@ -566,6 +761,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
             max_session_seconds: None,
+            database_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -581,6 +777,137 @@ mod tests {
             })
             .count();
         assert_eq!(prod_count, 1, "Same account+role should appear only once");
+    }
+
+    #[test]
+    fn test_matching_database_scope_deduplicates_identical_grants() {
+        let mut store = test_store();
+        let scope = store.rules[0].database_scopes[0].clone();
+        store.rules.push(EntitlementRule {
+            id: "rule-duplicate-db-scope".into(),
+            group: "duplicate-db-scope".into(),
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_database: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![],
+            allowed_regions: vec![],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![scope.clone()],
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "duplicate-db-scope".into(),
+        });
+
+        let matched = store
+            .matching_database_scope(
+                "dev-admin",
+                "admin@example.com",
+                true,
+                "orders_prod_readonly",
+                Some("orders_prod"),
+                Some("production"),
+            )
+            .unwrap();
+        assert_eq!(matched, scope);
+
+        let listed = store.database_scopes_for_user("dev-admin", "admin@example.com", true);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], scope);
+    }
+
+    #[test]
+    fn test_database_scope_list_hides_ambiguous_policy_grants() {
+        let mut store = test_store();
+        let mut conflicting_scope = store.rules[0].database_scopes[0].clone();
+        conflicting_scope.max_rows = 50;
+        conflicting_scope.allowed_tables = vec!["orders".into()];
+        store.rules.push(EntitlementRule {
+            id: "rule-conflicting-db-scope".into(),
+            group: "conflicting-db-scope".into(),
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_database: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![],
+            allowed_regions: vec![],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![conflicting_scope],
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "conflicting-db-scope".into(),
+        });
+
+        assert!(store
+            .matching_database_scope(
+                "dev-admin",
+                "admin@example.com",
+                true,
+                "orders_prod_readonly",
+                Some("orders_prod"),
+                Some("production"),
+            )
+            .is_none());
+
+        let listed = store.database_scopes_for_user("dev-admin", "admin@example.com", true);
+        assert!(
+            listed.is_empty(),
+            "scope list should not advertise a scope that query would reject as ambiguous"
+        );
+
+        let ent = store.evaluate("dev-admin", "admin@example.com", "Admin", true);
+        assert!(
+            ent.database_scopes.is_empty(),
+            "merged entitlements should follow the same ambiguity policy as database query matching"
+        );
+    }
+
+    #[test]
+    fn test_database_scopes_require_same_rule_database_feature() {
+        let mut store = test_store();
+        let leaked_scope = store.rules[0].database_scopes[0].clone();
+        store.rules[0].database_scopes.clear();
+        store.rules.push(EntitlementRule {
+            id: "rule-db-scope-without-feature".into(),
+            group: "db-scope-without-feature".into(),
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_database: false,
+                ..Default::default()
+            },
+            allowed_accounts: vec![],
+            allowed_regions: vec![],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![leaked_scope],
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "db-scope-without-feature".into(),
+        });
+
+        let ent = store.evaluate("dev-admin", "admin@example.com", "Admin", true);
+
+        assert!(ent.features.can_use_mcp_database);
+        assert!(
+            ent.database_scopes.is_empty(),
+            "database scopes must come from the same matching rule that grants can_use_mcp_database"
+        );
     }
 
     #[test]
@@ -631,6 +958,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
             max_session_seconds: None,
+            database_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -666,6 +994,51 @@ mod tests {
         // "DEV-ADMIN" != "dev-admin" → no groups, no permissions
         assert!(ent.groups.is_empty());
         assert!(!ent.features.can_view_ec2);
+    }
+
+    #[test]
+    fn uppercase_database_scope_identifier_rejected_at_load_time() {
+        // The runtime validator rejects mixed-case table identifiers in
+        // queries, and the entitlement side must reject the same mixed-case
+        // spelling instead of silently lowercasing it. Now `load_from_file`
+        // refuses to accept an `allowed_tables` entry that contains uppercase
+        // characters, so a hand-written TOML typo can never get the server to
+        // authorize `orders` on the basis of a grant for `Orders` on
+        // case-sensitive MySQL deployments.
+        let bad_scope = DatabaseScope {
+            name: "orders_prod_readonly".into(),
+            connection: "orders_prod".into(),
+            environment: "production".into(),
+            allowed_schemas: vec!["orders".into()],
+            allowed_tables: vec!["Orders".into()],
+            allowed_actions: vec!["select".into()],
+            max_rows: 100,
+            statement_timeout_ms: 5000,
+            require_explain: true,
+            max_examined_rows: 10000,
+            allow_full_table_scan: false,
+            allow_views: false,
+        };
+        let err = super::validate_database_scope_identifiers("rule-bad", &bad_scope)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("uppercase"),
+            "expected uppercase rejection, got: {err}"
+        );
+
+        let bad_schema = DatabaseScope {
+            allowed_schemas: vec!["Orders".into()],
+            allowed_tables: vec!["orders".into()],
+            ..bad_scope
+        };
+        let err = super::validate_database_scope_identifiers("rule-bad", &bad_schema)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("uppercase"),
+            "expected uppercase rejection, got: {err}"
+        );
     }
 
     #[test]

@@ -92,10 +92,74 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
     use crate::services::audit::AuditService;
+    use crate::services::database::{
+        DatabaseExecutor, DatabaseSecret, DatabaseSecretProvider, QueryRows, TableType,
+        TableTypeQuery, ViewCheckedQueryOutcome,
+    };
     use crate::services::oidc::OidcClient;
+    use async_trait::async_trait;
     use axum::{body::Body, middleware as axum_mw, routing::get, Router};
     use http_body_util::BodyExt;
+    use shared::dto::database::ExplainSummary;
+    use std::collections::HashMap;
     use tower::ServiceExt;
+
+    struct TestDatabaseSecretProvider;
+
+    #[async_trait]
+    impl DatabaseSecretProvider for TestDatabaseSecretProvider {
+        async fn load_secret(&self, _secret_arn: &str) -> anyhow::Result<DatabaseSecret> {
+            anyhow::bail!("database secret provider should not be called in auth tests")
+        }
+    }
+
+    struct TestDatabaseExecutor;
+
+    #[async_trait]
+    impl DatabaseExecutor for TestDatabaseExecutor {
+        async fn explain(
+            &self,
+            _connection: &crate::config::DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _sql: &str,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<ExplainSummary> {
+            anyhow::bail!("database executor should not be called in auth tests")
+        }
+
+        async fn query(
+            &self,
+            _connection: &crate::config::DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _sql: &str,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<QueryRows> {
+            anyhow::bail!("database executor should not be called in auth tests")
+        }
+
+        async fn fetch_table_types(
+            &self,
+            _connection: &crate::config::DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _tables: &[TableTypeQuery],
+            _timeout_ms: u64,
+        ) -> anyhow::Result<HashMap<(String, String), TableType>> {
+            anyhow::bail!("database executor should not be called in auth tests")
+        }
+
+        async fn query_with_view_check(
+            &self,
+            _connection: &crate::config::DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _scope: &shared::dto::entitlements::DatabaseScope,
+            _view_targets: &[TableTypeQuery],
+            _sql: &str,
+            _explain_timeout_ms: u64,
+            _statement_timeout_ms: u64,
+        ) -> anyhow::Result<ViewCheckedQueryOutcome> {
+            anyhow::bail!("database executor should not be called in auth tests")
+        }
+    }
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -120,6 +184,7 @@ mod tests {
                 session_duration_seconds: Some(3600),
                 sts_external_id: Some("canopy".into()),
             },
+            database_connections: HashMap::new(),
             dev_mode: true,
             mock_aws_data: None,
             entitlements_file: None,
@@ -141,6 +206,9 @@ mod tests {
             audit_service: AuditService::new(),
             oidc_client: OidcClient::new(test_config().oidc),
             base_aws_config,
+            database_secret_provider: Arc::new(TestDatabaseSecretProvider),
+            database_executor: Arc::new(TestDatabaseExecutor),
+            mcp_sessions: dashmap::DashMap::new(),
             ready: std::sync::atomic::AtomicBool::new(true),
         })
     }

@@ -580,6 +580,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec!["ec2-user".into(), "ubuntu".into()],
             max_session_seconds: None,
+            database_scopes: vec![],
         }
     }
 
@@ -610,6 +611,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
             max_session_seconds: Some(3600),
+            database_scopes: vec![],
         }
     }
 
@@ -835,7 +837,7 @@ mod tests {
         let ent = platform_eng_entitlements();
         let tags = prod_instance_tags();
         let creds = AssumedRoleCredentials {
-            access_key_id: "ASIATEST123".into(),
+            access_key_id: "TEST_ACCESS_KEY_ID".into(),
             secret_access_key: "secret123".into(),
             session_token: "token123".into(),
         };
@@ -850,7 +852,7 @@ mod tests {
         assert!(resp.authorized);
         assert_eq!(
             resp.env_vars.get("AWS_ACCESS_KEY_ID").unwrap(),
-            "ASIATEST123"
+            "TEST_ACCESS_KEY_ID"
         );
         assert_eq!(
             resp.env_vars.get("AWS_SECRET_ACCESS_KEY").unwrap(),

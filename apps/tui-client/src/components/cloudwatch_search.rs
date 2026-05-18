@@ -1374,6 +1374,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
             max_session_seconds: None,
+            database_scopes: vec![],
         }
     }
 

@@ -208,6 +208,29 @@ can_use_cloudwatch_search = true  # 可以搜尋 CloudWatch 日誌
 can_use_cloudwatch_tail = true    # 可以使用 Live Tail
 can_use_ssm = true                # 可以透過 SSM Session Manager 連線
 can_use_ec2_instance_connect = true  # 可以透過 EC2 Instance Connect 連線
+can_use_mcp = true                # 可以啟動本機 MCP / AI Tools server
+can_use_mcp_cloudwatch = false    # 預留給 MCP CloudWatch data tools
+can_use_mcp_ec2 = false           # 預留給未來 MCP EC2 tools
+can_use_mcp_database = true       # 搭配下方 scope 使用 MCP Database tools
+
+# 可選：MCP Database v1 scope。v1 只支援 MySQL，且只允許 SELECT。
+# connection 必須存在於 config.toml / Terraform database_connections_toml，
+# 密碼只能放 Secrets Manager。
+[[rules.database_scopes]]
+name = "orders_prod_readonly"
+connection = "orders_prod"
+environment = "production"
+allowed_schemas = ["orders"]
+allowed_tables = ["orders", "order_items"]
+allowed_actions = ["select"]
+max_rows = 100
+statement_timeout_ms = 5000
+require_explain = true
+max_examined_rows = 10000
+allow_full_table_scan = false
+# 預設拒絕 VIEW。要設 true 之前，operator 必須完成 review checklist —
+# 詳見 entitlements.sample.toml 與 docs/OPERATOR-SETUP.md。
+allow_views = false
 
 [[rules.allowed_accounts]]
 account_id = "123456789012"
@@ -361,6 +384,15 @@ cp entitlements.dev.toml entitlements.toml
 - `[[memberships]]` 中的 `user_id` → 真實的 OIDC 使用者識別（通常是 email）
 - `allowed_regions` → 真實的 AWS 區域
 - `allowed_log_group_arns` → 真實的 Log Group ARN 樣式
+- `can_use_mcp` → 開啟 TUI 的 `MCP / AI Tools` 頁面，讓使用者用本機 Codex/Claude 連到 Canopy MCP
+
+MCP 權限刻意和一般 TUI 權限分開：
+
+- `can_use_mcp` 是本機 MCP server 的總開關。
+- `can_use_mcp_cloudwatch` 不會跟隨 `can_use_cloudwatch_search`；這是獨立的 MCP feature gate。
+- `can_use_mcp_database` 只是在 MCP 開 DB tools；真正能查哪些 DB / schema / table，要看同一條 matching rule 裡的 `[[rules.database_scopes]]`。
+- Product Phase 1 提供 MCP 基礎工具（`canopy_describe_capabilities`、`canopy_get_guidance`），並在明確啟用時提供 MCP Database v1。CloudWatch 查詢必須等後續 MCP 專用 control-plane route 上線。
+- MCP Database v1 提供 `canopy_list_database_scopes` 與 `canopy_query_database`，只允許 MySQL read-only `SELECT`。control-plane 會在執行前強制檢查 SQL、table scope、`LIMIT`、Secrets Manager 憑證與 `EXPLAIN FORMAT=JSON`。MCP response 不會回傳 DB host、secret ARN、username 或 password。view-guard **預設拒絕 VIEW**：所有 query 都會在 MDL-protected transaction 內把 EXPLAIN、type re-check、SELECT 跑在同一條 connection；要允許 VIEW 需在 scope 設 `allow_views = true` 並完成 DEFINER / base-table review。Connection 池飽和會回 HTTP 503（`connection_queue_full` / `database_connection_unavailable`），不是 500 — operator 加固 checklist 請見 `docs/OPERATOR-SETUP.md`。
 
 ### 第四步：設定 OIDC 提供者
 

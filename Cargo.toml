@@ -31,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-ec2 = "1"
 aws-sdk-cloudwatchlogs = "1"
+aws-sdk-secretsmanager = "1"
 aws-sdk-sts = "1"
 aws-sdk-iam = "1"
 aws-credential-types = "1"
@@ -47,6 +48,10 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+async-trait = "0.1"
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust", "rustls-tls"] }
+sqlparser = { version = "0.41", features = ["visitor"] }
+subtle = "2"
 
 # TUI
 ratatui = "0.28"

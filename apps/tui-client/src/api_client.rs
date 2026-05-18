@@ -6,10 +6,17 @@ use reqwest::{
 use serde::de::DeserializeOwned;
 use shared::dto::auth::*;
 use shared::dto::cloudwatch::*;
+use shared::dto::database::*;
 use shared::dto::ec2::*;
 use shared::dto::entitlements::UserEntitlements;
+use shared::dto::mcp::{
+    McpGuidanceSyncRequest, McpGuidanceSyncResponse, McpRegisterSessionRequest,
+    McpRegisterSessionResponse,
+};
 use shared::errors::ApiError;
 use shared::headers;
+
+use crate::build_info;
 
 pub type ApiResult<T> = std::result::Result<T, ApiClientError>;
 
@@ -44,13 +51,10 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static(concat!("canopy-tui/", env!("CARGO_PKG_VERSION"))),
-        );
+        headers.insert(USER_AGENT, HeaderValue::from_str(&Self::user_agent())?);
         headers.insert(
             headers::CANOPY_TUI_VERSION,
-            HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+            HeaderValue::from_str(Self::tui_version())?,
         );
 
         Ok(Self {
@@ -63,11 +67,11 @@ impl ApiClient {
     }
 
     pub fn tui_version() -> &'static str {
-        env!("CARGO_PKG_VERSION")
+        build_info::version()
     }
 
-    pub fn user_agent() -> &'static str {
-        concat!("canopy-tui/", env!("CARGO_PKG_VERSION"))
+    pub fn user_agent() -> String {
+        build_info::user_agent()
     }
 
     pub fn set_token(&mut self, token: String) {
@@ -301,6 +305,76 @@ impl ApiClient {
         let mut req = self
             .client
             .post(format!("{}/api/cloudwatch/insights/results", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    // ── MCP local server support ───────────────────────
+
+    pub async fn register_mcp_session(
+        &self,
+        request: &McpRegisterSessionRequest,
+    ) -> ApiResult<McpRegisterSessionResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/session/register", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn sync_mcp_guidance(
+        &self,
+        request: &McpGuidanceSyncRequest,
+    ) -> ApiResult<McpGuidanceSyncResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/guidance/delivered", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn list_mcp_database_scopes(
+        &self,
+        request: &ListDatabaseScopesRequest,
+    ) -> ApiResult<ListDatabaseScopesResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/database/scopes", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn query_mcp_database(
+        &self,
+        request: &QueryDatabaseRequest,
+    ) -> ApiResult<QueryDatabaseResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/database/query", self.base_url))
             .json(request);
 
         if let Some(ref auth) = self.auth_header() {

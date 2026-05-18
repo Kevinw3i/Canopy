@@ -2,6 +2,7 @@ use anyhow::Result;
 use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
 use shared::dto::entitlements::UserEntitlements;
+use std::process::Command;
 use tokio::sync::mpsc;
 
 use crate::api_client::{ApiClient, ApiClientError};
@@ -13,11 +14,13 @@ use crate::components::ec2::Ec2Screen;
 use crate::components::error_modal::ErrorModal;
 use crate::components::live_tail::LiveTailScreen;
 use crate::components::login::LoginScreen;
+use crate::components::mcp::McpScreen;
 use crate::components::settings::SettingsScreen;
 use crate::components::Component;
 use crate::config::ClientConfig;
 use crate::event::{Action, Event, EventReader, Screen};
 use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRunner};
+use crate::mcp::McpRuntime;
 use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
@@ -38,6 +41,7 @@ pub struct App {
     live_tail: LiveTailScreen,
     access: AccessScreen,
     settings: SettingsScreen,
+    mcp: McpScreen,
     connect_session: Option<ConnectSessionScreen>,
     error_modal: ErrorModal,
 
@@ -54,6 +58,7 @@ pub struct App {
 
     // Cancellation token for the live tail background task
     live_tail_cancel: Option<tokio_util::sync::CancellationToken>,
+    mcp_runtime: Option<McpRuntime>,
 
     // Auto-update banner message, shown until dismissed
     update_banner: Option<String>,
@@ -116,6 +121,19 @@ fn should_retry_api_error(err: &ApiClientError) -> bool {
 const TOKEN_EXPIRED_MODAL_MESSAGE: &str =
     "Your session has expired. Please sign in again.\n\nPress Enter to return to the login screen.";
 
+/// Prefix for the Codex / Claude MCP server name we register on the user's
+/// behalf. The actual registered name embeds the TUI PID so two concurrent
+/// Canopy sessions cannot stomp on each other AND a user's own pre-existing
+/// MCP entry called `canopy` is never deleted by Canopy's launcher cleanup.
+const MCP_AI_CLIENT_SERVER_NAME_PREFIX: &str = "canopy-session";
+
+fn mcp_ai_client_server_name() -> String {
+    format!(
+        "{}-{}",
+        MCP_AI_CLIENT_SERVER_NAME_PREFIX,
+        std::process::id()
+    )
+}
 const SESSION_COUNTDOWN_WIDTH: u64 = 20;
 
 fn format_session_duration(secs: u64) -> String {
@@ -181,6 +199,12 @@ struct ConnectTarget<'a> {
     os_user: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAiClient {
+    Codex,
+    Claude,
+}
+
 fn prompt_yes_no(prompt: &str) -> bool {
     use std::io::Write;
 
@@ -193,6 +217,156 @@ fn prompt_yes_no(prompt: &str) -> bool {
     }
 
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn prompt_mcp_ai_client() -> Result<Option<McpAiClient>, String> {
+    use std::io::Write;
+
+    println!("\n== Canopy MCP AI launcher ==");
+    println!("MCP health check passed.");
+    println!("\nChoose AI client:");
+    println!("  1) Codex CLI");
+    println!("  2) Claude Code");
+    println!("  q) Cancel");
+    print!("Start which client? [1/2/q]: ");
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("Failed to write prompt: {err}"))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("Failed to read choice: {err}"))?;
+
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "codex" | "c" => Ok(Some(McpAiClient::Codex)),
+        "2" | "claude" => Ok(Some(McpAiClient::Claude)),
+        "q" | "quit" | "cancel" | "" => Ok(None),
+        other => Err(format!("Invalid AI client choice: {other}")),
+    }
+}
+
+fn resolve_command(program: &str) -> Result<String, String> {
+    let output = Command::new("sh")
+        .args(["-lc", "command -v \"$1\"", "sh", program])
+        .output()
+        .map_err(|err| format!("Failed to resolve command '{program}': {err}"))?;
+    if !output.status.success() {
+        return Err(format!("Required command '{program}' not found in PATH."));
+    }
+
+    let resolved = String::from_utf8(output.stdout)
+        .map_err(|err| format!("Resolved command path is not UTF-8: {err}"))?
+        .trim()
+        .to_string();
+    if resolved.is_empty() {
+        Err(format!("Required command '{program}' not found in PATH."))
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn write_temp_claude_mcp_config(
+    endpoint: &str,
+    authorization_header: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!(
+        "canopy-claude-mcp-{}.json",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let body = serde_json::json!({
+        "mcpServers": {
+            (mcp_ai_client_server_name()): {
+                "type": "http",
+                "url": endpoint,
+                "headers": {
+                    "Authorization": authorization_header,
+                }
+            }
+        }
+    });
+    let data = serde_json::to_vec_pretty(&body)
+        .map_err(|err| format!("Failed to encode temporary Claude MCP config: {err}"))?;
+    write_temp_file_private(&path, &data, 0o600)
+        .map_err(|err| format!("Failed to write temporary Claude MCP config: {err}"))?;
+
+    Ok(path)
+}
+
+fn write_temp_launch_script(name: &str, body: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!(
+        "canopy-{name}-{}.command",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    write_temp_file_private(&path, body.as_bytes(), 0o700)
+        .map_err(|err| format!("Failed to write temporary {name} launch script: {err}"))?;
+
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn write_temp_file_private(path: &std::path::Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    file.write_all(data)
+}
+
+#[cfg(not(unix))]
+fn write_temp_file_private(path: &std::path::Path, data: &[u8], _mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data)
+}
+
+fn open_new_terminal_window(script_path: &std::path::Path) -> Result<(), String> {
+    let script = script_path
+        .to_str()
+        .ok_or_else(|| "Temporary launch script path is not UTF-8.".to_string())?;
+
+    if cfg!(target_os = "macos") {
+        let command = shell_single_quote(script);
+        let script = format!(
+            "tell application \"Terminal\" to do script {}",
+            applescript_string(&command)
+        );
+        let status = Command::new("osascript")
+            .args([
+                "-e",
+                "tell application \"Terminal\" to activate",
+                "-e",
+                &script,
+            ])
+            .status()
+            .map_err(|err| format!("Failed to open Terminal.app: {err}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("Failed to open a new Terminal.app window.".into())
+        }
+    } else {
+        Err(
+            "Launching a new terminal window is currently implemented for macOS Terminal.app only."
+                .into(),
+        )
+    }
 }
 
 impl App {
@@ -210,6 +384,7 @@ impl App {
             live_tail: LiveTailScreen::new(scrollback),
             access: AccessScreen::new(),
             settings: SettingsScreen::new(config.clone()),
+            mcp: McpScreen::new(),
             connect_session: None,
             error_modal: ErrorModal::new(),
             config,
@@ -224,6 +399,7 @@ impl App {
             ec2_fetch_cancel: None,
             cw_fetch_cancel: None,
             live_tail_cancel: None,
+            mcp_runtime: None,
             update_banner: None,
             session_expired_pending_login: false,
         })
@@ -300,6 +476,7 @@ impl App {
                 Screen::LiveTail => self.live_tail.render(area, buf),
                 Screen::Access => self.access.render(area, buf),
                 Screen::Settings => self.settings.render(area, buf),
+                Screen::Mcp => self.mcp.render(area, buf),
                 Screen::ConnectSession => {
                     if let Some(session) = self.connect_session.as_ref() {
                         session.render(area, buf);
@@ -378,6 +555,7 @@ impl App {
                     Screen::LiveTail => self.live_tail.handle_key(key),
                     Screen::Access => self.access.handle_key(key),
                     Screen::Settings => self.settings.handle_key(key),
+                    Screen::Mcp => self.mcp.handle_key(key),
                     Screen::ConnectSession => self
                         .connect_session
                         .as_mut()
@@ -398,6 +576,7 @@ impl App {
                     Screen::LiveTail => self.live_tail.handle_paste(&text),
                     Screen::Access => self.access.handle_paste(&text),
                     Screen::Settings => self.settings.handle_paste(&text),
+                    Screen::Mcp => self.mcp.handle_paste(&text),
                     Screen::ConnectSession => self
                         .connect_session
                         .as_mut()
@@ -429,6 +608,7 @@ impl App {
     async fn handle_action(&mut self, action: Action, terminal: &mut Tui) {
         match action {
             Action::Quit => {
+                self.stop_mcp_runtime();
                 self.running = false;
             }
             Action::NavigateTo(screen) => {
@@ -775,6 +955,36 @@ impl App {
                 self.live_tail.push_event(event);
             }
 
+            // MCP local server
+            Action::EnableMcp => {
+                self.start_mcp_runtime(terminal, true).await;
+            }
+            Action::StopMcp => {
+                self.stop_mcp_runtime();
+            }
+            Action::RestartMcp => {
+                self.stop_mcp_runtime();
+                self.start_mcp_runtime(terminal, true).await;
+            }
+            Action::TestMcp => {
+                self.test_mcp_runtime().await;
+            }
+            Action::McpStarted(status) => {
+                self.mcp.set_running(&status);
+            }
+            Action::McpStartFailed(error) => {
+                self.mcp.set_error(error);
+            }
+            Action::McpStopped => {
+                self.mcp.set_stopped();
+            }
+            Action::McpHealthChecked(result) => match result {
+                Ok(()) => self
+                    .mcp
+                    .set_status_line("Health check OK; server responded successfully.".into()),
+                Err(error) => self.mcp.set_error(error),
+            },
+
             // Dashboard
             Action::FetchPublicIp => {
                 self.dashboard.ip_fetch_generation += 1;
@@ -856,6 +1066,7 @@ impl App {
             session.disconnect();
         }
         self.connect_session = None;
+        self.stop_mcp_runtime();
     }
 
     fn cancel_cloudwatch_request(&mut self) {
@@ -962,6 +1173,7 @@ impl App {
             }
             Screen::Access => self.access.on_leave(),
             Screen::Settings => self.settings.on_leave(),
+            Screen::Mcp => self.mcp.on_leave(),
             Screen::ConnectSession => {
                 if let Some(session) = self.connect_session.as_mut() {
                     session.disconnect();
@@ -981,6 +1193,7 @@ impl App {
             Screen::LiveTail => self.live_tail.on_enter(),
             Screen::Access => self.access.on_enter(),
             Screen::Settings => self.settings.on_enter(),
+            Screen::Mcp => self.mcp.on_enter(),
             Screen::ConnectSession => vec![],
         };
 
@@ -1033,6 +1246,7 @@ impl App {
                 Screen::LiveTail => self.live_tail.on_enter(),
                 Screen::Access => self.access.on_enter(),
                 Screen::Settings => self.settings.on_enter(),
+                Screen::Mcp => self.mcp.on_enter(),
                 Screen::Login => self.login.on_enter(),
                 Screen::ConnectSession => vec![],
             };
@@ -1047,7 +1261,223 @@ impl App {
         self.ec2.set_entitlements(ent.clone());
         self.cloudwatch_search.set_entitlements(ent.clone());
         self.access.set_entitlements(ent.clone());
+        self.mcp.set_entitlements(ent.clone());
         self.entitlements = Some(ent);
+    }
+
+    async fn start_mcp_runtime(&mut self, terminal: &mut Tui, launch_client: bool) {
+        if let Some(runtime) = self.mcp_runtime.as_ref() {
+            self.mcp.set_running(runtime.status());
+            if launch_client {
+                self.launch_mcp_ai_client(terminal).await;
+            }
+            return;
+        }
+
+        let Some(entitlements) = self.entitlements.clone() else {
+            self.mcp
+                .set_error("Entitlements are not loaded; sign in again.".into());
+            return;
+        };
+
+        self.mcp.set_starting();
+        match McpRuntime::start(self.api.clone(), entitlements).await {
+            Ok(runtime) => {
+                let status = runtime.status().clone();
+                self.mcp.set_running(&status);
+                self.mcp_runtime = Some(runtime);
+                if launch_client {
+                    self.launch_mcp_ai_client(terminal).await;
+                }
+            }
+            Err(error) => {
+                self.mcp.set_error(error.to_string());
+            }
+        }
+    }
+
+    fn stop_mcp_runtime(&mut self) {
+        if let Some(runtime) = self.mcp_runtime.take() {
+            if let Err(error) = runtime.stop() {
+                self.mcp
+                    .set_error(format!("Failed to stop MCP server: {error}"));
+                return;
+            }
+        }
+        self.mcp.set_stopped();
+    }
+
+    async fn test_mcp_runtime(&mut self) {
+        let Some(runtime) = self.mcp_runtime.as_ref() else {
+            self.mcp.set_error("MCP server is not running.".into());
+            return;
+        };
+
+        let result = self.mcp_health_check(runtime).await.map(|_| ());
+
+        match result {
+            Ok(()) => self
+                .mcp
+                .set_status_line("Health check OK; server responded successfully.".into()),
+            Err(error) => self.mcp.set_error(error.to_string()),
+        }
+    }
+
+    async fn mcp_health_check(
+        &self,
+        runtime: &McpRuntime,
+    ) -> Result<(crate::mcp::McpSessionFile, String)> {
+        let status = runtime.status();
+        let raw = std::fs::read_to_string(&status.session_file)?;
+        let session: crate::mcp::McpSessionFile = serde_json::from_str(&raw)?;
+        let health_url = status.stable_endpoint.replace("/mcp", "/healthz");
+
+        let response = reqwest::Client::new()
+            .get(&health_url)
+            .header("Authorization", session.authorization_header.clone())
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok((session, health_url))
+        } else {
+            Err(anyhow::anyhow!(
+                "health check failed: {}",
+                response.status()
+            ))
+        }
+    }
+
+    async fn launch_mcp_ai_client(&mut self, terminal: &mut Tui) {
+        let Some(runtime) = self.mcp_runtime.as_ref() else {
+            self.mcp.set_error("MCP server is not running.".into());
+            return;
+        };
+
+        let endpoint = runtime.status().stable_endpoint.clone();
+        let (session, health_url) = match self.mcp_health_check(runtime).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.mcp
+                    .set_error(format!("MCP health check failed before AI launch: {error}"));
+                return;
+            }
+        };
+
+        self.suspend_for_external_command();
+        let result = self.run_mcp_ai_launcher(&endpoint, &health_url, &session);
+        self.resume_after_external_command(terminal);
+
+        match result {
+            Ok(Some(client)) => self
+                .mcp
+                .set_status_line(format!("{client} launched in a new Terminal window.")),
+            Ok(None) => self
+                .mcp
+                .set_status_line("AI client launch cancelled; MCP server is running.".into()),
+            Err(error) => self.mcp.set_error(error),
+        }
+    }
+
+    fn run_mcp_ai_launcher(
+        &self,
+        endpoint: &str,
+        health_url: &str,
+        session: &crate::mcp::McpSessionFile,
+    ) -> Result<Option<&'static str>, String> {
+        println!("\nCanopy MCP server is healthy: {health_url}");
+
+        let Some(client) = prompt_mcp_ai_client()? else {
+            return Ok(None);
+        };
+
+        match client {
+            McpAiClient::Codex => {
+                self.run_codex_with_mcp(endpoint, &session.bearer_token)?;
+                Ok(Some("Codex CLI"))
+            }
+            McpAiClient::Claude => {
+                self.run_claude_with_mcp(endpoint, &session.authorization_header)?;
+                Ok(Some("Claude Code"))
+            }
+        }
+    }
+
+    fn run_codex_with_mcp(&self, endpoint: &str, bearer_token: &str) -> Result<(), String> {
+        let codex_bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
+        let codex_bin = resolve_command(&codex_bin)?;
+
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+	set -uo pipefail
+	cleanup() {{
+	  {codex_bin} mcp remove {server_name} >/dev/null 2>&1 || true
+	  rm -f "$0"
+	}}
+	trap cleanup EXIT
+
+export CANOPY_MCP_BEARER_TOKEN={bearer_token}
+echo "Configuring Codex MCP server '{server_name}' -> {endpoint}"
+{codex_bin} mcp remove {server_name} >/dev/null 2>&1 || true
+{codex_bin} mcp add {server_name} --url {endpoint} --bearer-token-env-var CANOPY_MCP_BEARER_TOKEN
+config_rc=$?
+if [ "$config_rc" -ne 0 ]; then
+  echo
+  echo "Failed to configure Codex MCP server. Exit status: $config_rc"
+  read -r -p "Press Enter to close this window..."
+  exit "$config_rc"
+fi
+echo
+echo "Starting Codex CLI with Canopy MCP..."
+{codex_bin}
+rc=$?
+echo
+echo "Codex CLI exited with status $rc."
+read -r -p "Press Enter to close this window..."
+exit "$rc"
+"#,
+            bearer_token = shell_single_quote(bearer_token),
+            server_name = shell_single_quote(&mcp_ai_client_server_name()),
+            endpoint = shell_single_quote(endpoint),
+            codex_bin = shell_single_quote(&codex_bin),
+        );
+        let script_path = write_temp_launch_script("codex-mcp", &script_body)?;
+        open_new_terminal_window(&script_path)
+    }
+
+    fn run_claude_with_mcp(
+        &self,
+        endpoint: &str,
+        authorization_header: &str,
+    ) -> Result<(), String> {
+        let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let claude_bin = resolve_command(&claude_bin)?;
+
+        let config_path = write_temp_claude_mcp_config(endpoint, authorization_header)?;
+        let config_path_str = config_path
+            .to_str()
+            .ok_or_else(|| "Temporary Claude MCP config path is not UTF-8.".to_string())?;
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+set -uo pipefail
+cleanup() {{
+  rm -f {config_path}
+  rm -f "$0"
+}}
+trap cleanup EXIT
+
+echo "Starting Claude Code with temporary Canopy MCP config..."
+{claude_bin} --mcp-config {config_path}
+rc=$?
+echo
+echo "Claude Code exited with status $rc."
+read -r -p "Press Enter to close this window..."
+exit "$rc"
+"#,
+            claude_bin = shell_single_quote(&claude_bin),
+            config_path = shell_single_quote(config_path_str),
+        );
+        let script_path = write_temp_launch_script("claude-mcp", &script_body)?;
+        open_new_terminal_window(&script_path)
     }
 
     // ── Async operations ────────────────────────────────
@@ -1944,6 +2374,7 @@ mod tests {
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
+            database_scopes: vec![],
         }
     }
 

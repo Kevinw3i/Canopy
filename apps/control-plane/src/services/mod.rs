@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod auth;
 pub mod cloudwatch;
+pub mod database;
 pub mod ec2;
 pub mod entitlements;
 pub mod oidc;
@@ -8,6 +9,13 @@ pub mod oidc;
 use crate::config::AppConfig;
 use crate::models::entitlements::EntitlementStore;
 use aws_config::SdkConfig;
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use database::{
+    AwsSecretsDatabaseSecretProvider, DatabaseExecutor, DatabaseSecretProvider,
+    MySqlDatabaseExecutor,
+};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -16,6 +24,25 @@ use tokio::sync::RwLock;
 pub struct QueryAuthorization {
     pub user_id: String,
     pub log_group_names: Vec<String>,
+}
+
+/// Durable MCP session state lives in control-plane for authorization/audit
+/// decisions. The TUI-local MCP server can cache this for UX, but it is not
+/// the authority for guidance gates.
+#[derive(Debug, Clone)]
+pub struct McpSessionRecord {
+    pub actor: String,
+    pub actor_email: String,
+    pub local_secret_generation: String,
+    pub forwarding_key: String,
+    pub protocol_version: String,
+    pub client_name: String,
+    pub client_version: String,
+    pub product_phase: String,
+    pub guidance_delivered: BTreeSet<String>,
+    pub expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Encode query authorization into a signed token that can survive restarts.
@@ -77,6 +104,9 @@ pub struct AppState {
     pub audit_service: audit::AuditService,
     pub oidc_client: oidc::OidcClient,
     pub base_aws_config: SdkConfig,
+    pub database_secret_provider: Arc<dyn DatabaseSecretProvider>,
+    pub database_executor: Arc<dyn DatabaseExecutor>,
+    pub mcp_sessions: DashMap<String, McpSessionRecord>,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     pub ready: std::sync::atomic::AtomicBool,
 }
@@ -109,6 +139,7 @@ impl AppState {
             ))
             .load()
             .await;
+        let secrets_client = aws_sdk_secretsmanager::Client::new(&base_aws_config);
 
         let audit_service = if let Some(ref log_path) = config.audit_log {
             audit::AuditService::with_file(log_path)?
@@ -122,6 +153,11 @@ impl AppState {
             audit_service,
             oidc_client,
             base_aws_config,
+            database_secret_provider: Arc::new(AwsSecretsDatabaseSecretProvider::new(
+                secrets_client,
+            )),
+            database_executor: Arc::new(MySqlDatabaseExecutor::new()),
+            mcp_sessions: DashMap::new(),
             ready: std::sync::atomic::AtomicBool::new(false),
         })
     }

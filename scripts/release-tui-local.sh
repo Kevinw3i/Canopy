@@ -241,7 +241,7 @@ if [ "$SKIP_TESTS" != "1" ]; then
 fi
 
 info "Build TUI"
-cargo build --release -p "$PACKAGE_NAME" --target "$TARGET"
+CANOPY_BUILD_VERSION="$VERSION" cargo build --release -p "$PACKAGE_NAME" --target "$TARGET"
 
 [ -f "$BINARY_PATH" ] || fail "Built binary not found: $BINARY_PATH"
 

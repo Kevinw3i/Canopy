@@ -105,7 +105,22 @@ resource "aws_iam_role_policy" "task_permissions" {
         Effect   = "Allow"
         Action   = ["sts:GetCallerIdentity"]
         Resource = "*"
-      }]
+      }],
+
+      # MCP database credentials. Passwords stay in Secrets Manager; config only stores ARNs.
+      length(var.database_secret_arns) > 0 ? [{
+        Sid      = "DatabaseSecrets"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = var.database_secret_arns
+      }] : [],
+
+      length(var.database_secret_arns) > 0 && length(var.secrets_kms_key_arns) > 0 ? [{
+        Sid      = "DatabaseSecretsKmsDecrypt"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = var.secrets_kms_key_arns
+      }] : []
     )
   })
 }

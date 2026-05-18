@@ -73,6 +73,13 @@ impl DashboardScreen {
                     enabled: true,
                     hidden: false,
                 },
+                MenuItem {
+                    key: '6',
+                    label: "MCP / AI Tools",
+                    screen: Screen::Mcp,
+                    enabled: false,
+                    hidden: false,
+                },
             ],
         }
     }
@@ -88,6 +95,7 @@ impl DashboardScreen {
         // Only enable live tail when the feature flag is on AND the user has
         // the entitlement.
         self.items[2].enabled = self.live_tail_enabled && ent.features.can_use_cloudwatch_tail;
+        self.items[5].enabled = ent.features.can_use_mcp;
         self.entitlements = Some(ent);
     }
 
@@ -242,7 +250,7 @@ impl Component for DashboardScreen {
         }
 
         // Help bar
-        Paragraph::new("Ctrl+x: logout | q: quit | j/k: navigate | Enter: select | 1-5: quick nav")
+        Paragraph::new("Ctrl+x: logout | q: quit | j/k: navigate | Enter: select | 1-6: quick nav")
             .style(Style::default().fg(Color::Gray))
             .render(chunks[5], buf);
     }
@@ -300,6 +308,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
             max_session_seconds: None,
+            database_scopes: vec![],
         }
     }
 
@@ -307,13 +316,14 @@ mod tests {
     fn initial_state_all_menu_items_except_access_settings_disabled() {
         let screen = DashboardScreen::new(false, false);
         let visible = screen.visible_items();
-        // Items: EC2(disabled), CW(disabled), Access(enabled), Settings(enabled)
+        // Items: EC2(disabled), CW(disabled), Access(enabled), Settings(enabled), MCP(disabled)
         // Live Tail is hidden when enable_live_tail=false
-        assert_eq!(visible.len(), 4);
+        assert_eq!(visible.len(), 5);
         assert!(!visible[0].enabled); // EC2
         assert!(!visible[1].enabled); // CW
         assert!(visible[2].enabled); // Access
         assert!(visible[3].enabled); // Settings
+        assert!(!visible[4].enabled); // MCP
     }
 
     #[test]

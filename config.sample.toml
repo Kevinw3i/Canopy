@@ -64,3 +64,31 @@ default_region = "us-east-1"                 # STS 呼叫的預設區域
 session_duration_seconds = 3600              # AssumeRole session 時長
 # sts_external_id = "canopy"           # AssumeRole ExternalId（預設 "canopy"）
                                              # 必須與目標 role trust policy 一致
+
+# ── MCP Database connections ─────────────────────────
+#
+# v1 only supports MySQL. This registry intentionally stores only non-secret
+# connection metadata. Username/password must live in Secrets Manager and use:
+#   {"username":"canopy_readonly","password":"..."}
+#
+# [database_connections.orders_prod]
+# engine = "mysql"
+# host = "orders-prod.xxxxxx.ap-northeast-1.rds.amazonaws.com"
+# port = 3306
+# database = "orders"
+# secret_arn = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/db/orders-prod"
+# readonly = true
+# connect_timeout_ms = 3000
+# statement_timeout_ms = 5000
+# explain_timeout_ms = 3000
+# max_connections = 4
+#
+# ── TLS ─────────────────────────────────────────────────────────────────
+# `mysql_async` ships with ssl_opts = None, so without an explicit opt-in
+# Secrets-Manager-sourced DB credentials would traverse the VPC in cleartext.
+# Canopy defaults to verified TLS (require_tls = true) and uses the system
+# trust store. Override only for local dev against a self-signed RDS proxy:
+#
+# require_tls = true                       # default; never set false in production
+# accept_invalid_tls_certs = false         # local dev opt-in for self-signed certs
+# skip_tls_hostname_verification = false   # local dev opt-in if SAN/CN mismatches host

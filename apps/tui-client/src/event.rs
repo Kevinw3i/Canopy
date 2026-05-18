@@ -113,6 +113,16 @@ pub enum Action {
     ResumeLiveTail,
     LiveTailEvent(shared::dto::cloudwatch::LiveTailEvent),
 
+    // MCP local server
+    EnableMcp,
+    StopMcp,
+    RestartMcp,
+    TestMcp,
+    McpStarted(crate::mcp::McpRuntimeStatus),
+    McpStartFailed(String),
+    McpStopped,
+    McpHealthChecked(Result<(), String>),
+
     // Dashboard
     FetchPublicIp,
     SetPublicIp(String, u64), // ip, generation
@@ -137,6 +147,7 @@ pub enum Screen {
     LiveTail,
     Access,
     Settings,
+    Mcp,
     ConnectSession,
 }
 

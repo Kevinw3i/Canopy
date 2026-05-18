@@ -226,6 +226,7 @@ impl AuthService {
 mod tests {
     use super::*;
     use crate::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
+    use std::collections::HashMap;
 
     fn test_config(dev_mode: bool) -> AppConfig {
         AppConfig {
@@ -250,6 +251,7 @@ mod tests {
                 session_duration_seconds: Some(3600),
                 sts_external_id: Some("canopy".into()),
             },
+            database_connections: HashMap::new(),
             dev_mode,
             mock_aws_data: None,
             entitlements_file: None,

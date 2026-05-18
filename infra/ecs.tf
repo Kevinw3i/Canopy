@@ -62,6 +62,7 @@ resource "aws_ecs_task_definition" "control_plane" {
       { name = "ENTITLEMENTS_FILE", value = var.entitlements_file },
       { name = "CORS_ALLOWED_ORIGINS", value = join(",", var.cors_allowed_origins) },
       { name = "STS_EXTERNAL_ID", value = var.sts_external_id },
+      { name = "DATABASE_CONNECTIONS_TOML", value = var.database_connections_toml },
     ]
 
     # Inject secrets via ECS-native secrets injection (uses execution role).
