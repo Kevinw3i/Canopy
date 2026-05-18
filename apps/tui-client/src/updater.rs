@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::build_info;
+
 const TAG_PREFIX: &str = "tui-v";
 const CHECK_INTERVAL_SECS: i64 = 600; // 10 minutes
 
@@ -21,7 +23,7 @@ pub struct UpdateState {
     /// install). Persisted so the manual-update banner survives throttled restarts.
     pub available_version: Option<String>,
     /// Version we last attempted to apply. Prevents re-downloading the same
-    /// release when `CARGO_PKG_VERSION` was not bumped to match the tag.
+    /// release when the embedded binary version was not bumped to match the tag.
     pub last_attempted_version: Option<String>,
 }
 
@@ -149,14 +151,14 @@ fn platform_asset_suffix() -> Option<&'static str> {
 /// `repo_owner` and `repo_name` come from `ClientConfig` so forks can
 /// point at their own GitHub repo.
 pub async fn check_and_apply(repo_owner: &str, repo_name: &str) -> Result<Option<UpdateResult>> {
-    let current_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let current_version = semver::Version::parse(build_info::version())?;
     let mut state = UpdateState::load(repo_owner, repo_name);
 
     // Throttle: skip network call if checked recently
     if !state.should_check() {
         // Re-surface banner if a previous download is pending restart
         if let Some(ref pending) = state.pending_version {
-            // If we already attempted this version and CARGO_PKG_VERSION still
+            // If we already attempted this version and the embedded binary version still
             // hasn't caught up, the user already restarted — stop prompting.
             if state.last_attempted_version.as_deref() == Some(pending.as_str())
                 && semver::Version::parse(pending)
@@ -263,13 +265,13 @@ async fn do_check_and_apply(
     let version_str = latest_version.to_string();
 
     // Guard against re-download loops: if we already attempted this exact
-    // version and the running binary still reports an older CARGO_PKG_VERSION
-    // (e.g. the tag was cut without bumping Cargo.toml), don't download again.
+    // version and the running binary still reports an older version, don't
+    // download again.
     if state.last_attempted_version.as_deref() == Some(version_str.as_str()) {
         tracing::debug!("Already attempted v{}, skipping re-download", version_str);
 
-        // If pending_version is set, the binary was replaced but CARGO_PKG_VERSION
-        // wasn't bumped. Since we're running now, the user already restarted —
+        // If pending_version is set, the binary was replaced but its embedded
+        // version was not bumped. Since we're running now, the user restarted —
         // clear the pending state to stop the endless "restart to apply" prompt.
         if state.pending_version.is_some() {
             state.pending_version = None;

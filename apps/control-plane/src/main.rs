@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::ec2::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
+        .merge(routes::mcp::router())
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

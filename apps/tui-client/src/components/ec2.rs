@@ -1106,6 +1106,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec!["ec2-user".into(), "ubuntu".into()],
             max_session_seconds: None,
+            database_scopes: vec![],
         }
     }
 

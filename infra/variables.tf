@@ -166,7 +166,13 @@ variable "jwt_secret_version_id" {
 }
 
 variable "secrets_kms_key_arns" {
-  description = "KMS key ARNs used to encrypt Secrets Manager secrets (jwt_secret, oidc_client_secret). Leave empty if using AWS-managed keys."
+  description = "KMS key ARNs used to encrypt Secrets Manager secrets (jwt_secret, oidc_client_secret, database secrets). Leave empty if using AWS-managed keys."
+  type        = list(string)
+  default     = []
+}
+
+variable "database_secret_arns" {
+  description = "Secrets Manager ARNs for MCP database credentials. Secrets must contain JSON with username and password. Create them out-of-band to avoid exposing passwords in Terraform state."
   type        = list(string)
   default     = []
 }
@@ -228,6 +234,12 @@ variable "cors_allowed_origins" {
   description = "CORS allowed origins list"
   type        = list(string)
   default     = []
+}
+
+variable "database_connections_toml" {
+  description = "Optional TOML snippet appended to generated config.toml for [database_connections.*]. Do not include passwords; use secret_arn fields only."
+  type        = string
+  default     = ""
 }
 
 variable "log_retention_days" {

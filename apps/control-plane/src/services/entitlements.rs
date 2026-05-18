@@ -357,6 +357,7 @@ mod tests {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec!["ec2-user".into()],
                     max_session_seconds: None,
+                    database_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-ops".into(),
@@ -382,6 +383,7 @@ mod tests {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec!["ubuntu".into()],
                     max_session_seconds: Some(1800),
+                    database_scopes: vec![],
                 },
             ],
             memberships: vec![

@@ -209,6 +209,30 @@ can_use_cloudwatch_search = true  # Can search CloudWatch logs
 can_use_cloudwatch_tail = true    # Can use Live Tail
 can_use_ssm = true                # Can connect via SSM Session Manager
 can_use_ec2_instance_connect = true  # Can connect via EC2 Instance Connect
+can_use_mcp = true                # Can start the local MCP / AI Tools server
+can_use_mcp_cloudwatch = false    # Reserved for MCP CloudWatch data tools
+can_use_mcp_ec2 = false           # Reserved for future MCP EC2 tools
+can_use_mcp_database = true       # Can use MCP Database tools when scoped below
+
+# Optional MCP Database v1 scope. v1 is MySQL only and SELECT-only.
+# The referenced connection must exist in config.toml / Terraform
+# database_connections_toml, and passwords must live in Secrets Manager.
+[[rules.database_scopes]]
+name = "orders_prod_readonly"
+connection = "orders_prod"
+environment = "production"
+allowed_schemas = ["orders"]
+allowed_tables = ["orders", "order_items"]
+allowed_actions = ["select"]
+max_rows = 100
+statement_timeout_ms = 5000
+require_explain = true
+max_examined_rows = 10000
+allow_full_table_scan = false
+# default-deny VIEW reads. Flip to `true` only after the operator has
+# reviewed the view's DEFINER and base-table reach — see entitlements.sample.toml
+# and docs/OPERATOR-SETUP.md for the full opt-in checklist.
+allow_views = false
 
 [[rules.allowed_accounts]]
 account_id = "123456789012"
@@ -364,6 +388,15 @@ Change:
 - `user_id` in `[[memberships]]` → real OIDC user identifiers (usually email)
 - `allowed_regions` → your real regions
 - `allowed_log_group_arns` → your real log group patterns
+- `can_use_mcp` → enable the TUI `MCP / AI Tools` page for local Codex/Claude MCP access
+
+MCP permissions are intentionally separate from the normal TUI permissions:
+
+- `can_use_mcp` is the master switch for the local MCP server.
+- `can_use_mcp_cloudwatch` does **not** follow `can_use_cloudwatch_search`; it is a separate MCP feature gate.
+- `can_use_mcp_database` enables MCP database tools only when a matching `[[rules.database_scopes]]` grants a specific connection/schema/table scope.
+- Product Phase 1 exposes MCP foundation tools (`canopy_describe_capabilities`, `canopy_get_guidance`) plus MCP Database v1 when explicitly enabled. CloudWatch data access must go through future MCP-specific control-plane routes.
+- MCP Database v1 exposes `canopy_list_database_scopes` and `canopy_query_database` for MySQL read-only `SELECT` queries. The control-plane enforces SQL validation, table scope, `LIMIT`, Secrets Manager credentials, and `EXPLAIN FORMAT=JSON` before executing the query. MCP responses never include DB host, secret ARN, username, or password. The view-guard is **default-deny**: every referenced object is verified as `BASE TABLE` under MDL inside the same transaction that runs EXPLAIN and the SELECT; scopes can opt into reading views by setting `allow_views = true` after reviewing the view's DEFINER and base-table reach. Connection-pool saturation surfaces as HTTP 503 (`connection_queue_full` / `database_connection_unavailable`), not 500 — see `docs/OPERATOR-SETUP.md` for the operator hardening checklist.
 
 ### Step 4: Set up your OIDC provider
 

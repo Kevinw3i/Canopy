@@ -4,11 +4,13 @@
 pub mod api_client;
 pub mod app;
 pub mod auth;
+pub mod build_info;
 pub mod components;
 pub mod config;
 pub mod event;
 pub mod live_tail_ws;
 pub mod local_deps;
+pub mod mcp;
 pub mod tui;
 pub mod updater;
 pub mod widgets;

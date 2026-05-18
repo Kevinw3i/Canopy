@@ -10,18 +10,29 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc,
+};
 use tower::ServiceExt;
 
 // ── Re-use crate internals via the library-style paths ──────────────────
-use control_plane::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
+use control_plane::config::{
+    AppConfig, AwsConfig, DatabaseConnectionConfig, DatabaseEngine, JwtConfig, OidcConfig,
+};
 use control_plane::middleware;
 use control_plane::routes;
 use control_plane::services::audit::AuditService;
 use control_plane::services::auth::AuthService;
+use control_plane::services::database::{
+    evaluate_explain, ConnectionQueueFull, DatabaseExecutor, DatabaseSecret,
+    DatabaseSecretProvider, QueryRows, TableType, TableTypeQuery, ViewCheckedQueryOutcome,
+};
 use control_plane::services::oidc::OidcClient;
 use control_plane::services::AppState;
+use shared::dto::database::{ExplainSummary, ExplainTableSummary};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -48,6 +59,7 @@ fn dev_config() -> AppConfig {
             session_duration_seconds: Some(3600),
             sts_external_id: Some("canopy".into()),
         },
+        database_connections: HashMap::new(),
         dev_mode: true,
         mock_aws_data: None,
         entitlements_file: None,
@@ -75,8 +87,322 @@ fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService
         audit_service,
         oidc_client,
         base_aws_config,
+        database_secret_provider: Arc::new(StaticSecretProvider),
+        database_executor: Arc::new(NullDatabaseExecutor),
+        mcp_sessions: dashmap::DashMap::new(),
         ready: std::sync::atomic::AtomicBool::new(true),
     })
+}
+
+fn build_state_with_database(
+    config: AppConfig,
+    audit_service: AuditService,
+    secret_provider: Arc<dyn DatabaseSecretProvider>,
+    executor: Arc<dyn DatabaseExecutor>,
+) -> Arc<AppState> {
+    build_state_with_database_and_allow_views(
+        config,
+        audit_service,
+        secret_provider,
+        executor,
+        false,
+    )
+}
+
+/// Build an `AppState` whose `orders_prod_readonly` scope has the supplied
+/// `allow_views` value. Used by the view-guard tests to flip the scope's
+/// VIEW opt-in without standing up an entirely new entitlement store.
+fn build_state_with_database_and_allow_views(
+    config: AppConfig,
+    audit_service: AuditService,
+    secret_provider: Arc<dyn DatabaseSecretProvider>,
+    executor: Arc<dyn DatabaseExecutor>,
+    allow_views: bool,
+) -> Arc<AppState> {
+    let mut entitlement_store =
+        control_plane::models::entitlements::EntitlementStore::dev_defaults();
+    for rule in &mut entitlement_store.rules {
+        for scope in &mut rule.database_scopes {
+            if scope.name == "orders_prod_readonly" {
+                scope.allow_views = allow_views;
+            }
+        }
+    }
+    let oidc_client = OidcClient::new(config.oidc.clone());
+    let base_aws_config = aws_config::SdkConfig::builder()
+        .region(aws_types::region::Region::new("us-east-1"))
+        .build();
+
+    Arc::new(AppState {
+        config,
+        entitlement_store: Arc::new(tokio::sync::RwLock::new(entitlement_store)),
+        audit_service,
+        oidc_client,
+        base_aws_config,
+        database_secret_provider: secret_provider,
+        database_executor: executor,
+        mcp_sessions: dashmap::DashMap::new(),
+        ready: std::sync::atomic::AtomicBool::new(true),
+    })
+}
+
+struct StaticSecretProvider;
+
+#[async_trait::async_trait]
+impl DatabaseSecretProvider for StaticSecretProvider {
+    async fn load_secret(&self, _secret_arn: &str) -> anyhow::Result<DatabaseSecret> {
+        Ok(DatabaseSecret {
+            username: "readonly".into(),
+            password: "not-logged".into(),
+        })
+    }
+}
+
+struct NullDatabaseExecutor;
+
+#[async_trait::async_trait]
+impl DatabaseExecutor for NullDatabaseExecutor {
+    async fn explain(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        _sql: &str,
+        _timeout_ms: u64,
+    ) -> anyhow::Result<ExplainSummary> {
+        anyhow::bail!("database executor should not be called by this test")
+    }
+
+    async fn query(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        _sql: &str,
+        _timeout_ms: u64,
+    ) -> anyhow::Result<QueryRows> {
+        anyhow::bail!("database executor should not be called by this test")
+    }
+
+    async fn fetch_table_types(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        _tables: &[TableTypeQuery],
+        _timeout_ms: u64,
+    ) -> anyhow::Result<HashMap<(String, String), TableType>> {
+        anyhow::bail!("database executor should not be called by this test")
+    }
+
+    async fn query_with_view_check(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        _scope: &shared::dto::entitlements::DatabaseScope,
+        _view_targets: &[TableTypeQuery],
+        _sql: &str,
+        _explain_timeout_ms: u64,
+        _statement_timeout_ms: u64,
+    ) -> anyhow::Result<ViewCheckedQueryOutcome> {
+        anyhow::bail!("database executor should not be called by this test")
+    }
+}
+
+struct MockDatabaseExecutor {
+    explain: ExplainSummary,
+    query_calls: AtomicUsize,
+    /// Pre-seeded `information_schema.tables` answers keyed by
+    /// `(schema_lc, table_lc)`. Tests that exercise the view guard build
+    /// this map; tests that don't can pass an empty map and the executor
+    /// will report every lookup as missing (treated as denied by the
+    /// route, which is the safe default).
+    table_types: HashMap<(String, String), TableType>,
+    /// Optional Layer-B override. When set, `query_with_view_check` uses
+    /// this map instead of `table_types` to decide each entry's type. The
+    /// test for the same-request DDL TOCTOU race uses this to simulate
+    /// "Layer A sees BaseTable but by the time Layer B runs under MDL,
+    /// the object is a View" — a plain mock could not model that
+    /// asymmetry otherwise.
+    table_types_layer_b: Option<HashMap<(String, String), TableType>>,
+    fetch_table_type_calls: AtomicUsize,
+    /// Last `explain_timeout_ms` observed by `query_with_view_check`.
+    /// Used by the regression test that proves EXPLAIN and SELECT
+    /// get their own per-phase timeouts.
+    last_explain_timeout_ms: AtomicU64,
+    /// Last `statement_timeout_ms` observed by `query_with_view_check`.
+    last_statement_timeout_ms: AtomicU64,
+}
+
+impl MockDatabaseExecutor {
+    /// Convenience constructor that pre-seeds every table referenced by
+    /// the `orders_prod_readonly` test scope as a `BASE TABLE`. Tests that
+    /// only care about the query / explain path use this so the new view
+    /// guard treats their queries as benign.
+    fn with_base_tables(explain: ExplainSummary) -> Self {
+        let mut table_types = HashMap::new();
+        for table in ["orders", "order_items"] {
+            table_types.insert(
+                ("orders".to_string(), table.to_string()),
+                TableType::BaseTable,
+            );
+        }
+        Self {
+            explain,
+            query_calls: AtomicUsize::new(0),
+            table_types,
+            table_types_layer_b: None,
+            fetch_table_type_calls: AtomicUsize::new(0),
+            last_explain_timeout_ms: AtomicU64::new(0),
+            last_statement_timeout_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DatabaseExecutor for MockDatabaseExecutor {
+    async fn explain(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        _sql: &str,
+        _timeout_ms: u64,
+    ) -> anyhow::Result<ExplainSummary> {
+        Ok(self.explain.clone())
+    }
+
+    async fn query(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        _sql: &str,
+        _timeout_ms: u64,
+    ) -> anyhow::Result<QueryRows> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(QueryRows {
+            columns: vec!["id".into(), "status".into()],
+            rows: vec![vec![json!(123), json!("paid")]],
+            truncated_by_byte_budget: false,
+        })
+    }
+
+    async fn fetch_table_types(
+        &self,
+        _connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        tables: &[TableTypeQuery],
+        _timeout_ms: u64,
+    ) -> anyhow::Result<HashMap<(String, String), TableType>> {
+        self.fetch_table_type_calls.fetch_add(1, Ordering::SeqCst);
+        let mut out = HashMap::new();
+        for entry in tables {
+            let key = (
+                entry.schema.to_ascii_lowercase(),
+                entry.table.to_ascii_lowercase(),
+            );
+            if let Some(kind) = self.table_types.get(&key) {
+                out.insert(key, *kind);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn query_with_view_check(
+        &self,
+        connection: &DatabaseConnectionConfig,
+        _secret: &DatabaseSecret,
+        scope: &shared::dto::entitlements::DatabaseScope,
+        view_targets: &[TableTypeQuery],
+        _sql: &str,
+        explain_timeout_ms: u64,
+        statement_timeout_ms: u64,
+    ) -> anyhow::Result<ViewCheckedQueryOutcome> {
+        // Capture the per-phase timeouts so a regression test can prove
+        // the route is wiring `connection.explain_timeout_ms` for EXPLAIN
+        // and the merged scope+connection minimum for the SELECT.
+        self.last_explain_timeout_ms
+            .store(explain_timeout_ms, Ordering::SeqCst);
+        self.last_statement_timeout_ms
+            .store(statement_timeout_ms, Ordering::SeqCst);
+        let _ = connection;
+        // Mirror  the protected path is taken for
+        // every scope, including `allow_views = true`. The BASE-TABLE
+        // enforcement only fires when the scope has NOT opted into
+        // views. View-opt-in scopes still populate `types` for audit,
+        // run EXPLAIN (via the evaluate_explain fall-through below),
+        // and execute the SELECT.
+        // Simulate the MDL-protected Layer-B re-check. Mirror the
+        // executor's contract: empty view_targets is a logic error in the
+        // caller, and any non-BASE-TABLE target short-circuits without
+        // running the SELECT.
+        if view_targets.is_empty() {
+            anyhow::bail!(
+                "query_with_view_check called with empty view_targets; mock parity check"
+            );
+        }
+        self.fetch_table_type_calls.fetch_add(1, Ordering::SeqCst);
+        // When `table_types_layer_b` is set, Layer-B sees a different
+        // reality than Layer-A — this is how the TOCTOU race test
+        // simulates DDL flipping a table to a view between the two
+        // checks.
+        let source = self
+            .table_types_layer_b
+            .as_ref()
+            .unwrap_or(&self.table_types);
+        let mut types: HashMap<(String, String), TableType> = HashMap::new();
+        for entry in view_targets {
+            let key = (
+                entry.schema.to_ascii_lowercase(),
+                entry.table.to_ascii_lowercase(),
+            );
+            if let Some(kind) = source.get(&key) {
+                types.insert(key, *kind);
+            }
+        }
+        if !scope.allow_views {
+            let mut offender: Option<(String, String, TableType)> = None;
+            for entry in view_targets {
+                let key = (
+                    entry.schema.to_ascii_lowercase(),
+                    entry.table.to_ascii_lowercase(),
+                );
+                match types.get(&key) {
+                    Some(TableType::BaseTable) => {}
+                    Some(kind) => {
+                        offender = Some((key.0, key.1, *kind));
+                        break;
+                    }
+                    None => {
+                        offender = Some((key.0, key.1, TableType::Other));
+                        break;
+                    }
+                }
+            }
+            if let Some(offender) = offender {
+                return Ok(ViewCheckedQueryOutcome::ViewSwapDetected { types, offender });
+            }
+        }
+        // Mirror the real executor by also running `evaluate_explain` on
+        // the same explain summary the route would otherwise have used
+        // through the legacy path. This keeps full-scan / row-cap tests
+        // exercising the gate regardless of which executor method gets
+        // called.
+        let explain = self.explain.clone();
+        if let Err(error) = evaluate_explain(scope, &explain, &connection.database) {
+            return Ok(ViewCheckedQueryOutcome::ExplainRejected {
+                types,
+                explain,
+                error,
+            });
+        }
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ViewCheckedQueryOutcome::Ok {
+            types,
+            explain,
+            rows: QueryRows {
+                columns: vec!["id".into(), "status".into()],
+                rows: vec![vec![json!(123), json!("paid")]],
+                truncated_by_byte_budget: false,
+            },
+        })
+    }
 }
 
 struct AuditFile {
@@ -126,6 +452,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .merge(routes::ec2::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
+        .merge(routes::mcp::router())
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
@@ -150,10 +477,308 @@ fn issue_test_token(config: &AppConfig) -> String {
     auth.issue_token(&identity).unwrap().access_token
 }
 
+fn with_orders_database(mut config: AppConfig) -> AppConfig {
+    config.database_connections.insert(
+        "orders_prod".into(),
+        DatabaseConnectionConfig {
+            engine: DatabaseEngine::Mysql,
+            host: "orders-prod.example.internal".into(),
+            port: 3306,
+            database: "orders".into(),
+            secret_arn:
+                "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/db/orders-prod"
+                    .into(),
+            readonly: true,
+            connect_timeout_ms: 3000,
+            statement_timeout_ms: 5000,
+            explain_timeout_ms: 3000,
+            max_connections: 4,
+            require_tls: true,
+            accept_invalid_tls_certs: false,
+            skip_tls_hostname_verification: false,
+        },
+    );
+    config
+}
+
+fn indexed_explain() -> ExplainSummary {
+    ExplainSummary {
+        access_type: Some("const".into()),
+        key_used: Some("PRIMARY".into()),
+        estimated_rows: Some(1),
+        full_table_scan: false,
+        tables: vec![ExplainTableSummary {
+            table: "orders".into(),
+            access_type: Some("const".into()),
+            key_used: Some("PRIMARY".into()),
+            estimated_rows: Some(1),
+            full_table_scan: false,
+        }],
+    }
+}
+
+fn full_scan_explain() -> ExplainSummary {
+    ExplainSummary {
+        access_type: Some("ALL".into()),
+        key_used: None,
+        estimated_rows: Some(2400000),
+        full_table_scan: true,
+        tables: vec![ExplainTableSummary {
+            table: "orders".into(),
+            access_type: Some("ALL".into()),
+            key_used: None,
+            estimated_rows: Some(2400000),
+            full_table_scan: true,
+        }],
+    }
+}
+
 /// Parse a response body as JSON.
 async fn body_json(body: Body) -> Value {
     let bytes = body.collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn register_database_guidance(app: &Router, token: &str) -> (String, String) {
+    register_database_guidance_ids(
+        app,
+        token,
+        &[
+            "security_boundaries",
+            "database_query_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await
+}
+
+async fn register_database_guidance_ids(
+    app: &Router,
+    token: &str,
+    guidance_ids: &[&str],
+) -> (String, String) {
+    let local_secret_generation = "lsg_test_database_guidance".to_string();
+    let register_body = json!({
+        "local_secret_generation": local_secret_generation,
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_1_local_foundation"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), StatusCode::OK);
+    let register_json = body_json(register_resp.into_body()).await;
+    let session_id = register_json["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for &guidance_id in guidance_ids {
+        let guidance_body = json!({
+            "canopy_mcp_session_id": session_id,
+            "local_secret_generation": local_secret_generation,
+            "guidance_id": guidance_id,
+            "guidance_version": "2026-05-13"
+        });
+        let guidance_resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/mcp/guidance/delivered")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .body(Body::from(guidance_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guidance_resp.status(), StatusCode::OK);
+    }
+
+    (session_id, local_secret_generation)
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_returns_server_owned_content_on_success() {
+    // The server-issued guidance content must come from the control-plane,
+    // not be supplied (and trivially echoed) by the client. The audit
+    // trail's "delivered" event must be paired with the actual content
+    // emitted in the response, otherwise a client could claim delivery
+    // without the server having transmitted anything.
+    let audit = AuditFile::new("mcp-guidance-server-content");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let register_body = json!({
+        "local_secret_generation": "lsg_test_server_content",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_1_local_foundation"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let register_json = body_json(register_resp.into_body()).await;
+    let session_id = register_json["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_test_server_content",
+        "guidance_id": "database_query_workflow",
+        "guidance_version": "2026-05-13"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["guidance_id"], "database_query_workflow");
+    assert_eq!(body["guidance_version"], "2026-05-13");
+    assert_eq!(body["content_type"], "text/markdown");
+    let content = body["content"].as_str().expect("content field is required");
+    assert!(
+        !content.is_empty(),
+        "server-issued content must be non-empty"
+    );
+    assert!(
+        content.contains("canopy_list_database_scopes"),
+        "server content must come from the catalog, not a client echo: got {content}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_rejects_unknown_guidance_id() {
+    // A client cannot self-attest having received guidance the control-plane
+    // never issued: arbitrary `(id, version)` pairs must be rejected with 400
+    // and the rejection must be audited.
+    let audit = AuditFile::new("mcp-guidance-unknown-id");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let register_body = json!({
+        "local_secret_generation": "lsg_test_unknown_guidance",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_1_local_foundation"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let register_json = body_json(register_resp.into_body()).await;
+    let session_id = register_json["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_test_unknown_guidance",
+        "guidance_id": "i_made_this_up",
+        "guidance_version": "9999-12-31"
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "guidance_sync")
+        .expect("guidance sync audit event");
+    assert_eq!(event["action"], "mcp_guidance_sync");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "unknown_guidance");
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_unknown_session_is_audited() {
+    let audit = AuditFile::new("mcp-guidance-unknown-session");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let guidance_body = json!({
+        "canopy_mcp_session_id": "mcp_missing",
+        "local_secret_generation": "lsg_missing",
+        "guidance_id": "database_query_workflow",
+        "guidance_version": "2026-05-13"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["metadata"]["mcp_event_kind"] == "guidance_sync")
+        .expect("guidance sync audit event");
+    assert_eq!(event["action"], "mcp_guidance_sync");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "mcp_session_not_found"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -398,6 +1023,854 @@ async fn entitlements_returns_user_entitlements() {
     let json = body_json(resp.into_body()).await;
     assert_eq!(json["user_id"], "dev-admin");
     assert!(json["features"]["can_view_ec2"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn mcp_database_scope_list_hides_connection_secrets() {
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/scopes")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let body = serde_json::to_string(&json).unwrap();
+    assert_eq!(json["scopes"][0]["name"], "orders_prod_readonly");
+    assert_eq!(json["scopes"][0]["connection"], "orders_prod");
+    assert!(!body.contains("secret_arn"));
+    assert!(!body.contains("orders-prod.example.internal"));
+    assert!(!body.contains("canopy/db/orders-prod"));
+}
+
+#[tokio::test]
+async fn mcp_database_scope_list_requires_guidance_session() {
+    let audit = AuditFile::new("mcp-db-scope-list-guidance-required");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({});
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/scopes")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["metadata"]["mcp_event_kind"] == "database_scope_list")
+        .expect("database scope list audit event");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "mcp_session_required"
+    );
+    assert_eq!(event["metadata"]["db_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_query_success_audits_raw_sql_and_explain() {
+    let audit = AuditFile::new("mcp-db-query-success");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let executor = Arc::new(MockDatabaseExecutor::with_base_tables(indexed_explain()));
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id, status from orders where id = 123 limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["row_count"], 1);
+    assert_eq!(json["explain"]["key_used"], "PRIMARY");
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 1);
+
+    let events = read_audit_events(&audit.path);
+    // The route now emits TWO database_query events on the happy path: a
+    // durable `attempt` event before touching Secrets Manager / MySQL, and
+    // a `success` completion event after the query returns. The attempt
+    // event is committed ahead of EXPLAIN so credentials are never used
+    // without a durable audit record.
+    let attempt = events
+        .iter()
+        .find(|event| {
+            event["metadata"]["mcp_event_kind"] == "database_query"
+                && event["metadata"]["mcp_outcome_kind"] == "attempt"
+        })
+        .expect("database attempt audit event");
+    assert_eq!(
+        attempt["metadata"]["sql_raw"],
+        "select id, status from orders where id = 123 limit 20"
+    );
+    // the pre-DB attempt event records intent via
+    // `*_planned`, NOT `*_attempted`. The latter is reserved for terminal
+    // events that fired after the executor actually entered each stage.
+    assert_eq!(attempt["metadata"]["db_execution_planned"], true);
+    assert_eq!(attempt["metadata"]["explain_planned"], true);
+    assert_eq!(attempt["metadata"]["db_execution_attempted"], false);
+    assert_eq!(attempt["metadata"]["explain_attempted"], false);
+
+    let success = events
+        .iter()
+        .find(|event| {
+            event["metadata"]["mcp_event_kind"] == "database_query"
+                && event["metadata"]["mcp_outcome_kind"] == "success"
+        })
+        .expect("database success audit event");
+    assert_eq!(success["metadata"]["explain_passed"], true);
+    assert_eq!(success["metadata"]["db_execution_attempted"], true);
+    let audit_body = serde_json::to_string(success).unwrap();
+    assert!(!audit_body.contains("not-logged"));
+    assert!(!audit_body.contains("canopy/db/orders-prod"));
+}
+
+#[tokio::test]
+async fn mcp_database_query_plan_rejected_does_not_execute_select() {
+    let audit = AuditFile::new("mcp-db-query-rejected");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let executor = Arc::new(MockDatabaseExecutor::with_base_tables(full_scan_explain()));
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 0);
+
+    let events = read_audit_events(&audit.path);
+    // EXPLAIN-rejected requests also emit the attempt event first (since
+    // EXPLAIN still touches the database), then a rejection event with the
+    // plan-failure outcome.
+    let rejection = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "database_query")
+        .expect("database audit event");
+    assert_eq!(rejection["metadata"]["mcp_outcome_kind"], "full_table_scan");
+    assert_eq!(rejection["metadata"]["explain_attempted"], true);
+    assert_eq!(rejection["metadata"]["db_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_query_requires_guidance_session() {
+    let audit = AuditFile::new("mcp-db-query-guidance-required");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let executor = Arc::new(MockDatabaseExecutor::with_base_tables(indexed_explain()));
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders limit 20"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 0);
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["metadata"]["mcp_event_kind"] == "database_query")
+        .expect("database audit event");
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "denied");
+    assert_eq!(
+        event["metadata"]["rejection_reason"],
+        "mcp_session_required"
+    );
+    assert_eq!(event["metadata"]["db_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_query_requires_all_advertised_guidance() {
+    let audit = AuditFile::new("mcp-db-query-partial-guidance");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let executor = Arc::new(MockDatabaseExecutor::with_base_tables(indexed_explain()));
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &["security_boundaries", "database_query_workflow"],
+    )
+    .await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 0);
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["metadata"]["mcp_event_kind"] == "database_query")
+        .expect("database audit event");
+    assert_eq!(event["metadata"]["rejection_reason"], "guidance_required");
+    assert_eq!(event["metadata"]["db_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_query_rejects_view_when_allow_views_is_false() {
+    // The default `orders_prod_readonly` scope has `allow_views = false`.
+    // When the executor reports `orders` as a VIEW, the route MUST reject
+    // BEFORE EXPLAIN runs (so a malicious view can never get its plan /
+    // base-table reads evaluated against the production database) and the
+    // audit record MUST flag `views_allowed = false` so reviewers can spot
+    // the denial in the audit stream.
+    let audit = AuditFile::new("mcp-db-query-view-rejected");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let mut table_types = HashMap::new();
+    table_types.insert(
+        ("orders".to_string(), "orders".to_string()),
+        TableType::View,
+    );
+    let executor = Arc::new(MockDatabaseExecutor {
+        explain: indexed_explain(),
+        query_calls: AtomicUsize::new(0),
+        table_types,
+        table_types_layer_b: None,
+        fetch_table_type_calls: AtomicUsize::new(0),
+        last_explain_timeout_ms: AtomicU64::new(0),
+        last_statement_timeout_ms: AtomicU64::new(0),
+    });
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executor.fetch_table_type_calls.load(Ordering::SeqCst), 1);
+
+    let events = read_audit_events(&audit.path);
+    let rejection = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "database_query")
+        .expect("database audit event");
+    assert_eq!(
+        rejection["metadata"]["mcp_outcome_kind"],
+        "view_not_allowed_by_scope"
+    );
+    assert_eq!(rejection["metadata"]["explain_attempted"], false);
+    assert_eq!(rejection["metadata"]["db_execution_attempted"], false);
+    assert_eq!(rejection["metadata"]["views_allowed"], false);
+    assert_eq!(rejection["metadata"]["view_check_required"], true);
+    assert_eq!(rejection["metadata"]["view_check_passed"], false);
+
+    // The attempt event preceding the rejection must already advertise the
+    // scope's view policy so a reviewer pivoting on `views_allowed` finds
+    // both the intent and the outcome.
+    let attempt = events
+        .iter()
+        .find(|event| event["metadata"]["mcp_outcome_kind"] == "attempt")
+        .expect("attempt audit event");
+    assert_eq!(attempt["metadata"]["views_allowed"], false);
+    assert_eq!(attempt["metadata"]["view_check_required"], true);
+}
+
+#[tokio::test]
+async fn mcp_database_query_allows_view_when_scope_opts_in() {
+    // When the operator has reviewed the view and set `allow_views = true`
+    // on the scope, the route must skip the view check entirely (one fewer
+    // information_schema round trip) and let the existing EXPLAIN / row-cap
+    // / function allow-list pipeline take over. The audit record still
+    // surfaces `views_allowed = true` so an audit grep can find every
+    // request that landed on a view-opt-in scope.
+    let audit = AuditFile::new("mcp-db-query-view-allowed");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let mut table_types = HashMap::new();
+    table_types.insert(
+        ("orders".to_string(), "orders".to_string()),
+        TableType::View,
+    );
+    let executor = Arc::new(MockDatabaseExecutor {
+        explain: indexed_explain(),
+        query_calls: AtomicUsize::new(0),
+        table_types,
+        table_types_layer_b: None,
+        fetch_table_type_calls: AtomicUsize::new(0),
+        last_explain_timeout_ms: AtomicU64::new(0),
+        last_statement_timeout_ms: AtomicU64::new(0),
+    });
+    let state = build_state_with_database_and_allow_views(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+        true,
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id, status from orders where id = 123 limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 1);
+    //  `allow_views = true` no longer skips the
+    // MDL-protected path. The route's Layer-A early reject is still
+    // skipped (it only fires for `!allow_views`), but the executor's
+    // Layer-B information_schema lookup runs unconditionally so the
+    // MDL umbrella spans EXPLAIN + SELECT for view-opt-in scopes too.
+    // Exactly one fetch per request — the Layer-B call.
+    assert_eq!(executor.fetch_table_type_calls.load(Ordering::SeqCst), 1);
+
+    let events = read_audit_events(&audit.path);
+    let success = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_outcome_kind"] == "success")
+        .expect("success audit event");
+    assert_eq!(success["metadata"]["views_allowed"], true);
+    assert_eq!(success["metadata"]["view_check_required"], false);
+    assert_eq!(success["metadata"]["view_check_passed"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_query_view_check_caches_information_schema_lookups() {
+    // The production executor caches `(connection, schema, table)` →
+    // table_type for 5 minutes. The mock exposes a call counter; this test
+    // asserts the route does NOT bypass the cache by calling
+    // `fetch_table_types` more than once per (scope, validated tables)
+    // tuple — a regression there would let a Claude session burst into 30+
+    // information_schema queries per minute on a single scope.
+    //
+    // The mock executor here does not implement caching (it counts every
+    // call directly), so what we actually verify is that the route makes
+    // exactly one batched call per request rather than one per table. A
+    // SELECT touching both `orders` and `order_items` must fan into a
+    // single executor call.
+    let audit = AuditFile::new("mcp-db-query-view-check-batched");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let mut table_types = HashMap::new();
+    table_types.insert(
+        ("orders".to_string(), "orders".to_string()),
+        TableType::BaseTable,
+    );
+    table_types.insert(
+        ("orders".to_string(), "order_items".to_string()),
+        TableType::BaseTable,
+    );
+    let executor = Arc::new(MockDatabaseExecutor {
+        explain: indexed_explain(),
+        query_calls: AtomicUsize::new(0),
+        table_types,
+        table_types_layer_b: None,
+        fetch_table_type_calls: AtomicUsize::new(0),
+        last_explain_timeout_ms: AtomicU64::new(0),
+        last_statement_timeout_ms: AtomicU64::new(0),
+    });
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select o.id from orders o join order_items oi on oi.order_id = o.id limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Two batched fetches per request: Layer A (route's early reject via
+    // `fetch_table_types`) plus Layer B (MDL-protected re-check inside
+    // `query_with_view_check`). The point of this assertion is that
+    // BATCHING is preserved — touching both tables results in one call
+    // each, not one per table. A regression that fanned the lookup into
+    // per-table calls would push this number to 4 (2 tables × 2 layers)
+    // or higher.
+    assert_eq!(executor.fetch_table_type_calls.load(Ordering::SeqCst), 2);
+
+    let events = read_audit_events(&audit.path);
+    let success = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_outcome_kind"] == "success")
+        .expect("success audit event");
+    assert_eq!(success["metadata"]["views_allowed"], false);
+    assert_eq!(success["metadata"]["view_check_required"], true);
+    assert_eq!(success["metadata"]["view_check_passed"], true);
+}
+
+#[tokio::test]
+async fn mcp_database_query_connection_queue_full_returns_503_overload() {
+    // when `acquire_connection_permit`'s
+    // semaphore wait expires, the route must surface a typed
+    // overload — HTTP 503 with `connection_queue_full` audit reason —
+    // not collapse the saturation case into a generic 500. The mock
+    // simulates the failure mode the production executor's
+    // `acquire_connection_permit` produces by returning
+    // `anyhow::Error::new(ConnectionQueueFull)` from
+    // `query_with_view_check`, which is exactly what the real helper
+    // does when its `tokio::time::timeout(connect_timeout_ms, …)`
+    // fires.
+    struct OverloadedExecutor;
+    #[async_trait::async_trait]
+    impl DatabaseExecutor for OverloadedExecutor {
+        async fn explain(
+            &self,
+            _connection: &DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _sql: &str,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<ExplainSummary> {
+            anyhow::bail!("explain not used in this test")
+        }
+
+        async fn query(
+            &self,
+            _connection: &DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _sql: &str,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<QueryRows> {
+            anyhow::bail!("query not used in this test")
+        }
+
+        async fn fetch_table_types(
+            &self,
+            _connection: &DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _tables: &[TableTypeQuery],
+            _timeout_ms: u64,
+        ) -> anyhow::Result<HashMap<(String, String), TableType>> {
+            // Make Layer A also overloaded so the route exercises the
+            // same translation path on the early-reject branch.
+            Err(anyhow::Error::new(ConnectionQueueFull))
+        }
+
+        async fn query_with_view_check(
+            &self,
+            _connection: &DatabaseConnectionConfig,
+            _secret: &DatabaseSecret,
+            _scope: &shared::dto::entitlements::DatabaseScope,
+            _view_targets: &[TableTypeQuery],
+            _sql: &str,
+            _explain_timeout_ms: u64,
+            _statement_timeout_ms: u64,
+        ) -> anyhow::Result<ViewCheckedQueryOutcome> {
+            Err(anyhow::Error::new(ConnectionQueueFull))
+        }
+    }
+
+    let audit = AuditFile::new("mcp-db-query-overload");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        Arc::new(OverloadedExecutor),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // 503 with the typed overload error body and a `connection_queue_full`
+    // reason on the durable audit record (post-attempt).
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["code"], "SERVICE_UNAVAILABLE");
+
+    let events = read_audit_events(&audit.path);
+    let rejection = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "database_query")
+        .expect("database audit event");
+    assert_eq!(
+        rejection["metadata"]["mcp_outcome_kind"],
+        "connection_queue_full"
+    );
+    assert_eq!(rejection["metadata"]["explain_attempted"], false);
+    assert_eq!(rejection["metadata"]["db_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_query_allow_views_scope_still_uses_protected_executor_method() {
+    //  when `scope.allow_views = true` the route
+    // used to fall back to standalone `.explain()` + `.query()` calls,
+    // re-opening the cross-connection DDL race on every view-opt-in
+    // scope (even for base-table SELECTs in those scopes). The fix
+    // routes ALL scopes through `query_with_view_check` regardless of
+    // `allow_views`; the policy flag only affects the offender check
+    // inside the executor. This test pins the behavior: a successful
+    // query on an `allow_views = true` scope must observe the protected
+    // executor's per-phase timeouts, which the legacy path never sets.
+    let audit = AuditFile::new("mcp-db-query-allow-views-protected-path");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let executor = Arc::new(MockDatabaseExecutor::with_base_tables(indexed_explain()));
+    let state = build_state_with_database_and_allow_views(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+        true,
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders where id = 1 limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The protected method captured both timeouts. If the route had
+    // reverted to standalone `.explain()` + `.query()`, these counters
+    // would still read zero (the default).
+    assert_eq!(
+        executor.last_explain_timeout_ms.load(Ordering::SeqCst),
+        3000,
+        "allow_views = true must still pass through query_with_view_check"
+    );
+    assert_eq!(
+        executor.last_statement_timeout_ms.load(Ordering::SeqCst),
+        5000
+    );
+}
+
+#[tokio::test]
+async fn mcp_database_query_with_view_check_uses_separate_explain_and_select_timeouts() {
+    // the MDL-protected pipeline must apply the
+    // EXPLAIN budget to the EXPLAIN step and the SELECT budget to the
+    // SELECT, NOT a single timeout for both. Otherwise a slow EXPLAIN
+    // holds MDL locks for the full SELECT budget, blocking concurrent
+    // DDL longer than configured.
+    //
+    // `with_orders_database` sets explain_timeout_ms=3000 and
+    // statement_timeout_ms=5000, with the scope's
+    // statement_timeout_ms=5000 (so `min(...)` resolves to 5000). The
+    // mock captures the values it received; this test asserts the route
+    // wired them through unchanged.
+    let audit = AuditFile::new("mcp-db-query-timeout-split");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let executor = Arc::new(MockDatabaseExecutor::with_base_tables(indexed_explain()));
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders where id = 1 limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    // EXPLAIN gets the connection's explain_timeout_ms (3000 ms).
+    assert_eq!(
+        executor.last_explain_timeout_ms.load(Ordering::SeqCst),
+        3000,
+        "EXPLAIN must use connection.explain_timeout_ms; using a single \
+         merged timeout would let a slow EXPLAIN hold MDL for the SELECT \
+         budget."
+    );
+    // SELECT gets min(scope.statement_timeout_ms, connection.statement_timeout_ms).
+    assert_eq!(
+        executor.last_statement_timeout_ms.load(Ordering::SeqCst),
+        5000,
+        "SELECT must use the scope/connection statement_timeout_ms minimum."
+    );
+}
+
+#[tokio::test]
+async fn mcp_database_query_detects_view_swap_between_layer_a_and_layer_b() {
+    // even with the negative-only cache, a
+    // `DROP TABLE orders; CREATE VIEW orders AS ...` running concurrently
+    // with an in-flight MCP request could fall between Layer A
+    // (`fetch_table_types` on its own connection) and the SELECT (its own
+    // connection). The MDL-protected re-check inside
+    // `query_with_view_check` closes that race by holding
+    // `MDL_SHARED_READ` on each referenced object across the type lookup
+    // AND the SELECT. The mock simulates the race by feeding Layer A a
+    // `BaseTable` answer and Layer B a `View` answer for the same name.
+    let audit = AuditFile::new("mcp-db-query-view-swap-toctou");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+
+    // Layer A view of the world: orders is a base table → request passes
+    // the early reject and proceeds to EXPLAIN + the user SELECT.
+    let mut layer_a = HashMap::new();
+    layer_a.insert(
+        ("orders".to_string(), "orders".to_string()),
+        TableType::BaseTable,
+    );
+
+    // Layer B view (under MDL) sees the result of the concurrent DDL —
+    // the same name now resolves to a View. The executor must refuse the
+    // SELECT and emit a `view_swap_detected_between_checks` denial so
+    // operators reviewing the audit log can distinguish a "stable view"
+    // refusal from a "DDL race" refusal.
+    let mut layer_b = HashMap::new();
+    layer_b.insert(
+        ("orders".to_string(), "orders".to_string()),
+        TableType::View,
+    );
+
+    let executor = Arc::new(MockDatabaseExecutor {
+        explain: indexed_explain(),
+        query_calls: AtomicUsize::new(0),
+        table_types: layer_a,
+        table_types_layer_b: Some(layer_b),
+        fetch_table_type_calls: AtomicUsize::new(0),
+        last_explain_timeout_ms: AtomicU64::new(0),
+        last_statement_timeout_ms: AtomicU64::new(0),
+    });
+    let state = build_state_with_database(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(StaticSecretProvider),
+        executor.clone(),
+    );
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance(&app, &token).await;
+
+    let body = json!({
+        "scope": "orders_prod_readonly",
+        "sql": "select id from orders limit 20",
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/query")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // The SELECT must NOT have run — that is the whole point of the
+    // Layer-B re-check.
+    assert_eq!(executor.query_calls.load(Ordering::SeqCst), 0);
+    // Both layers should have fired their information_schema lookup
+    // exactly once.
+    assert_eq!(executor.fetch_table_type_calls.load(Ordering::SeqCst), 2);
+
+    let events = read_audit_events(&audit.path);
+    let rejection = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "database_query")
+        .expect("database audit event");
+    assert_eq!(
+        rejection["metadata"]["mcp_outcome_kind"],
+        "view_swap_detected_between_checks"
+    );
+    // EXPLAIN now lives inside the MDL-protected transaction, so a
+    // view-swap denial happens before EXPLAIN runs. The audit reflects
+    // that the EXPLAIN step never started for this request. The legacy
+    // `allow_views = true` path still records `explain_attempted = true`
+    // because EXPLAIN is standalone there.
+    assert_eq!(rejection["metadata"]["explain_attempted"], false);
+    assert_eq!(rejection["metadata"]["db_execution_attempted"], false);
+    assert_eq!(rejection["metadata"]["views_allowed"], false);
+    assert_eq!(rejection["metadata"]["view_check_required"], true);
+    assert_eq!(rejection["metadata"]["view_check_passed"], false);
+    let offender = rejection["metadata"]["table"].as_str().expect("table");
+    assert!(
+        offender.contains("orders"),
+        "expected offender to mention the renamed table, got: {offender}"
+    );
 }
 
 #[tokio::test]

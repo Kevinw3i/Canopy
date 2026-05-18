@@ -49,6 +49,10 @@ Current actions:
 - `cloudwatch_live_tail_stop`
 - `log_group_list`
 - `entitlements_view`
+- `mcp_session_register`
+- `mcp_guidance_sync`
+- `mcp_database_scope_list`
+- `mcp_database_query`
 
 <!-- PHASE2-REMOVE-START -->
 `ec2_power` is schema-reserved for EC2 power actions. The server does not emit
@@ -111,6 +115,91 @@ EC2 power metadata (`action: "ec2_power"`) can include:
 
 Entitlements metadata usually contains the common request context fields only.
 
+MCP metadata is additive and is recorded inside `metadata`. Product Phase 1
+uses dedicated top-level MCP actions:
+
+- `mcp_session_register` for MCP session registration.
+- `mcp_guidance_sync` for guidance delivery sync.
+- `mcp_database_scope_list` for MCP Database v1 scope discovery.
+- `mcp_database_query` for MCP Database v1 query events.
+
+Common MCP metadata can include:
+
+- `client_type`: `mcp`
+- `surface`: `mcp`
+- `mcp_event_kind`
+- `mcp_outcome_kind`
+- `aws_execution_attempted`
+- `canopy_mcp_session_id`
+- `local_secret_generation`
+- `protocol_version`
+- `client_name`
+- `client_version`
+- `product_phase`
+
+MCP Database v1 metadata can include:
+
+- `mcp_event_kind`: `database_scope_list` or `database_query`
+- `mcp_outcome_kind`: one of the values listed below (matches the
+  `reason` literal the executor emits — keep this list in sync with
+  `apps/control-plane/src/services/database.rs` if new ones are added):
+
+  - `attempt` / `success` — lifecycle markers.
+  - View-guard rejections: `view_not_allowed_by_scope`,
+    `non_base_table_not_allowed_by_scope`, `table_type_unknown`,
+    `view_swap_detected_between_checks`, `view_check_failed`.
+  - EXPLAIN-plan rejections: `full_table_scan`, `max_examined_rows`,
+    `empty_explain`, `explain_failed`, `explain_table_case_mismatch`,
+    `explain_schema_out_of_scope`, `explain_schema_outside_default_db`.
+  - Overload: `connection_queue_full`,
+    `database_connection_unavailable`.
+  - Generic IO/exec failure: `database_execution_failed`,
+    `credential_load_failed` (Secrets Manager fetch failed before any
+    MySQL round-trip).
+  - Validation failures: `bad_request`, `denied` (catch-all when no
+    structured reason fits).
+- `tool_name`: `canopy_list_database_scopes` or `canopy_query_database`
+- `database_scope`
+- `connection`
+- `environment`
+- `sql_raw`
+- `tables`
+- `db_execution_planned` / `explain_planned` **:
+  intent recorded on the `attempt` event committed BEFORE Secrets
+  Manager or MySQL is touched. SIEM rules that previously pivoted on
+  `db_execution_attempted == true` on the attempt event must migrate to
+  these fields.
+- `db_execution_attempted` / `explain_attempted`: reserved for terminal
+  events that actually entered each stage. **On the pre-DB `attempt`
+  event these are `false`.** A `true` value implies the executor
+  acquired a real MySQL connection (for `db_execution_attempted`) or
+  issued the EXPLAIN statement (for `explain_attempted`).
+- `explain_passed`
+- `access_type`
+- `key_used`
+- `estimated_rows`
+- `row_count`
+- `views_allowed` / `view_check_required` / `view_check_passed`
+- `rejection_reason`
+
+MCP Database v1 records raw SQL by design. Treat audit access as sensitive.
+
+### Overload events
+
+When the executor refuses a request because of saturation rather than
+policy or input, the terminal event is `outcome=failure` with
+`mcp_outcome_kind` set to one of:
+
+- `connection_queue_full` — the local per-connection semaphore queue
+  hit its wait budget. HTTP 503.
+- `database_connection_unavailable` — MySQL connection acquisition
+  failed in a way consistent with upstream saturation (timeout, `1040
+  ER_CON_COUNT_ERROR`, `1203 ER_TOO_MANY_USER_CONNECTIONS`). HTTP 503.
+
+Both records carry `db_execution_attempted=false` and
+`explain_attempted=false`; alerting on these reasons should drive
+client-side backoff, not on-call paging.
+
 ## Examples
 
 Successful EC2 connect:
@@ -129,6 +218,33 @@ Failure during log group listing:
 
 ```json
 {"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e3333","timestamp":"2026-05-08T02:17:30Z","actor":"example-cognito-sub","action":"log_group_list","account_id":"123456789012","region":"ap-northeast-1","outcome":"failure","error_message":"AWS DescribeLogGroups failed","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","prefix":"/app/"}}
+```
+
+Pre-DB MCP Database `attempt` event (committed before Secrets Manager or
+MySQL is touched; the `*_planned` fields signal user intent, while
+`*_attempted` waits for the terminal event):
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e3330","timestamp":"2026-05-08T02:17:44Z","actor":"example-cognito-sub","action":"mcp_database_query","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_type":"mcp","surface":"mcp","mcp_event_kind":"database_query","mcp_outcome_kind":"attempt","tool_name":"canopy_query_database","database_scope":"orders_prod_readonly","connection":"orders_prod","environment":"production","sql_raw":"select id, status from orders where id = 123 limit 20","tables":["orders"],"db_execution_attempted":false,"explain_attempted":false,"db_execution_planned":true,"explain_planned":true,"views_allowed":false,"view_check_required":true}}
+```
+
+Successful MCP Database query:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e3334","timestamp":"2026-05-08T02:17:45Z","actor":"example-cognito-sub","action":"mcp_database_query","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_type":"mcp","surface":"mcp","mcp_event_kind":"database_query","mcp_outcome_kind":"success","tool_name":"canopy_query_database","database_scope":"orders_prod_readonly","connection":"orders_prod","environment":"production","sql_raw":"select id, status from orders where id = 123 limit 20","tables":["orders"],"db_execution_attempted":true,"explain_attempted":true,"explain_passed":true,"views_allowed":false,"view_check_required":true,"view_check_passed":true,"access_type":"const","key_used":"PRIMARY","estimated_rows":1,"row_count":1}}
+```
+
+MCP Database overload (503; the executor refused the request because the
+local connection-limiter queue was full):
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e3336","timestamp":"2026-05-08T02:17:55Z","actor":"example-cognito-sub","action":"mcp_database_query","outcome":"failure","error_message":"Database connection queue is full; retry after the in-flight requests complete.","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_type":"mcp","surface":"mcp","mcp_event_kind":"database_query","mcp_outcome_kind":"connection_queue_full","tool_name":"canopy_query_database","database_scope":"orders_prod_readonly","connection":"orders_prod","environment":"production","db_execution_attempted":false,"explain_attempted":false,"views_allowed":false,"view_check_required":true,"view_check_passed":false,"rejection_reason":"connection_queue_full"}}
+```
+
+MCP Database query rejected by EXPLAIN gate:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e3335","timestamp":"2026-05-08T02:17:50Z","actor":"example-cognito-sub","action":"mcp_database_query","outcome":"denied","error_message":"Query rejected before execution: full table scan is not allowed","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_type":"mcp","surface":"mcp","mcp_event_kind":"database_query","mcp_outcome_kind":"full_table_scan","tool_name":"canopy_query_database","database_scope":"orders_prod_readonly","connection":"orders_prod","environment":"production","sql_raw":"[redacted: denial path; raw SQL is captured only by the post-guidance `attempt` event]","tables":["orders"],"db_execution_attempted":false,"explain_attempted":true,"explain_passed":false,"rejection_reason":"full_table_scan","access_type":"ALL","estimated_rows":2400000}}
 ```
 
 Successful EC2 power action (stop):
