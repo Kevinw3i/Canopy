@@ -210,6 +210,8 @@ mod tests {
             database_executor: Arc::new(TestDatabaseExecutor),
             mcp_sessions: dashmap::DashMap::new(),
             ready: std::sync::atomic::AtomicBool::new(true),
+            db_connection_ready: dashmap::DashMap::new(),
+            db_connection_next_probe: dashmap::DashMap::new(),
         })
     }
 

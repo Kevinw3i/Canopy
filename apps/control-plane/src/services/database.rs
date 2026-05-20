@@ -265,6 +265,12 @@ where
         Ok(Err(err)) => {
             let wrapped: anyhow::Error = err.into();
             if is_mysql_capacity_error(&wrapped) {
+                // Codex round 40 + 41 (HIGH): tag the route-level
+                // 503 marker. `is_ambiguous_acquire_failure`
+                // re-inspects the chain via downcast_ref to
+                // `mysql_async::Error::Server` and skips the
+                // cool-down / permit hold for capacity codes —
+                // no orphan session, just upstream refusal.
                 Err(anyhow::Error::new(DatabaseConnectionUnavailable).context(wrapped))
             } else {
                 Err(wrapped)
@@ -273,6 +279,494 @@ where
         Err(_) => Err(anyhow::Error::new(DatabaseConnectionUnavailable)
             .context("database connection acquisition timed out under connect_timeout_ms")),
     }
+}
+
+/// Hard upper bound on how long a background cleanup task can hold the
+/// connection permit waiting for `pool.disconnect()` or
+/// `conn.disconnect()` to complete. The permit will eventually release
+/// even if MySQL is permanently wedged; this prevents a stalled
+/// upstream from leaking every connection slot forever.
+///
+/// Codex round 23 (HIGH): for this cap to actually bound concurrent
+/// server-side sessions, the server itself must be set to drop the
+/// session at a horizon **shorter** than the cap. We do that in
+/// `mysql_opts_for_conn` by injecting `SET SESSION net_read_timeout =
+/// 10` / `net_write_timeout = 10` / `wait_timeout = 25` as init SQL.
+/// Together those guarantee that, regardless of whether the client-
+/// side `disconnect` future completes within the cap, the server will
+/// have already torn down the TCP session and freed the upstream
+/// `max_connections` slot before the limiter releases its accounting
+/// permit. Without those init values the helpers below would only
+/// bound client-side resource usage, not the upstream session count
+/// they claim to bound.
+///
+/// Picked at 30 s because it greatly exceeds the largest configurable
+/// `connect_timeout_ms` (10 s) plus typical TCP RST/QUIT, while still
+/// being short enough that operators see slot depletion recover
+/// within a minute of the upstream coming back. See
+/// `ACQUIRE_FAILURE_PERMIT_HOLD` below for the **longer** hold used
+/// when init SQL never ran.
+const POOL_CLEANUP_HARD_CAP: Duration = Duration::from_secs(30);
+
+/// Hold time used by `permit_hold_after_acquire_failure`. Strictly
+/// longer than `POOL_CLEANUP_HARD_CAP` because the acquire-failure
+/// path is the one case where our init SQL may NOT have run yet (the
+/// future was cancelled during TCP / handshake / auth / init), so the
+/// only horizon that bounds the orphan upstream session is the
+/// role-level `wait_timeout` set by the operator — not the 25 s init
+/// value we would otherwise install.
+///
+/// Codex round 25 (HIGH): an acquire-failure-induced orphan session
+/// will live as long as the role's `wait_timeout`. The repo operator
+/// docs (`docs/OPERATOR-SETUP.md`) MUST mandate that role-level
+/// `wait_timeout` be ≤ this constant; otherwise the helper releases
+/// the limiter slot before MySQL has reaped the orphan, and a retry
+/// can put us back over `max_connections`. The control plane is not
+/// in a position to probe and validate that at runtime today (we hold
+/// the read-only Secrets Manager credential, not an admin one), so
+/// the contract is enforced by operator setup + doc + a comfortable
+/// margin here: 60 s comfortably covers the operator guidance
+/// (`wait_timeout` ≤ 30 s) plus a typical TCP keep-alive window for
+/// pre-init RST.
+const ACQUIRE_FAILURE_PERMIT_HOLD: Duration = Duration::from_secs(60);
+
+/// Maximum allowed `@@session.wait_timeout` on a pre-init connection,
+/// in seconds. See `preflight_session_safety` and round-26 review.
+const PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS: u64 = 30;
+
+/// Open a *pre-init* connection (no `OptsBuilder::init` SQL) and verify
+/// that the server-side `@@session.wait_timeout` is at or below
+/// `PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS`.
+///
+/// Codex round 26 (HIGH): the operator doc `docs/OPERATOR-SETUP.md`
+/// declares the invariant
+///   role-level `wait_timeout` ≤ 30 s
+/// but documentation cannot enforce a runtime guarantee — an operator
+/// who follows the `SET PERSIST_ONLY init_connect = ...` recipe and
+/// forgets to restart MySQL is still serving partial sessions with
+/// the default 28 800 s timeout. This preflight closes that gap by
+/// actually connecting as the read-only user, asking the server what
+/// `@@session.wait_timeout` it would hand a session that hasn't run
+/// init SQL, and failing startup readiness if the answer is too
+/// large.
+///
+/// The connection is built deliberately without our own
+/// `OptsBuilder::init` so the value reported is the one a partial
+/// (auth done, init not run) session would see — which is the exact
+/// state `permit_hold_after_acquire_failure` is sized for. Calling
+/// this from `AppState::run_preflight` keeps the health endpoint at
+/// 503 (and the ALB target unhealthy) until the upstream invariant
+/// is met.
+pub async fn preflight_session_safety(
+    connection: &DatabaseConnectionConfig,
+    secret: &DatabaseSecret,
+) -> anyhow::Result<()> {
+    use mysql_async::prelude::Queryable;
+
+    let mut opts = mysql_async::OptsBuilder::default()
+        .ip_or_hostname(connection.host.clone())
+        .tcp_port(connection.port)
+        .db_name(Some(connection.database.clone()))
+        .user(Some(secret.username.clone()))
+        .pass(Some(secret.password.clone()));
+    if connection.require_tls {
+        let mut ssl_opts = mysql_async::SslOpts::default();
+        if connection.accept_invalid_tls_certs {
+            ssl_opts = ssl_opts.with_danger_accept_invalid_certs(true);
+        }
+        if connection.skip_tls_hostname_verification {
+            ssl_opts = ssl_opts.with_danger_skip_domain_validation(true);
+        }
+        opts = opts.ssl_opts(Some(ssl_opts));
+    }
+
+    // Codex round 40 (HIGH): hard-cap the preflight connect/disconnect
+    // budget so an operator who set `connect_timeout_ms` very large
+    // cannot wedge startup readiness or block the reprobe loop for
+    // arbitrarily long. 5 s comfortably covers a healthy
+    // RDS/Aurora handshake while staying well inside any
+    // operationally-sensible deadline.
+    const MAX_PREFLIGHT_CONNECT_BUDGET: Duration = Duration::from_secs(5);
+    let connect_timeout = std::cmp::min(
+        Duration::from_millis(connection.connect_timeout_ms),
+        MAX_PREFLIGHT_CONNECT_BUDGET,
+    );
+    let mut conn = match tokio::time::timeout(connect_timeout, mysql_async::Conn::new(opts)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(err)) => {
+            // Codex round 36 + 37 + 41 (HIGH): three-way classify.
+            //   - Pre-session (auth denied, ECONNREFUSED, ...): no
+            //     marker, no cool-down.
+            //   - Capacity (1037/1040/1041/1203): mark BOTH
+            //     `DatabaseConnectionUnavailable` (route 503) AND
+            //     `DatabaseOverloadRetryable` so
+            //     `is_ambiguous_acquire_failure` skips the
+            //     5-minute reprobe cool-down — there is no orphan
+            //     session, just upstream capacity refusal.
+            //   - Everything else (driver/TLS/unknown IO): stays
+            //     ambiguous → cool-down.
+            if is_pre_session_mysql_error(&err) {
+                return Err(
+                    anyhow::Error::new(err).context("preflight connect failed (pre-session)")
+                );
+            }
+            let wrapped: anyhow::Error = err.into();
+            if is_mysql_capacity_error(&wrapped) {
+                // `is_ambiguous_acquire_failure` detects capacity
+                // by downcasting `mysql_async::Error::Server` in
+                // the chain, so the marker stack here matches the
+                // request-path acquire helper.
+                return Err(anyhow::Error::new(DatabaseConnectionUnavailable)
+                    .context(wrapped)
+                    .context("preflight connect refused (upstream capacity)"));
+            }
+            return Err(anyhow::Error::new(DatabaseConnectionUnavailable)
+                .context(wrapped)
+                .context("preflight connect failed (ambiguous)"));
+        }
+        Err(_) => {
+            // Codex round 35 + 36 (HIGH): we cancelled
+            // `Conn::new` mid-flight. The server may have
+            // allocated an authenticated session it cannot
+            // know is orphaned — exactly the case where the
+            // cool-down matters. Tag ambiguous.
+            return Err(anyhow::Error::new(DatabaseConnectionUnavailable)
+                .context("preflight connect timed out (connect_timeout_ms)"));
+        }
+    };
+
+    // Codex round 27 (HIGH): we MUST validate both @@session and
+    // @@global. See round 38 comment below for the cleanup
+    // structure that makes this safe under flapping upstreams.
+    //
+    // Codex round 38 + 39 (HIGH): the cleanup invariants are
+    //   - probe is bounded internally (no outer cancellation can
+    //     interrupt cleanup); see PROBE_QUERY_BUDGET.
+    //   - disconnect always runs and its outcome is captured.
+    //   - if disconnect didn't return Ok(Ok(())), we cannot prove
+    //     the server-side session is gone — tag ambiguous, even
+    //     if probe succeeded with healthy wait_timeout values,
+    //     so the caller applies the orphan cool-down.
+    const PROBE_QUERY_BUDGET: Duration = Duration::from_secs(10);
+    let probe_result: anyhow::Result<(u64, u64)> =
+        match tokio::time::timeout(PROBE_QUERY_BUDGET, async {
+            let session_wait: Option<u64> =
+                conn.query_first("SELECT @@session.wait_timeout").await?;
+            let global_wait: Option<u64> = conn.query_first("SELECT @@global.wait_timeout").await?;
+            let session_wait = session_wait
+                .ok_or_else(|| anyhow::anyhow!("SELECT @@session.wait_timeout returned no rows"))?;
+            let global_wait = global_wait
+                .ok_or_else(|| anyhow::anyhow!("SELECT @@global.wait_timeout returned no rows"))?;
+            anyhow::Ok((session_wait, global_wait))
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "preflight probe exceeded PROBE_QUERY_BUDGET"
+            )),
+        };
+    // Capture disconnect outcome so we can tell whether the
+    // server-side session is provably gone.
+    let disconnect_outcome = tokio::time::timeout(connect_timeout, conn.disconnect()).await;
+    let disconnect_clean = matches!(disconnect_outcome, Ok(Ok(())));
+
+    let (session_wait, global_wait) = match probe_result {
+        Ok(t) => t,
+        Err(e) => {
+            // Probe failed mid-flight; ambiguous regardless of
+            // disconnect outcome.
+            return Err(anyhow::Error::new(DatabaseConnectionUnavailable)
+                .context(e.context("preflight probe failed after connect (ambiguous)")));
+        }
+    };
+
+    if session_wait > PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS
+        || global_wait > PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS
+    {
+        let invariant_err = anyhow::anyhow!(
+            "wait_timeout invariant violated on database connection (host={}, db={}): \
+             @@session={session_wait}s, @@global={global_wait}s, both must be ≤ {ceiling}s. \
+             A connection that fails before our `OptsBuilder::init` runs inherits @@global, \
+             so a low @@session.wait_timeout via init_connect is NOT enough on its own. \
+             Fix the upstream via parameter group (RDS/Aurora) or `SET GLOBAL/SET PERSIST \
+             wait_timeout = 25`; see docs/OPERATOR-SETUP.md.",
+            connection.host,
+            connection.database,
+            ceiling = PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS,
+        );
+        // Codex round 39 (HIGH): invariant violation + clean
+        // disconnect = no orphan to protect. Invariant violation
+        // + failed/timed-out disconnect = orphan with the very
+        // wait_timeout we just rejected (e.g. 28 800 s), so we
+        // tag ambiguous to apply the orphan cool-down.
+        return if disconnect_clean {
+            Err(invariant_err)
+        } else {
+            Err(anyhow::Error::new(DatabaseConnectionUnavailable).context(invariant_err))
+        };
+    }
+
+    // Healthy invariant. If disconnect didn't return Ok(Ok(())),
+    // the upstream session may linger ≤ 25 s (the value we just
+    // verified). That is shorter than DB_REPROBE_COOLDOWN, so we
+    // do NOT need to tag ambiguous — the next reprobe tick
+    // (60 s) will already be safe.
+    let _ = disconnect_clean; // kept for documentation
+    Ok(())
+}
+
+/// Drive `pool.disconnect()` to completion while holding `permit`, with
+/// the caller waiting at most `cleanup_budget` for it to finish.
+///
+/// Codex round 21 (HIGH): the obvious shape
+///
+///   let _permit = acquire();
+///   let _ = tokio::time::timeout(cleanup_budget, pool.disconnect()).await;
+///
+/// has a subtle accounting bug. On timeout the disconnect future is
+/// cancelled mid-flight but `_permit` releases the slot immediately as
+/// the surrounding scope exits, even though the server-side session
+/// (reset / QUIT / TLS shutdown) may still be alive. Under retry storms
+/// against a wedged upstream, Canopy could admit more concurrent
+/// requests than `max_connections` lets in, defeating the load shedding
+/// contract this limiter exists to enforce.
+///
+/// This helper instead spawns a detached task that owns *both* the
+/// permit and the pool. The task runs `pool.disconnect()` under
+/// `POOL_CLEANUP_HARD_CAP` so a dead upstream cannot leak slots
+/// forever, and releases the permit only when disconnect actually
+/// returns (or the hard cap fires). The current task waits up to
+/// `cleanup_budget` to see if the disconnect lands quickly; if not,
+/// dropping the JoinHandle simply detaches it — tokio tasks are not
+/// cancelled on handle drop — so the slot remains accounted for in the
+/// background while the caller returns.
+///
+/// `context` is a short literal label used in the warn log on timeout
+/// so it can be attributed back to the call site.
+async fn release_pool_bounded_cleanup(
+    permit: OwnedSemaphorePermit,
+    pool: mysql_async::Pool,
+    cleanup_budget: Duration,
+    context: &'static str,
+) {
+    let mut handle = tokio::spawn(async move {
+        // `_held` is the permit lifetime: by holding it inside the
+        // task we guarantee the limiter only counts the slot as free
+        // once `pool.disconnect()` actually returns.
+        let _held = permit;
+        let _ = tokio::time::timeout(POOL_CLEANUP_HARD_CAP, pool.disconnect()).await;
+    });
+    if tokio::time::timeout(cleanup_budget, &mut handle)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            operation = context,
+            cleanup_budget_ms = cleanup_budget.as_millis() as u64,
+            hard_cap_ms = POOL_CLEANUP_HARD_CAP.as_millis() as u64,
+            "pool.disconnect() exceeded cleanup_budget; connection permit will be held by a \
+             background cleanup task (bounded by POOL_CLEANUP_HARD_CAP) so max_connections \
+             continues to bound concurrent server-side sessions"
+        );
+        // Drop the JoinHandle — the task is detached and continues to
+        // run until it finishes or hits the hard cap, at which point
+        // the permit is released.
+    }
+}
+
+/// Same accounting invariant as `release_pool_bounded_cleanup` but for
+/// the standalone `Conn::new(...)` lifecycle used by the MDL-protected
+/// `query_with_view_check` path (which deliberately bypasses the pool).
+///
+/// Codex round 22 (HIGH): the pool variant fixed `explain` / `query` /
+/// `fetch_table_types`, but `query_with_view_check` — the load-bearing
+/// path the route actually drives `/api/mcp/database/query` through —
+/// still wrapped `conn.disconnect()` in a stack-bound timeout. On
+/// expiry the future drops, `Drop for Conn` spawns its own background
+/// cleanup, and the `OwnedSemaphorePermit` releases as the caller's
+/// stack unwinds — even though the upstream session may still be
+/// alive. Under retries against a wedged upstream, this is the path
+/// that admits more concurrent server-side sessions than
+/// `max_connections` is supposed to allow.
+///
+/// This helper moves both the `Conn` and the permit into a detached
+/// task. The task runs `conn.disconnect()` under
+/// `POOL_CLEANUP_HARD_CAP` so a dead upstream cannot leak slots
+/// forever, and releases the permit only when disconnect returns or
+/// the hard cap fires. The current task waits up to `cleanup_budget`
+/// for the disconnect to land; if not, dropping the JoinHandle simply
+/// detaches it (tokio tasks are not cancelled on handle drop).
+async fn release_conn_bounded_cleanup(
+    permit: OwnedSemaphorePermit,
+    conn: mysql_async::Conn,
+    cleanup_budget: Duration,
+    context: &'static str,
+) {
+    let mut handle = tokio::spawn(async move {
+        let _held = permit;
+        let _ = tokio::time::timeout(POOL_CLEANUP_HARD_CAP, conn.disconnect()).await;
+    });
+    if tokio::time::timeout(cleanup_budget, &mut handle)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            operation = context,
+            cleanup_budget_ms = cleanup_budget.as_millis() as u64,
+            hard_cap_ms = POOL_CLEANUP_HARD_CAP.as_millis() as u64,
+            "conn.disconnect() exceeded cleanup_budget; connection permit will be held by a \
+             background cleanup task (bounded by POOL_CLEANUP_HARD_CAP) so max_connections \
+             continues to bound concurrent server-side sessions"
+        );
+    }
+}
+
+/// Hold `permit` for `ACQUIRE_FAILURE_PERMIT_HOLD` after a connection
+/// acquire fails (timeout or error), without owning a `Conn` we could
+/// disconnect.
+///
+/// Codex round 24 + 25 (HIGH): `Conn::new(...)` and `pool.get_conn()`
+/// both open the TCP socket, run the MySQL handshake, authenticate,
+/// AND execute any `OptsBuilder::init` SQL before returning. If our
+/// `acquire_conn_or_classify_overload` timeout fires anywhere in that
+/// window, the future is cancelled and the partially-built `Conn`
+/// drops — but the server may already have an authenticated session
+/// it doesn't know is orphaned. Releasing the limiter permit
+/// immediately on this path lets a fresh request open a new session
+/// while the old one still consumes a slot in MySQL's
+/// `max_connections`, putting us right back where the bounded
+/// cleanup is supposed to prevent over-admission.
+///
+/// The orphan's lifetime depends on whether init SQL ran before
+/// cancellation:
+///
+/// - If init SQL ran, server-side `wait_timeout` is 25 s
+///   (`mysql_opts_for_conn`).
+/// - If init SQL did NOT run, the orphan lives as long as the
+///   **role-level** `wait_timeout` — which `docs/OPERATOR-SETUP.md`
+///   now mandates be ≤ 30 s.
+///
+/// We can't actively `KILL CONNECTION` here because we don't have the
+/// `thread_id` and don't want to demand DBA privileges for the
+/// Secrets-Manager-issued read-only role. So we hold the permit for
+/// `ACQUIRE_FAILURE_PERMIT_HOLD` (60 s) — comfortably longer than the
+/// 30 s role-level `wait_timeout` ceiling, with margin to spare for
+/// operator misconfiguration. After that the slot returns; the warn
+/// log below tells operators to investigate the upstream.
+/// Decide whether a `Conn::new` / `pool.get_conn` failure could have
+/// left a half-built server-side session.
+///
+/// Codex round 30 (MED): only timeout / capacity / TLS handshake
+/// errors are "ambiguous" (the TCP socket may have completed and the
+/// server may have allocated an authenticated session before
+/// cancellation). Deterministic config errors — wrong password,
+/// unknown database, TLS validation rejected by the server — never
+/// produce an upstream session. Holding the permit for
+/// `ACQUIRE_FAILURE_PERMIT_HOLD` (60 s) on those is just queue
+/// exhaustion: every retry burns a slot for a minute even though the
+/// limiter invariant is not at risk.
+pub fn is_ambiguous_acquire_failure(err: &anyhow::Error) -> bool {
+    // Codex round 40 + 41 (HIGH): a failure is ambiguous (orphan-
+    // risk → cool-down) iff:
+    //   - it carries the `DatabaseConnectionUnavailable` marker
+    //     (the route-level 503 signal), AND
+    //   - it is NOT a known upstream capacity refusal.
+    // Capacity errors (MySQL server codes 1037 / 1040 / 1041 /
+    // 1203) are deterministic — the server explicitly refused to
+    // allocate a session, so there is no orphan to protect.
+    //
+    // `DatabaseOverloadRetryable` exists for documentation /
+    // tracing but `anyhow::Error::context(typed_marker)` wraps
+    // it inside `ContextError<T,_>`, so `e.is::<T>()` checking the
+    // chain does NOT see it. We instead inspect every chain layer
+    // and ask: is any of them a `mysql_async::Error::Server` with
+    // a known capacity code? That works because anyhow preserves
+    // the original typed error at the chain root via
+    // `Error::new(err)` / `err.into()`.
+    let has_unavailable = err.chain().any(|e| e.is::<DatabaseConnectionUnavailable>());
+    if !has_unavailable {
+        return false;
+    }
+    let is_capacity = err.chain().any(|e| {
+        e.downcast_ref::<mysql_async::Error>()
+            .map(|me| {
+                matches!(
+                    me,
+                    mysql_async::Error::Server(s)
+                        if matches!(s.code, 1037 | 1040 | 1041 | 1203)
+                )
+            })
+            .unwrap_or(false)
+    });
+    !is_capacity
+}
+
+/// Decide whether a `mysql_async::Error` is *definitely* pre-session
+/// (i.e. the server never allocated an authenticated session for the
+/// connection attempt). Used by `preflight_session_safety` to decide
+/// whether to tag the resulting error as ambiguous.
+///
+/// Codex round 37 (HIGH): allowlist, not denylist. We treat the
+/// outcome as ambiguous (might-have-orphan, set cool-down) by
+/// default, and only short-circuit to "deterministic, no cool-down"
+/// for error variants/codes we can prove never allocated a session.
+/// `Conn::new` does handshake + auth + setup before returning, so
+/// driver/protocol failures and unclassified I/O variants can have
+/// touched the server post-handshake — they must stay ambiguous to
+/// avoid orphan accumulation under a flapping upstream.
+pub fn is_pre_session_mysql_error(err: &mysql_async::Error) -> bool {
+    use mysql_async::Error;
+    use mysql_async::IoError;
+    use std::io::ErrorKind;
+    match err {
+        Error::Server(server_err) => matches!(
+            server_err.code,
+            // ER_ACCESS_DENIED_ERROR — auth phase, server closes.
+            1045
+            // ER_DBACCESS_DENIED_ERROR — auth phase.
+            | 1044
+            // ER_BAD_DB_ERROR — auth phase, server closes.
+            | 1049
+            // ER_HOST_IS_BLOCKED — pre-handshake reject (max
+            // connect errors hit).
+            | 1129
+            // ER_HOST_NOT_PRIVILEGED — pre-handshake reject.
+            | 1130
+            // ER_PASSWORD_NO_MATCH — auth phase.
+            | 1133
+        ),
+        Error::Io(IoError::Io(io_err)) => matches!(
+            io_err.kind(),
+            // ConnectionRefused / no listener / unrouteable address
+            // — TCP layer never completed handshake.
+            ErrorKind::ConnectionRefused
+                | ErrorKind::NotFound
+                | ErrorKind::AddrNotAvailable
+                | ErrorKind::InvalidInput
+        ),
+        // URL parsing / config errors never touch the wire.
+        Error::Url(_) => true,
+        // TLS handshake, driver protocol, and unclassified Other
+        // failures may have reached the server post-auth before
+        // surfacing the error. Treat as ambiguous.
+        _ => false,
+    }
+}
+
+fn permit_hold_after_acquire_failure(permit: OwnedSemaphorePermit, context: &'static str) {
+    tracing::warn!(
+        operation = context,
+        hold_ms = ACQUIRE_FAILURE_PERMIT_HOLD.as_millis() as u64,
+        "connection acquire failed; holding limiter permit for ACQUIRE_FAILURE_PERMIT_HOLD \
+         so a half-built upstream session does not put us over max_connections before the \
+         server's role-level `wait_timeout` reaps it (operators: confirm role `wait_timeout` \
+         is ≤ 30 s — see docs/OPERATOR-SETUP.md)"
+    );
+    tokio::spawn(async move {
+        let _held = permit;
+        tokio::time::sleep(ACQUIRE_FAILURE_PERMIT_HOLD).await;
+    });
 }
 
 #[async_trait]
@@ -483,23 +977,64 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
     ) -> anyhow::Result<ExplainSummary> {
         use mysql_async::prelude::Queryable;
 
-        let _permit = self.acquire_connection_permit(connection).await?;
+        let permit = self.acquire_connection_permit(connection).await?;
         let pool = mysql_pool(connection, secret)?;
-        let result = async {
-            let mut conn = acquire_conn_or_classify_overload(
-                Duration::from_millis(connection.connect_timeout_ms),
-                pool.get_conn(),
-            )
-            .await?;
+        let connect_timeout = Duration::from_millis(connection.connect_timeout_ms);
+        let cleanup_budget = connect_timeout;
+
+        // Codex round 20 (HIGH) + round 21 (HIGH refinement): two
+        // failure modes the original code created and one accounting
+        // bug round 20 left open.
+        //   * `pool.disconnect().await` inside the work future deadlocks
+        //     because the pool waits for `conn` to return but `conn` is
+        //     still borrowed by this scope.
+        //   * Removing the disconnect entirely lets Pool::drop close
+        //     only the recycler channel — reset/QUIT keep running
+        //     asynchronously while `_permit` releases immediately.
+        //   * Wrapping disconnect in a stack-bound `timeout(...)` is
+        //     still wrong: on elapsed, the permit drops with the scope
+        //     even though the server-side session may still be alive.
+        //     That makes `max_connections` a soft hint, not a bound.
+        //
+        // Fix: split into (a) bounded work, (b) bounded cleanup that
+        // owns the permit. `release_pool_bounded_cleanup` spawns a
+        // detached task holding both the permit and the pool; the
+        // limiter only counts the slot free after disconnect actually
+        // returns or POOL_CLEANUP_HARD_CAP fires.
+        let mut conn =
+            match acquire_conn_or_classify_overload(connect_timeout, pool.get_conn()).await {
+                Ok(c) => c,
+                Err(err) => {
+                    // Codex round 24 + 30 (HIGH/MED): only hold the
+                    // permit when the failure is ambiguous (could
+                    // have left a half-built upstream session).
+                    // Deterministic config errors release immediately.
+                    if is_ambiguous_acquire_failure(&err) {
+                        permit_hold_after_acquire_failure(permit, "explain_acquire");
+                    } else {
+                        drop(permit);
+                    }
+                    let _ = pool;
+                    return Err(err);
+                }
+            };
+
+        let work = async {
             let explain_sql = format!("EXPLAIN FORMAT=JSON {sql}");
             let raw: Option<String> = conn.query_first(explain_sql).await?;
-            pool.disconnect().await?;
             let raw = raw.ok_or_else(|| anyhow::anyhow!("EXPLAIN returned no rows"))?;
             explain_summary_from_json(&raw)
         };
-        tokio::time::timeout(Duration::from_millis(timeout_ms), result)
-            .await
-            .map_err(|_| anyhow::anyhow!("EXPLAIN timed out"))?
+        let work_outcome: anyhow::Result<ExplainSummary> =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), work).await {
+                Ok(o) => o,
+                Err(_) => Err(anyhow::anyhow!("EXPLAIN timed out")),
+            };
+
+        drop(conn);
+        release_pool_bounded_cleanup(permit, pool, cleanup_budget, "explain").await;
+
+        work_outcome
     }
 
     async fn query(
@@ -511,14 +1046,31 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
     ) -> anyhow::Result<QueryRows> {
         use mysql_async::prelude::Queryable;
 
-        let _permit = self.acquire_connection_permit(connection).await?;
+        let permit = self.acquire_connection_permit(connection).await?;
         let pool = mysql_pool(connection, secret)?;
-        let result = async {
-            let mut conn = acquire_conn_or_classify_overload(
-                Duration::from_millis(connection.connect_timeout_ms),
-                pool.get_conn(),
-            )
-            .await?;
+        let connect_timeout = Duration::from_millis(connection.connect_timeout_ms);
+        let cleanup_budget = connect_timeout;
+
+        // Codex round 20 + round 21 (HIGH): see `explain()` for the
+        // full rationale. Phase-split: bounded work, then permit-aware
+        // cleanup via `release_pool_bounded_cleanup` so a wedged
+        // upstream cannot release the permit prematurely.
+        let mut conn =
+            match acquire_conn_or_classify_overload(connect_timeout, pool.get_conn()).await {
+                Ok(c) => c,
+                Err(err) => {
+                    // Codex round 24 + 30 (HIGH/MED): see `explain()`.
+                    if is_ambiguous_acquire_failure(&err) {
+                        permit_hold_after_acquire_failure(permit, "query_acquire");
+                    } else {
+                        drop(permit);
+                    }
+                    let _ = pool;
+                    return Err(err);
+                }
+            };
+
+        let work = async {
             conn.query_drop(format!(
                 "SET SESSION max_execution_time = {}",
                 timeout_ms.min(u64::from(u32::MAX))
@@ -557,16 +1109,22 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
                 rows.push(parsed_row);
             }
             drop(result);
-            pool.disconnect().await?;
             Ok(QueryRows {
                 columns,
                 rows,
                 truncated_by_byte_budget,
             })
         };
-        tokio::time::timeout(Duration::from_millis(timeout_ms), result)
-            .await
-            .map_err(|_| anyhow::anyhow!("query timed out"))?
+        let work_outcome: anyhow::Result<QueryRows> =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), work).await {
+                Ok(o) => o,
+                Err(_) => Err(anyhow::anyhow!("query timed out")),
+            };
+
+        drop(conn);
+        release_pool_bounded_cleanup(permit, pool, cleanup_budget, "query").await;
+
+        work_outcome
     }
 
     async fn fetch_table_types(
@@ -592,14 +1150,32 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
             return Ok(result_map);
         }
 
-        let _permit = self.acquire_connection_permit(connection).await?;
+        let permit = self.acquire_connection_permit(connection).await?;
         let pool = mysql_pool(connection, secret)?;
+        let connect_timeout = Duration::from_millis(connection.connect_timeout_ms);
+        let cleanup_budget = connect_timeout;
+
+        // Codex round 20 + round 21 (HIGH): same phase split as
+        // `explain()` / `query()`. Without it `max_connections` no
+        // longer bounds server-side sessions on a stalled upstream;
+        // `release_pool_bounded_cleanup` keeps the permit held until
+        // disconnect actually completes (or the hard cap fires).
+        let mut conn =
+            match acquire_conn_or_classify_overload(connect_timeout, pool.get_conn()).await {
+                Ok(c) => c,
+                Err(err) => {
+                    // Codex round 24 + 30 (HIGH/MED): see `explain()`.
+                    if is_ambiguous_acquire_failure(&err) {
+                        permit_hold_after_acquire_failure(permit, "fetch_table_types_acquire");
+                    } else {
+                        drop(permit);
+                    }
+                    let _ = pool;
+                    return Err(err);
+                }
+            };
+
         let lookup = async {
-            let mut conn = acquire_conn_or_classify_overload(
-                Duration::from_millis(connection.connect_timeout_ms),
-                pool.get_conn(),
-            )
-            .await?;
             conn.query_drop(format!(
                 "SET SESSION max_execution_time = {}",
                 timeout_ms.min(u64::from(u32::MAX))
@@ -607,12 +1183,18 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
             .await?;
             conn.query_drop("SET SESSION TRANSACTION READ ONLY").await?;
             let rows = lookup_table_types_on_conn(&mut conn, &pending).await?;
-            pool.disconnect().await?;
             anyhow::Ok(rows)
         };
-        let fetched = tokio::time::timeout(Duration::from_millis(timeout_ms), lookup)
-            .await
-            .map_err(|_| anyhow::anyhow!("information_schema lookup timed out"))??;
+        let lookup_outcome: anyhow::Result<Vec<((String, String), TableType)>> =
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), lookup).await {
+                Ok(o) => o,
+                Err(_) => Err(anyhow::anyhow!("information_schema lookup timed out")),
+            };
+
+        drop(conn);
+        release_pool_bounded_cleanup(permit, pool, cleanup_budget, "fetch_table_types").await;
+
+        let fetched = lookup_outcome?;
 
         let now = Instant::now();
         for (key, kind) in fetched {
@@ -682,11 +1264,21 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
             );
         }
 
-        let _permit = self.acquire_connection_permit(connection).await?;
+        let permit = self.acquire_connection_permit(connection).await?;
         // The MDL-protected path bypasses the mysql_async pool by opening
         // its connection via `mysql_async::Conn::new(opts)` directly. This
         // avoids the pool recycler entirely for the request-return wall
         // clock.
+        //
+        // Codex round 22 (HIGH): the permit (`permit`) is no longer
+        // released by stack drop on this path. It is handed off to
+        // `release_conn_bounded_cleanup` at the end of the method,
+        // which spawns a detached task that owns both the `Conn` and
+        // the permit. The limiter slot is released only after
+        // `conn.disconnect()` returns or POOL_CLEANUP_HARD_CAP fires —
+        // matching the pool variant used by explain/query/fetch and
+        // making `max_connections` a hard bound even when the MDL-
+        // protected SELECT is the one whose disconnect stalls.
         //
         // Caveat: mysql_async 0.34.2's
         // `impl Drop for Conn` ALWAYS spawns a background async task to
@@ -695,17 +1287,19 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
         // `Pool` or `Conn::new`. We cannot make Drop fully synchronous
         // without replacing the driver. What this method DOES guarantee:
         //   * The async fn returns within the documented wall clock.
-        //   * The executor's semaphore permit (`_permit`) is released
-        //     on return.
+        //   * The executor's semaphore permit is NOT released until
+        //     the bounded background cleanup task finishes
+        //     (success, error, or hard-cap-elapsed) — see
+        //     `release_conn_bounded_cleanup`.
         //   * The user SELECT does not execute if the cleanup phase was
         //     entered early (timeout or error).
         // What we cannot guarantee: server-side MDL release timing.
         // Under a wedged-server worst case, mysql_async's background
         // cleanup task may continue holding the connection open past
-        // our return; the server eventually times out its own end
-        // (`wait_timeout`, default 8h). Operators who need a tighter
-        // server-side ceiling should pair Canopy with a low-value
-        // `wait_timeout` on the read-only database role.
+        // POOL_CLEANUP_HARD_CAP; the server eventually times out its
+        // own end (`wait_timeout`, default 8h). Operators who need a
+        // tighter server-side ceiling should pair Canopy with a
+        // low-value `wait_timeout` on the read-only database role.
         let opts: mysql_async::Opts = mysql_opts_for_conn(connection, secret)?.into();
         let default_schema = connection.database.clone();
         let connect_timeout = Duration::from_millis(connection.connect_timeout_ms);
@@ -717,13 +1311,16 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
         //
         //   * Every awaitable that talks to the server lives under an
         //     explicit `tokio::time::timeout`.
-        //   * The semaphore wait is bounded too — the
-        //     `_permit` acquired above already burned at most
+        //   * The semaphore wait is bounded too — the `permit`
+        //     acquired above already burned at most
         //     `connect_timeout_ms` on the connection-limiter queue.
         //   * The cleanup path NEVER shares a timeout boundary with the
         //     work it is cleaning up after.
-        //   * The disconnect path is its own bounded phase so even a `conn.disconnect()` that the server stalls
-        //     does not extend the caller's wall clock.
+        //   * The disconnect path is its own bounded phase so even a
+        //     `conn.disconnect()` that the server stalls does not
+        //     extend the caller's wall clock; the permit accounting
+        //     is decoupled from caller wall clock via
+        //     `release_conn_bounded_cleanup` (round 22 HIGH fix).
         //
         //   0. (Already done above.) Permit acquisition bounded by
         //      `connect_timeout_ms`.
@@ -733,16 +1330,20 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
         //      server expires this WITHOUT cancelling cleanup.
         //   3. Best-effort COMMIT/ROLLBACK with its own `cleanup_budget`
         //      timeout. Runs even if step 2 timed out.
-        //   4. Explicit `conn.disconnect()` under `cleanup_budget`
-        //      (graceful QUIT + socket close). On timeout the future
-        //      drops and `Drop for Conn` takes over — see the honest
-        //      caveat above.
+        //   4. `release_conn_bounded_cleanup(permit, conn, …)` —
+        //      bounded `conn.disconnect()` AND permit lifetime control.
+        //      The caller waits up to `cleanup_budget`; on overflow,
+        //      the permit is held by a detached task until disconnect
+        //      actually completes (or `POOL_CLEANUP_HARD_CAP` fires).
         //
         // Caller-side worst-case wall clock:
         // `queue + connect + work_budget + cleanup_budget + cleanup_budget`.
         // With production defaults
         // (3000 / 3000 / 3000+5000+3000 / 3000 / 3000) that is ~23s,
-        // versus an unbounded prior worst case.
+        // versus an unbounded prior worst case. The permit may stay
+        // held in the background for up to POOL_CLEANUP_HARD_CAP after
+        // the caller returns, which is exactly the property
+        // `max_connections` needs to be a hard bound.
 
         // Phase 1: acquire a standalone connection (no pool). The
         // `acquire_conn_or_classify_overload` helper wraps both timeout
@@ -750,11 +1351,39 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
         // / RDS Proxy borrow exhaustion) in `DatabaseConnectionUnavailable`
         // so the route can translate them into 503 overload responses —
         // matching the shape of the `ConnectionQueueFull` path. Same
-        // helper used by `explain` / `query` / `fetch_table_types`
-        //.
+        // helper used by `explain` / `query` / `fetch_table_types`.
+        //
+        // Codex round 24 (HIGH): on the failure branch we cannot
+        // assume "no upstream session was created." `Conn::new` runs
+        // TCP connect + handshake + AUTH + init SQL before returning,
+        // so an acquire-timeout fired mid-handshake/mid-init may have
+        // already left a half-built authenticated session on the
+        // server. Releasing the limiter permit immediately would let
+        // a fresh request open another session before MySQL reaps
+        // that orphan, putting us back over `max_connections`. The
+        // safer accounting is `permit_hold_after_acquire_failure`,
+        // which holds the permit for `POOL_CLEANUP_HARD_CAP` so the
+        // server has time to drop the partial session under its own
+        // (operator-configured) timeouts.
         let mut conn =
-            acquire_conn_or_classify_overload(connect_timeout, mysql_async::Conn::new(opts))
-                .await?;
+            match acquire_conn_or_classify_overload(connect_timeout, mysql_async::Conn::new(opts))
+                .await
+            {
+                Ok(c) => c,
+                Err(err) => {
+                    // Codex round 30 (MED): only hold the permit when
+                    // the failure is ambiguous (partial server
+                    // session plausible). See helper docstring for
+                    // why deterministic config errors release
+                    // immediately.
+                    if is_ambiguous_acquire_failure(&err) {
+                        permit_hold_after_acquire_failure(permit, "query_with_view_check_acquire");
+                    } else {
+                        drop(permit);
+                    }
+                    return Err(err);
+                }
+            };
 
         // `PreflightOutcome` distinguishes the early-bail variants
         // (`ViewSwapDetected` / `ExplainRejected`) from the
@@ -930,21 +1559,18 @@ impl DatabaseExecutor for MySqlDatabaseExecutor {
             ),
         }
 
-        // Phase 4: explicit, bounded graceful close. `conn.disconnect()`
-        // sends a MySQL `QUIT` packet and then closes the socket. We
-        // wrap it in a timeout so a stalled server cannot extend the
-        // caller's wall clock; on expiry the future drops and `Drop for
-        // Conn` takes over (mysql_async's unavoidable background cleanup
-        // task — see the honest caveat at the top of this method). The
-        // request returns either way; the executor permit is released
-        // via `_permit`'s Drop on function return.
-        if let Err(_elapsed) = tokio::time::timeout(cleanup_budget, conn.disconnect()).await {
-            tracing::warn!(
-                budget_ms = connection.connect_timeout_ms,
-                "conn.disconnect() exceeded its budget; mysql_async will continue \
-                 cleanup in a background task while the request returns"
-            );
-        }
+        // Phase 4: explicit, bounded graceful close + permit hand-off.
+        // `release_conn_bounded_cleanup` sends `conn.disconnect()` (MySQL
+        // QUIT + socket close) under `POOL_CLEANUP_HARD_CAP` and keeps
+        // the permit live until either disconnect actually completes or
+        // the hard cap fires. The current task waits up to
+        // `cleanup_budget` for that to happen; on overflow the helper
+        // detaches the cleanup task and returns. The caller's wall
+        // clock is therefore bounded by `cleanup_budget` while the
+        // limiter slot accounting is bounded by `POOL_CLEANUP_HARD_CAP`
+        // — both of which matter, but for different invariants
+        // (latency vs. max_connections honesty).
+        release_conn_bounded_cleanup(permit, conn, cleanup_budget, "query_with_view_check").await;
 
         inner_outcome
     }
@@ -1111,6 +1737,17 @@ fn classify_table_type(raw: &str) -> TableType {
 /// wedged server. `query_with_view_check` avoids the recycler entirely
 /// by owning a non-pool `Conn`; dropping that `Conn` closes the socket
 /// immediately and the server tears down its end.
+///
+/// Codex round 23 (HIGH): the `init` SQL below pins server-side
+/// timeouts so the server is guaranteed to drop the session within
+/// `POOL_CLEANUP_HARD_CAP` even if the client-side `Conn::disconnect()`
+/// stalls past the cap. Without this, `release_*_bounded_cleanup`
+/// could release the limiter permit at the cap while the MySQL
+/// session still held an MDL and consumed a slot in the upstream's
+/// `max_connections`, so the limiter would not bound real concurrent
+/// server-side sessions. The chosen values bracket the cap from
+/// below — server-side timeout < cap < hard cap + headroom — so
+/// "permit released" implies "server session is gone or about to be".
 fn mysql_opts_for_conn(
     connection: &DatabaseConnectionConfig,
     secret: &DatabaseSecret,
@@ -1122,6 +1759,25 @@ fn mysql_opts_for_conn(
         .db_name(Some(connection.database.clone()))
         .user(Some(secret.username.clone()))
         .pass(Some(secret.password.clone()))
+        .init(vec![
+            // `net_read_timeout` / `net_write_timeout` — bound how
+            // long the server is willing to wait on either direction
+            // of the TCP socket. With `POOL_CLEANUP_HARD_CAP` = 30s,
+            // capping these at 10s gives the server up to 20s of
+            // headroom to actually close before the limiter releases
+            // its slot in the worst case. Default values (30s/60s)
+            // would let the server keep a session past the cap on a
+            // half-broken socket and re-open the over-admission hole
+            // the bounded cleanup is supposed to close.
+            String::from("SET SESSION net_read_timeout = 10"),
+            String::from("SET SESSION net_write_timeout = 10"),
+            // `wait_timeout` — idle-session reaper. Canopy never
+            // pools idle, so this is purely a safety net for the
+            // window between cleanup cap elapsing on the client and
+            // the server noticing the socket is dead. 25s gives the
+            // server ~5s to reap before the hard cap fires.
+            String::from("SET SESSION wait_timeout = 25"),
+        ])
         // `max_allowed_packet` is the MySQL protocol packet ceiling. By
         // setting it here at connection time (instead of via the read-
         // only session variable) we tell `mysql_async` to abort the
