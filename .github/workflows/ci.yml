@@ -2,8 +2,16 @@ name: CI
 
 on:
   push:
+    # Run on master/main pushes (e.g. after a PR merge) so the default
+    # branch is always known-green. Also run on the existing ci-v* tag
+    # for explicit release-tagging workflows.
+    branches: [master, main]
     tags:
       - "ci-v*"
+  # Run on every PR targeting master/main. This is the primary signal
+  # that catches regressions before merge.
+  pull_request:
+    branches: [master, main]
 
 permissions:
   contents: read
@@ -34,3 +42,33 @@ jobs:
 
       - name: Validate entitlements script syntax
         run: bash -n scripts/validate-entitlements.sh
+
+  # Heavyweight MySQL E2E test (tests/database_e2e_test.rs) tagged
+  # `#[ignore]`. Split into its own job so the main `test` job stays
+  # fast — pulling mysql:8 (~600MB) on a cold runner cache adds ~30-60s,
+  # which we do not want to pay on every ci-v* tag. This job needs a
+  # working Docker daemon; ubuntu-latest runners ship with one
+  # pre-installed and configured.
+  e2e_docker:
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify Docker is available
+        run: docker version
+
+      - name: Pre-pull MySQL image
+        # Optional: testcontainers will pull on demand, but doing it
+        # explicitly puts the pull in its own step so a slow image pull
+        # is not blamed on cargo test.
+        run: docker pull mysql:8
+
+      - name: Run #[ignore]-d E2E tests (P3 — testcontainers MySQL)
+        run: cargo test --workspace -- --ignored

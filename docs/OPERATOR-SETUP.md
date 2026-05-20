@@ -186,24 +186,83 @@ connection 本身設定在 control-plane `config.toml` 或 Terraform
 
 啟用 `can_use_mcp_database = true` 之前，建議完成以下設定。
 
-### 1. 在唯讀 DB role 上加 `wait_timeout`（強烈建議）
+### 1. 在唯讀 DB role 上加 `wait_timeout`（**必設**，不是 nice-to-have）
 
 Control-plane 內部已對每個請求做 wall-clock bounding（caller 端最壞
-~23 秒：semaphore queue + connect + work + cleanup），但 mysql_async
-的 `Drop for Conn` 會 spawn 背景 cleanup task，**server-side MDL 可能
-在 caller 已 return 後仍被持有少量時間**。把唯讀 DB role 的 session
-`wait_timeout` 設低可以鎖死這個殘餘窗口：
+~23 秒：semaphore queue + connect + work + cleanup），但兩個 cleanup
+失敗模式仍需要 server 端配合才能鎖死 over-admission：
+
+1. **`disconnect()` 完成 path**：每個建好的 connection，Canopy 透過
+   `OptsBuilder::init` 已自動 `SET SESSION wait_timeout = 25`、
+   `net_read_timeout = 10`、`net_write_timeout = 10`。Server 端會在 25 秒內
+   reap 任何卡住的 session，限制 `POOL_CLEANUP_HARD_CAP` (30 s) 後 limiter
+   permit 才釋放。**這條 path 不需要 operator 配置**，code 內 init SQL
+   就能保證。
+2. **acquire failure path**：`Conn::new` / `pool.get_conn` 超時時被取消，
+   init SQL 可能還沒跑就被砍。這時 orphan session 的 lifetime 就是
+   **role-level** `wait_timeout`。Canopy 會在這條 path 持有 limiter permit
+   `ACQUIRE_FAILURE_PERMIT_HOLD` (60 s)，**必須**比 role-level wait_timeout
+   長才能保證 server 端 orphan 在 permit 釋放前已被 reap。
+
+**Invariant（必須遵守，否則 max_connections 不是 hard bound）**：
+**`@@session.wait_timeout` AND `@@global.wait_timeout` 兩個都 ≤ 30 秒。**
+預設 28800（8 小時）絕對不行。
+
+Control-plane **啟動時 preflight** 會用 read-only secret 連到每個
+`database_connections` entry，**同時**跑 `SELECT @@session.wait_timeout` 與
+`SELECT @@global.wait_timeout`，兩個都必須 ≤ 30 秒。
+
+**違反者的行為（重要：與其他 routes 隔離）**：
+
+- `GET /health` 仍會 **200**（global readiness 維持 ready=true，EC2 /
+  CloudWatch / auth path 不會被 deregister）。
+- **只有受影響的 database scope** 會回 `503 SERVICE_UNAVAILABLE` +
+  `code: "SERVICE_UNAVAILABLE"` + message 指向 `GET /health` 的 message。
+- 其他健康的 `database_connections` 仍可服務查詢。
+- 背景 reprobe 每 60 秒重試該 connection（cool-down 5 分鐘若是 connect/handshake
+  phase failure）；operator 修好 upstream 後自動恢復，不需重啟 control-plane。
+
+換言之這個 invariant 由 code per-connection 強制，doc 只是說明為什麼。Operator
+應該以 **MCP database query 回 503** 為訊號（不是 /health），並查 control-plane
+日誌 `DB preflight FAILED for database connection` / `DB preflight regressed` /
+`DB preflight recovered` 等 line 找哪個 connection name。
+
+> **常見陷阱**：靠 `init_connect` 把 `@@session.wait_timeout` 壓到 25，但
+> `@@global.wait_timeout` 還是 28800 → preflight 仍會 503，因為 partial
+> session（init SQL 還沒跑完）會繼承 `@@global`。**必須**改 global。
 
 ```sql
--- MySQL 8.x 或相容版本
+-- MySQL 8.x / RDS / Aurora MySQL：以下任一條 path 都行，**必須是 immediate-effective**。
+
 CREATE USER 'canopy_readonly'@'%' IDENTIFIED BY '...';
 GRANT SELECT ON orders.* TO 'canopy_readonly'@'%';
-GRANT SELECT ON information_schema.tables TO 'canopy_readonly'@'%';
-
--- 建議值：60–120 秒。預設 28800（8 小時）對自動清理無幫助。
+GRANT SHOW VIEW ON orders.* TO 'canopy_readonly'@'%';   -- 若 allow_views=true 需要
 ALTER USER 'canopy_readonly'@'%' WITH MAX_USER_CONNECTIONS 16;
-SET PERSIST_ONLY init_connect = 'SET SESSION wait_timeout = 120';
+
+-- Path A：MySQL/RDS parameter group（推薦，作用在所有 sessions）。
+--   * 修 cluster/instance parameter group 把 `wait_timeout` 改成 25。
+--   * 套用 → 對 MySQL 8 / Aurora MySQL 是 dynamic（不需 restart）。
+--   * 套用後跑 path C 驗證。
+
+-- Path B：手動 SET GLOBAL + SET PERSIST（適合非 RDS 自建 MySQL）。
+SET GLOBAL  wait_timeout = 25;   -- 立刻對 NEW sessions 生效。
+SET PERSIST wait_timeout = 25;   -- 跨重啟生效。
+-- 對既有 sessions 不會立刻生效；如有長連線可手動 KILL 或等他們自然 close。
+
+-- Path C（必跑）：以 canopy_readonly 身分驗證。
+--   不能用 admin/root 驗 — 必須是 control-plane 實際會用的 secret。
+--   **必須同時查 @@session 與 @@global**：control-plane preflight 兩個都檢，
+--   只滿足 @@session（例如靠 init_connect）會讓 service 啟動後永遠 503。
+mysql -h <host> -u canopy_readonly -p<password> <db> \
+  -e "SELECT @@session.wait_timeout, @@global.wait_timeout;"
+-- 兩個 column 結果都必須 ≤ 30，否則 control-plane 起來會 503。
 ```
+
+**Don't use `SET PERSIST_ONLY init_connect = ...`**：這個 (a) 不是 immediate-
+effective，要 restart 才生效；(b) 是 server-level session-startup hook，不是
+role-level setting；(c) 對 SUPER / CONNECTION_ADMIN user 完全跳過；(d) 只動
+session 不動 global，preflight 同時檢 @@global 會直接 503。四個性質都會讓
+operator 以為 invariant 滿足、實際 session 仍跑 default 28 800 秒。
 
 `MAX_USER_CONNECTIONS` 也建議設一個保守上限，這樣 MySQL 在飽和時會
 回 1203 (`ER_TOO_MANY_USER_CONNECTIONS`)，Canopy 會把它翻成

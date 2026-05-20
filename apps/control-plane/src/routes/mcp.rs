@@ -367,6 +367,22 @@ async fn list_database_scopes(
             Json(ApiError::internal("Audit logging unavailable")),
         ));
     }
+    // Codex round 27 (HIGH): readiness is not just an LB signal — it
+    // includes the `wait_timeout` invariant `permit_hold_after_acquire_failure`
+    // is sized for. Refuse database routes until preflight has cleared
+    // them, so an authenticated request during LB deregistration lag
+    // or via direct/internal traffic cannot bypass the limiter's
+    // correctness contract. Codex round 28 (MED): use
+    // `service_unavailable` (not `internal`) so clients can tell
+    // startup-not-ready (retryable) from a server bug.
+    if !state.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "database routes not ready: startup preflight has not passed (see GET /health)",
+            )),
+        ));
+    }
 
     let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let store = state.entitlement_store.read().await;
@@ -459,6 +475,25 @@ async fn query_database(
             Json(ApiError::internal("Audit logging unavailable")),
         ));
     }
+    // Codex round 27 + 28 + 30 (HIGH/MED): readiness gate. Global
+    // readiness (`state.is_ready()`) covers OIDC + STS — its failure
+    // indicates the whole service is unusable, so all auth-protected
+    // routes already 503 via `/health` deregistration. The
+    // **per-connection** check below is the database-specific
+    // half: only fail the connection whose wait_timeout invariant
+    // was not provable, leaving healthy scopes serving traffic. The
+    // per-connection check fires AFTER scope resolution because we
+    // need `scope.connection` to look up the right entry. Pre-scope
+    // global readiness is still asserted here so an entirely unbooted
+    // process cannot accept database calls.
+    if !state.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "database routes not ready: startup preflight has not passed (see GET /health)",
+            )),
+        ));
+    }
 
     let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
 
@@ -523,6 +558,29 @@ async fn query_database(
             )),
         ));
     };
+    // Codex round 30 (HIGH): per-connection readiness. Only this
+    // scope's underlying connection has to be preflight-OK. A
+    // different misconfigured upstream still serves its own healthy
+    // scopes, and other Canopy surfaces (EC2, CloudWatch) are never
+    // affected.
+    if !state.db_connection_is_ready(&scope.connection) {
+        audit_database_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            "database_connection_not_ready",
+            Some(&scope),
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(format!(
+                "database connection '{}' is not ready: its @@session/@@global.wait_timeout \
+                 preflight has not passed (see GET /health and docs/OPERATOR-SETUP.md)",
+                scope.connection
+            ))),
+        ));
+    }
     if !connection.readonly {
         audit_database_denied(
             &state,
