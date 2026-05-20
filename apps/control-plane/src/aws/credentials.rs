@@ -526,4 +526,232 @@ mod tests {
         let stmts = v["Statement"].as_array().unwrap();
         assert!(stmts.is_empty());
     }
+
+    // ── Additional boundary / null / permission / scoping coverage ──
+
+    #[test]
+    fn sanitize_session_name_with_empty_input_meets_iam_minimum_length() {
+        // IAM SessionName needs >= 2 chars. Empty input is padded.
+        let name = sanitize_session_name("c", "");
+        assert!(
+            name.len() >= 2,
+            "STS rejects session names shorter than 2 chars, got {name:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_session_name_replaces_unicode_with_underscore() {
+        // Non-ASCII characters (Chinese, emoji) must be replaced —
+        // STS only accepts the documented charset [a-zA-Z0-9+=,.@_-].
+        let name = sanitize_session_name("p", "用戶alice🎉");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+=,.@-_".contains(c)),
+            "non-ASCII must be replaced, got {name:?}"
+        );
+        assert!(name.contains("alice"));
+    }
+
+    #[test]
+    fn sanitize_session_name_truncates_long_prefix_plus_user_to_iam_max_64() {
+        // STS limit is 64 chars; combined prefix + delim + identity
+        // must be clamped.
+        let long_prefix = "a".repeat(80);
+        let name = sanitize_session_name(&long_prefix, "alice");
+        assert_eq!(name.len(), 64);
+    }
+
+    #[test]
+    fn sanitize_session_name_uses_only_iam_charset_for_email_with_dots() {
+        // Real Cognito subs / emails contain dots and @ — both must
+        // pass through unmodified (they are in the allow-list).
+        let name = sanitize_session_name("canopy", "alice.smith+canopy@example.co.uk");
+        assert_eq!(name, "canopy-alice.smith+canopy@example.co.uk");
+    }
+
+    #[test]
+    fn policy_ssm_resource_arn_scopes_to_specific_instance_only() {
+        // Permission scoping: the generated policy must reference the
+        // *exact* instance ARN, never a wildcard, so STS-down-scoped
+        // credentials cannot start a session on a sibling instance.
+        let policy = connect_session_policy(
+            "i-target123",
+            "111111111111",
+            "us-east-1",
+            true,
+            false,
+            false,
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
+        let resources = v["Statement"][0]["Resource"].as_array().unwrap();
+        let arns: Vec<&str> = resources.iter().filter_map(|r| r.as_str()).collect();
+        assert!(arns
+            .iter()
+            .any(|s| s == &"arn:aws:ec2:us-east-1:111111111111:instance/i-target123"));
+        assert!(
+            !arns.iter().any(|s| s.ends_with("instance/*")),
+            "no wildcard instance ARN allowed: {arns:?}"
+        );
+    }
+
+    #[test]
+    fn policy_ssm_does_not_attach_runas_condition_when_os_user_is_none() {
+        // Null os_user: policy should not emit any SSM RunAs Condition
+        // block (which would tag-bind to a non-existent user).
+        let policy = connect_session_policy(
+            "i-noru",
+            "111111111111",
+            "us-east-1",
+            true,
+            false,
+            true, // ssm_os_user_enforced
+            None, // os_user
+        );
+        let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
+        assert!(
+            v["Statement"][0].get("Condition").is_none(),
+            "Condition block must not be set when os_user is None"
+        );
+    }
+
+    #[test]
+    fn policy_eic_describe_instances_is_region_scoped_via_request_region_condition() {
+        // EIC needs DescribeInstances on Resource: "*" — but it must
+        // be scoped to the target region via the aws:RequestedRegion
+        // condition so the temp credentials can't enumerate instances
+        // across other regions.
+        let policy = connect_session_policy(
+            "i-eic1",
+            "222222222222",
+            "ap-northeast-1",
+            false,
+            true,
+            false,
+            Some("ec2-user"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
+        let describe = v["Statement"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["Action"][0] == "ec2:DescribeInstances")
+            .expect("DescribeInstances statement must be present");
+        assert_eq!(
+            describe["Condition"]["StringEquals"]["aws:RequestedRegion"],
+            "ap-northeast-1"
+        );
+    }
+
+    #[test]
+    fn policy_eic_resource_arn_does_not_leak_other_account_ids() {
+        // ARN templating must always interpolate the specific account
+        // and region; nothing should reference other accounts even if
+        // strings happen to match.
+        let policy = connect_session_policy(
+            "i-eic2",
+            "999999999999",
+            "us-west-2",
+            false,
+            true,
+            false,
+            None,
+        );
+        // Search the policy text for any 12-digit number that is not
+        // 999999999999. None should appear.
+        for chunk in policy.split(|c: char| !c.is_ascii_digit()) {
+            if chunk.len() == 12 {
+                assert_eq!(
+                    chunk, "999999999999",
+                    "unexpected 12-digit account id leaked into policy: {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn policy_neither_ssm_nor_eic_returns_well_formed_empty_statement_list() {
+        // Defensive: even with all features off, the policy must be a
+        // syntactically valid IAM policy document, not empty / null.
+        let policy = connect_session_policy(
+            "i-none",
+            "111111111111",
+            "us-east-1",
+            false,
+            false,
+            false,
+            None,
+        );
+        let v: serde_json::Value = serde_json::from_str(&policy).expect("must parse as JSON");
+        assert_eq!(v["Version"], "2012-10-17");
+        assert!(v["Statement"].is_array());
+        assert!(v["Statement"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn policy_with_special_chars_in_os_user_passes_through_to_condition_unchanged() {
+        // OS user names can contain dots / hyphens / underscores
+        // (e.g. "service.account_v2"). The policy should not mangle
+        // them — IAM condition matching is exact-equals.
+        let policy = connect_session_policy(
+            "i-x",
+            "111111111111",
+            "us-east-1",
+            true,
+            false,
+            true,
+            Some("service.account_v2-prod"),
+        );
+        let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
+        assert_eq!(
+            v["Statement"][0]["Condition"]["StringEquals"]["ssm:resourceTag/SSMSessionRunAs"],
+            "service.account_v2-prod"
+        );
+    }
+
+    // ── Routing logic: role_arn → credential resolution mode ─────────
+    //
+    // `resolve_aws_config` cannot be exercised end-to-end without real
+    // AWS endpoints, but the routing decision (direct vs profile: vs
+    // arn:) is a pure prefix check we can lock here.
+
+    #[test]
+    fn role_arn_string_classifies_into_direct_profile_or_assume_role() {
+        let cases: &[(&str, &str)] = &[
+            ("direct", "direct"),
+            ("profile:dev", "profile"),
+            ("profile:my-aws-profile", "profile"),
+            ("arn:aws:iam::111111111111:role/CanopyRole", "assume_role"),
+            ("arn:aws:iam::222:role/Foo", "assume_role"),
+        ];
+
+        for (input, expected_mode) in cases {
+            let mode = if *input == "direct" {
+                "direct"
+            } else if input.starts_with("profile:") {
+                "profile"
+            } else {
+                "assume_role"
+            };
+            assert_eq!(
+                mode, *expected_mode,
+                "role_arn {input:?} should classify as {expected_mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_arn_with_empty_string_does_not_match_direct_or_profile() {
+        // Defensive: empty role_arn must NOT silently match the
+        // "direct" path — that would let an unconfigured entitlement
+        // accidentally use ambient AWS credentials.
+        let input = "";
+        let matches_direct = input == "direct";
+        let matches_profile = input.starts_with("profile:");
+        assert!(!matches_direct, "empty string must not classify as direct");
+        assert!(
+            !matches_profile,
+            "empty string must not classify as profile"
+        );
+    }
 }

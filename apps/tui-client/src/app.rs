@@ -25,6 +25,24 @@ use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
 
+/// Outcome of `App::set_session_token`. Callers use this to decide
+/// whether to proceed to the dashboard after a successful login.
+/// Codex round 8: when save AND stale-token-clear both fail we MUST
+/// refuse to proceed, because the next restart would auto-load the
+/// prior user's credential.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionTokenOutcome {
+    /// New token persisted; safe to proceed to the dashboard.
+    PersistedFresh,
+    /// New token did NOT persist, BUT we successfully removed any
+    /// stale on-disk token. The in-memory session is safe to use
+    /// for THIS run; restart will require re-login.
+    InMemoryOnly,
+    /// New token did not persist AND we could not remove the stale
+    /// on-disk token. Caller MUST refuse to enter the dashboard.
+    StaleTokenSurvivesOnDisk,
+}
+
 pub struct App {
     config: ClientConfig,
     api: ApiClient,
@@ -56,8 +74,22 @@ pub struct App {
     ec2_fetch_cancel: Option<tokio_util::sync::CancellationToken>,
     cw_fetch_cancel: Option<tokio_util::sync::CancellationToken>,
 
+    // Override for the on-disk token persistence path. `None` in
+    // production code (falls back to `auth::token_path()`). Tests
+    // inject a tempdir-based path so `cargo test` cannot clobber
+    // the developer's real persisted credential (Codex round 10).
+    token_store_path: Option<std::path::PathBuf>,
+
     // Cancellation token for the live tail background task
     live_tail_cancel: Option<tokio_util::sync::CancellationToken>,
+    // Monotonic counter identifying the active live-tail stream.
+    // Each call to `try_arm_live_tail_stream` increments this; the
+    // stream's emitted `LiveTailEvent` / `LiveTailStreamEnded`
+    // actions carry the generation they were spawned with, so the
+    // handler can drop signals from a previously-active stream
+    // (Codex round 5: prevents stale `LiveTailStreamEnded` from
+    // cancelling a freshly-armed replacement stream).
+    pub(crate) live_tail_generation: u64,
     mcp_runtime: Option<McpRuntime>,
 
     // Auto-update banner message, shown until dismissed
@@ -398,7 +430,9 @@ impl App {
             event_reader_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ec2_fetch_cancel: None,
             cw_fetch_cancel: None,
+            token_store_path: None, // Production default uses auth::token_path()
             live_tail_cancel: None,
+            live_tail_generation: 0,
             mcp_runtime: None,
             update_banner: None,
             session_expired_pending_login: false,
@@ -418,7 +452,13 @@ impl App {
                 Err(e) => {
                     match e {
                         ApiClientError::TokenExpired => {
-                            crate::auth::clear_token().ok();
+                            // Codex round 7+8: surface clear failures so
+                            // a stale on-disk token doesn't quietly
+                            // resurrect the next session. Modal shown
+                            // by the helper when delete fails; we still
+                            // proceed with in-memory clear because the
+                            // user must be logged out NOW.
+                            let _ = self.clear_persisted_token_or_warn();
                             self.api.clear_token();
                         }
                         other => {
@@ -668,13 +708,26 @@ impl App {
                 }
             },
             Action::TokenReceived(token) => {
-                self.api.set_token(token.clone());
-                crate::auth::save_token(&token).ok();
-                if self.fetch_entitlements().await {
-                    self.enter_dashboard();
+                // Codex round 8: set_session_token positively
+                // removes any stale on-disk token if persist fails.
+                // If both save AND clear fail, refuse to enter the
+                // dashboard — the prior user's credential could
+                // resurrect on restart.
+                match self.set_session_token(&token) {
+                    SessionTokenOutcome::PersistedFresh | SessionTokenOutcome::InMemoryOnly => {
+                        if self.fetch_entitlements().await {
+                            self.enter_dashboard();
+                        }
+                        // If fetch_entitlements failed, error modal
+                        // is shown and we stay on the current screen
+                        // so the user can retry.
+                    }
+                    SessionTokenOutcome::StaleTokenSurvivesOnDisk => {
+                        // Modal already shown by set_session_token.
+                        // Stay on Login so the user must remediate.
+                        self.api.clear_token();
+                    }
                 }
-                // If fetch_entitlements failed, error modal is shown and we
-                // stay on the current screen so the user can retry.
             }
 
             // EC2
@@ -780,23 +833,16 @@ impl App {
                 .await;
             }
             Action::ConnectSessionStdoutReady => {
-                if let Some(session) = self.connect_session.as_mut() {
-                    session.process_pending_output();
-                }
+                self.apply_connect_session_stdout_ready();
             }
             Action::ConnectSessionFailure(message) => {
-                if let Some(session) = self.connect_session.as_mut() {
-                    session.fail(message);
-                }
+                self.apply_connect_session_failure(message);
             }
             Action::ConnectSessionUserDisconnect => {
-                if let Some(session) = self.connect_session.as_mut() {
-                    session.disconnect();
-                }
+                self.apply_connect_session_user_disconnect();
             }
             Action::ConnectSessionExit => {
-                self.connect_session = None;
-                self.current_screen = Screen::Ec2Inventory;
+                self.apply_connect_session_exit();
             }
 
             // CloudWatch
@@ -824,20 +870,10 @@ impl App {
                 append,
                 generation,
             } => {
-                if generation != self.cloudwatch_search.fetch_generation {
-                    return;
-                }
-                if append {
-                    self.cloudwatch_search.append_events(events, next_token);
-                } else {
-                    self.cloudwatch_search.set_events(events, next_token);
-                }
+                self.apply_filter_events_loaded(events, next_token, append, generation);
             }
             Action::FilterEventsFetchFailed(err, generation) => {
-                if generation != self.cloudwatch_search.fetch_generation {
-                    return;
-                }
-                self.cloudwatch_search.set_error(err);
+                self.apply_filter_events_fetch_failed(err, generation);
             }
             Action::LoadMoreFilterResults => {
                 self.spawn_filter_search(true);
@@ -913,24 +949,29 @@ impl App {
                 if self.config.dev_mode {
                     // Dev mode: connect to the control-plane's WebSocket
                     // and stream simulated events into the live tail screen.
-                    self.live_tail.set_connected();
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    self.live_tail_cancel = Some(cancel.clone());
-                    let tx = self.action_tx.clone();
-                    let base_url = self.config.control_plane_url.clone();
-                    let token = self.api.get_token();
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::live_tail_ws::stream_live_tail(
-                            &base_url,
-                            token.as_deref(),
-                            tx,
-                            cancel,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Live tail stream ended: {}", e);
-                        }
-                    });
+                    if let Some((cancel, generation)) = self.try_arm_live_tail_stream() {
+                        let tx = self.action_tx.clone();
+                        let base_url = self.config.control_plane_url.clone();
+                        let token = self.api.get_token();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::live_tail_ws::stream_simulated_live_tail(
+                                &base_url,
+                                token.as_deref(),
+                                tx,
+                                cancel,
+                                generation,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Live tail stream ended: {}", e);
+                            }
+                        });
+                    }
+                    // else: a stream is already in flight; ignore the
+                    // duplicate StartLiveTail (Codex round 3: a queued
+                    // double-Start would otherwise overwrite the
+                    // cancel token, leaking the old stream and making
+                    // the old stream's StopLiveTail cancel the new one).
                 } else {
                     self.error_modal.show(
                         "Live tail WebSocket client is not yet available. \
@@ -939,20 +980,17 @@ impl App {
                     );
                 }
             }
-            Action::StopLiveTail => {
-                if let Some(cancel) = self.live_tail_cancel.take() {
-                    cancel.cancel();
-                }
-                self.live_tail.set_disconnected();
-            }
-            Action::PauseLiveTail => {
-                self.live_tail.set_paused();
-            }
-            Action::ResumeLiveTail => {
-                self.live_tail.set_connected();
-            }
-            Action::LiveTailEvent(event) => {
-                self.live_tail.push_event(event);
+            // Live-tail actions are dispatched through a single
+            // entry point so tests can call the same code path as
+            // production (Codex round 2: testing apply_* alone
+            // doesn't catch deletion of this match arm — but
+            // funneling through dispatch_live_tail_action does).
+            other @ (Action::StopLiveTail
+            | Action::PauseLiveTail
+            | Action::ResumeLiveTail
+            | Action::LiveTailEvent { .. }
+            | Action::LiveTailStreamEnded(_)) => {
+                self.dispatch_live_tail_action(other);
             }
 
             // MCP local server
@@ -1077,6 +1115,105 @@ impl App {
         self.cloudwatch_search.cancel_loading();
     }
 
+    /// Resolved path to the on-disk token store, honoring any test
+    /// override. Production code: `None` → falls back to the real
+    /// `auth::token_path()`. Tests: install a tempdir-based path so
+    /// `cargo test` never touches the real credential (Codex round 10).
+    fn resolved_token_path(&self) -> std::path::PathBuf {
+        self.token_store_path
+            .clone()
+            .unwrap_or_else(crate::auth::token_path)
+    }
+
+    /// Clear the persisted-on-disk token. Returns Ok on success.
+    /// On failure both logs a tracing::warn AND shows a user-visible
+    /// modal (Codex round 8: warning-only is insufficient because
+    /// startup `load_token` would resurrect the stale token without
+    /// the user knowing).
+    fn clear_persisted_token_or_warn(&mut self) -> Result<(), String> {
+        let path = self.resolved_token_path();
+        match crate::auth::clear_token_at_path(&path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::warn!(
+                    error = %e,
+                    "Failed to remove persisted token file during teardown; \
+                     a stale credential may survive to the next session.",
+                );
+                self.error_modal.show(format!(
+                    "Could not delete the persisted auth token: {e}\n\n\
+                     A stale credential may auto-resurrect on next restart. \
+                     Manually remove the canopy token file before re-logging in."
+                ));
+                Err(msg)
+            }
+        }
+    }
+
+    /// Persist a freshly received token to disk. Returns true on
+    /// success, false on failure. Callers that handle a fresh login
+    /// (TokenReceived, do_dev_login) should NOT use this directly —
+    /// they should call `set_session_token` instead, which adds the
+    /// "delete the stale on-disk token on save failure" guard
+    /// Codex round 8 required.
+    fn persist_token_or_warn(&mut self, token: &str) -> bool {
+        let path = self.resolved_token_path();
+        match crate::auth::save_token_to_path(&path, token) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist auth token to disk. The session \
+                     remains valid in memory but will not survive restart.",
+                );
+                self.error_modal.show(format!(
+                    "Auth token could not be saved to disk: {e}\n\n\
+                     You can keep using the app this session, but you will \
+                     have to log in again after restart."
+                ));
+                false
+            }
+        }
+    }
+
+    /// Install `token` into the in-memory API client and attempt
+    /// to persist it. Codex round 8 contract: on persist failure
+    /// we MUST positively delete any stale on-disk token before
+    /// allowing the in-memory session to continue, otherwise the
+    /// next restart would auto-load the prior user's credential.
+    pub(crate) fn set_session_token(&mut self, token: &str) -> SessionTokenOutcome {
+        self.api.set_token(token.to_string());
+        if self.persist_token_or_warn(token) {
+            return SessionTokenOutcome::PersistedFresh;
+        }
+        // Save failed — actively try to delete any leftover stale
+        // token so the next restart can't pick it up.
+        let path = self.resolved_token_path();
+        if crate::auth::clear_token_at_path(&path).is_ok() {
+            tracing::warn!(
+                "Could not save the new auth token, but successfully removed \
+                 the stale on-disk token. In-memory session continues; \
+                 restart will require re-login.",
+            );
+            SessionTokenOutcome::InMemoryOnly
+        } else {
+            tracing::error!(
+                "Could not save NEW token AND could not remove the OLD token. \
+                 Refusing to enter the dashboard — the prior user's \
+                 credential could auto-resurrect on restart.",
+            );
+            self.error_modal.show(
+                "Auth token could not be saved AND the old token could not be \
+                 removed.\n\nThe app cannot safely proceed because the next \
+                 restart could auto-load the previous credential. Please fix \
+                 disk permissions and try again."
+                    .to_string(),
+            );
+            SessionTokenOutcome::StaleTokenSurvivesOnDisk
+        }
+    }
+
     fn reset_to_login(&mut self) {
         self.cancel_in_flight_work();
 
@@ -1091,13 +1228,29 @@ impl App {
         self.dashboard.public_ip = None;
         self.dashboard.ip_fetch_generation += 1;
 
-        crate::auth::clear_token().ok();
+        // Wipe live-tail buffer so the next user / session does NOT
+        // see the previous session's log lines (Codex round 7).
+        // Rebuild rather than just .clear()ing — keeps filter,
+        // scroll, and auto-scroll state fresh too.
+        self.live_tail = LiveTailScreen::new(self.config.live_tail_scrollback);
+        // Bump generation so any in-flight stream's queued events
+        // are now stale and will be dropped by the generation guard.
+        self.live_tail_generation = self.live_tail_generation.saturating_add(1);
+
+        // Codex round 8: if the disk delete failed, the helper
+        // already showed an error modal — leave it visible. Only
+        // dismiss when clear succeeded; otherwise the user must
+        // see and dismiss the failure modal so the stale-credential
+        // risk is acknowledged.
+        let clear_ok = self.clear_persisted_token_or_warn().is_ok();
         self.api.clear_token();
         self.entitlements = None;
         self.current_screen = Screen::Login;
         self.screen_stack.clear();
         self.session_expired_pending_login = false;
-        self.error_modal.dismiss();
+        if clear_ok {
+            self.error_modal.dismiss();
+        }
     }
 
     fn begin_token_expired_flow(&mut self) {
@@ -1106,12 +1259,23 @@ impl App {
         }
 
         self.cancel_in_flight_work();
-        crate::auth::clear_token().ok();
+        // Same defense as reset_to_login: scrub live-tail state so
+        // the post-relogin user does not see the prior session's
+        // logs (Codex round 7).
+        self.live_tail = LiveTailScreen::new(self.config.live_tail_scrollback);
+        self.live_tail_generation = self.live_tail_generation.saturating_add(1);
+
+        let clear_ok = self.clear_persisted_token_or_warn().is_ok();
         self.api.clear_token();
         self.entitlements = None;
         self.session_expired_pending_login = true;
-        self.error_modal
-            .show_with_title(" Session Expired ", TOKEN_EXPIRED_MODAL_MESSAGE.into());
+        if clear_ok {
+            // Standard session-expired modal. If clear FAILED, the
+            // helper already showed a more urgent modal explaining
+            // the stale-credential risk — leave that one up.
+            self.error_modal
+                .show_with_title(" Session Expired ", TOKEN_EXPIRED_MODAL_MESSAGE.into());
+        }
     }
 
     fn handle_route_error<F>(&mut self, err: ApiClientError, fallback: F)
@@ -1485,10 +1649,17 @@ exit "$rc"
     async fn do_dev_login(&mut self, username: &str) {
         match self.api.dev_login(username).await {
             Ok(resp) => {
-                self.api.set_token(resp.access_token.clone());
-                crate::auth::save_token(&resp.access_token).ok();
-                if self.fetch_entitlements().await {
-                    self.enter_dashboard();
+                // Codex round 8: same guard as TokenReceived — refuse
+                // to proceed when save AND stale-clear both fail.
+                match self.set_session_token(&resp.access_token) {
+                    SessionTokenOutcome::PersistedFresh | SessionTokenOutcome::InMemoryOnly => {
+                        if self.fetch_entitlements().await {
+                            self.enter_dashboard();
+                        }
+                    }
+                    SessionTokenOutcome::StaleTokenSurvivesOnDisk => {
+                        self.api.clear_token();
+                    }
                 }
             }
             Err(e) => {
@@ -2043,6 +2214,221 @@ exit "$rc"
         });
     }
 
+    /// Apply a `FilterEventsLoaded` action to the screen state.
+    ///
+    /// Stale-generation guard: a response from an older spawned task
+    /// (whose generation no longer matches the current
+    /// `fetch_generation`) is silently dropped, so a brand-new search
+    /// cannot be overwritten by a late reply from the previous one.
+    ///
+    /// Extracted as a `&mut self` reducer so unit tests can exercise
+    /// the dispatcher contract without constructing a `Tui` backend.
+    pub(crate) fn apply_filter_events_loaded(
+        &mut self,
+        events: Vec<shared::dto::cloudwatch::LogEvent>,
+        next_token: Option<String>,
+        append: bool,
+        generation: u64,
+    ) {
+        if generation != self.cloudwatch_search.fetch_generation {
+            return;
+        }
+        if append {
+            self.cloudwatch_search.append_events(events, next_token);
+        } else {
+            self.cloudwatch_search.set_events(events, next_token);
+        }
+    }
+
+    /// Apply a `FilterEventsFetchFailed` action. Stale generations are
+    /// dropped without surfacing the error so the user does not see
+    /// stale "Error: ..." messages bleed through into a new search.
+    pub(crate) fn apply_filter_events_fetch_failed(&mut self, err: String, generation: u64) {
+        if generation != self.cloudwatch_search.fetch_generation {
+            return;
+        }
+        self.cloudwatch_search.set_error(err);
+    }
+
+    /// Apply a `ConnectSessionStdoutReady` action. Drains the PTY
+    /// output buffer if a session is alive; otherwise a silent no-op
+    /// so late signals from a torn-down session do not crash.
+    pub(crate) fn apply_connect_session_stdout_ready(&mut self) {
+        if let Some(session) = self.connect_session.as_mut() {
+            session.process_pending_output();
+        }
+    }
+
+    /// Apply a `ConnectSessionFailure` action. The error message is
+    /// surfaced inside the active session as a terminal-state
+    /// overlay; if no session is alive the message is dropped (the
+    /// matching screen is gone, the user already moved on).
+    pub(crate) fn apply_connect_session_failure(&mut self, message: String) {
+        if let Some(session) = self.connect_session.as_mut() {
+            session.fail(message);
+        }
+    }
+
+    /// Apply a `ConnectSessionUserDisconnect` action (Ctrl+]/Ctrl+5).
+    /// Forwarded to the session so it tears down the PTY and shows the
+    /// "Disconnected" final state; no-op if no session is active.
+    pub(crate) fn apply_connect_session_user_disconnect(&mut self) {
+        if let Some(session) = self.connect_session.as_mut() {
+            session.disconnect();
+        }
+    }
+
+    /// Apply a `ConnectSessionExit` action — the user dismissed the
+    /// terminal screen with Enter. Drops the session and returns the
+    /// app to the EC2 inventory.
+    pub(crate) fn apply_connect_session_exit(&mut self) {
+        self.connect_session = None;
+        self.current_screen = Screen::Ec2Inventory;
+    }
+
+    /// Decide whether to start a new live-tail stream and, if so,
+    /// install the cancel token + flip the UI to Connected. Returns
+    /// `Some(token)` for the caller to hand to the background task;
+    /// returns `None` when a stream is already in flight (the caller
+    /// must NOT spawn a new task in that case).
+    ///
+    /// Codex round 3: prior code always spawned a new stream and
+    /// overwrote `live_tail_cancel`, which meant two queued
+    /// `StartLiveTail` actions left an orphaned old stream whose
+    /// eventual `Action::StopLiveTail` would mis-cancel the new
+    /// stream. This idempotency check closes that race at the
+    /// source (the handler only spawns when `try_arm` returns Some).
+    pub(crate) fn try_arm_live_tail_stream(
+        &mut self,
+    ) -> Option<(tokio_util::sync::CancellationToken, u64)> {
+        if self.live_tail_cancel.is_some() {
+            // Already streaming — refuse to install a second token.
+            tracing::debug!(
+                "Live tail: ignoring duplicate StartLiveTail (stream already in flight)",
+            );
+            return None;
+        }
+        // Bump the generation. Saturating-add so wraparound after
+        // 2^64 arms (unreachable in practice) doesn't panic.
+        self.live_tail_generation = self.live_tail_generation.saturating_add(1);
+        self.live_tail.set_connected();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.live_tail_cancel = Some(cancel.clone());
+        Some((cancel, self.live_tail_generation))
+    }
+
+    /// Apply a `StopLiveTail` action — cancel the background WS task
+    /// (if any) and transition the screen into the Disconnected
+    /// state. Idempotent: calling twice is harmless because
+    /// `take()` clears the token and `set_disconnected` is a state
+    /// setter, not a transition.
+    pub(crate) fn apply_stop_live_tail(&mut self) {
+        if let Some(cancel) = self.live_tail_cancel.take() {
+            cancel.cancel();
+        }
+        self.live_tail.set_disconnected();
+    }
+
+    /// Apply a `PauseLiveTail` action — flip the UI into Paused
+    /// state. The background WS task keeps running so events keep
+    /// arriving and accumulating in the scrollback; only the visible
+    /// indicator changes. (Pause is purely a UI affordance for the
+    /// human; the AWS API has no "pause" for live tail.)
+    pub(crate) fn apply_pause_live_tail(&mut self) {
+        self.live_tail.set_paused();
+    }
+
+    /// Apply a `ResumeLiveTail` action — flip the UI back into the
+    /// Connected state from Paused. No background work is restarted
+    /// because the WS task never actually stopped; this is purely
+    /// the inverse of `apply_pause_live_tail`.
+    pub(crate) fn apply_resume_live_tail(&mut self) {
+        self.live_tail.set_connected();
+    }
+
+    /// Apply a `LiveTailEvent(event)` action — append the event to
+    /// the live-tail scrollback. `push_event` enforces the scrollback
+    /// cap configured at construction, so this stays bounded.
+    pub(crate) fn apply_live_tail_event(&mut self, event: shared::dto::cloudwatch::LiveTailEvent) {
+        self.live_tail.push_event(event);
+    }
+
+    /// Single entry point for the live-tail subset of `Action`. The
+    /// `handle_action` match arm delegates to this function so that
+    /// tests can drive the same dispatch chain production uses (give
+    /// `Action::*`, observe state mutation) without spinning up a
+    /// real `Tui` backend.
+    ///
+    /// Codex round 2 flagged that testing the `apply_*` helpers in
+    /// isolation does not catch a regression that deletes the
+    /// `handle_action` match arm: it would compile, silently swallow
+    /// the action, and the apply-level tests would still pass. By
+    /// funnelling production AND the tests through this function we
+    /// remove that gap — the only way an `Action::StopLiveTail`
+    /// reaches the screen state is by going through here.
+    pub(crate) fn dispatch_live_tail_action(&mut self, action: Action) {
+        match action {
+            Action::StopLiveTail => self.apply_stop_live_tail(),
+            Action::PauseLiveTail => self.apply_pause_live_tail(),
+            Action::ResumeLiveTail => self.apply_resume_live_tail(),
+            Action::LiveTailEvent { event, generation } => {
+                // Drop late-arriving events from a stream that has
+                // since been replaced (stop-then-rearm). Without
+                // this guard, a stop-and-rearm sequence could leak
+                // the old stream's tail-end events into the new
+                // stream's buffer.
+                //
+                // Also require an active stream (`live_tail_cancel
+                // .is_some()`). Codex round 6 pointed out that after
+                // stop/logout, `live_tail_generation` retains its
+                // last value — a stale event with that same gen
+                // would otherwise still get appended into the
+                // scrollback even though the UI says Disconnected.
+                let active =
+                    self.live_tail_cancel.is_some() && generation == self.live_tail_generation;
+                if active {
+                    self.apply_live_tail_event(event);
+                } else {
+                    tracing::debug!(
+                        active_gen = self.live_tail_generation,
+                        stale_gen = generation,
+                        cancel_armed = self.live_tail_cancel.is_some(),
+                        "Dropping LiveTailEvent: no active stream or generation mismatch",
+                    );
+                }
+            }
+            Action::LiveTailStreamEnded(generation) => {
+                // Same idea for the natural-completion signal:
+                // only the CURRENT stream is allowed to flip the UI
+                // back to Disconnected. A stale one is silently
+                // discarded (the new stream is still active).
+                // This is Codex round 5's flagged race fix.
+                let active =
+                    self.live_tail_cancel.is_some() && generation == self.live_tail_generation;
+                if active {
+                    self.apply_stop_live_tail();
+                } else {
+                    tracing::debug!(
+                        active_gen = self.live_tail_generation,
+                        stale_gen = generation,
+                        cancel_armed = self.live_tail_cancel.is_some(),
+                        "Dropping LiveTailStreamEnded: no active stream or generation mismatch",
+                    );
+                }
+            }
+            _ => {
+                // Not a live-tail action — caller should pre-filter
+                // via the `@` binding in `handle_action`. Silently
+                // ignore in release; trip in debug to surface
+                // mis-routing during development.
+                debug_assert!(
+                    false,
+                    "dispatch_live_tail_action called with non-live-tail Action: {action:?}",
+                );
+            }
+        }
+    }
+
     fn spawn_filter_search(&mut self, append: bool) {
         if self.cloudwatch_search.selected_log_group.is_empty() {
             self.cloudwatch_search
@@ -2344,9 +2730,22 @@ mod tests {
     use std::collections::HashMap;
 
     /// Helper: build an App with dev defaults for testing state-machine logic.
+    /// Installs a per-test tempdir-based `token_store_path` so the test
+    /// can call set_session_token / reset_to_login / etc. without
+    /// touching the real `~/Library/Application Support/canopy/token`
+    /// (Codex round 10: prior pre-existing tests would silently
+    /// clobber the developer's persisted credential).
     async fn test_app() -> App {
         let config = App::test_config();
-        App::new(config).await.unwrap()
+        let mut app = App::new(config).await.unwrap();
+        // Sandbox the token store so `cargo test` cannot touch the
+        // real on-disk file. The TempDir is leaked into the App via
+        // `into_path()` so it survives for the lifetime of this
+        // test's runtime (Drop on Application takes care of nothing
+        // here; the tempdir lives until the OS reaps /tmp).
+        let dir = tempfile::TempDir::new().expect("tempdir for test token store");
+        app.token_store_path = Some(dir.keep().join("token"));
+        app
     }
 
     fn mock_entitlements() -> UserEntitlements {
@@ -2646,6 +3045,311 @@ mod tests {
         assert!(!app.cloudwatch_search.is_loading());
     }
 
+    // ── Filter-events action handler (stale-generation contract) ─────
+
+    fn log_event(message: &str) -> shared::dto::cloudwatch::LogEvent {
+        shared::dto::cloudwatch::LogEvent {
+            timestamp: 1_700_000_000_000,
+            message: message.into(),
+            log_stream_name: Some("app/web".into()),
+            ingestion_time: Some(1_700_000_000_500),
+            event_id: Some(format!("evt-{message}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_with_matching_generation_replaces_events() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+
+        app.apply_filter_events_loaded(
+            vec![log_event("first"), log_event("second")],
+            Some("tok-next".into()),
+            /* append = */ false,
+            gen,
+        );
+
+        assert_eq!(app.cloudwatch_search.events.len(), 2);
+        assert_eq!(app.cloudwatch_search.events[0].message, "first");
+        assert_eq!(app.cloudwatch_search.events[1].message, "second");
+        assert!(app.cloudwatch_search.has_more);
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_with_stale_generation_does_not_overwrite_state() {
+        // Reproduces this race:
+        //   user runs search-1 (gen=1) → in-flight
+        //   user runs search-2 (gen=2) → returns first, populates "current"
+        //   search-1's response finally arrives with stale gen=1
+        // Expectation: search-1's payload is silently dropped.
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 1
+        app.cloudwatch_search.advance_fetch_generation(); // gen 2 (current)
+        let current_gen = app.cloudwatch_search.fetch_generation;
+
+        // search-2 result lands first.
+        app.apply_filter_events_loaded(vec![log_event("current-result")], None, false, current_gen);
+        assert_eq!(app.cloudwatch_search.events.len(), 1);
+
+        // search-1's late reply arrives with stale gen.
+        let stale_gen = current_gen - 1;
+        app.apply_filter_events_loaded(
+            vec![
+                log_event("stale-A"),
+                log_event("stale-B"),
+                log_event("stale-C"),
+            ],
+            Some("stale-token".into()),
+            false,
+            stale_gen,
+        );
+
+        // Current state unchanged.
+        assert_eq!(app.cloudwatch_search.events.len(), 1);
+        assert_eq!(app.cloudwatch_search.events[0].message, "current-result");
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_append_extends_existing_events() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+        app.cloudwatch_search.set_events(
+            vec![log_event("page1-a"), log_event("page1-b")],
+            Some("tok".into()),
+        );
+
+        app.apply_filter_events_loaded(
+            vec![log_event("page2-c"), log_event("page2-d")],
+            None,
+            /* append = */ true,
+            gen,
+        );
+
+        assert_eq!(app.cloudwatch_search.events.len(), 4);
+        assert_eq!(app.cloudwatch_search.events[3].message, "page2-d");
+        assert!(!app.cloudwatch_search.has_more);
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_append_with_stale_generation_keeps_old_page() {
+        // Pagination race: user has page 1 loaded, presses `n` to
+        // load more (spawning gen=2). Then user starts a fresh search
+        // (gen=3, which clears events). The old `n` reply with gen=2
+        // arrives late; we must NOT append it to the new empty list.
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 1
+        app.cloudwatch_search
+            .set_events(vec![log_event("page1")], Some("tok".into()));
+
+        app.cloudwatch_search.advance_fetch_generation(); // gen 2 (n pressed)
+        let gen_for_n = app.cloudwatch_search.fetch_generation;
+
+        app.cloudwatch_search.advance_fetch_generation(); // gen 3 (new search)
+        app.cloudwatch_search.set_events(vec![], None);
+        assert!(app.cloudwatch_search.events.is_empty());
+
+        // Late n-page-2 reply at gen 2 arrives.
+        app.apply_filter_events_loaded(vec![log_event("stale-page2")], None, true, gen_for_n);
+
+        // New empty state is preserved; no stale append.
+        assert!(app.cloudwatch_search.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_with_empty_events_and_no_token_marks_end() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+
+        app.apply_filter_events_loaded(vec![], None, false, gen);
+
+        assert!(app.cloudwatch_search.events.is_empty());
+        assert!(!app.cloudwatch_search.has_more);
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_fetch_failed_with_matching_generation_sets_error() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+
+        app.apply_filter_events_fetch_failed("network timeout".into(), gen);
+
+        assert_eq!(
+            app.cloudwatch_search.error.as_deref(),
+            Some("network timeout")
+        );
+        assert!(!app.cloudwatch_search.is_loading());
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_fetch_failed_with_stale_generation_does_not_set_error() {
+        // A late error from a cancelled / superseded search must not
+        // surface to the user.
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 1
+        let stale_gen = app.cloudwatch_search.fetch_generation;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 2 (current)
+
+        app.apply_filter_events_fetch_failed("stale upstream 5xx".into(), stale_gen);
+
+        assert!(
+            app.cloudwatch_search.error.is_none(),
+            "stale fetch error should be silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_does_not_panic_on_generation_zero_default() {
+        // Defensive: even if a caller forgets to advance the generation
+        // first, default (0) compared against current (0) should still
+        // accept the data — i.e. no off-by-one in the equality check.
+        let mut app = test_app().await;
+        let gen = app.cloudwatch_search.fetch_generation; // 0
+        app.apply_filter_events_loaded(vec![log_event("zero-gen")], None, false, gen);
+        assert_eq!(app.cloudwatch_search.events.len(), 1);
+    }
+
+    // ── ConnectSession reducer (Action::ConnectSession*) ─────────────
+
+    /// Spawn a real PTY-backed session attached to `app.connect_session`
+    /// so the reducer tests run against the same code path production
+    /// uses. The session runs `sleep 30` so it stays alive long enough
+    /// for the assertions; tests clean it up at the end via disconnect.
+    #[cfg(unix)]
+    fn attach_sleeping_session(app: &mut App) {
+        use crate::components::connect_session::{ConnectSessionLaunch, ConnectSessionScreen};
+
+        let launch = ConnectSessionLaunch {
+            instance_id: "i-test123".into(),
+            instance_name: Some("test".into()),
+            account_id: "111111111111".into(),
+            region: "us-east-1".into(),
+            method: shared::dto::ec2::ConnectMethod::Ssh,
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_vars: std::collections::HashMap::new(),
+            max_session_seconds: 60,
+            cols: 80,
+            rows: 24,
+        };
+        let session =
+            ConnectSessionScreen::spawn(launch, app.action_tx.clone()).expect("spawn PTY session");
+        app.connect_session = Some(session);
+        app.current_screen = Screen::ConnectSession;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_connect_session_exit_clears_session_and_returns_to_ec2_inventory() {
+        let mut app = test_app().await;
+        attach_sleeping_session(&mut app);
+        assert!(app.connect_session.is_some());
+        assert!(matches!(app.current_screen, Screen::ConnectSession));
+
+        app.apply_connect_session_exit();
+
+        assert!(app.connect_session.is_none());
+        assert!(matches!(app.current_screen, Screen::Ec2Inventory));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_connect_session_user_disconnect_drains_session_without_clearing_screen() {
+        // Ctrl+] / Ctrl+5: user wants to leave the session but stay
+        // on the screen so they can read the "Disconnected" message
+        // and decide when to dismiss. The session should be torn
+        // down (terminal state) but app.connect_session stays Some
+        // until the user presses Enter to exit.
+        let mut app = test_app().await;
+        attach_sleeping_session(&mut app);
+
+        app.apply_connect_session_user_disconnect();
+
+        assert!(
+            app.connect_session.is_some(),
+            "session should remain on screen until user dismisses"
+        );
+        assert!(matches!(app.current_screen, Screen::ConnectSession));
+        // After disconnect, pressing Enter on the screen should yield
+        // ConnectSessionExit. We don't simulate that here; the
+        // disconnect-only behavior is the contract under test.
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_connect_session_failure_propagates_message_to_session_overlay() {
+        // The session itself records the failure as a terminal-state
+        // CopyMessage-style overlay so the user sees why their PTY
+        // session ended.
+        let mut app = test_app().await;
+        attach_sleeping_session(&mut app);
+
+        app.apply_connect_session_failure("PTY write to pty failed: broken pipe".into());
+
+        // Session is still attached (user can still see + dismiss).
+        assert!(app.connect_session.is_some());
+        // Screen does not auto-return.
+        assert!(matches!(app.current_screen, Screen::ConnectSession));
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_stdout_ready_is_no_op_when_no_session_attached() {
+        // Late signal: PTY reader thread fired ConnectSessionStdoutReady
+        // after the user already exited the session screen. Must not
+        // panic, must not change app state.
+        let mut app = test_app().await;
+        assert!(app.connect_session.is_none());
+        let prev_screen = app.current_screen.clone();
+
+        app.apply_connect_session_stdout_ready();
+
+        assert!(app.connect_session.is_none());
+        assert_eq!(app.current_screen, prev_screen);
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_failure_is_no_op_when_no_session_attached() {
+        // Same race: PTY write thread surfaced a failure but the
+        // session screen has already been torn down. Drop silently.
+        let mut app = test_app().await;
+        assert!(app.connect_session.is_none());
+
+        app.apply_connect_session_failure("late error from torn-down session".into());
+
+        // No panics, no error_modal pop-up — just dropped.
+        assert!(app.connect_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_user_disconnect_is_no_op_when_no_session_attached() {
+        // Defensive: if user somehow triggers ConnectSessionUserDisconnect
+        // while the screen has already been popped, nothing happens.
+        let mut app = test_app().await;
+        assert!(app.connect_session.is_none());
+
+        app.apply_connect_session_user_disconnect();
+
+        assert!(app.connect_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_exit_when_already_inactive_still_lands_on_ec2_inventory() {
+        // Idempotency: exit while session is already None should still
+        // route the user back to the inventory (covers Esc fallthrough
+        // edge cases).
+        let mut app = test_app().await;
+        app.connect_session = None;
+        app.current_screen = Screen::Login; // some unrelated screen
+
+        app.apply_connect_session_exit();
+
+        assert!(app.connect_session.is_none());
+        assert!(matches!(app.current_screen, Screen::Ec2Inventory));
+    }
+
     #[test]
     fn session_countdown_renders_remaining_bar() {
         assert_eq!(
@@ -2783,6 +3487,683 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|msg| msg.contains("UNAUTHORIZED")));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase A — Core user flows
+    // ─────────────────────────────────────────────────────────────────
+
+    // ── Login / post-auth: set_entitlements → enter_dashboard ────────
+
+    #[tokio::test]
+    async fn login_success_propagates_entitlements_to_ec2_screen() {
+        // After login the Access screen, EC2 screen, CloudWatch search,
+        // and Dashboard all need to see the user's entitlements.
+        // `set_entitlements` is the single fan-out point; the test
+        // locks that it actually reaches each screen.
+        let mut app = test_app().await;
+        let ent = mock_entitlements();
+
+        app.set_entitlements(ent.clone());
+
+        assert!(app.entitlements.is_some(), "app should retain entitlements");
+        // EC2 screen learns its allowed scopes from entitlements.
+        assert!(!app.ec2.available_accounts.is_empty());
+        assert!(!app.ec2.available_regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn login_success_lands_on_dashboard_with_clean_back_stack() {
+        // The post-login transition: `enter_dashboard` sets the
+        // current screen and produces a fresh back stack (no stale
+        // entries from before login). Any actions emitted by
+        // Dashboard's on_enter (e.g. FetchPublicIp when public-IP
+        // display is enabled) flow through the action channel.
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+
+        app.enter_dashboard();
+
+        assert_eq!(app.current_screen, Screen::Dashboard);
+        assert!(
+            app.screen_stack.is_empty(),
+            "Dashboard is the root after login, no back-stack"
+        );
+
+        // Drain the action channel and verify nothing unexpected like
+        // an error or quit slipped through. We don't require a
+        // specific action because Dashboard's on_enter is config-driven
+        // (FetchPublicIp only when show_public_ip is true).
+        while let Ok(action) = app.action_rx.try_recv() {
+            assert!(
+                !matches!(action, Action::Quit | Action::ShowError(_)),
+                "enter_dashboard must not emit Quit or ShowError, got {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_dashboard_does_not_clear_existing_screen_stack() {
+        // Boundary: if the user navigates away from Dashboard and then
+        // a TokenReceived flow lands them back on Dashboard, the back
+        // stack should NOT inherit stale entries from before login
+        // (the prior session was wiped by reset_to_login). After a
+        // fresh login the stack starts empty.
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        app.navigate_to(Screen::Ec2Inventory);
+        app.navigate_to(Screen::CloudWatchSearch);
+        // Pretend the screen_stack was reset by reset_to_login then
+        // login lands the user on Dashboard.
+        app.screen_stack.clear();
+
+        app.enter_dashboard();
+
+        assert_eq!(app.current_screen, Screen::Dashboard);
+        assert!(app.screen_stack.is_empty());
+    }
+
+    // ── Logout: `reset_to_login` is testable directly now ────────────
+
+    #[tokio::test]
+    async fn reset_to_login_clears_token_entitlements_and_returns_to_login_screen() {
+        let mut app = test_app().await;
+        app.api.set_token("active-session-token".into());
+        app.set_entitlements(mock_entitlements());
+        app.enter_dashboard();
+        app.navigate_to(Screen::Ec2Inventory);
+        assert!(app.api.has_token());
+        assert!(app.entitlements.is_some());
+
+        app.reset_to_login();
+
+        assert_eq!(app.current_screen, Screen::Login);
+        assert!(app.screen_stack.is_empty(), "back stack cleared");
+        assert!(app.entitlements.is_none(), "entitlements cleared");
+        assert!(!app.api.has_token(), "in-memory API client token cleared");
+        assert!(
+            !app.error_modal.is_visible(),
+            "any prior modal must be dismissed on logout"
+        );
+        assert!(
+            !app.session_expired_pending_login,
+            "session-expired flag reset to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_login_advances_generations_to_drop_in_flight_async_results() {
+        // Race-safety: while logged in, the user may have an EC2 list
+        // request and a CloudWatch search in flight. Logging out
+        // must bump fetch_generation on each screen so late replies
+        // are silently dropped by the generation guard in the
+        // matching action handler (covered separately by #9 / R3).
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        let ec2_gen_before = app.ec2.fetch_generation;
+        let cw_gen_before = app.cloudwatch_search.fetch_generation;
+
+        app.reset_to_login();
+
+        assert!(
+            app.ec2.fetch_generation > ec2_gen_before,
+            "ec2 generation must advance: was {ec2_gen_before}, now {}",
+            app.ec2.fetch_generation
+        );
+        assert!(
+            app.cloudwatch_search.fetch_generation > cw_gen_before,
+            "cw search generation must advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_login_cancels_in_flight_cancellation_tokens() {
+        // EC2/CW/LiveTail spawn tokio tasks that hold a CancellationToken
+        // clone. On logout the app side of each token must be cancelled
+        // so the tasks unwind.
+        let mut app = test_app().await;
+        let ec2_token = tokio_util::sync::CancellationToken::new();
+        let cw_token = tokio_util::sync::CancellationToken::new();
+        let lt_token = tokio_util::sync::CancellationToken::new();
+        app.ec2_fetch_cancel = Some(ec2_token.clone());
+        app.cw_fetch_cancel = Some(cw_token.clone());
+        app.live_tail_cancel = Some(lt_token.clone());
+
+        app.reset_to_login();
+
+        assert!(ec2_token.is_cancelled(), "EC2 fetch must be cancelled");
+        assert!(cw_token.is_cancelled(), "CW fetch must be cancelled");
+        assert!(
+            lt_token.is_cancelled(),
+            "Live Tail stream must be cancelled"
+        );
+        assert!(app.ec2_fetch_cancel.is_none(), "stale handle cleared");
+        assert!(app.cw_fetch_cancel.is_none());
+        assert!(app.live_tail_cancel.is_none());
+    }
+
+    // ── Token-expired flow (begin + dismiss path) ────────────────────
+
+    #[tokio::test]
+    async fn begin_token_expired_flow_is_idempotent_within_one_session_expiry() {
+        // Multiple failing API calls may all surface as `TokenExpired`
+        // before the user can dismiss the modal. The second invocation
+        // must NOT re-show the modal or re-cancel anything — otherwise
+        // the modal would jitter and audit-worthy state would be
+        // double-mutated.
+        let mut app = test_app().await;
+        app.api.set_token("expired".into());
+        app.set_entitlements(mock_entitlements());
+
+        app.begin_token_expired_flow();
+        assert!(app.session_expired_pending_login);
+        assert!(app.error_modal.is_visible());
+        let api_has_token_after_first = app.api.has_token();
+
+        // Second call while modal is already showing — must be a no-op.
+        app.begin_token_expired_flow();
+
+        assert!(app.session_expired_pending_login);
+        assert!(app.error_modal.is_visible());
+        // Token was already cleared by the first call; second is no-op.
+        assert_eq!(app.api.has_token(), api_has_token_after_first);
+    }
+
+    #[tokio::test]
+    async fn token_expired_flow_does_not_change_screen_until_user_dismisses_modal() {
+        // The user might be deep in CloudWatch or PTY when their token
+        // expires. We surface the modal on top of the current screen
+        // and only navigate after the user acknowledges (Enter).
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        app.navigate_to(Screen::Ec2Inventory);
+        app.navigate_to(Screen::CloudWatchSearch);
+
+        app.begin_token_expired_flow();
+
+        // Screen unchanged — modal is the overlay
+        assert_eq!(app.current_screen, Screen::CloudWatchSearch);
+        assert!(app.error_modal.is_visible());
+    }
+
+    #[tokio::test]
+    async fn dismiss_error_during_session_expired_pending_login_returns_to_login() {
+        // Reproduces the Token-Expired dismissal path: user sees the
+        // modal, presses Enter, which fires Action::DismissError;
+        // because session_expired_pending_login is set, the dismissal
+        // handler also runs reset_to_login.
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        app.navigate_to(Screen::Ec2Inventory);
+        app.begin_token_expired_flow();
+        assert!(app.error_modal.is_visible());
+        assert!(app.session_expired_pending_login);
+
+        // Inline the DismissError handler logic since handle_action
+        // needs a Tui. (See Action::DismissError arm in app.rs.)
+        app.error_modal.dismiss();
+        if app.session_expired_pending_login {
+            app.reset_to_login();
+        }
+
+        assert_eq!(app.current_screen, Screen::Login);
+        assert!(!app.session_expired_pending_login);
+        assert!(!app.error_modal.is_visible());
+        assert!(!app.api.has_token());
+    }
+
+    #[tokio::test]
+    async fn token_expired_recovery_re_login_clears_pending_flag() {
+        // After re-login, the session_expired_pending_login flag must
+        // be false so a future token expiry can trigger a fresh modal.
+        let mut app = test_app().await;
+        app.begin_token_expired_flow();
+        assert!(app.session_expired_pending_login);
+
+        app.reset_to_login();
+        // User now logs in again.
+        app.set_entitlements(mock_entitlements());
+        app.api.set_token("fresh-token".into());
+        app.enter_dashboard();
+
+        // A subsequent expiry should be able to fire the modal again.
+        app.begin_token_expired_flow();
+        assert!(app.error_modal.is_visible());
+        assert!(app.session_expired_pending_login);
+    }
+
+    // ── Live Tail action handlers ────────────────────────────────────
+
+    /// Build a minimal `LiveTailEvent` fixture matching the
+    /// `shared::dto::cloudwatch::LiveTailEvent` wire shape (timestamp,
+    /// message, log_group_name, log_stream_name — all required).
+    fn live_tail_event(ts: i64, msg: &str) -> shared::dto::cloudwatch::LiveTailEvent {
+        shared::dto::cloudwatch::LiveTailEvent {
+            timestamp: ts,
+            message: msg.into(),
+            log_group_name: "/app/web-service".into(),
+            log_stream_name: "stream-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatching_stop_live_tail_action_cancels_token_and_disconnects() {
+        // Exercise the SAME entry point that the production
+        // `handle_action` match arm uses (`dispatch_live_tail_action`),
+        // not the apply_* helpers directly. Codex round 2: testing
+        // apply_* in isolation lets a regression that breaks the
+        // dispatch fn body slip past. Going through the dispatch
+        // chain closes that loop.
+        let mut app = test_app().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        app.live_tail_cancel = Some(cancel.clone());
+        app.live_tail.set_connected();
+        assert_eq!(app.live_tail.connection_state, "Connected");
+
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+
+        assert!(
+            cancel.is_cancelled(),
+            "stop must cancel the in-flight WS task token so the background loop terminates",
+        );
+        assert!(
+            app.live_tail_cancel.is_none(),
+            "stop must drop the stored token so a fresh start can install a new one",
+        );
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+    }
+
+    #[tokio::test]
+    async fn dispatching_pause_live_tail_action_keeps_buffer_but_pauses_state() {
+        let mut app = test_app().await;
+        app.live_tail.set_connected();
+        // Seed an event so we can assert the buffer survives pause.
+        app.live_tail
+            .push_event(live_tail_event(1_700_000_000_000, "before-pause"));
+        let before = app.live_tail.events.len();
+
+        app.dispatch_live_tail_action(Action::PauseLiveTail);
+
+        assert_eq!(app.live_tail.connection_state, "Paused");
+        assert_eq!(
+            app.live_tail.events.len(),
+            before,
+            "pause must not drop buffered events",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatching_resume_live_tail_action_transitions_paused_to_connected() {
+        let mut app = test_app().await;
+        app.live_tail.set_paused();
+        assert_eq!(app.live_tail.connection_state, "Paused");
+
+        app.dispatch_live_tail_action(Action::ResumeLiveTail);
+
+        assert_eq!(app.live_tail.connection_state, "Connected");
+    }
+
+    #[tokio::test]
+    async fn dispatching_live_tail_event_actions_appends_to_buffer_in_arrival_order() {
+        let mut app = test_app().await;
+        // Arm so the dispatch fn matches our generation.
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "first"),
+            generation: gen,
+        });
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(2, "second"),
+            generation: gen,
+        });
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(3, "third"),
+            generation: gen,
+        });
+
+        assert_eq!(app.live_tail.events.len(), 3);
+        assert_eq!(
+            app.live_tail.events[0].message, "first",
+            "events must be appended in arrival order, not reverse-chronological",
+        );
+        assert_eq!(app.live_tail.events[2].message, "third");
+    }
+
+    #[tokio::test]
+    async fn dispatching_stale_live_tail_event_from_old_stream_is_silently_dropped() {
+        // Codex round 5: the stop-then-rearm race meant a late-
+        // arriving event from a previously-active stream could
+        // bleed into the new stream's buffer.
+        let mut app = test_app().await;
+
+        // Arm stream #1 (generation 1), then stop it, then arm
+        // stream #2 (generation 2).
+        let _ = app.try_arm_live_tail_stream();
+        let gen_old = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        let _ = app.try_arm_live_tail_stream();
+        let gen_new = app.live_tail_generation;
+        assert_ne!(gen_old, gen_new, "rearm must bump the generation");
+
+        // Late event from the OLD stream — must NOT land in the buffer.
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(99, "stale-late-event"),
+            generation: gen_old,
+        });
+        assert_eq!(
+            app.live_tail.events.len(),
+            0,
+            "stale events must be dropped, got {:?}",
+            app.live_tail.events,
+        );
+
+        // Event from the NEW (current) stream — must land normally.
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(100, "fresh-event"),
+            generation: gen_new,
+        });
+        assert_eq!(app.live_tail.events.len(), 1);
+        assert_eq!(app.live_tail.events[0].message, "fresh-event");
+    }
+
+    #[tokio::test]
+    async fn dispatching_live_tail_event_after_stop_without_rearm_is_silently_dropped() {
+        // Codex round 6: after StopLiveTail (no subsequent rearm),
+        // a stale event still in the action channel must NOT appear
+        // in the scrollback. The previous gen-only check would have
+        // accepted it because `live_tail_generation` retains its
+        // last value across teardown.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+
+        // Stop — clears live_tail_cancel, but live_tail_generation
+        // is intentionally NOT bumped (it identifies "the most
+        // recent stream", not "the currently-running one").
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        assert!(app.live_tail_cancel.is_none());
+        assert_eq!(app.live_tail_generation, gen);
+
+        // Late event arriving AFTER stop with the just-stopped
+        // stream's gen — must NOT be appended.
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "post-stop-leak"),
+            generation: gen,
+        });
+        assert_eq!(
+            app.live_tail.events.len(),
+            0,
+            "after stop, events from the just-stopped stream must NOT bleed into the buffer, got {:?}",
+            app.live_tail.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatching_live_tail_stream_ended_after_stop_does_not_redisconnect() {
+        // Same idea for the stream-ended signal — already-disconnected
+        // app must not be flipped by a late-arriving ended signal
+        // (no-op rather than disrupting the user's flow).
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+
+        // Late ended-signal from the just-stopped stream.
+        app.dispatch_live_tail_action(Action::LiveTailStreamEnded(gen));
+
+        assert_eq!(
+            app.live_tail.connection_state, "Disconnected",
+            "state already Disconnected — a stale end signal must not toggle anything",
+        );
+        assert!(app.live_tail_cancel.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatching_stale_live_tail_stream_ended_does_not_disconnect_new_stream() {
+        // The headline race from Codex round 5: stream A's natural
+        // completion sends LiveTailStreamEnded; if stream B has
+        // already been armed in the meantime, that stale signal
+        // must NOT flip the UI to Disconnected.
+        let mut app = test_app().await;
+
+        let _ = app.try_arm_live_tail_stream();
+        let gen_old = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        let _ = app.try_arm_live_tail_stream();
+        let gen_new = app.live_tail_generation;
+        assert_eq!(app.live_tail.connection_state, "Connected");
+
+        // Late "ended" signal from the OLD stream.
+        app.dispatch_live_tail_action(Action::LiveTailStreamEnded(gen_old));
+
+        assert_eq!(
+            app.live_tail.connection_state, "Connected",
+            "stale LiveTailStreamEnded must not disconnect the new stream",
+        );
+        assert!(
+            app.live_tail_cancel.is_some(),
+            "stale LiveTailStreamEnded must not clear the new stream's cancel token",
+        );
+
+        // The current stream's ended signal IS honored.
+        app.dispatch_live_tail_action(Action::LiveTailStreamEnded(gen_new));
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+        assert!(app.live_tail_cancel.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_arm_live_tail_stream_is_idempotent_under_double_start() {
+        // Codex round 3 regression guard: two queued StartLiveTail
+        // actions used to:
+        //   1. spawn stream A with token A → stored in live_tail_cancel
+        //   2. spawn stream B with token B → OVERWRITES live_tail_cancel
+        //      (token A leaks; stream A keeps running)
+        //   3. eventually stream A emits Action::StopLiveTail
+        //   4. apply_stop_live_tail() cancels token B — the NEW stream — wrongly
+        //
+        // The fix: try_arm_live_tail_stream returns None when a
+        // stream is already in flight, so the handler refuses to
+        // spawn a second one and the original token survives.
+        let mut app = test_app().await;
+
+        // First call arms the stream — returns (cancel_token, generation).
+        let (token_a, gen_a) = app
+            .try_arm_live_tail_stream()
+            .expect("first call must succeed (no stream in flight)");
+        assert!(
+            app.live_tail_cancel.is_some(),
+            "first arm must install a cancel token",
+        );
+        assert_eq!(
+            app.live_tail.connection_state, "Connected",
+            "first arm must flip UI state to Connected",
+        );
+        assert_eq!(
+            gen_a, app.live_tail_generation,
+            "returned generation must match the stored field",
+        );
+
+        // Second call must NOT install a new token.
+        let token_b = app.try_arm_live_tail_stream();
+        assert!(
+            token_b.is_none(),
+            "duplicate StartLiveTail must yield None (no new spawn)",
+        );
+        assert_eq!(
+            app.live_tail_generation, gen_a,
+            "refused arm must NOT bump the generation",
+        );
+
+        // Now prove token identity *bidirectionally*. Codex round 4
+        // pointed out that one-way propagation (`token_a.cancel() ⇒
+        // stored.is_cancelled()`) is satisfied even by a child
+        // token — a buggy impl that returned `parent.child_token()`
+        // would pass that single check, but `apply_stop_live_tail`
+        // would then cancel only the stored CHILD, leaving the
+        // background stream's parent token uncancelled. So we test
+        // BOTH directions:
+        //
+        //   * cancelling `stored` propagates to `token_a`  → proves
+        //     `stored` is not a child of `token_a`
+        //   * cancelling `token_a` propagates to `stored`  → proves
+        //     `token_a` is not a child of `stored`
+        //
+        // Both directions hold only when both handles share the
+        // same root (i.e. are clones of each other).
+        let stored = app
+            .live_tail_cancel
+            .clone()
+            .expect("stored token must survive the duplicate-arm refusal");
+        assert!(!stored.is_cancelled());
+        assert!(!token_a.is_cancelled());
+
+        // Direction 1: cancel the stored handle, check token_a sees it.
+        stored.cancel();
+        assert!(
+            token_a.is_cancelled(),
+            "stored→token_a propagation failed — `stored` is a CHILD of `token_a`, \
+             not the same token; the duplicate-arm path silently substituted a \
+             child token. Cancelling the stored handle therefore leaves the \
+             background task uncancelled, recreating the orphan-stream bug.",
+        );
+
+        // Direction 2: a freshly-armed token's cancel must propagate
+        // both ways too. Use a fresh app so we don't reuse the
+        // already-cancelled handles above.
+        let mut app2 = test_app().await;
+        let (task_token, _gen) = app2.try_arm_live_tail_stream().expect("first arm");
+        let stored2 = app2.live_tail_cancel.clone().expect("stored 2");
+        task_token.cancel();
+        assert!(
+            stored2.is_cancelled(),
+            "token_a→stored propagation failed — `token_a` is a CHILD of `stored`. \
+             This is the inverse of the bug above and equally orphan-prone.",
+        );
+    }
+
+    #[tokio::test]
+    async fn try_arm_live_tail_stream_re_arms_after_stop() {
+        // Companion to the idempotency test: once the stream has
+        // been stopped (cancel token taken / state Disconnected),
+        // a fresh StartLiveTail MUST be allowed through again.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        assert!(app.live_tail_cancel.is_none());
+
+        let second_arm = app.try_arm_live_tail_stream();
+        assert!(
+            second_arm.is_some(),
+            "post-stop arm must succeed — otherwise the user could never restart live tail",
+        );
+        assert_eq!(app.live_tail.connection_state, "Connected");
+    }
+
+    #[tokio::test]
+    async fn set_session_token_returns_persisted_fresh_or_in_memory_only_on_happy_path() {
+        // Sanity: when save_token succeeds (happy path), the
+        // outcome is PersistedFresh; if save fails BUT clear of
+        // stale token succeeds, it's InMemoryOnly. In either case
+        // the caller is allowed to proceed to the dashboard.
+        // StaleTokenSurvivesOnDisk is the only "refuse-to-proceed"
+        // path and Codex round 8's contract — this test pins that
+        // the happy path doesn't accidentally return the refuse-
+        // to-proceed variant.
+        let mut app = test_app().await;
+
+        let outcome = app.set_session_token("fresh-token-xyz");
+
+        assert!(
+            matches!(
+                outcome,
+                SessionTokenOutcome::PersistedFresh | SessionTokenOutcome::InMemoryOnly,
+            ),
+            "happy-path login must NOT yield StaleTokenSurvivesOnDisk, got {outcome:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_login_clears_live_tail_events_so_next_user_does_not_see_prior_logs() {
+        // Codex round 7: a logout must scrub previously-buffered
+        // log lines from the LiveTailScreen, otherwise a second
+        // user logging in on the same TUI process can navigate to
+        // Live Tail and see prior CloudWatch output. This is a
+        // cross-user log isolation contract.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "user-a-secret-log-line"),
+            generation: gen,
+        });
+        assert_eq!(app.live_tail.events.len(), 1, "fixture sanity");
+
+        app.reset_to_login();
+
+        assert!(
+            app.live_tail.events.is_empty(),
+            "logout must clear the live-tail buffer, found leaked event(s): {:?}",
+            app.live_tail.events,
+        );
+        assert_eq!(
+            app.current_screen,
+            Screen::Login,
+            "reset_to_login must also return to Login screen",
+        );
+        // Generation also bumped so any still-in-flight queued
+        // events from the previous session can't match against
+        // the new session's gen by accident.
+        assert!(
+            app.live_tail_generation > gen,
+            "logout must invalidate the prior generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_token_expired_flow_also_clears_live_tail_events() {
+        // Same invariant for the session-expiry path — Codex round 7
+        // explicitly listed token expiry as one of the teardown
+        // boundaries that must scrub buffered logs.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "expired-session-log"),
+            generation: gen,
+        });
+        assert_eq!(app.live_tail.events.len(), 1);
+
+        app.begin_token_expired_flow();
+
+        assert!(
+            app.live_tail.events.is_empty(),
+            "session-expiry teardown must clear the live-tail buffer",
+        );
+        assert!(
+            app.live_tail_generation > gen,
+            "session-expiry must invalidate the prior generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_live_tail_when_no_token_is_active_is_a_safe_no_op() {
+        // Boundary / idempotent: user double-presses 's' to stop the
+        // stream. Second stop must not panic on the missing token.
+        let mut app = test_app().await;
+        assert!(app.live_tail_cancel.is_none());
+        app.live_tail.set_disconnected();
+
+        // Calling the dispatch fn twice in a row must be safe —
+        // the first call already took the (None) token slot.
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+
+        // No panic, still disconnected, still no cancel token in flight.
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+        assert!(app.live_tail_cancel.is_none());
     }
 
     // ── Update banner ───────────────────────────────────────

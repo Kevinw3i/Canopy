@@ -1759,6 +1759,194 @@ mod tests {
         assert_eq!(sanitize_log_text_for_tui("a\r\nb\rc"), "a\nb\nc");
     }
 
+    // ── Sanitizer boundary cases ─────────────────────────────────────
+
+    #[test]
+    fn sanitizer_returns_empty_string_for_empty_input() {
+        assert_eq!(sanitize_log_text_for_tui(""), "");
+    }
+
+    #[test]
+    fn sanitizer_returns_unchanged_text_when_no_escapes_present() {
+        let plain = "INFO 2026-05-19 web-01 starting up";
+        assert_eq!(sanitize_log_text_for_tui(plain), plain);
+    }
+
+    #[test]
+    fn sanitizer_preserves_unicode_characters_outside_ascii() {
+        let unicode = "錯誤訊息 ✓ 🎉 한국어 中文";
+        assert_eq!(sanitize_log_text_for_tui(unicode), unicode);
+    }
+
+    #[test]
+    fn sanitizer_preserves_tab_within_log_message() {
+        assert_eq!(
+            sanitize_log_text_for_tui("level\tINFO\tmsg\thello"),
+            "level\tINFO\tmsg\thello"
+        );
+    }
+
+    #[test]
+    fn sanitizer_strips_csi_color_sequence_emitted_by_log4j_color_appender() {
+        // Typical "\e[31mERROR\e[0m" coloring from Java/Python apps that
+        // detect a TTY and emit ANSI colors.
+        let raw = "\x1b[31mERROR\x1b[0m: pipeline failed";
+        assert_eq!(sanitize_log_text_for_tui(raw), "ERROR: pipeline failed");
+    }
+
+    #[test]
+    fn sanitizer_strips_csi_cursor_move_sequences() {
+        // Cursor moves are a real injection vector: a log line that
+        // contains `\e[2J\e[H` would clear the host terminal.
+        let raw = "evil\x1b[2J\x1b[Hbenign";
+        assert_eq!(sanitize_log_text_for_tui(raw), "evilbenign");
+    }
+
+    #[test]
+    fn sanitizer_strips_osc_title_with_bel_terminator() {
+        let raw = "msg\x1b]0;hijacked title\x07tail";
+        assert_eq!(sanitize_log_text_for_tui(raw), "msgtail");
+    }
+
+    #[test]
+    fn sanitizer_strips_osc_title_with_st_terminator() {
+        // OSC strings may end with `ESC \\` (String Terminator) instead of BEL.
+        let raw = "msg\x1b]0;hijacked title\x1b\\tail";
+        assert_eq!(sanitize_log_text_for_tui(raw), "msgtail");
+    }
+
+    #[test]
+    fn sanitizer_strips_dcs_p_sequence() {
+        // Device Control String: ESC P ... ST
+        let raw = "head\x1b\x50payload\x1b\\tail";
+        assert_eq!(sanitize_log_text_for_tui(raw), "headtail");
+    }
+
+    #[test]
+    fn sanitizer_strips_sos_underscore_sequence() {
+        // Start of String: ESC _ ... ST
+        let raw = "head\x1b_payload\x1b\\tail";
+        assert_eq!(sanitize_log_text_for_tui(raw), "headtail");
+    }
+
+    #[test]
+    fn sanitizer_strips_pm_caret_sequence() {
+        // Privacy Message: ESC ^ ... ST
+        let raw = "head\x1b^secret\x1b\\tail";
+        assert_eq!(sanitize_log_text_for_tui(raw), "headtail");
+    }
+
+    #[test]
+    fn sanitizer_consumes_lone_escape_at_end_of_input_without_panicking() {
+        // ESC with nothing following (truncated stream)
+        let raw = "msg\x1b";
+        assert_eq!(sanitize_log_text_for_tui(raw), "msg");
+    }
+
+    #[test]
+    fn sanitizer_drops_other_escape_two_char_sequences() {
+        // ESC + non-bracket char (e.g. reverse index `ESC M`,
+        // next-line `ESC E`) gets stripped as a two-char sequence
+        // (the ESC and the following char are consumed; surrounding
+        // text is preserved verbatim).
+        let raw = "before\x1bMafter";
+        assert_eq!(sanitize_log_text_for_tui(raw), "beforeafter");
+    }
+
+    #[test]
+    fn sanitizer_drops_csi_without_terminator_to_end_of_input() {
+        // Malformed/unterminated CSI swallows the rest of the input.
+        // This is intentional — better to drop than to leak escape
+        // bytes into the terminal.
+        let raw = "before\x1b[31;1;0";
+        assert_eq!(sanitize_log_text_for_tui(raw), "before");
+    }
+
+    #[test]
+    fn sanitizer_drops_osc_without_terminator_to_end_of_input() {
+        let raw = "before\x1b]0;runaway title";
+        assert_eq!(sanitize_log_text_for_tui(raw), "before");
+    }
+
+    #[test]
+    fn sanitizer_handles_double_escape_by_consuming_first_as_other() {
+        // `\x1b\x1b[31m`: the outer ESC takes its peek branch, sees
+        // another ESC (not `[` / `]` / `P` / `_` / `^`), so it
+        // consumes that inner ESC as the "other escape + 1 char" path.
+        // Result: the remaining `[31m` are emitted as literal text.
+        let raw = "\x1b\x1b[31mfoo";
+        assert_eq!(sanitize_log_text_for_tui(raw), "[31mfoo");
+    }
+
+    #[test]
+    fn sanitizer_handles_multiple_sequences_back_to_back() {
+        let raw = "\x1b[31m\x1b[1m\x1b[4mbold red underline\x1b[0m\x1b[0m\x1b[0mEND";
+        assert_eq!(sanitize_log_text_for_tui(raw), "bold red underlineEND");
+    }
+
+    #[test]
+    fn sanitizer_drops_non_printing_control_characters_other_than_tab_newline() {
+        // BEL (\x07) would ring the host terminal's bell — drop it.
+        // BS (\x08) would overwrite previous char — drop it.
+        // VT (\x0b) / FF (\x0c) — drop them.
+        let raw = "a\x07b\x08c\x0bd\x0ce";
+        assert_eq!(sanitize_log_text_for_tui(raw), "abcde");
+    }
+
+    #[test]
+    fn sanitizer_drops_form_feed_but_preserves_following_text() {
+        // Regression: VT/FF characters can appear in Java stack traces;
+        // we drop them but must not drop neighbouring printable text.
+        let raw = "java.lang.NullPointerException\x0c\tat com.foo.Bar";
+        assert_eq!(
+            sanitize_log_text_for_tui(raw),
+            "java.lang.NullPointerException\tat com.foo.Bar"
+        );
+    }
+
+    #[test]
+    fn sanitizer_terminates_under_pathological_input_with_thousand_escapes() {
+        // Build a 10_000-char input of repeated unterminated CSI starts.
+        // The sanitizer must terminate without consuming exponential
+        // CPU and must produce a finite string.
+        let mut raw = String::with_capacity(10_000);
+        for _ in 0..1_000 {
+            raw.push_str("a\x1b[31m");
+        }
+        let sanitized = sanitize_log_text_for_tui(&raw);
+
+        // All "a" survive; all CSI strip.
+        assert_eq!(sanitized, "a".repeat(1_000));
+    }
+
+    #[test]
+    fn sanitizer_preview_truncates_to_200_characters() {
+        let long = "x".repeat(500);
+        let preview = sanitize_log_preview_for_tui(&long);
+        assert_eq!(preview.chars().count(), 200);
+        assert_eq!(preview, "x".repeat(200));
+    }
+
+    #[test]
+    fn sanitizer_preview_strips_escapes_before_truncating() {
+        // Without sanitizing first, the 200-char window could fall
+        // inside an escape sequence and leak partial bytes.
+        let raw = format!("\x1b[31m{}", "a".repeat(500));
+        let preview = sanitize_log_preview_for_tui(&raw);
+        assert!(!preview.contains('\x1b'));
+        assert!(preview.starts_with('a'));
+    }
+
+    #[test]
+    fn sanitizer_keeps_unicode_when_truncating_preview() {
+        // 250 chars of multi-byte unicode — preview must not slice
+        // through a UTF-8 boundary.
+        let raw = "錯".repeat(250);
+        let preview = sanitize_log_preview_for_tui(&raw);
+        assert_eq!(preview.chars().count(), 200);
+        assert!(preview.chars().all(|c| c == '錯'));
+    }
+
     #[test]
     fn set_events_caches_sanitized_display_text() {
         let mut screen = CloudWatchSearchScreen::new();

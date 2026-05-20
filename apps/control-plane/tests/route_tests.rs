@@ -798,6 +798,245 @@ async fn mcp_guidance_sync_unknown_session_is_audited() {
     );
 }
 
+#[tokio::test]
+async fn mcp_guidance_sync_rejects_stale_local_secret_generation_with_403() {
+    // Security: `local_secret_generation` is the only thing tying a
+    // guidance/delivered call back to the secret that the register
+    // response handed out. If a caller can produce a valid JWT but
+    // does NOT know the current local secret, they must NOT be able
+    // to mark guidance as delivered for that session.
+    //
+    // We simulate a "stale" attempt by registering with one generation
+    // and then submitting a delivery with a different generation but
+    // the same JWT.
+    let audit = AuditFile::new("mcp-guidance-stale-lsg");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let register_body = json!({
+        "local_secret_generation": "lsg_original",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_1_local_foundation"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), StatusCode::OK);
+    let register_json = body_json(register_resp.into_body()).await;
+    let session_id = register_json["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Now attempt delivery with a DIFFERENT local_secret_generation.
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        // ↓ doesn't match the registered "lsg_original"
+        "local_secret_generation": "lsg_TAMPERED",
+        "guidance_id": "database_query_workflow",
+        "guidance_version": "2026-05-13"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "stale local_secret_generation must be 403 (not 200) — otherwise an attacker with the JWT but not the local secret can claim deliveries",
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "guidance_sync")
+        .expect("guidance sync audit event");
+    assert_eq!(event["action"], "mcp_guidance_sync");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"], "denied",
+        "stale-secret denial uses the generic `denied` outcome kind (distinct from unknown_guidance / mcp_session_not_found)",
+    );
+    // The submitted (tampered) generation must be present in the audit
+    // so an operator reviewing the trail can see what was tried.
+    assert_eq!(
+        event["metadata"]["local_secret_generation"], "lsg_TAMPERED",
+        "audit must record the *attempted* generation, not the stored one",
+    );
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_rejects_cross_actor_session_access_with_403() {
+    // Security boundary: actor "dev-admin" registers an MCP session;
+    // a DIFFERENT actor presents a valid JWT and tries to mark
+    // guidance delivered for that session. Even if they guessed the
+    // session id (it's effectively a UUID, but the boundary must
+    // hold regardless), the server must refuse: the audit record is
+    // attributed to the JWT subject, not the session owner, and we
+    // can't allow one user's guidance state to be mutated by another.
+    let audit = AuditFile::new("mcp-guidance-cross-actor");
+    let config = dev_config();
+    let owner_token = issue_test_token(&config); // sub = "dev-admin"
+    let other_token = issue_test_token_for_other_mcp_user(&config); // sub = "other-mcp-user"
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    // Owner registers and obtains a session.
+    let register_body = json!({
+        "local_secret_generation": "lsg_owner",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_1_local_foundation"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", owner_token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let register_json = body_json(register_resp.into_body()).await;
+    let session_id = register_json["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Another authenticated user attempts to deliver guidance for the
+    // owner's session, using both the correct local secret and a
+    // catalog-valid guidance id (so the only failing predicate is the
+    // actor mismatch).
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_owner",
+        "guidance_id": "database_query_workflow",
+        "guidance_version": "2026-05-13"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", other_token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "cross-actor guidance delivery must be 403 — session ownership is enforced server-side",
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "guidance_sync")
+        .expect("guidance sync audit event");
+    assert_eq!(event["action"], "mcp_guidance_sync");
+    assert_eq!(event["outcome"], "denied");
+    // Most importantly: the audit subject is the *attempting* user,
+    // not the legitimate session owner — operators must be able to
+    // tell who tried this.
+    assert_eq!(
+        event["actor"], "other-mcp-user",
+        "audit must attribute the denied attempt to the JWT subject (the attacker), not the session owner",
+    );
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_rejects_expired_session_with_403() {
+    // TTL boundary: the 8h session window is enforced. We seed the
+    // DashMap directly with an `expires_at` in the past so we don't
+    // have to wait 8h — the production code path that compares
+    // `session.expires_at < Utc::now()` is what we exercise.
+    use chrono::Duration;
+
+    let audit = AuditFile::new("mcp-guidance-expired-session");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+
+    // Manually insert an already-expired session for `dev-admin`.
+    // We bypass register_session so we have explicit control over
+    // expires_at.
+    let now = chrono::Utc::now();
+    let session_id = "mcp_expired_for_test".to_string();
+    state.mcp_sessions.insert(
+        session_id.clone(),
+        control_plane::services::McpSessionRecord {
+            actor: "dev-admin".into(),
+            actor_email: "dev-admin@dev.local".into(),
+            local_secret_generation: "lsg_for_expired_test".into(),
+            forwarding_key: "fk_does_not_matter".into(),
+            protocol_version: "2025-06-18".into(),
+            client_name: "route-test".into(),
+            client_version: "0.1.0".into(),
+            product_phase: "phase_1_local_foundation".into(),
+            guidance_delivered: Default::default(),
+            // Expired one hour ago.
+            expires_at: now - Duration::hours(1),
+            created_at: now - Duration::hours(9),
+            updated_at: now - Duration::hours(9),
+        },
+    );
+
+    let app = build_app(state);
+
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_for_expired_test",
+        "guidance_id": "database_query_workflow",
+        "guidance_version": "2026-05-13"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "expired session must be 403 — a long-running attacker who captures a token must not be able to ride the same MCP session forever",
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "guidance_sync")
+        .expect("guidance sync audit event");
+    assert_eq!(event["outcome"], "denied");
+    // Same denial path as cross-actor / stale-lsg — they share an arm.
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "denied");
+}
+
 // ── Live-tail WebSocket route registration + dev-mode gate ─────────
 
 /// Build a router that mounts `/api/cloudwatch/live-tail` alongside
@@ -823,12 +1062,16 @@ fn build_app_with_live_tail(state: Arc<AppState>) -> Router {
 }
 
 #[tokio::test]
-async fn live_tail_endpoint_rejects_non_websocket_get_with_426_upgrade_required() {
+async fn live_tail_endpoint_rejects_plain_get_without_upgrade_headers_with_4xx() {
     // Plain GET without an Upgrade header is not a WebSocket handshake.
-    // axum's `WebSocketUpgrade` extractor short-circuits with 426
-    // Upgrade Required before the handler body runs. This lock prevents
-    // an accidental refactor that would turn live-tail into a regular
-    // HTTP endpoint (which would bypass the in-message auth design).
+    // axum's `WebSocketUpgrade` extractor short-circuits with a 4xx
+    // before the handler body runs. This lock prevents an accidental
+    // refactor that would turn live-tail into a regular HTTP endpoint
+    // (which would bypass the in-message auth design).
+    //
+    // NOTE: the dev_mode gate itself is verified by the real-WS
+    // handshake tests below, which spawn a TcpListener so axum can
+    // populate hyper's OnUpgrade extension.
     let state = build_state(dev_config());
     let app = build_app_with_live_tail(state);
 
@@ -841,13 +1084,11 @@ async fn live_tail_endpoint_rejects_non_websocket_get_with_426_upgrade_required(
         .await
         .unwrap();
 
-    // Axum's WebSocketUpgrade extractor short-circuits with a 4xx
-    // (typically 400 Bad Request when the upgrade headers are
-    // missing, or 426 Upgrade Required for some shapes) — the
-    // exact code is an axum implementation detail, but the
-    // important contract is that it is NEVER 101 Switching
-    // Protocols and NEVER 2xx, because a plain GET must not be
-    // served as a regular HTTP endpoint.
+    // The exact 4xx code is an axum implementation detail (400 or
+    // 426 depending on which header check fails first) — what
+    // matters is that it is NEVER 101 Switching Protocols and
+    // NEVER 2xx, because a plain GET must not be served as a
+    // regular HTTP endpoint.
     assert_ne!(
         resp.status(),
         StatusCode::SWITCHING_PROTOCOLS,
@@ -860,38 +1101,101 @@ async fn live_tail_endpoint_rejects_non_websocket_get_with_426_upgrade_required(
     );
 }
 
+/// Spin up a real `axum::serve` on an ephemeral port and return the
+/// bound port. This is necessary for the WebSocket handler tests
+/// because axum's `WebSocketUpgrade` extractor needs the hyper
+/// connection's `OnUpgrade` extension — which `tower::ServiceExt::
+/// oneshot` does NOT install. Tests that need to reach the handler
+/// body for a WS route MUST use this helper, not `oneshot`.
+async fn spawn_live_tail_server(app: Router) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local_addr").port();
+    let handle = tokio::spawn(async move {
+        // We don't care about the result — the test owns the
+        // server's lifetime and aborts the join handle on drop.
+        let _ = axum::serve(listener, app).await;
+    });
+    (port, handle)
+}
+
 #[tokio::test]
-async fn live_tail_endpoint_responds_to_get_in_non_dev_mode_without_serving_websocket() {
-    // Production safety net: in a non-dev build, even if a client
-    // sends a normal GET (or partial upgrade), the handler must not
-    // serve a real WebSocket. The exact response code is 426 because
-    // the extractor rejects before the dev_mode gate runs (no proper
-    // Upgrade headers were sent), but the important contract is that
-    // status is 4xx (NOT 101 Switching Protocols).
+async fn live_tail_endpoint_rejects_real_websocket_handshake_in_non_dev_mode_with_404() {
+    // Production safety net (real-handshake variant). Codex flagged
+    // that a plain-GET test trips the WebSocketUpgrade extractor's
+    // "missing upgrade header" branch BEFORE the handler runs, so
+    // a regression that drops the dev_mode gate would still pass
+    // against a plain GET via tower::oneshot. This test spawns a
+    // real `axum::serve` and uses `tokio_tungstenite::connect_async`
+    // — that gives hyper a real connection with OnUpgrade, the
+    // extractor accepts the request, the handler runs, and we can
+    // assert on what it actually returns.
+    use tokio_tungstenite::tungstenite::Error as TError;
+
     let mut config = dev_config();
     config.dev_mode = false;
     let state = build_state(config);
     let app = build_app_with_live_tail(state);
+    let (port, server) = spawn_live_tail_server(app).await;
 
-    let resp = app
-        .oneshot(
-            Request::get("/api/cloudwatch/live-tail")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let url = format!("ws://127.0.0.1:{port}/api/cloudwatch/live-tail");
+    let result = tokio_tungstenite::connect_async(&url).await;
 
-    assert_ne!(
-        resp.status(),
-        StatusCode::SWITCHING_PROTOCOLS,
-        "non-dev mode must NEVER allow a WebSocket upgrade"
-    );
-    assert!(
-        resp.status().is_client_error(),
-        "non-dev mode WS request must be 4xx, got {}",
-        resp.status()
-    );
+    // The dev_mode gate returns 404 BEFORE doing the WS upgrade,
+    // which `connect_async` surfaces as `Http(...)` rejection.
+    match result {
+        Err(TError::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "non-dev build must reject WS upgrade with 404 (the dev-only \
+                 gate). Got {} — if this is 101, the dev_mode gate was bypassed; \
+                 anything else means the handler took a different code path \
+                 than intended.",
+                resp.status(),
+            );
+        }
+        Ok(_) => panic!(
+            "connect_async succeeded — the WebSocket upgrade COMPLETED in \
+             non-dev mode. The dev_mode gate has been bypassed. This is a \
+             production safety regression."
+        ),
+        Err(other) => panic!("expected Http(404) rejection from connect_async, got: {other:?}"),
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn live_tail_endpoint_completes_websocket_handshake_in_dev_mode() {
+    // Positive control: in dev_mode the handler must accept the
+    // upgrade (101 Switching Protocols). If THIS test fails, the
+    // production live-tail route is broken; if the non-dev test
+    // above passes BUT this one fails, then the dev_mode gate is
+    // backwards. Pairing the two locks the truth-table down.
+    let state = build_state(dev_config());
+    let app = build_app_with_live_tail(state);
+    let (port, server) = spawn_live_tail_server(app).await;
+
+    let url = format!("ws://127.0.0.1:{port}/api/cloudwatch/live-tail");
+    let result = tokio_tungstenite::connect_async(&url).await;
+
+    match result {
+        Ok((_stream, response)) => {
+            assert_eq!(
+                response.status(),
+                StatusCode::SWITCHING_PROTOCOLS,
+                "dev_mode WS upgrade must complete with 101",
+            );
+        }
+        Err(e) => panic!(
+            "dev_mode WS upgrade unexpectedly failed: {e:?} — the \
+             dev_mode gate or the upstream handler is broken"
+        ),
+    }
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -928,6 +1232,23 @@ async fn live_tail_route_is_mounted_at_expected_path_only() {
 /// `can_use_mcp = true` per dev_defaults.
 fn issue_test_token_for_mcp_user(config: &AppConfig) -> String {
     issue_test_token(config)
+}
+
+/// JWT for a DIFFERENT MCP-entitled user. Same group membership as
+/// `issue_test_token` (so `can_use_mcp` is on), but a distinct
+/// `user_id`. Used to verify cross-actor session ownership boundaries
+/// — i.e. that user A cannot mutate user B's MCP session state even
+/// when A has all the required entitlements.
+fn issue_test_token_for_other_mcp_user(config: &AppConfig) -> String {
+    let auth = AuthService::new(config.clone());
+    let identity = shared::dto::auth::UserIdentity {
+        user_id: "other-mcp-user".into(),
+        email: "other@example.com".into(),
+        display_name: "Other MCP User".into(),
+        groups: vec!["platform-engineering".into()],
+        email_verified: true,
+    };
+    auth.issue_token(&identity).unwrap().access_token
 }
 
 /// JWT for a user that does not belong to any entitlement group —
