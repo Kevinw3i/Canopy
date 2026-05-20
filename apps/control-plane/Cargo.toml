@@ -49,6 +49,10 @@ http-body-util = "0.1"
 rsa = "0.9"
 rand = "0.8"
 tempfile = "3"
+# Real WebSocket client for end-to-end live-tail route tests
+# (cannot be done via tower::oneshot because axum's WebSocketUpgrade
+# extractor needs hyper's OnUpgrade connection extension).
+tokio-tungstenite = "0.24"
 # Heavyweight MySQL E2E tests are tagged `#[ignore]` so that
 # `cargo test --workspace` (which everyone runs) does not require a
 # Docker daemon. To run them explicitly:
