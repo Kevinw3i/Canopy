@@ -31,7 +31,7 @@ pub enum Action {
     LoginDeviceCode,
     Logout,
     ChangePassword,
-    TokenReceived(String),
+    TokenReceived(shared::dto::auth::TokenResponse),
     TokenExpired,
 
     // EC2

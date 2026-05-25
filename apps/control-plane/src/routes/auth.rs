@@ -249,6 +249,7 @@ async fn device_code_poll(
             Ok(token) => Ok(Json(DeviceCodePollResponse::Complete {
                 access_token: token.access_token,
                 expires_in: token.expires_in,
+                refresh_token: token.refresh_token,
             })),
             Err(_) => Ok(Json(DeviceCodePollResponse::Pending)),
         };
@@ -315,12 +316,14 @@ async fn device_code_poll(
                 let ent = store.evaluate(&oidc_claims.sub, &email, &name, email_verified);
                 let identity = AuthService::identity_from_oidc_claims(&oidc_claims, ent.groups);
 
-                let token = auth_service.issue_token(&identity).map_err(|e| {
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiError::internal(e.to_string())),
-                    )
-                })?;
+                let token = auth_service
+                    .issue_token_with_refresh(&identity, oidc_tokens.refresh_token)
+                    .map_err(|e| {
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiError::internal(e.to_string())),
+                        )
+                    })?;
 
                 state
                     .audit_service
@@ -340,6 +343,7 @@ async fn device_code_poll(
                 Ok(Json(DeviceCodePollResponse::Complete {
                     access_token: token.access_token,
                     expires_in: token.expires_in,
+                    refresh_token: token.refresh_token,
                 }))
             } else {
                 // No id_token — we cannot issue a valid internal JWT without

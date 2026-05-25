@@ -4,16 +4,21 @@
 //! the real `reqwest`-based ApiClient, covering the full HTTP round-trip.
 
 use axum::{
-    extract::Json,
+    extract::{Json, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::net::TcpListener;
 
 use tui_client::api_client::{ApiClient, ApiClientError};
+use tui_client::auth::{device_code::DeviceCodeFlow, SessionTokens};
 
 // ── Mock server helpers ─────────────────────────────────────────────────
 
@@ -191,12 +196,200 @@ async fn log_groups_handler(headers: HeaderMap) -> impl IntoResponse {
     .into_response()
 }
 
+async fn refresh_handler(Json(body): Json<Value>) -> impl IntoResponse {
+    if body["refresh_token"].as_str() != Some("refresh-ok") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "refresh token rejected"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "access_token": "fresh-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": "refresh-next"
+    }))
+    .into_response()
+}
+
+async fn refresh_500_handler(Json(_body): Json<Value>) -> impl IntoResponse {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "code": "INTERNAL_ERROR",
+            "message": "temporary refresh failure"
+        })),
+    )
+        .into_response()
+}
+
+async fn refresh_401_handler(Json(_body): Json<Value>) -> impl IntoResponse {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "code": "UNAUTHORIZED",
+            "message": "refresh token revoked"
+        })),
+    )
+        .into_response()
+}
+
+async fn device_code_start_handler() -> impl IntoResponse {
+    Json(json!({
+        "device_code": "device-ok",
+        "user_code": "ABCD-EFGH",
+        "verification_uri": "https://example.com/device",
+        "expires_in": 60,
+        "interval": 0
+    }))
+}
+
+async fn device_code_poll_with_refresh(Json(_body): Json<Value>) -> impl IntoResponse {
+    Json(json!({
+        "status": "complete",
+        "access_token": "device-access",
+        "expires_in": 3600,
+        "refresh_token": "device-refresh"
+    }))
+}
+
+async fn device_code_poll_without_refresh(Json(_body): Json<Value>) -> impl IntoResponse {
+    Json(json!({
+        "status": "complete",
+        "access_token": "device-access",
+        "expires_in": 3600
+    }))
+}
+
+#[derive(Clone)]
+struct RefreshCounter {
+    calls: Arc<AtomicUsize>,
+}
+
+async fn counted_refresh_handler(
+    State(state): State<RefreshCounter>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let call = state.calls.fetch_add(1, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    if body["refresh_token"].as_str() != Some("refresh-ok") || call > 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "refresh token rejected"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "access_token": "fresh-token",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": "refresh-next"
+    }))
+    .into_response()
+}
+
+async fn entitlements_requires_fresh_token(headers: HeaderMap) -> impl IntoResponse {
+    let auth = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if auth != "Bearer fresh-token" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "code": "UNAUTHORIZED",
+                "message": "Invalid or expired token"
+            })),
+        )
+            .into_response();
+    }
+
+    entitlements_handler(headers).await.into_response()
+}
+
+async fn entitlements_always_unauthorized(_headers: HeaderMap) -> impl IntoResponse {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "code": "UNAUTHORIZED",
+            "message": "Invalid or expired token"
+        })),
+    )
+        .into_response()
+}
+
 fn mock_app() -> Router {
     Router::new()
         .route("/auth/dev-login", post(dev_login_handler))
         .route("/api/ec2/list", post(list_ec2_handler))
         .route("/api/entitlements", get(entitlements_handler))
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
+}
+
+fn mock_app_refresh() -> Router {
+    Router::new()
+        .route("/auth/refresh", post(refresh_handler))
+        .route("/api/entitlements", get(entitlements_requires_fresh_token))
+}
+
+fn mock_app_refresh_then_unauthorized() -> Router {
+    Router::new()
+        .route("/auth/refresh", post(refresh_handler))
+        .route("/api/entitlements", get(entitlements_always_unauthorized))
+}
+
+fn mock_app_refresh_401() -> Router {
+    Router::new()
+        .route("/auth/refresh", post(refresh_401_handler))
+        .route("/api/entitlements", get(entitlements_requires_fresh_token))
+}
+
+fn mock_app_device_code_with_refresh() -> Router {
+    Router::new()
+        .route("/auth/device-code/start", post(device_code_start_handler))
+        .route(
+            "/auth/device-code/poll",
+            post(device_code_poll_with_refresh),
+        )
+}
+
+fn mock_app_device_code_without_refresh() -> Router {
+    Router::new()
+        .route("/auth/device-code/start", post(device_code_start_handler))
+        .route(
+            "/auth/device-code/poll",
+            post(device_code_poll_without_refresh),
+        )
+}
+
+fn mock_app_no_refresh_needed(calls: Arc<AtomicUsize>) -> Router {
+    Router::new()
+        .route("/auth/refresh", post(counted_refresh_handler))
+        .route("/api/entitlements", get(entitlements_handler))
+        .with_state(RefreshCounter { calls })
+}
+
+fn mock_app_counted_refresh(calls: Arc<AtomicUsize>) -> Router {
+    Router::new()
+        .route("/auth/refresh", post(counted_refresh_handler))
+        .route("/api/entitlements", get(entitlements_requires_fresh_token))
+        .with_state(RefreshCounter { calls })
+}
+
+fn mock_app_refresh_500() -> Router {
+    Router::new()
+        .route("/auth/refresh", post(refresh_500_handler))
+        .route("/api/entitlements", get(entitlements_requires_fresh_token))
 }
 
 fn mock_app_forbidden() -> Router {
@@ -252,7 +445,7 @@ async fn auth_route_401_is_not_token_expired() {
 #[tokio::test]
 async fn token_lifecycle_across_requests() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url).unwrap();
+    let client = ApiClient::new(&base_url).unwrap();
 
     // Without token, listing EC2 should fail (server returns 401)
     let err = client
@@ -295,7 +488,7 @@ async fn token_lifecycle_across_requests() {
 #[tokio::test]
 async fn get_entitlements_requires_auth() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url).unwrap();
+    let client = ApiClient::new(&base_url).unwrap();
 
     // No token -> 401
     let err = client.get_entitlements().await.unwrap_err();
@@ -309,9 +502,296 @@ async fn get_entitlements_requires_auth() {
 }
 
 #[tokio::test]
+async fn authenticated_401_refreshes_session_and_retries() {
+    let base_url = start_mock(mock_app_refresh()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    let dir = std::env::temp_dir().join(format!("canopy-api-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token_path = dir.join("token");
+    client.set_session_store_path(token_path.clone());
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let ent = client.get_entitlements().await.unwrap();
+    assert_eq!(ent.user_id, "alice");
+    assert_eq!(client.get_token().as_deref(), Some("fresh-token"));
+    assert_eq!(client.get_refresh_token().as_deref(), Some("refresh-next"));
+
+    let persisted: SessionTokens =
+        serde_json::from_str(&std::fs::read_to_string(&token_path).unwrap()).unwrap();
+    assert_eq!(persisted.access_token, "fresh-token");
+    assert_eq!(persisted.refresh_token.as_deref(), Some("refresh-next"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn authenticated_success_does_not_call_refresh() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_mock(mock_app_no_refresh_needed(calls.clone())).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "valid-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let ent = client.get_entitlements().await.unwrap();
+
+    assert_eq!(ent.user_id, "alice");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(client.get_token().as_deref(), Some("valid-token"));
+}
+
+#[tokio::test]
+async fn concurrent_401s_share_one_refresh_request() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_mock(mock_app_counted_refresh(calls.clone())).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    let dir = std::env::temp_dir().join(format!("canopy-api-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    client.set_session_store_path(dir.join("token"));
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let (first, second) = tokio::join!(client.get_entitlements(), client.get_entitlements());
+
+    assert!(first.is_ok(), "first request failed: {first:?}");
+    assert!(second.is_ok(), "second request failed: {second:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(client.get_token().as_deref(), Some("fresh-token"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn authenticated_retry_still_401_returns_token_expired_without_looping() {
+    let base_url = start_mock(mock_app_refresh_then_unauthorized()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let err = client.get_entitlements().await.unwrap_err();
+
+    assert!(matches!(err, ApiClientError::TokenExpired));
+    assert_eq!(client.get_token().as_deref(), Some("fresh-token"));
+}
+
+#[tokio::test]
+async fn refresh_401_returns_token_expired() {
+    let base_url = start_mock(mock_app_refresh_401()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-revoked".into()),
+    ));
+
+    let err = client.get_entitlements().await.unwrap_err();
+
+    assert!(matches!(err, ApiClientError::TokenExpired));
+    assert_eq!(client.get_token().as_deref(), Some("expired-token"));
+}
+
+#[tokio::test]
+async fn initial_transport_error_propagates_without_token_expired() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let client = ApiClient::new(&format!("http://{addr}")).unwrap();
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let err = client.get_entitlements().await.unwrap_err();
+
+    assert!(
+        matches!(err, ApiClientError::Transport(_)),
+        "connection failure must remain transport error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_requires_existing_refresh_token() {
+    let base_url = start_mock(mock_app_refresh()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new("expired-token".into(), None));
+
+    let err = client.get_entitlements().await.unwrap_err();
+
+    assert!(matches!(err, ApiClientError::TokenExpired));
+    assert_eq!(client.get_token().as_deref(), Some("expired-token"));
+}
+
+#[tokio::test]
+async fn logout_during_refresh_does_not_restore_session() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_mock(mock_app_counted_refresh(calls.clone())).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    let dir = std::env::temp_dir().join(format!("canopy-api-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token_path = dir.join("token");
+    client.set_session_store_path(token_path.clone());
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let pending = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get_entitlements().await })
+    };
+    for _ in 0..20 {
+        if calls.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    client.clear_token();
+    let err = pending.await.unwrap().unwrap_err();
+
+    assert!(matches!(err, ApiClientError::TokenExpired));
+    assert!(!client.has_token());
+    assert!(
+        !token_path.exists(),
+        "refresh must not persist a token after logout"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn refresh_5xx_remains_api_error_not_token_expired() {
+    let base_url = start_mock(mock_app_refresh_500()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let err = client.get_entitlements().await.unwrap_err();
+
+    assert!(
+        matches!(err, ApiClientError::Api { status: 500, .. }),
+        "expected refresh 5xx to remain API error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_persist_failure_does_not_activate_rotated_token() {
+    let base_url = start_mock(mock_app_refresh()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    let dir = std::env::temp_dir().join(format!("canopy-api-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Point the session store path at a directory so the atomic file write
+    // fails after the refresh endpoint has returned rotated credentials.
+    client.set_session_store_path(dir.clone());
+    client.set_session(SessionTokens::new(
+        "expired-token".into(),
+        Some("refresh-ok".into()),
+    ));
+
+    let err = client.get_entitlements().await.unwrap_err();
+
+    assert!(matches!(err, ApiClientError::SessionStore { .. }));
+    assert_eq!(client.get_token().as_deref(), Some("expired-token"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn apply_token_response_preserves_existing_refresh_when_omitted() {
+    let base_url = start_mock(mock_app()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "old-access".into(),
+        Some("refresh-keep".into()),
+    ));
+
+    let session = client.apply_token_response(shared::dto::auth::TokenResponse {
+        access_token: "new-access".into(),
+        token_type: "Bearer".into(),
+        expires_in: 3600,
+        refresh_token: None,
+    });
+
+    assert_eq!(session.access_token, "new-access");
+    assert_eq!(session.refresh_token.as_deref(), Some("refresh-keep"));
+    assert_eq!(client.get_refresh_token().as_deref(), Some("refresh-keep"));
+}
+
+#[tokio::test]
+async fn apply_token_response_uses_server_refresh_when_provided() {
+    let base_url = start_mock(mock_app()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "old-access".into(),
+        Some("refresh-old".into()),
+    ));
+
+    let session = client.apply_token_response(shared::dto::auth::TokenResponse {
+        access_token: "new-access".into(),
+        token_type: "Bearer".into(),
+        expires_in: 3600,
+        refresh_token: Some("refresh-new".into()),
+    });
+
+    assert_eq!(session.access_token, "new-access");
+    assert_eq!(session.refresh_token.as_deref(), Some("refresh-new"));
+    assert_eq!(client.get_token().as_deref(), Some("new-access"));
+    assert_eq!(client.get_refresh_token().as_deref(), Some("refresh-new"));
+}
+
+#[tokio::test]
+async fn set_token_replaces_session_and_clears_refresh_token() {
+    let base_url = start_mock(mock_app()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_session(SessionTokens::new(
+        "old-access".into(),
+        Some("refresh-old".into()),
+    ));
+
+    client.set_token("raw-access".into());
+
+    assert_eq!(client.get_token().as_deref(), Some("raw-access"));
+    assert_eq!(client.get_refresh_token(), None);
+}
+
+#[tokio::test]
+async fn device_code_flow_returns_token_response_with_refresh() {
+    let base_url = start_mock(mock_app_device_code_with_refresh()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+
+    let flow = DeviceCodeFlow::start(&client).await.unwrap();
+    let token = flow.poll_until_complete(&client).await.unwrap();
+
+    assert_eq!(token.access_token, "device-access");
+    assert_eq!(token.refresh_token.as_deref(), Some("device-refresh"));
+}
+
+#[tokio::test]
+async fn device_code_flow_accepts_missing_refresh_token() {
+    let base_url = start_mock(mock_app_device_code_without_refresh()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+
+    let flow = DeviceCodeFlow::start(&client).await.unwrap();
+    let token = flow.poll_until_complete(&client).await.unwrap();
+
+    assert_eq!(token.access_token, "device-access");
+    assert_eq!(token.refresh_token, None);
+}
+
+#[tokio::test]
 async fn authenticated_403_is_not_token_expired() {
     let base_url = start_mock(mock_app_ec2_forbidden()).await;
-    let mut client = ApiClient::new(&base_url).unwrap();
+    let client = ApiClient::new(&base_url).unwrap();
     client.set_token("test-token".into());
 
     let err = client
@@ -344,7 +824,7 @@ async fn authenticated_403_is_not_token_expired() {
 #[tokio::test]
 async fn list_log_groups_success() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url).unwrap();
+    let client = ApiClient::new(&base_url).unwrap();
     client.set_token("test-token".into());
 
     let resp = client
@@ -363,7 +843,7 @@ async fn list_log_groups_success() {
 #[tokio::test]
 async fn clear_token_revokes_access() {
     let base_url = start_mock(mock_app()).await;
-    let mut client = ApiClient::new(&base_url).unwrap();
+    let client = ApiClient::new(&base_url).unwrap();
 
     client.set_token("my-token".into());
     assert!(client.has_token());

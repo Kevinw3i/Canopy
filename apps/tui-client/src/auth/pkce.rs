@@ -1,5 +1,6 @@
 use crate::api_client::{generate_code_verifier, ApiClient};
 use anyhow::Result;
+use shared::dto::auth::TokenResponse;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -10,7 +11,7 @@ use tokio::net::TcpListener;
 /// 4. Wait for callback with authorization code
 /// 5. Exchange code for token via control-plane
 /// 6. Return internal access token
-pub async fn start_pkce_flow(api: &ApiClient, callback_port: u16) -> Result<String> {
+pub async fn start_pkce_flow(api: &ApiClient, callback_port: u16) -> Result<TokenResponse> {
     let code_verifier = generate_code_verifier();
     let redirect_uri = format!("http://localhost:{}/callback", callback_port);
 
@@ -59,7 +60,7 @@ pub async fn start_pkce_flow(api: &ApiClient, callback_port: u16) -> Result<Stri
         .pkce_exchange(&code, &code_verifier, &state, &redirect_uri)
         .await?;
 
-    Ok(token_resp.access_token)
+    Ok(token_resp)
 }
 
 /// Accept one HTTP GET request on the given listener, extract

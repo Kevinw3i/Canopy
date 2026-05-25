@@ -1,9 +1,13 @@
 use anyhow::Result;
 use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
-    StatusCode,
+    RequestBuilder, StatusCode,
 };
 use serde::de::DeserializeOwned;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use crate::auth::SessionTokens;
 use shared::dto::auth::*;
 use shared::dto::cloudwatch::*;
 use shared::dto::ec2::*;
@@ -12,6 +16,19 @@ use shared::errors::ApiError;
 use shared::headers;
 
 pub type ApiResult<T> = std::result::Result<T, ApiClientError>;
+
+#[derive(Debug, Default)]
+struct SessionState {
+    tokens: Option<SessionTokens>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct SessionSnapshot {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    generation: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthBehavior {
@@ -31,6 +48,8 @@ pub enum ApiClientError {
     },
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
+    #[error("failed to persist auth session: {message}")]
+    SessionStore { message: String },
 }
 
 /// HTTP client for the control-plane API
@@ -38,7 +57,9 @@ pub enum ApiClientError {
 pub struct ApiClient {
     base_url: String,
     client: reqwest::Client,
-    token: Option<String>,
+    session: Arc<Mutex<SessionState>>,
+    session_store_path: Arc<Mutex<Option<PathBuf>>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ApiClient {
@@ -58,7 +79,9 @@ impl ApiClient {
             client: reqwest::Client::builder()
                 .default_headers(headers)
                 .build()?,
-            token: None,
+            session: Arc::new(Mutex::new(SessionState::default())),
+            session_store_path: Arc::new(Mutex::new(Some(crate::auth::token_path()))),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -70,24 +93,100 @@ impl ApiClient {
         concat!("canopy-tui/", env!("CARGO_PKG_VERSION"))
     }
 
-    pub fn set_token(&mut self, token: String) {
-        self.token = Some(token);
+    pub fn set_token(&self, token: String) {
+        self.set_session(SessionTokens::new(token, None));
     }
 
-    pub fn clear_token(&mut self) {
-        self.token = None;
+    pub fn set_session(&self, session: SessionTokens) {
+        self.replace_session(Some(session));
+    }
+
+    pub fn set_session_store_path(&self, path: PathBuf) {
+        *self.session_store_path_guard() = Some(path);
+    }
+
+    pub fn apply_token_response(&self, resp: TokenResponse) -> SessionTokens {
+        let mut state = self.session_guard();
+        let refresh_token = resp.refresh_token.or_else(|| {
+            state
+                .tokens
+                .as_ref()
+                .and_then(|session| session.refresh_token.clone())
+        });
+        let session = SessionTokens::new(resp.access_token, refresh_token);
+        state.tokens = Some(session.clone());
+        state.generation = state.generation.wrapping_add(1);
+        session
+    }
+
+    pub fn clear_token(&self) {
+        self.replace_session(None);
     }
 
     pub fn has_token(&self) -> bool {
-        self.token.is_some()
+        self.session_guard()
+            .tokens
+            .as_ref()
+            .is_some_and(|session| !session.access_token.is_empty())
     }
 
     pub fn get_token(&self) -> Option<String> {
-        self.token.clone()
+        self.session_guard()
+            .tokens
+            .as_ref()
+            .map(|session| session.access_token.clone())
+    }
+
+    pub fn get_refresh_token(&self) -> Option<String> {
+        self.session_guard()
+            .tokens
+            .as_ref()
+            .and_then(|session| session.refresh_token.clone())
+    }
+
+    fn session_guard(&self) -> MutexGuard<'_, SessionState> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn session_store_path_guard(&self) -> MutexGuard<'_, Option<PathBuf>> {
+        self.session_store_path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn replace_session(&self, tokens: Option<SessionTokens>) {
+        let mut state = self.session_guard();
+        state.tokens = tokens;
+        state.generation = state.generation.wrapping_add(1);
+    }
+
+    fn session_snapshot(&self) -> SessionSnapshot {
+        let state = self.session_guard();
+        SessionSnapshot {
+            access_token: state
+                .tokens
+                .as_ref()
+                .map(|session| session.access_token.clone()),
+            refresh_token: state
+                .tokens
+                .as_ref()
+                .and_then(|session| session.refresh_token.clone()),
+            generation: state.generation,
+        }
+    }
+
+    fn refresh_preempted_result(&self) -> ApiResult<()> {
+        if self.has_token() {
+            Ok(())
+        } else {
+            Err(ApiClientError::TokenExpired)
+        }
     }
 
     fn auth_header(&self) -> Option<String> {
-        self.token.as_ref().map(|t| format!("Bearer {}", t))
+        self.get_token().map(|t| format!("Bearer {}", t))
     }
 
     async fn decode_response<T: DeserializeOwned>(
@@ -112,6 +211,105 @@ impl ApiClient {
             code: err.code,
             message: err.message,
         })
+    }
+
+    fn with_auth(&self, mut req: RequestBuilder) -> RequestBuilder {
+        if let Some(auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+        req
+    }
+
+    async fn refresh_access_token_if_stale(
+        &self,
+        stale_snapshot: SessionSnapshot,
+    ) -> ApiResult<()> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let current = self.session_snapshot();
+        if current.generation != stale_snapshot.generation
+            || current.access_token != stale_snapshot.access_token
+        {
+            return self.refresh_preempted_result();
+        }
+
+        let refresh_token = current
+            .refresh_token
+            .clone()
+            .ok_or(ApiClientError::TokenExpired)?;
+
+        let resp = self
+            .client
+            .post(format!("{}/auth/refresh", self.base_url))
+            .json(&RefreshTokenRequest { refresh_token })
+            .send()
+            .await?;
+
+        let token_resp = match Self::decode_response::<TokenResponse>(
+            resp,
+            AuthBehavior::ReturnUnauthorizedAsApiError,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(ApiClientError::Transport(err)) => return Err(ApiClientError::Transport(err)),
+            Err(ApiClientError::Api {
+                status,
+                code,
+                message,
+            }) if status >= 500 => {
+                return Err(ApiClientError::Api {
+                    status,
+                    code,
+                    message,
+                });
+            }
+            Err(_) => return Err(ApiClientError::TokenExpired),
+        };
+
+        let session = SessionTokens::new(
+            token_resp.access_token,
+            token_resp.refresh_token.or(current.refresh_token),
+        );
+        let path = self.session_store_path_guard().clone();
+        let mut state = self.session_guard();
+        if state.generation != stale_snapshot.generation
+            || state
+                .tokens
+                .as_ref()
+                .map(|session| session.access_token.clone())
+                != stale_snapshot.access_token
+        {
+            drop(state);
+            return self.refresh_preempted_result();
+        }
+        if let Some(path) = path {
+            crate::auth::save_session_to_path(&path, &session).map_err(|err| {
+                ApiClientError::SessionStore {
+                    message: err.to_string(),
+                }
+            })?;
+        }
+        state.tokens = Some(session);
+        state.generation = state.generation.wrapping_add(1);
+        tracing::info!("refreshed auth session and persisted updated token");
+        Ok(())
+    }
+
+    async fn send_authenticated<T, F>(&self, build_request: F) -> ApiResult<T>
+    where
+        T: DeserializeOwned,
+        F: Fn() -> RequestBuilder,
+    {
+        let snapshot = self.session_snapshot();
+        let resp = self.with_auth(build_request()).send().await?;
+        match Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await {
+            Err(ApiClientError::TokenExpired) => {
+                self.refresh_access_token_if_stale(snapshot).await?;
+                let resp = self.with_auth(build_request()).send().await?;
+                Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+            }
+            other => other,
+        }
     }
 
     // ── Auth ────────────────────────────────────────────
@@ -199,46 +397,31 @@ impl ApiClient {
     // ── Entitlements ────────────────────────────────────
 
     pub async fn get_entitlements(&self) -> ApiResult<UserEntitlements> {
-        let mut req = self
-            .client
-            .get(format!("{}/api/entitlements", self.base_url));
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .get(format!("{}/api/entitlements", self.base_url))
+        })
+        .await
     }
 
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {
-        let mut req = self
-            .client
-            .post(format!("{}/api/ec2/list", self.base_url))
-            .json(request);
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ec2/list", self.base_url))
+                .json(request)
+        })
+        .await
     }
 
     pub async fn connect(&self, request: &ConnectRequest) -> ApiResult<ConnectResponse> {
-        let mut req = self
-            .client
-            .post(format!("{}/api/ec2/connect", self.base_url))
-            .json(request);
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ec2/connect", self.base_url))
+                .json(request)
+        })
+        .await
     }
 
     // ── CloudWatch ──────────────────────────────────────
@@ -247,68 +430,48 @@ impl ApiClient {
         &self,
         request: &LogGroupsRequest,
     ) -> ApiResult<LogGroupsResponse> {
-        let mut req = self
-            .client
-            .post(format!("{}/api/cloudwatch/log-groups", self.base_url))
-            .json(request);
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/cloudwatch/log-groups", self.base_url))
+                .json(request)
+        })
+        .await
     }
 
     pub async fn filter_log_events(
         &self,
         request: &FilterLogEventsRequest,
     ) -> ApiResult<FilterLogEventsResponse> {
-        let mut req = self
-            .client
-            .post(format!("{}/api/cloudwatch/filter-events", self.base_url))
-            .json(request);
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/cloudwatch/filter-events", self.base_url))
+                .json(request)
+        })
+        .await
     }
 
     pub async fn start_insights_query(
         &self,
         request: &StartInsightsQueryRequest,
     ) -> ApiResult<StartInsightsQueryResponse> {
-        let mut req = self
-            .client
-            .post(format!("{}/api/cloudwatch/insights/start", self.base_url))
-            .json(request);
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/cloudwatch/insights/start", self.base_url))
+                .json(request)
+        })
+        .await
     }
 
     pub async fn get_query_results(
         &self,
         request: &GetQueryResultsRequest,
     ) -> ApiResult<GetQueryResultsResponse> {
-        let mut req = self
-            .client
-            .post(format!("{}/api/cloudwatch/insights/results", self.base_url))
-            .json(request);
-
-        if let Some(ref auth) = self.auth_header() {
-            req = req.header("Authorization", auth);
-        }
-
-        let resp = req.send().await?;
-        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/cloudwatch/insights/results", self.base_url))
+                .json(request)
+        })
+        .await
     }
 }
 
@@ -332,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_token_lifecycle() {
-        let mut client = ApiClient::new("http://localhost:8443").unwrap();
+        let client = ApiClient::new("http://localhost:8443").unwrap();
         assert!(!client.has_token());
         assert!(client.get_token().is_none());
         assert!(client.auth_header().is_none());
@@ -345,6 +508,36 @@ mod tests {
         client.clear_token();
         assert!(!client.has_token());
         assert!(client.auth_header().is_none());
+    }
+
+    #[test]
+    fn session_mutations_bump_generation() {
+        let client = ApiClient::new("http://localhost:8443").unwrap();
+        let initial = client.session_snapshot().generation;
+
+        client.set_token("first".into());
+        let after_set = client.session_snapshot().generation;
+        client.clear_token();
+        let after_clear = client.session_snapshot().generation;
+
+        assert!(after_set > initial);
+        assert!(after_clear > after_set);
+    }
+
+    #[test]
+    fn poisoned_session_mutex_does_not_panic_subsequent_calls() {
+        let client = ApiClient::new("http://localhost:8443").unwrap();
+        let session = Arc::clone(&client.session);
+        let _ = std::thread::spawn(move || {
+            let _guard = session.lock().unwrap();
+            panic!("poison session mutex for test");
+        })
+        .join();
+
+        client.set_token("after-poison".into());
+
+        assert!(client.has_token());
+        assert_eq!(client.get_token().as_deref(), Some("after-poison"));
     }
 
     #[test]

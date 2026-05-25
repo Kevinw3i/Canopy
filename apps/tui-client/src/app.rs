@@ -110,6 +110,7 @@ fn should_retry_api_error(err: &ApiClientError) -> bool {
         ApiClientError::TokenExpired => false,
         ApiClientError::Api { status, .. } => *status >= 500,
         ApiClientError::Transport(_) => true,
+        ApiClientError::SessionStore { .. } => false,
     }
 }
 
@@ -231,8 +232,8 @@ impl App {
 
     pub async fn run(&mut self, terminal: &mut Tui) -> Result<()> {
         // Check for saved token
-        if let Some(token) = crate::auth::load_token() {
-            self.api.set_token(token);
+        if let Some(session) = crate::auth::load_session() {
+            self.api.set_session(session);
             // Try to validate by fetching entitlements
             match self.api.get_entitlements().await {
                 Ok(ent) => {
@@ -242,8 +243,8 @@ impl App {
                 Err(e) => {
                     match e {
                         ApiClientError::TokenExpired => {
-                            crate::auth::clear_token().ok();
                             self.api.clear_token();
+                            crate::auth::clear_token().ok();
                         }
                         other => {
                             // Transient or non-authz error: keep the token but stay on login
@@ -487,9 +488,8 @@ impl App {
                     );
                 }
             },
-            Action::TokenReceived(token) => {
-                self.api.set_token(token.clone());
-                crate::auth::save_token(&token).ok();
+            Action::TokenReceived(resp) => {
+                self.install_token_response(resp);
                 if self.fetch_entitlements().await {
                     self.enter_dashboard();
                 }
@@ -880,8 +880,8 @@ impl App {
         self.dashboard.public_ip = None;
         self.dashboard.ip_fetch_generation += 1;
 
-        crate::auth::clear_token().ok();
         self.api.clear_token();
+        crate::auth::clear_token().ok();
         self.entitlements = None;
         self.current_screen = Screen::Login;
         self.screen_stack.clear();
@@ -895,8 +895,8 @@ impl App {
         }
 
         self.cancel_in_flight_work();
-        crate::auth::clear_token().ok();
         self.api.clear_token();
+        crate::auth::clear_token().ok();
         self.entitlements = None;
         self.session_expired_pending_login = true;
         self.error_modal
@@ -1050,13 +1050,26 @@ impl App {
         self.entitlements = Some(ent);
     }
 
+    fn install_session(&mut self, session: crate::auth::SessionTokens) {
+        self.api.set_session(session.clone());
+        if let Err(err) = crate::auth::save_session(&session) {
+            tracing::warn!(error = %err, "failed to persist auth session");
+        }
+    }
+
+    fn install_token_response(&mut self, resp: shared::dto::auth::TokenResponse) {
+        let session = self.api.apply_token_response(resp);
+        if let Err(err) = crate::auth::save_session(&session) {
+            tracing::warn!(error = %err, "failed to persist auth session");
+        }
+    }
+
     // ── Async operations ────────────────────────────────
 
     async fn do_dev_login(&mut self, username: &str) {
         match self.api.dev_login(username).await {
             Ok(resp) => {
-                self.api.set_token(resp.access_token.clone());
-                crate::auth::save_token(&resp.access_token).ok();
+                self.install_session(crate::auth::SessionTokens::new(resp.access_token, None));
                 if self.fetch_entitlements().await {
                     self.enter_dashboard();
                 }
@@ -1070,8 +1083,8 @@ impl App {
     async fn do_pkce_login(&mut self) {
         let port = self.config.pkce_callback_port;
         match crate::auth::pkce::start_pkce_flow(&self.api, port).await {
-            Ok(token) => {
-                let _ = self.action_tx.send(Action::TokenReceived(token));
+            Ok(resp) => {
+                let _ = self.action_tx.send(Action::TokenReceived(resp));
             }
             Err(e) => {
                 self.login.set_status(format!("PKCE login failed: {}", e));
@@ -1101,8 +1114,8 @@ impl App {
         let api = self.api.clone();
         tokio::spawn(async move {
             match flow.poll_until_complete(&api).await {
-                Ok(token) => {
-                    let _ = tx.send(Action::TokenReceived(token));
+                Ok(resp) => {
+                    let _ = tx.send(Action::TokenReceived(resp));
                 }
                 Err(e) => {
                     let _ = tx.send(Action::ShowError(format!("Device code auth failed: {}", e)));

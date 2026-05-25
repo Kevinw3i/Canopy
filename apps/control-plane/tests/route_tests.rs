@@ -5,13 +5,17 @@
 
 use axum::{
     body::Body,
+    extract::{Form, State as AxumState},
     http::{Request, StatusCode},
-    middleware as axum_mw, Router,
+    middleware as axum_mw,
+    response::IntoResponse,
+    Router,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tower::ServiceExt;
 
 // ── Re-use crate internals via the library-style paths ──────────────────
@@ -156,6 +160,147 @@ async fn body_json(body: Body) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+struct RouteTestOidcKey {
+    pem: Vec<u8>,
+    n: String,
+    e: String,
+}
+
+static ROUTE_TEST_OIDC_KEY: LazyLock<RouteTestOidcKey> = LazyLock::new(|| {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::traits::PublicKeyParts;
+
+    let mut rng = rand::thread_rng();
+    let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let pem_doc = private_key
+        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .unwrap();
+    let public_key = private_key.to_public_key();
+
+    RouteTestOidcKey {
+        pem: pem_doc.as_bytes().to_vec(),
+        n: URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+        e: URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
+    }
+});
+
+#[derive(Clone)]
+struct MockOidcState {
+    id_token: String,
+}
+
+fn route_test_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn sign_route_test_id_token(issuer: &str, sub: &str, email: &str) -> String {
+    let header = jsonwebtoken::Header {
+        alg: jsonwebtoken::Algorithm::RS256,
+        kid: Some("route-test-key-1".into()),
+        ..Default::default()
+    };
+    let claims = json!({
+        "iss": issuer,
+        "aud": "test-client",
+        "sub": sub,
+        "email": email,
+        "email_verified": true,
+        "name": "Dev Admin",
+        "exp": route_test_now_secs() + 600
+    });
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(&ROUTE_TEST_OIDC_KEY.pem).unwrap();
+    jsonwebtoken::encode(&header, &claims, &key).unwrap()
+}
+
+async fn mock_oidc_jwks() -> impl IntoResponse {
+    axum::Json(json!({
+        "keys": [{
+            "kid": "route-test-key-1",
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "n": ROUTE_TEST_OIDC_KEY.n.as_str(),
+            "e": ROUTE_TEST_OIDC_KEY.e.as_str()
+        }]
+    }))
+}
+
+async fn mock_oidc_token(
+    AxumState(state): AxumState<MockOidcState>,
+    Form(form): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    match form.get("grant_type").map(String::as_str) {
+        Some("refresh_token")
+            if form.get("refresh_token").map(String::as_str) == Some("valid-refresh") =>
+        {
+            return axum::Json(json!({
+                "access_token": "oidc-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": state.id_token,
+                "refresh_token": "rotated-refresh"
+            }))
+            .into_response();
+        }
+        Some("urn:ietf:params:oauth:grant-type:device_code")
+            if form.get("device_code").map(String::as_str) == Some("device-valid") =>
+        {
+            return axum::Json(json!({
+                "access_token": "oidc-device-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": state.id_token,
+                "refresh_token": "device-refresh"
+            }))
+            .into_response();
+        }
+        _ => {}
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({
+            "error": "invalid_grant",
+            "error_description": "token rejected"
+        })),
+    )
+        .into_response()
+}
+
+async fn start_mock_oidc() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let issuer = format!("http://{addr}");
+    let state = MockOidcState {
+        id_token: sign_route_test_id_token(&issuer, "dev-admin", "dev-admin@dev.local"),
+    };
+    let app = Router::new()
+        .route("/jwks", axum::routing::get(mock_oidc_jwks))
+        .route("/token", axum::routing::post(mock_oidc_token))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    issuer
+}
+
+fn prod_config_with_mock_oidc(issuer: &str) -> AppConfig {
+    let mut config = dev_config();
+    config.dev_mode = false;
+    config.oidc.issuer_url = issuer.into();
+    config.oidc.authorization_endpoint = Some(format!("{issuer}/authorize"));
+    config.oidc.token_endpoint = Some(format!("{issuer}/token"));
+    config.oidc.jwks_uri = Some(format!("{issuer}/jwks"));
+    config
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Auth routes (public)
 // ═══════════════════════════════════════════════════════════════════════
@@ -262,6 +407,31 @@ async fn device_code_poll_auto_approves_in_dev_mode() {
 }
 
 #[tokio::test]
+async fn device_code_poll_complete_response_includes_oidc_refresh_token() {
+    let issuer = start_mock_oidc().await;
+    let audit = AuditFile::new("device-refresh");
+    let state = build_state_with_audit_file(prod_config_with_mock_oidc(&issuer), &audit.path);
+    let app = build_app(state);
+
+    let body = json!({"device_code": "device-valid", "client_id": "test"});
+    let resp = app
+        .oneshot(
+            Request::post("/auth/device-code/poll")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["status"], "complete");
+    assert!(json["access_token"].is_string());
+    assert_eq!(json["refresh_token"], "device-refresh");
+}
+
+#[tokio::test]
 async fn refresh_token_rejected_in_dev_mode() {
     let state = build_state(dev_config());
     let app = build_app(state);
@@ -278,6 +448,68 @@ async fn refresh_token_rejected_in_dev_mode() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn refresh_endpoint_accepts_valid_refresh_token_and_audits_without_secret() {
+    let issuer = start_mock_oidc().await;
+    let config = prod_config_with_mock_oidc(&issuer);
+    let audit = AuditFile::new("refresh-success");
+    let state = build_state_with_audit_file(config.clone(), &audit.path);
+    let app = build_app(state);
+
+    let body = json!({"refresh_token": "valid-refresh"});
+    let resp = app
+        .oneshot(
+            Request::post("/auth/refresh")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert!(json["access_token"].is_string());
+    assert_eq!(json["refresh_token"], "rotated-refresh");
+
+    let auth = AuthService::new(config);
+    let claims = auth
+        .validate_token(json["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.sub, "dev-admin");
+
+    let audit_contents = std::fs::read_to_string(&audit.path).unwrap();
+    assert!(audit_contents.contains(r#""actor":"dev-admin""#));
+    assert!(audit_contents.contains(r#""action":"login""#));
+    assert!(audit_contents.contains(r#""error_message":"refresh""#));
+    assert!(
+        !audit_contents.contains("valid-refresh") && !audit_contents.contains("rotated-refresh"),
+        "refresh token values must not be written to audit log: {audit_contents}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_endpoint_rejects_revoked_refresh_token() {
+    let issuer = start_mock_oidc().await;
+    let state = build_state(prod_config_with_mock_oidc(&issuer));
+    let app = build_app(state);
+
+    let body = json!({"refresh_token": "revoked-refresh"});
+    let resp = app
+        .oneshot(
+            Request::post("/auth/refresh")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

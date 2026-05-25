@@ -1,6 +1,6 @@
 use crate::api_client::ApiClient;
 use anyhow::Result;
-use shared::dto::auth::DeviceCodePollResponse;
+use shared::dto::auth::{DeviceCodePollResponse, TokenResponse};
 use std::time::Duration;
 
 /// Device code flow for headless terminals.
@@ -29,8 +29,8 @@ impl DeviceCodeFlow {
     }
 
     /// Poll until the user completes authentication or the code expires.
-    /// Returns the access token on success.
-    pub async fn poll_until_complete(&self, api: &ApiClient) -> Result<String> {
+    /// Returns the control-plane token response on success.
+    pub async fn poll_until_complete(&self, api: &ApiClient) -> Result<TokenResponse> {
         let deadline = tokio::time::Instant::now() + self.expires_in;
         let mut current_interval = self.interval;
 
@@ -44,8 +44,16 @@ impl DeviceCodeFlow {
             match api.device_code_poll(&self.device_code).await? {
                 DeviceCodePollResponse::Complete {
                     access_token,
-                    expires_in: _,
-                } => return Ok(access_token),
+                    expires_in,
+                    refresh_token,
+                } => {
+                    return Ok(TokenResponse {
+                        access_token,
+                        token_type: "Bearer".into(),
+                        expires_in,
+                        refresh_token,
+                    });
+                }
                 DeviceCodePollResponse::Pending => continue,
                 DeviceCodePollResponse::SlowDown => {
                     // RFC 8628 §3.5: increase interval by 5 seconds

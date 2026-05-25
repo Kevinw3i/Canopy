@@ -58,6 +58,9 @@ pub enum DeviceCodePollResponse {
     Complete {
         access_token: String,
         expires_in: u64,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        refresh_token: Option<String>,
     },
     #[serde(rename = "expired")]
     Expired,
@@ -140,6 +143,20 @@ mod tests {
     }
 
     #[test]
+    fn token_response_defaults_missing_refresh_token() {
+        let json = json!({
+            "access_token": "tok",
+            "token_type": "Bearer",
+            "expires_in": 3600
+        });
+
+        let resp: TokenResponse = serde_json::from_value(json).unwrap();
+
+        assert_eq!(resp.access_token, "tok");
+        assert_eq!(resp.refresh_token, None);
+    }
+
+    #[test]
     fn device_code_poll_pending_roundtrip() {
         let val = DeviceCodePollResponse::Pending;
         let json = serde_json::to_value(&val).unwrap();
@@ -153,10 +170,45 @@ mod tests {
         let val = DeviceCodePollResponse::Complete {
             access_token: "tok".into(),
             expires_in: 3600,
+            refresh_token: Some("refresh".into()),
         };
         let json = serde_json::to_value(&val).unwrap();
         assert_eq!(json["status"], "complete");
         assert_eq!(json["access_token"], "tok");
+        assert_eq!(json["refresh_token"], "refresh");
+    }
+
+    #[test]
+    fn device_code_poll_complete_defaults_missing_refresh_token() {
+        let json = json!({
+            "status": "complete",
+            "access_token": "tok",
+            "expires_in": 3600
+        });
+        let val: DeviceCodePollResponse = serde_json::from_value(json).unwrap();
+        match val {
+            DeviceCodePollResponse::Complete { refresh_token, .. } => {
+                assert_eq!(refresh_token, None);
+            }
+            other => panic!("expected complete response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_code_poll_complete_omits_none_refresh_token() {
+        let val = DeviceCodePollResponse::Complete {
+            access_token: "tok".into(),
+            expires_in: 3600,
+            refresh_token: None,
+        };
+
+        let json = serde_json::to_value(&val).unwrap();
+
+        assert_eq!(json["status"], "complete");
+        assert!(
+            json.get("refresh_token").is_none(),
+            "refresh_token must be omitted, not serialized as null"
+        );
     }
 
     #[test]
