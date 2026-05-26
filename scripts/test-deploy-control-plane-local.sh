@@ -65,15 +65,68 @@ EOF
 
 cat > "$REPO_TMP_DIR/bin/aws" <<'SH'
 #!/usr/bin/env bash
-echo "ERROR: aws should not be called for --plan-only" >&2
-exit 1
+set -euo pipefail
+
+if [ "${CANOPY_EXPECT_AWS_PROFILE_UNSET:-0}" = "1" ] && [ "${AWS_PROFILE+x}" = "x" ]; then
+  echo "expected AWS_PROFILE to be unset" >&2
+  exit 1
+fi
+
+if [ "${CANOPY_ALLOW_AWS:-0}" != "1" ]; then
+  echo "ERROR: aws should not be called for --plan-only" >&2
+  exit 1
+fi
+
+service="${1:-}"
+operation="${2:-}"
+case "$service:$operation" in
+  ecr:describe-images)
+    state_dir="${CANOPY_AWS_STATE_DIR:?}"
+    count_file="$state_dir/aws-describe-images-count"
+    count=0
+    [ -f "$count_file" ] && count="$(cat "$count_file")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    if [ "$count" -eq 1 ]; then
+      echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation: image not found" >&2
+      exit 254
+    fi
+    printf 'stub describe-images table\n'
+    ;;
+  ecr:get-login-password)
+    printf 'stub-password\n'
+    ;;
+  ecs:wait|ecs:describe-services|elbv2:describe-target-health)
+    printf 'stub %s %s\n' "$service" "$operation"
+    ;;
+  *)
+    echo "unexpected aws command: $*" >&2
+    exit 1
+    ;;
+esac
 SH
 chmod +x "$REPO_TMP_DIR/bin/aws"
 
 cat > "$REPO_TMP_DIR/bin/docker" <<'SH'
 #!/usr/bin/env bash
-echo "ERROR: docker should not be called for --plan-only" >&2
-exit 1
+set -euo pipefail
+
+if [ "${CANOPY_ALLOW_DOCKER:-0}" != "1" ]; then
+  echo "ERROR: docker should not be called for --plan-only" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  login)
+    cat >/dev/null
+    ;;
+  build|push)
+    ;;
+  *)
+    echo "unexpected docker command: $*" >&2
+    exit 1
+    ;;
+esac
 SH
 chmod +x "$REPO_TMP_DIR/bin/docker"
 
@@ -97,7 +150,26 @@ shift || true
 
 case "$cmd" in
   output)
-    exit 1
+    if [ "${CANOPY_ALLOW_TERRAFORM_OUTPUTS:-0}" != "1" ]; then
+      exit 1
+    fi
+    if [ "${1:-}" = "-raw" ]; then
+      shift
+    fi
+    case "${1:-}" in
+      ecr_repository_url)
+        printf '123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane\n'
+        ;;
+      log_group_name)
+        printf '/ecs/canopy/control-plane\n'
+        ;;
+      alb_dns_name)
+        printf 'canopy-alb.example.com\n'
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
     ;;
   init|test)
     exit 0
@@ -114,6 +186,8 @@ case "$cmd" in
     ;;
   show)
     printf '%s\n' "${CANOPY_TERRAFORM_SHOW_TEXT:-No changes. Infrastructure is up-to-date.}"
+    ;;
+  apply)
     ;;
   *)
     echo "unexpected terraform command: $cmd" >&2
@@ -175,6 +249,43 @@ if ! env \
 fi
 grep -qF -- "AWS profile:       default credential chain" "$NO_PROFILE_OUT"
 grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$NO_PROFILE_OUT"
+
+FULL_DEPLOY_OUT="$TMP_DIR/full-deploy.out"
+rm -f "$TMP_DIR/aws-describe-images-count"
+if ! env \
+  PATH="$REPO_TMP_DIR/bin:$PATH" \
+  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+  AWS_PROFILE= \
+  CANOPY_EXPECT_AWS_PROFILE_UNSET=1 \
+  CANOPY_ALLOW_AWS=1 \
+  CANOPY_ALLOW_DOCKER=1 \
+  CANOPY_ALLOW_TERRAFORM_OUTPUTS=1 \
+  CANOPY_AWS_STATE_DIR="$TMP_DIR" \
+  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+  --yes \
+  --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
+  --cluster canopy \
+  --service control-plane \
+  --target-group-arn "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/canopy/abcdef1234567890" \
+  > "$FULL_DEPLOY_OUT" 2>&1; then
+  cat "$FULL_DEPLOY_OUT" >&2
+  echo "ERROR: expected stubbed full deploy to pass with default AWS credential chain." >&2
+  exit 1
+fi
+grep -qF -- "AWS profile:       default credential chain" "$FULL_DEPLOY_OUT"
+grep -qF -- "Tag is available: cp-v0.1.0" "$FULL_DEPLOY_OUT"
+grep -qF -- "Image deployed: 123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.1.0" "$FULL_DEPLOY_OUT"
+grep -qF -- "CloudWatch:     aws logs tail /ecs/canopy/control-plane --region us-west-2 --since 30m --follow" "$FULL_DEPLOY_OUT"
+if grep -qF -- "AWS_PROFILE=" "$FULL_DEPLOY_OUT"; then
+  cat "$FULL_DEPLOY_OUT" >&2
+  echo "ERROR: default credential chain output should not suggest AWS_PROFILE=." >&2
+  exit 1
+fi
+if [ "$(cat "$TMP_DIR/aws-describe-images-count")" != "2" ]; then
+  cat "$FULL_DEPLOY_OUT" >&2
+  echo "ERROR: expected ECR describe-images to run before and after push." >&2
+  exit 1
+fi
 
 TF_VAR_REGION_OUT="$TMP_DIR/tf-var-region.out"
 if ! run_plan_only "$TF_VAR_REGION_OUT" TF_VAR_aws_region=ap-southeast-1; then
