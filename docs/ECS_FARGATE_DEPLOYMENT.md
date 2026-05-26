@@ -56,6 +56,7 @@ Internet
 ```bash
 aws ecr create-repository \
   --repository-name canopy/control-plane \
+  --image-tag-mutability IMMUTABLE \
   --region ap-northeast-1
 
 # 登入 ECR
@@ -75,6 +76,7 @@ aws ecr get-login-password --region ap-northeast-1 | \
 test -s entitlements.toml
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+ECR_REPOSITORY=canopy/control-plane
 CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in
@@ -87,6 +89,21 @@ esac
   -var="create_service=true" \
   -var="image_tag=$VERSION"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+if TAG_CHECK_OUTPUT=$(aws ecr describe-images \
+  --region ap-northeast-1 \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$VERSION" 2>&1); then
+  echo "$TAG_CHECK_OUTPUT"
+  echo "ECR image tag already exists: $VERSION"
+  exit 1
+else
+  TAG_CHECK_STATUS=$?
+  if ! grep -q "ImageNotFoundException" <<< "$TAG_CHECK_OUTPUT"; then
+    echo "$TAG_CHECK_OUTPUT"
+    exit "$TAG_CHECK_STATUS"
+  fi
+fi
 
 DOCKER_BUILDKIT=1 docker build \
   --platform "$PLATFORM" \
