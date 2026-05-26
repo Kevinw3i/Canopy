@@ -60,6 +60,10 @@ pub fn ecs_arn_region_account(arn: &str) -> Option<(&str, &str)> {
     }
 }
 
+pub fn ecs_status_is_running(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("RUNNING")
+}
+
 pub fn normalize_cluster_patterns(
     entries: &[String],
     account_ids: &[String],
@@ -129,7 +133,11 @@ pub fn convert_sdk_task(
                         )
                     })
                     .unwrap_or(false);
-                is_exec_agent && agent.last_status() == Some("RUNNING")
+                let agent_running = agent
+                    .last_status()
+                    .map(ecs_status_is_running)
+                    .unwrap_or(false);
+                is_exec_agent && agent_running
             });
 
             EcsContainer {
@@ -303,7 +311,7 @@ pub fn build_ecs_exec_command(
     else {
         return Err("Container not found in task".into());
     };
-    if container.last_status != "RUNNING" {
+    if !ecs_status_is_running(&container.last_status) {
         return Err("Container is not running".into());
     }
     if !container.execute_command_agent_running {
@@ -578,6 +586,65 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("ECS Exec is not enabled"));
+    }
+
+    #[test]
+    fn ecs_status_is_running_normalizes_case_and_whitespace() {
+        assert!(ecs_status_is_running("RUNNING"));
+        assert!(ecs_status_is_running(" running "));
+        assert!(ecs_status_is_running("Running"));
+        assert!(!ecs_status_is_running(""));
+        assert!(!ecs_status_is_running("STOPPED"));
+    }
+
+    #[test]
+    fn convert_sdk_task_normalizes_execute_command_agent_status() {
+        let sdk_task = aws_sdk_ecs::types::Task::builder()
+            .task_arn("arn:aws:ecs:us-east-1:111111111111:task/canopy-dev/abc123")
+            .cluster_arn(cluster_arn("us-east-1", "111111111111", "canopy-dev"))
+            .task_definition_arn("arn:aws:ecs:us-east-1:111111111111:task-definition/web:1")
+            .launch_type(aws_sdk_ecs::types::LaunchType::Fargate)
+            .last_status("RUNNING")
+            .desired_status("RUNNING")
+            .enable_execute_command(true)
+            .containers(
+                aws_sdk_ecs::types::Container::builder()
+                    .name("app")
+                    .last_status("RUNNING")
+                    .managed_agents(
+                        aws_sdk_ecs::types::ManagedAgent::builder()
+                            .name(aws_sdk_ecs::types::ManagedAgentName::ExecuteCommandAgent)
+                            .last_status(" running ")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+
+        let task = convert_sdk_task(&sdk_task, "111111111111", "us-east-1");
+
+        assert!(task.containers[0].execute_command_agent_running);
+    }
+
+    #[test]
+    fn build_ecs_exec_command_normalizes_container_running_status() {
+        let mut task = mock_tasks().remove(0);
+        task.containers[0].last_status = " running ".into();
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "app".into(),
+        };
+
+        let resp =
+            build_ecs_exec_command(&req, &entitlements(), &task, None, &[rule_scope()]).unwrap();
+
+        assert!(resp
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--container", "app"]));
     }
 
     #[test]

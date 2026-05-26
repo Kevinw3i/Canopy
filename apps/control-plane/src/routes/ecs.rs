@@ -10,8 +10,8 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::services::audit::AuditRequestContext;
 use crate::services::ecs::{
     build_ecs_exec_command, cluster_arn, cluster_name_from_arn, convert_sdk_task,
-    ecs_arn_region_account, filter_tasks_by_entitlements, matching_rule_scopes, mock_tasks,
-    AssumedRoleCredentials,
+    ecs_arn_region_account, ecs_status_is_running, filter_tasks_by_entitlements,
+    matching_rule_scopes, mock_tasks, AssumedRoleCredentials,
 };
 use crate::services::entitlements::EntitlementService;
 use crate::services::AppState;
@@ -869,7 +869,7 @@ fn validate_task_for_exec(
             "Task not found".into(),
         ));
     }
-    if task.last_status != "RUNNING" {
+    if !ecs_status_is_running(&task.last_status) {
         return Err((
             "task_not_running",
             axum::http::StatusCode::NOT_FOUND,
@@ -894,7 +894,7 @@ fn validate_task_for_exec(
             "Container not found in task".into(),
         ));
     };
-    if container.last_status != "RUNNING" {
+    if !ecs_status_is_running(&container.last_status) {
         return Err((
             "container_not_running",
             axum::http::StatusCode::NOT_FOUND,
@@ -1760,5 +1760,21 @@ mod tests {
         let matching = vec![&denying];
 
         assert!(container_eligible_rule_scopes(&matching, "app").is_empty());
+    }
+
+    #[test]
+    fn validate_task_for_exec_normalizes_running_statuses() {
+        let mut task = mock_tasks().remove(0);
+        task.last_status = " running ".into();
+        task.containers[0].last_status = "Running".into();
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "app".into(),
+        };
+
+        assert!(validate_task_for_exec(&task, &req).is_ok());
     }
 }
