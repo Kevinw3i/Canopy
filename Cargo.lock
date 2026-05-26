@@ -3432,9 +3432,12 @@ name = "tui-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-types",
  "axum",
  "base64",
  "chrono",
+ "control-plane",
  "crossterm",
  "dirs",
  "flate2",

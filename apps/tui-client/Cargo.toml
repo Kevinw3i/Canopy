@@ -34,5 +34,8 @@ tar = "0.4"
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["json"] }
+aws-config.workspace = true
+aws-types.workspace = true
+control-plane = { path = "../control-plane" }
 tokio = { version = "1", features = ["full"] }
 serde_json.workspace = true
