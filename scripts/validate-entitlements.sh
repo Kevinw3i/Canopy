@@ -9,6 +9,7 @@
 #   3. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
 #   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
 #   5. ECS Exec must imply ECS view, and ECS access rules need allowed_clusters
+#   6. SSM access rules need explicit allowed_os_users
 set -euo pipefail
 
 usage() {
@@ -196,6 +197,51 @@ if [ -n "$ECS_RULE_SHAPE_ERRORS" ]; then
         ;;
     esac
   done <<< "$ECS_RULE_SHAPE_ERRORS"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# Check 6: mirror SSM shell-scope invariant before image build.
+SSM_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function flush_rule() {
+  if (in_rule && can_ssm && !has_os_users) {
+    print rule_id
+  }
+}
+/^[[:space:]]*\[\[rules\]\][[:space:]]*$/ {
+  flush_rule()
+  in_rule = 1
+  in_os_users = 0
+  can_ssm = 0
+  has_os_users = 0
+  rule_id = "<unknown>"
+  next
+}
+in_rule && /^[[:space:]]*id[[:space:]]*=/ {
+  rule_id = $0
+  sub(/^[^"]*"/, "", rule_id)
+  sub(/".*$/, "", rule_id)
+}
+in_rule && /^[[:space:]]*can_use_ssm[[:space:]]*=[[:space:]]*true/ {
+  can_ssm = 1
+}
+in_rule && /^[[:space:]]*allowed_os_users[[:space:]]*=/ {
+  in_os_users = 1
+}
+in_rule && in_os_users && /"[^"]+"/ {
+  has_os_users = 1
+}
+in_rule && in_os_users && /\]/ {
+  in_os_users = 0
+}
+END {
+  flush_rule()
+}
+')
+
+if [ -n "$SSM_RULE_SHAPE_ERRORS" ]; then
+  while IFS= read -r rule_id; do
+    echo "ERROR: rule '$rule_id' has can_use_ssm=true but no allowed_os_users; set explicit users or [\"*\"] for unrestricted shell access"
+  done <<< "$SSM_RULE_SHAPE_ERRORS"
   ERRORS=$((ERRORS + 1))
 fi
 

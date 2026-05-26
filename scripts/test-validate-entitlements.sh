@@ -239,4 +239,22 @@ expect_failure \
   "$TMP_DIR/gov.tfvars" \
   "allowed_clusters is empty"
 
+cat > "$TMP_DIR/ssm-without-os-users-entitlements.toml" <<EOF
+[[rules]]
+id = "ssm-without-os-users"
+
+[rules.features]
+can_use_ssm = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "ssm-without-os-users" \
+  "$TMP_DIR/ssm-without-os-users-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "can_use_ssm=true but no allowed_os_users"
+
 echo "validate-entitlements tests passed."
