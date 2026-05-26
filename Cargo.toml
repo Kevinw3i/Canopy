@@ -48,6 +48,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+aes-gcm = "0.10"
 async-trait = "0.1"
 mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust", "rustls-tls"] }
 sqlparser = { version = "0.41", features = ["visitor"] }

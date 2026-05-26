@@ -51,6 +51,7 @@ Current actions:
 - `entitlements_view`
 - `mcp_session_register`
 - `mcp_guidance_sync`
+- `mcp_cloudwatch_discovery`
 - `mcp_database_scope_list`
 - `mcp_database_query`
 
@@ -115,11 +116,12 @@ EC2 power metadata (`action: "ec2_power"`) can include:
 
 Entitlements metadata usually contains the common request context fields only.
 
-MCP metadata is additive and is recorded inside `metadata`. Product Phase 1
+MCP metadata is additive and is recorded inside `metadata`. Product Phase 2
 uses dedicated top-level MCP actions:
 
 - `mcp_session_register` for MCP session registration.
 - `mcp_guidance_sync` for guidance delivery sync.
+- `mcp_cloudwatch_discovery` for MCP CloudWatch log-group discovery.
 - `mcp_database_scope_list` for MCP Database v1 scope discovery.
 - `mcp_database_query` for MCP Database v1 query events.
 
@@ -136,6 +138,23 @@ Common MCP metadata can include:
 - `client_name`
 - `client_version`
 - `product_phase`
+
+MCP CloudWatch discovery metadata can include:
+
+- `mcp_event_kind`: `cloudwatch_discovery`
+- `mcp_outcome_kind`: `success`, `entitlement_disabled`,
+  `scope_not_authorized`, `guidance_required`, `mcp_session_required`,
+  `discovery_cursor_expired`, `discovery_cursor_scope_mismatch`,
+  `discovery_cursor_entitlement_changed`,
+  `discovery_cursor_exhausted_or_policy_changed`, or other cursor validation
+  reasons.
+- `tool_name`: `canopy_list_allowed_log_groups`
+- `prefix`
+- `aws_execution_attempted`
+- `returned_count`
+- `scanned_count`
+- `truncated`
+- `cursor_issued`
 
 MCP Database v1 metadata can include:
 

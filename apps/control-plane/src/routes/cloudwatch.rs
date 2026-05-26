@@ -73,7 +73,7 @@ async fn get_cwl_clients_for_account(
 
 /// Returns all assumable clients for the account. Callers should iterate
 /// and retry on permission errors to handle multi-role accounts.
-async fn get_cwl_client_for_account(
+pub(crate) async fn get_cwl_client_for_account(
     state: &AppState,
     entitlements: &shared::dto::entitlements::UserEntitlements,
     account_id: &str,

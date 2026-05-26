@@ -391,7 +391,7 @@ MCP 權限刻意和一般 TUI 權限分開：
 - `can_use_mcp` 是本機 MCP server 的總開關。
 - `can_use_mcp_cloudwatch` 不會跟隨 `can_use_cloudwatch_search`；這是獨立的 MCP feature gate。
 - `can_use_mcp_database` 只是在 MCP 開 DB tools；真正能查哪些 DB / schema / table，要看同一條 matching rule 裡的 `[[rules.database_scopes]]`。
-- Product Phase 1 提供 MCP 基礎工具（`canopy_describe_capabilities`、`canopy_get_guidance`），並在明確啟用時提供 MCP Database v1。CloudWatch 查詢必須等後續 MCP 專用 control-plane route 上線。
+- Product Phase 2 提供 MCP 基礎工具（`canopy_describe_capabilities`、`canopy_get_guidance`），並在 MCP CloudWatch 啟用時提供 CloudWatch discovery（`canopy_list_allowed_log_groups`），也可在明確啟用時提供 MCP Database v1。CloudWatch search / Insights data access 仍屬 Phase 3。
 - MCP Database v1 提供 `canopy_list_database_scopes` 與 `canopy_query_database`，只允許 MySQL read-only `SELECT`。control-plane 會在執行前強制檢查 SQL、table scope、`LIMIT`、Secrets Manager 憑證與 `EXPLAIN FORMAT=JSON`。MCP response 不會回傳 DB host、secret ARN、username 或 password。view-guard **預設拒絕 VIEW**：所有 query 都會在 MDL-protected transaction 內把 EXPLAIN、type re-check、SELECT 跑在同一條 connection；要允許 VIEW 需在 scope 設 `allow_views = true` 並完成 DEFINER / base-table review。Connection 池飽和會回 HTTP 503（`connection_queue_full` / `database_connection_unavailable`），不是 500 — operator 加固 checklist 請見 `docs/OPERATOR-SETUP.md`。
 
 ### 第四步：設定 OIDC 提供者

@@ -13,9 +13,10 @@ use shared::dto::database::{ListDatabaseScopesRequest, QueryDatabaseRequest};
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
     McpDescribeCapabilitiesResponse, McpGuardrails, McpGuidanceResponse, McpGuidanceSyncRequest,
-    McpRegisterSessionRequest, McpToolAvailability, MCP_DATABASE_GUIDANCE_ID,
-    MCP_DATABASE_GUIDANCE_KEY, MCP_DATABASE_GUIDANCE_VERSION, MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
-    MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
+    McpListAllowedLogGroupsRequest, McpRegisterSessionRequest, McpToolAvailability,
+    MCP_DATABASE_GUIDANCE_ID, MCP_DATABASE_GUIDANCE_KEY, MCP_DATABASE_GUIDANCE_VERSION,
+    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION,
+    MCP_SECURITY_BOUNDARIES_KEY,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -474,6 +475,22 @@ fn tools_list(entitlements: &UserEntitlements) -> Value {
             }
         }));
     }
+    if entitlements.features.can_use_mcp_cloudwatch {
+        tools.push(json!({
+            "name": "canopy_list_allowed_log_groups",
+            "description": "List CloudWatch log groups available through Canopy MCP discovery. Initial calls require account_id and region; continuation calls use discovery_cursor.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "account_id": { "type": "string" },
+                    "region": { "type": "string" },
+                    "prefix": { "type": "string" },
+                    "discovery_cursor": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }));
+    }
 
     json!({ "tools": tools })
 }
@@ -558,6 +575,36 @@ async fn tools_call(state: Arc<McpServerState>, req: JsonRpcRequest) -> Response
                 }
             }
         }
+        "canopy_list_allowed_log_groups" => {
+            let mut request: McpListAllowedLogGroupsRequest =
+                match serde_json::from_value(arguments) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        return json_rpc_error(
+                            req.id,
+                            -32602,
+                            &format!("invalid CloudWatch discovery arguments: {err}"),
+                        )
+                    }
+                };
+            request.canopy_mcp_session_id = Some(state.canopy_mcp_session_id.clone());
+            request.local_secret_generation = Some(state.local_secret_generation.clone());
+            match state.api.list_mcp_allowed_log_groups(&request).await {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(text) => json_rpc_result(req.id, text_content(text)),
+                    Err(_) => json_rpc_error(
+                        req.id,
+                        -32603,
+                        "failed to serialize CloudWatch discovery result",
+                    ),
+                },
+                Err(err) => json_rpc_error(
+                    req.id,
+                    -32002,
+                    &format!("CloudWatch discovery failed: {err}"),
+                ),
+            }
+        }
         "canopy_query_database" => {
             if !state.entitlements.features.can_use_mcp_database {
                 return json_rpc_error(req.id, -32003, "MCP database is not enabled");
@@ -597,7 +644,7 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
     McpDescribeCapabilitiesResponse {
         mcp_product_phase: MCP_PRODUCT_PHASE.into(),
         scope_disclosure: if cloudwatch_enabled {
-            "cloudwatch_tools_pending_phase_2_implementation".into()
+            "cloudwatch_discovery_enabled_data_tools_pending_phase_3".into()
         } else {
             "cloudwatch_scope_hidden".into()
         },
@@ -620,12 +667,8 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
             ),
             tool(
                 "canopy_list_allowed_log_groups",
-                false,
-                Some(if cloudwatch_enabled {
-                    "product_phase_not_enabled"
-                } else {
-                    "entitlement_disabled"
-                }),
+                cloudwatch_enabled,
+                (!cloudwatch_enabled).then_some("entitlement_disabled"),
                 "phase_2_discovery",
                 vec!["security_boundaries@2026-05-13"],
                 false,
@@ -683,7 +726,7 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
         ],
         guardrails: McpGuardrails::default(),
         message: if cloudwatch_enabled {
-            "CloudWatch MCP entitlement is granted, but this local MCP server build exposes only capability/guidance and database v1 tools. CloudWatch tools require product phase 2/3 implementation."
+            "CloudWatch MCP discovery is enabled. Use canopy_list_allowed_log_groups to discover authorized log groups; search and Insights data tools still require Phase 3."
                 .into()
         } else {
             "CloudWatch MCP tools are disabled for this user.".into()
@@ -733,11 +776,11 @@ fn guidance_for(id: &str) -> Option<McpGuidanceResponse> {
         ),
         "cloudwatch_search_workflow" => (
             "CloudWatch Search Workflow",
-            "Before searching logs, call canopy_describe_capabilities. In Phase 1, CloudWatch search tools are intentionally disabled; do not fabricate log results.",
+            "Before using CloudWatch MCP tools, call canopy_describe_capabilities. In Phase 2, only canopy_list_allowed_log_groups is enabled for discovery; search and Insights data tools remain disabled until Phase 3.",
         ),
         "cloudwatch_insights_workflow" => (
             "CloudWatch Insights Workflow",
-            "Insights queries require explicit Phase 3 support, preflight validation, bounded time windows, and central guardrails. In Phase 1, do not run Insights.",
+            "Insights queries require explicit Phase 3 support, preflight validation, bounded time windows, and central guardrails. In Phase 2, do not run Insights.",
         ),
         MCP_DATABASE_GUIDANCE_ID => (
             "Database Query Workflow",
@@ -1136,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_phase_one_foundation_tools() {
+    fn tools_list_returns_foundation_tools_without_cloudwatch_entitlement() {
         let tools = tools_list(&minimal_entitlements());
         let names = tools["tools"]
             .as_array()

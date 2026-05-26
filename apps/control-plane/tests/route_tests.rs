@@ -580,7 +580,7 @@ async fn register_database_guidance_ids(
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_1_local_foundation"
+        "product_phase": "phase_2_discovery"
     });
     let register_resp = app
         .clone()
@@ -642,7 +642,7 @@ async fn mcp_guidance_sync_returns_server_owned_content_on_success() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_1_local_foundation"
+        "product_phase": "phase_2_discovery"
     });
     let register_resp = app
         .clone()
@@ -711,7 +711,7 @@ async fn mcp_guidance_sync_rejects_unknown_guidance_id() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_1_local_foundation"
+        "product_phase": "phase_2_discovery"
     });
     let register_resp = app
         .clone()
@@ -820,7 +820,7 @@ async fn mcp_guidance_sync_rejects_stale_local_secret_generation_with_403() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_1_local_foundation"
+        "product_phase": "phase_2_discovery"
     });
     let register_resp = app
         .clone()
@@ -905,7 +905,7 @@ async fn mcp_guidance_sync_rejects_cross_actor_session_access_with_403() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_1_local_foundation"
+        "product_phase": "phase_2_discovery"
     });
     let register_resp = app
         .clone()
@@ -994,7 +994,7 @@ async fn mcp_guidance_sync_rejects_expired_session_with_403() {
             protocol_version: "2025-06-18".into(),
             client_name: "route-test".into(),
             client_version: "0.1.0".into(),
-            product_phase: "phase_1_local_foundation".into(),
+            product_phase: "phase_2_discovery".into(),
             guidance_delivered: Default::default(),
             // Expired one hour ago.
             expires_at: now - Duration::hours(1),
@@ -1282,7 +1282,7 @@ async fn mcp_session_register_with_valid_entitlement_returns_session_id_and_forw
         "protocol_version": "2025-06-18",
         "client_name": "canopy-test-client",
         "client_version": "0.0.1",
-        "product_phase": "phase_1_local_foundation",
+        "product_phase": "phase_2_discovery",
     });
     let resp = app
         .oneshot(
@@ -1326,10 +1326,7 @@ async fn mcp_session_register_with_valid_entitlement_returns_session_id_and_forw
     assert_eq!(success["metadata"]["client_type"], "mcp");
     assert_eq!(success["metadata"]["client_name"], "canopy-test-client");
     assert_eq!(success["metadata"]["client_version"], "0.0.1");
-    assert_eq!(
-        success["metadata"]["product_phase"],
-        "phase_1_local_foundation"
-    );
+    assert_eq!(success["metadata"]["product_phase"], "phase_2_discovery");
 }
 
 #[tokio::test]
@@ -1349,7 +1346,7 @@ async fn mcp_session_register_without_can_use_mcp_returns_403_and_audits_denial(
         "protocol_version": "2025-06-18",
         "client_name": "denied-client",
         "client_version": "0.0.1",
-        "product_phase": "phase_1_local_foundation",
+        "product_phase": "phase_2_discovery",
     });
     let resp = app
         .oneshot(
@@ -1397,7 +1394,7 @@ async fn mcp_session_register_with_unsupported_protocol_version_returns_400_and_
         "protocol_version": "1999-01-01",
         "client_name": "old-client",
         "client_version": "0.0.1",
-        "product_phase": "phase_1_local_foundation",
+        "product_phase": "phase_2_discovery",
     });
     let resp = app
         .oneshot(
@@ -1439,7 +1436,7 @@ async fn mcp_session_register_without_authorization_header_returns_401() {
         "protocol_version": "2025-06-18",
         "client_name": "x",
         "client_version": "0.1",
-        "product_phase": "phase_1_local_foundation",
+        "product_phase": "phase_2_discovery",
     });
     let resp = app
         .oneshot(
@@ -1468,7 +1465,7 @@ async fn mcp_session_register_with_missing_required_field_returns_4xx() {
         "protocol_version": "2025-06-18",
         "client_name": "x",
         "client_version": "0.1",
-        "product_phase": "phase_1_local_foundation",
+        "product_phase": "phase_2_discovery",
     });
     let resp = app
         .oneshot(
@@ -1503,7 +1500,7 @@ async fn mcp_session_register_returns_distinct_session_ids_for_repeated_calls() 
         "protocol_version": "2025-06-18",
         "client_name": "x",
         "client_version": "0.1",
-        "product_phase": "phase_1_local_foundation",
+        "product_phase": "phase_2_discovery",
     });
     let resp1 = app
         .clone()
@@ -2088,6 +2085,191 @@ async fn entitlements_returns_user_entitlements() {
     let json = body_json(resp.into_body()).await;
     assert_eq!(json["user_id"], "dev-admin");
     assert!(json["features"]["can_view_ec2"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_discovery_lists_authorized_log_groups_and_audits_success() {
+    let audit = AuditFile::new("mcp-cloudwatch-discovery-success");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_database_guidance_ids(&app, &token, &["security_boundaries"]).await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "prefix": "/app"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["account_id"], "111111111111");
+    assert_eq!(json["region"], "us-east-1");
+    assert_eq!(json["truncated"], false);
+    let groups = json["log_groups"].as_array().expect("log_groups array");
+    assert_eq!(groups.len(), 3);
+    assert!(groups.iter().all(|group| group["name"]
+        .as_str()
+        .is_some_and(|name| name.starts_with("/app"))));
+    assert!(
+        json.get("discovery_cursor").is_none(),
+        "untruncated mock response must not issue a cursor"
+    );
+
+    let lines = read_audit_events(&audit.path);
+    let event = lines
+        .iter()
+        .find(|event| event["action"] == "mcp_cloudwatch_discovery")
+        .expect("MCP CloudWatch discovery audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["account_id"], "111111111111");
+    assert_eq!(event["region"], "us-east-1");
+    assert_eq!(event["metadata"]["mcp_event_kind"], "cloudwatch_discovery");
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "success");
+    assert_eq!(
+        event["metadata"]["tool_name"],
+        "canopy_list_allowed_log_groups"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert_eq!(event["metadata"]["returned_count"], 3);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_discovery_uses_mcp_cloudwatch_gate_not_tui_search_gate() {
+    let audit = AuditFile::new("mcp-cloudwatch-discovery-independent-gate");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    {
+        let mut store = state.entitlement_store.write().await;
+        for rule in &mut store.rules {
+            if rule.id == "rule-platform-eng" {
+                rule.features.can_use_cloudwatch_search = false;
+                rule.features.can_use_mcp_cloudwatch = true;
+            }
+        }
+    }
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_database_guidance_ids(&app, &token, &["security_boundaries"]).await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "prefix": "/app"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["returned_count"], 3);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_discovery_requires_guidance_session_and_audits_denial() {
+    let audit = AuditFile::new("mcp-cloudwatch-discovery-guidance-required");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "prefix": "/app"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let lines = read_audit_events(&audit.path);
+    let event = lines
+        .iter()
+        .find(|event| event["action"] == "mcp_cloudwatch_discovery")
+        .expect("MCP CloudWatch discovery denial audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "mcp_session_required"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_discovery_rejects_invalid_cursor_and_audits_denial() {
+    let audit = AuditFile::new("mcp-cloudwatch-discovery-invalid-cursor");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_database_guidance_ids(&app, &token, &["security_boundaries"]).await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "prefix": "/app",
+        "discovery_cursor": "not-a-valid-cursor"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let lines = read_audit_events(&audit.path);
+    let event = lines
+        .iter()
+        .find(|event| event["action"] == "mcp_cloudwatch_discovery")
+        .expect("MCP CloudWatch discovery invalid cursor audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "discovery_cursor_decode_failed"
+    );
+    assert_eq!(event["metadata"]["has_discovery_cursor"], true);
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
 }
 
 #[tokio::test]

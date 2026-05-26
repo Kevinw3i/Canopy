@@ -1,19 +1,28 @@
+use aes_gcm::{
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     routing::post,
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shared::dto::audit::{AuditAction, AuditOutcome};
+use shared::dto::cloudwatch::LogGroup;
 use shared::dto::database::{
     ListDatabaseScopesRequest, ListDatabaseScopesResponse, QueryDatabaseRequest,
     QueryDatabaseResponse,
 };
 use shared::dto::mcp::{
-    lookup_mcp_guidance, McpGuidanceSyncRequest, McpGuidanceSyncResponse,
-    McpRegisterSessionRequest, McpRegisterSessionResponse, MCP_DATABASE_GUIDANCE_KEY,
-    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
+    lookup_mcp_guidance, McpGuardrails, McpGuidanceSyncRequest, McpGuidanceSyncResponse,
+    McpListAllowedLogGroupsRequest, McpListAllowedLogGroupsResponse, McpRegisterSessionRequest,
+    McpRegisterSessionResponse, MCP_DATABASE_GUIDANCE_KEY, MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+    MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
 };
 use shared::errors::ApiError;
 use std::collections::BTreeSet;
@@ -23,6 +32,7 @@ use uuid::Uuid;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::services::audit::AuditRequestContext;
 use crate::services::auth::Claims;
+use crate::services::cloudwatch::mock_log_groups;
 use crate::services::database::{
     build_database_response, scope_summary, validate_select_sql_for_connection,
     ConnectionQueueFull, DatabaseConnectionUnavailable, DatabaseError, TableType, TableTypeQuery,
@@ -40,11 +50,18 @@ const DATABASE_QUERY_REQUIRED_GUIDANCE: &[&str] = &[
     MCP_DATABASE_GUIDANCE_KEY,
     MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
 ];
+const CLOUDWATCH_DISCOVERY_REQUIRED_GUIDANCE: &[&str] = &[MCP_SECURITY_BOUNDARIES_KEY];
+const CLOUDWATCH_DISCOVERY_TOOL: &str = "canopy_list_allowed_log_groups";
+const CLOUDWATCH_DISCOVERY_CURSOR_AAD: &[u8] = b"canopy:mcp:cloudwatch:discovery:v1";
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/mcp/session/register", post(register_session))
         .route("/api/mcp/guidance/delivered", post(sync_guidance))
+        .route(
+            "/api/mcp/cloudwatch/log-groups",
+            post(list_allowed_log_groups),
+        )
         .route("/api/mcp/database/scopes", post(list_database_scopes))
         .route("/api/mcp/database/query", post(query_database))
 }
@@ -353,6 +370,324 @@ fn random_secret() -> String {
         Uuid::new_v4().as_simple(),
         Uuid::new_v4().as_simple()
     )
+}
+
+async fn list_allowed_log_groups(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<McpListAllowedLogGroupsRequest>,
+) -> ApiResult<McpListAllowedLogGroupsResponse> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Audit logging unavailable")),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let entitlements = ent_service.evaluate(&claims).await;
+    let guardrails = McpGuardrails::default();
+
+    if !entitlements.features.can_use_mcp_cloudwatch {
+        audit_cloudwatch_discovery_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            "can_use_mcp_cloudwatch entitlement disabled",
+            "entitlement_disabled",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "MCP CloudWatch discovery is not enabled for this user",
+            )),
+        ));
+    }
+
+    if let Err(reason) = require_mcp_guidance(
+        &state,
+        &claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_DISCOVERY_REQUIRED_GUIDANCE,
+    ) {
+        audit_cloudwatch_discovery_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            "Required MCP CloudWatch guidance has not been completed",
+            reason,
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "Required MCP CloudWatch guidance has not been completed",
+            )),
+        ));
+    }
+
+    let cursor = match req.discovery_cursor.as_deref() {
+        Some(raw) => match decode_discovery_cursor(&state, raw) {
+            Ok(cursor) => Some(cursor),
+            Err(reason) => {
+                audit_cloudwatch_discovery_denied(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    &req,
+                    "Invalid MCP CloudWatch discovery cursor",
+                    reason,
+                )?;
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError::bad_request(
+                        "Invalid MCP CloudWatch discovery cursor",
+                    )),
+                ));
+            }
+        },
+        None => None,
+    };
+
+    if let Some(cursor) = cursor.as_ref() {
+        if let Err(reason) = validate_discovery_cursor_scope(cursor, &claims.sub, &req, &guardrails)
+        {
+            audit_cloudwatch_discovery_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                "MCP CloudWatch discovery cursor is not valid for this request",
+                reason,
+            )?;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(
+                    "MCP CloudWatch discovery cursor is not valid for this request",
+                )),
+            ));
+        }
+    }
+
+    let account_id = match cursor
+        .as_ref()
+        .map(|c| c.account_id.clone())
+        .or_else(|| req.account_id.clone())
+    {
+        Some(account_id) if !account_id.trim().is_empty() => account_id,
+        _ => {
+            audit_cloudwatch_discovery_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                "account_id is required for initial MCP CloudWatch discovery",
+                "bad_request",
+            )?;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(
+                    "account_id is required for initial MCP CloudWatch discovery",
+                )),
+            ));
+        }
+    };
+    let region = match cursor
+        .as_ref()
+        .map(|c| c.region.clone())
+        .or_else(|| req.region.clone())
+    {
+        Some(region) if !region.trim().is_empty() => region,
+        _ => {
+            audit_cloudwatch_discovery_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                "region is required for initial MCP CloudWatch discovery",
+                "bad_request",
+            )?;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(
+                    "region is required for initial MCP CloudWatch discovery",
+                )),
+            ));
+        }
+    };
+    let prefix = cursor
+        .as_ref()
+        .and_then(|c| c.prefix.clone())
+        .or_else(|| req.prefix.clone());
+
+    if !ent_service
+        .has_feature_for_scope(&claims, &account_id, Some(&region), None, None, |f| {
+            f.can_use_mcp && f.can_use_mcp_cloudwatch
+        })
+        .await
+    {
+        audit_cloudwatch_discovery_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            "MCP CloudWatch discovery not authorized for this scope",
+            "scope_not_authorized",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "MCP CloudWatch discovery not authorized for this scope",
+            )),
+        ));
+    }
+
+    let scoped_log_arns = ent_service
+        .allowed_log_group_arns_for_scope(&claims, &account_id, &region, |f| {
+            f.can_use_mcp && f.can_use_mcp_cloudwatch
+        })
+        .await;
+    let entitlement_hash = entitlement_snapshot_hash(&scoped_log_arns);
+
+    if let Some(cursor) = cursor.as_ref() {
+        if let Err(reason) =
+            validate_discovery_cursor_entitlement_snapshot(cursor, &entitlement_hash)
+        {
+            audit_cloudwatch_discovery_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                "MCP CloudWatch discovery cursor entitlements no longer match",
+                reason,
+            )?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "MCP CloudWatch discovery cursor is no longer valid for current entitlements",
+                )),
+            ));
+        }
+    }
+
+    let mut result = if state.config.use_mock_aws() {
+        discover_mock_log_groups(
+            &account_id,
+            &region,
+            prefix.as_deref(),
+            &scoped_log_arns,
+            &guardrails,
+        )
+    } else {
+        discover_aws_log_groups(
+            &state,
+            &claims,
+            &entitlements,
+            &account_id,
+            &region,
+            prefix.as_deref(),
+            &scoped_log_arns,
+            cursor.as_ref().and_then(|c| c.aws_next_token.clone()),
+            cursor.as_ref().map(|c| c.pages_scanned).unwrap_or(0),
+            cursor.as_ref().map(|c| c.results_scanned).unwrap_or(0),
+            &guardrails,
+            &audit_ctx,
+            &req,
+        )
+        .await?
+    };
+
+    let discovery_cursor = if result.truncated && !result.budget_exhausted {
+        match result.aws_next_token.take() {
+            Some(aws_next_token) => {
+                let cursor_payload = DiscoveryCursorPayload {
+                    version: 1,
+                    actor: claims.sub.clone(),
+                    canopy_mcp_session_id: req.canopy_mcp_session_id.clone().unwrap_or_default(),
+                    local_secret_generation: req
+                        .local_secret_generation
+                        .clone()
+                        .unwrap_or_default(),
+                    tool: CLOUDWATCH_DISCOVERY_TOOL.into(),
+                    account_id: account_id.clone(),
+                    region: region.clone(),
+                    prefix: prefix.clone(),
+                    aws_next_token: Some(aws_next_token),
+                    pages_scanned: result.pages_scanned,
+                    results_scanned: result.scanned_count,
+                    max_results_returned: guardrails.max_log_group_list_results,
+                    max_results_scanned: guardrails.max_discovery_results_scanned,
+                    max_pages: guardrails.max_describe_log_groups_pages,
+                    guardrail_policy_id: discovery_guardrail_policy_id(&guardrails),
+                    entitlement_snapshot_hash: entitlement_hash.clone(),
+                    expires_at: Utc::now()
+                        + Duration::seconds(guardrails.discovery_cursor_ttl_seconds as i64),
+                };
+                Some(
+                    encode_discovery_cursor(&state, &cursor_payload).map_err(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiError::internal("Failed to seal MCP discovery cursor")),
+                        )
+                    })?,
+                )
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let next_action_hint = if result.truncated && discovery_cursor.is_none() {
+        Some("Narrow the prefix and retry; the discovery scan budget was exhausted.".to_string())
+    } else if result.truncated {
+        Some("Use discovery_cursor to continue this exact discovery scope.".to_string())
+    } else {
+        None
+    };
+
+    state
+        .audit_service
+        .event(
+            &claims.sub,
+            AuditAction::McpCloudwatchDiscovery,
+            AuditOutcome::Success,
+        )
+        .account(Some(&account_id))
+        .region(Some(&region))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_discovery",
+            "mcp_outcome_kind": "success",
+            "tool_name": CLOUDWATCH_DISCOVERY_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "prefix": prefix.as_deref(),
+            "aws_execution_attempted": !state.config.use_mock_aws(),
+            "returned_count": result.log_groups.len(),
+            "scanned_count": result.scanned_count,
+            "truncated": result.truncated,
+            "cursor_issued": discovery_cursor.is_some(),
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_discovery_audit_failure_response())?;
+
+    Ok(Json(McpListAllowedLogGroupsResponse {
+        account_id,
+        region,
+        prefix,
+        returned_count: result.log_groups.len(),
+        scanned_count: result.scanned_count,
+        log_groups: result.log_groups,
+        truncated: result.truncated,
+        discovery_cursor,
+        next_action_hint,
+    }))
 }
 
 async fn list_database_scopes(
@@ -1066,6 +1401,537 @@ fn database_audit_failure_response() -> (StatusCode, Json<ApiError>) {
             "Audit logging failed — refusing to process database MCP request",
         )),
     )
+}
+
+fn cloudwatch_discovery_audit_failure_response() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::internal(
+            "Audit logging failed — refusing to process CloudWatch MCP discovery request",
+        )),
+    )
+}
+
+#[derive(Debug)]
+struct DiscoveryResult {
+    log_groups: Vec<LogGroup>,
+    scanned_count: u64,
+    pages_scanned: u64,
+    truncated: bool,
+    budget_exhausted: bool,
+    aws_next_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveryCursorPayload {
+    version: u8,
+    actor: String,
+    canopy_mcp_session_id: String,
+    local_secret_generation: String,
+    tool: String,
+    account_id: String,
+    region: String,
+    prefix: Option<String>,
+    aws_next_token: Option<String>,
+    pages_scanned: u64,
+    results_scanned: u64,
+    max_results_returned: u64,
+    max_results_scanned: u64,
+    max_pages: u64,
+    guardrail_policy_id: String,
+    entitlement_snapshot_hash: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DiscoveryCursorEnvelope {
+    version: u8,
+    alg: String,
+    key_id: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+fn discover_mock_log_groups(
+    account_id: &str,
+    region: &str,
+    prefix: Option<&str>,
+    scoped_log_arns: &[String],
+    guardrails: &McpGuardrails,
+) -> DiscoveryResult {
+    let scope_prefix = format!("arn:aws:logs:{region}:{account_id}:log-group:");
+    let mut scanned_count = 0_u64;
+    let mut log_groups = Vec::new();
+    for group in mock_log_groups()
+        .into_iter()
+        .filter(|group| group.arn.starts_with(&scope_prefix))
+        .filter(|group| prefix.map(|p| group.name.starts_with(p)).unwrap_or(true))
+    {
+        scanned_count += 1;
+        if scoped_log_arns.is_empty()
+            || scoped_log_arns.iter().any(|pattern| {
+                crate::services::entitlements::arn_matches_pattern(pattern, &group.arn)
+            })
+        {
+            log_groups.push(group);
+        }
+    }
+
+    let max_returned = guardrails.max_log_group_list_results as usize;
+    let truncated = log_groups.len() > max_returned;
+    if truncated {
+        log_groups.truncate(max_returned);
+    }
+
+    DiscoveryResult {
+        log_groups,
+        scanned_count,
+        pages_scanned: 1,
+        truncated,
+        budget_exhausted: truncated,
+        aws_next_token: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn discover_aws_log_groups(
+    state: &AppState,
+    claims: &Claims,
+    entitlements: &shared::dto::entitlements::UserEntitlements,
+    account_id: &str,
+    region: &str,
+    prefix: Option<&str>,
+    scoped_log_arns: &[String],
+    mut next_token: Option<String>,
+    mut pages_scanned: u64,
+    mut scanned_count: u64,
+    guardrails: &McpGuardrails,
+    audit_ctx: &AuditRequestContext,
+    req: &McpListAllowedLogGroupsRequest,
+) -> Result<DiscoveryResult, (StatusCode, Json<ApiError>)> {
+    let client = crate::routes::cloudwatch::get_cwl_client_for_account(
+        state,
+        entitlements,
+        account_id,
+        region,
+        &claims.sub,
+    )
+    .await?;
+
+    let max_returned = guardrails.max_log_group_list_results as usize;
+    let mut log_groups = Vec::new();
+    let mut budget_exhausted = false;
+    let mut returned_cap_overflow = false;
+
+    loop {
+        if pages_scanned >= guardrails.max_describe_log_groups_pages
+            || scanned_count >= guardrails.max_discovery_results_scanned
+        {
+            budget_exhausted = true;
+            break;
+        }
+
+        let mut describe = client.describe_log_groups().limit(50);
+        if let Some(prefix) = prefix {
+            describe = describe.log_group_name_prefix(prefix);
+        }
+        if let Some(token) = next_token.take() {
+            describe = describe.next_token(token);
+        }
+
+        let resp = describe.send().await.map_err(|e| {
+            tracing::error!("mcp DescribeLogGroups failed: {e}");
+            let _ = audit_cloudwatch_discovery_error(
+                state,
+                &claims.sub,
+                audit_ctx,
+                req,
+                account_id,
+                region,
+                "AWS DescribeLogGroups failed",
+                "aws_describe_log_groups_failed",
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError::internal(format!(
+                    "AWS DescribeLogGroups failed: {e}"
+                ))),
+            )
+        })?;
+
+        pages_scanned += 1;
+        for group in resp.log_groups() {
+            if scanned_count >= guardrails.max_discovery_results_scanned {
+                budget_exhausted = true;
+                break;
+            }
+            scanned_count += 1;
+            let name = group.log_group_name().unwrap_or_default().to_string();
+            let arn = group.arn().unwrap_or_default().to_string();
+            if scoped_log_arns.is_empty()
+                || scoped_log_arns.iter().any(|pattern| {
+                    crate::services::entitlements::arn_matches_pattern(pattern, &arn)
+                })
+            {
+                if log_groups.len() < max_returned {
+                    log_groups.push(LogGroup {
+                        name,
+                        arn,
+                        stored_bytes: group.stored_bytes(),
+                        retention_days: group.retention_in_days(),
+                    });
+                } else {
+                    returned_cap_overflow = true;
+                }
+            }
+        }
+
+        next_token = resp.next_token().map(|s| s.to_string());
+        if returned_cap_overflow {
+            budget_exhausted = true;
+            next_token = None;
+        }
+        if next_token.is_none() || log_groups.len() >= max_returned || budget_exhausted {
+            break;
+        }
+    }
+
+    let truncated = next_token.is_some() || budget_exhausted;
+    Ok(DiscoveryResult {
+        log_groups,
+        scanned_count,
+        pages_scanned,
+        truncated,
+        budget_exhausted,
+        aws_next_token: if budget_exhausted { None } else { next_token },
+    })
+}
+
+fn discovery_guardrail_policy_id(guardrails: &McpGuardrails) -> String {
+    format!(
+        "mcp-cloudwatch-discovery:v1:max_returned={}:max_scanned={}:max_pages={}:ttl={}",
+        guardrails.max_log_group_list_results,
+        guardrails.max_discovery_results_scanned,
+        guardrails.max_describe_log_groups_pages,
+        guardrails.discovery_cursor_ttl_seconds
+    )
+}
+
+fn entitlement_snapshot_hash(scoped_log_arns: &[String]) -> String {
+    let mut patterns = scoped_log_arns.to_vec();
+    patterns.sort();
+    let mut hasher = Sha256::new();
+    for pattern in patterns {
+        hasher.update(pattern.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn discovery_cursor_cipher(state: &AppState) -> Result<Aes256Gcm, ()> {
+    let digest = Sha256::digest(state.config.jwt.secret.as_bytes());
+    Aes256Gcm::new_from_slice(&digest).map_err(|_| ())
+}
+
+fn encode_discovery_cursor(
+    state: &AppState,
+    payload: &DiscoveryCursorPayload,
+) -> Result<String, ()> {
+    let cipher = discovery_cursor_cipher(state)?;
+    let mut nonce_bytes = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = serde_json::to_vec(payload).map_err(|_| ())?;
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext.as_slice(),
+                aad: CLOUDWATCH_DISCOVERY_CURSOR_AAD,
+            },
+        )
+        .map_err(|_| ())?;
+    let envelope = DiscoveryCursorEnvelope {
+        version: 1,
+        alg: "AES-256-GCM".into(),
+        key_id: "jwt-secret-sha256:v1".into(),
+        nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
+        ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+    };
+    let envelope_json = serde_json::to_vec(&envelope).map_err(|_| ())?;
+    Ok(URL_SAFE_NO_PAD.encode(envelope_json))
+}
+
+fn decode_discovery_cursor(
+    state: &AppState,
+    raw: &str,
+) -> Result<DiscoveryCursorPayload, &'static str> {
+    let envelope_bytes = URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|_| "discovery_cursor_decode_failed")?;
+    let envelope: DiscoveryCursorEnvelope =
+        serde_json::from_slice(&envelope_bytes).map_err(|_| "discovery_cursor_decode_failed")?;
+    if envelope.version != 1
+        || envelope.alg != "AES-256-GCM"
+        || envelope.key_id != "jwt-secret-sha256:v1"
+    {
+        return Err("discovery_cursor_unsupported_version");
+    }
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(envelope.nonce.as_bytes())
+        .map_err(|_| "discovery_cursor_decode_failed")?;
+    if nonce_bytes.len() != 12 {
+        return Err("discovery_cursor_decode_failed");
+    }
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(envelope.ciphertext.as_bytes())
+        .map_err(|_| "discovery_cursor_decode_failed")?;
+    let cipher = discovery_cursor_cipher(state).map_err(|_| "discovery_cursor_key_unavailable")?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            aes_gcm::aead::Payload {
+                msg: ciphertext.as_slice(),
+                aad: CLOUDWATCH_DISCOVERY_CURSOR_AAD,
+            },
+        )
+        .map_err(|_| "discovery_cursor_auth_failed")?;
+    serde_json::from_slice(&plaintext).map_err(|_| "discovery_cursor_decode_failed")
+}
+
+fn validate_discovery_cursor_scope(
+    cursor: &DiscoveryCursorPayload,
+    actor: &str,
+    req: &McpListAllowedLogGroupsRequest,
+    guardrails: &McpGuardrails,
+) -> Result<(), &'static str> {
+    if cursor.version != 1 || cursor.tool != CLOUDWATCH_DISCOVERY_TOOL {
+        return Err("discovery_cursor_unsupported_version");
+    }
+    if cursor.aws_next_token.is_none() {
+        return Err("discovery_cursor_unsupported_version");
+    }
+    if cursor.actor != actor {
+        return Err("discovery_cursor_actor_mismatch");
+    }
+    if req
+        .canopy_mcp_session_id
+        .as_deref()
+        .is_some_and(|sid| sid != cursor.canopy_mcp_session_id)
+    {
+        return Err("discovery_cursor_session_mismatch");
+    }
+    if req
+        .local_secret_generation
+        .as_deref()
+        .is_some_and(|lsg| lsg != cursor.local_secret_generation)
+    {
+        return Err("discovery_cursor_generation_mismatch");
+    }
+    if req
+        .account_id
+        .as_deref()
+        .is_some_and(|account_id| account_id != cursor.account_id)
+    {
+        return Err("discovery_cursor_scope_mismatch");
+    }
+    if req
+        .region
+        .as_deref()
+        .is_some_and(|region| region != cursor.region)
+    {
+        return Err("discovery_cursor_scope_mismatch");
+    }
+    if req.prefix.as_deref() != cursor.prefix.as_deref() && req.prefix.is_some() {
+        return Err("discovery_cursor_scope_mismatch");
+    }
+    if cursor.expires_at < Utc::now() {
+        return Err("discovery_cursor_expired");
+    }
+    if cursor.pages_scanned >= guardrails.max_describe_log_groups_pages
+        || cursor.results_scanned >= guardrails.max_discovery_results_scanned
+        || cursor.max_results_returned != guardrails.max_log_group_list_results
+        || cursor.max_results_scanned != guardrails.max_discovery_results_scanned
+        || cursor.max_pages != guardrails.max_describe_log_groups_pages
+        || cursor.guardrail_policy_id != discovery_guardrail_policy_id(guardrails)
+    {
+        return Err("discovery_cursor_exhausted_or_policy_changed");
+    }
+    Ok(())
+}
+
+fn validate_discovery_cursor_entitlement_snapshot(
+    cursor: &DiscoveryCursorPayload,
+    current_entitlement_hash: &str,
+) -> Result<(), &'static str> {
+    if cursor.entitlement_snapshot_hash != current_entitlement_hash {
+        return Err("discovery_cursor_entitlement_changed");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cloudwatch_discovery_tests {
+    use super::*;
+
+    fn matching_scope_hash() -> String {
+        entitlement_snapshot_hash(&[
+            "arn:aws:logs:*:111111111111:log-group:/app/*".to_string(),
+            "arn:aws:logs:*:111111111111:log-group:/worker/*".to_string(),
+        ])
+    }
+
+    fn cursor_payload(guardrails: &McpGuardrails) -> DiscoveryCursorPayload {
+        DiscoveryCursorPayload {
+            version: 1,
+            actor: "dev-admin".into(),
+            canopy_mcp_session_id: "session-1".into(),
+            local_secret_generation: "generation-1".into(),
+            tool: CLOUDWATCH_DISCOVERY_TOOL.into(),
+            account_id: "111111111111".into(),
+            region: "us-east-1".into(),
+            prefix: Some("/app".into()),
+            aws_next_token: Some("aws-token-1".into()),
+            pages_scanned: 1,
+            results_scanned: 25,
+            max_results_returned: guardrails.max_log_group_list_results,
+            max_results_scanned: guardrails.max_discovery_results_scanned,
+            max_pages: guardrails.max_describe_log_groups_pages,
+            guardrail_policy_id: discovery_guardrail_policy_id(guardrails),
+            entitlement_snapshot_hash: matching_scope_hash(),
+            expires_at: Utc::now() + Duration::minutes(5),
+        }
+    }
+
+    fn matching_request() -> McpListAllowedLogGroupsRequest {
+        McpListAllowedLogGroupsRequest {
+            canopy_mcp_session_id: Some("session-1".into()),
+            local_secret_generation: Some("generation-1".into()),
+            account_id: Some("111111111111".into()),
+            region: Some("us-east-1".into()),
+            prefix: Some("/app".into()),
+            discovery_cursor: Some("opaque".into()),
+        }
+    }
+
+    #[test]
+    fn discovery_cursor_validation_accepts_matching_scope_and_entitlements() {
+        let guardrails = McpGuardrails::default();
+        let cursor = cursor_payload(&guardrails);
+
+        assert_eq!(
+            validate_discovery_cursor_scope(&cursor, "dev-admin", &matching_request(), &guardrails),
+            Ok(())
+        );
+        assert_eq!(
+            validate_discovery_cursor_entitlement_snapshot(&cursor, &matching_scope_hash()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn discovery_cursor_validation_rejects_scope_mismatch() {
+        let guardrails = McpGuardrails::default();
+        let cursor = cursor_payload(&guardrails);
+        let mut req = matching_request();
+        req.region = Some("us-west-2".into());
+
+        assert_eq!(
+            validate_discovery_cursor_scope(&cursor, "dev-admin", &req, &guardrails),
+            Err("discovery_cursor_scope_mismatch")
+        );
+    }
+
+    #[test]
+    fn discovery_cursor_validation_rejects_exhausted_policy_or_entitlement_changes() {
+        let guardrails = McpGuardrails::default();
+        let mut cursor = cursor_payload(&guardrails);
+        cursor.pages_scanned = guardrails.max_describe_log_groups_pages;
+        assert_eq!(
+            validate_discovery_cursor_scope(&cursor, "dev-admin", &matching_request(), &guardrails),
+            Err("discovery_cursor_exhausted_or_policy_changed")
+        );
+
+        let cursor = cursor_payload(&guardrails);
+        let changed_hash =
+            entitlement_snapshot_hash(&["arn:aws:logs:*:111111111111:log-group:/other/*".into()]);
+        assert_eq!(
+            validate_discovery_cursor_entitlement_snapshot(&cursor, &changed_hash),
+            Err("discovery_cursor_entitlement_changed")
+        );
+    }
+}
+
+fn audit_cloudwatch_discovery_denied(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpListAllowedLogGroupsRequest,
+    message: &str,
+    reason: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchDiscovery,
+            AuditOutcome::Denied,
+        )
+        .account(req.account_id.as_deref())
+        .region(req.region.as_deref())
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_discovery",
+            "mcp_outcome_kind": reason,
+            "tool_name": CLOUDWATCH_DISCOVERY_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "prefix": req.prefix.as_deref(),
+            "has_discovery_cursor": req.discovery_cursor.is_some(),
+            "aws_execution_attempted": false,
+            "rejection_reason": reason
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_discovery_audit_failure_response())
+}
+
+fn audit_cloudwatch_discovery_error(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpListAllowedLogGroupsRequest,
+    account_id: &str,
+    region: &str,
+    message: &str,
+    reason: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchDiscovery,
+            AuditOutcome::Failure,
+        )
+        .account(Some(account_id))
+        .region(Some(region))
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_discovery",
+            "mcp_outcome_kind": reason,
+            "tool_name": CLOUDWATCH_DISCOVERY_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "prefix": req.prefix.as_deref(),
+            "has_discovery_cursor": req.discovery_cursor.is_some(),
+            "aws_execution_attempted": true,
+            "rejection_reason": reason
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_discovery_audit_failure_response())
 }
 
 fn require_mcp_guidance(

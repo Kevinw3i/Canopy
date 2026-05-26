@@ -133,7 +133,7 @@ impl Component for McpScreen {
         let entitlement_text = match self.entitlements.as_ref() {
             Some(ent) if ent.features.can_use_mcp => {
                 let cloudwatch = if ent.features.can_use_mcp_cloudwatch {
-                    "cloudwatch reserved"
+                    "cloudwatch discovery"
                 } else {
                     "cloudwatch disabled"
                 };
@@ -171,7 +171,7 @@ impl Component for McpScreen {
             .wrap(Wrap { trim: true })
             .render(chunks[1], buf);
 
-        let help = "Use e to enable the local MCP server, verify healthz, then choose Codex CLI or Claude Code. Use s to stop, r to restart, t to test health. Phase 1 only exposes canopy_describe_capabilities and canopy_get_guidance; CloudWatch data tools remain disabled.";
+        let help = "Use e to enable the local MCP server, verify healthz, then choose Codex CLI or Claude Code. Use s to stop, r to restart, t to test health. Phase 2 exposes CloudWatch discovery through canopy_list_allowed_log_groups; search and Insights remain disabled.";
         let body = if let Some(error) = self.last_error.as_ref() {
             format!("{help}\n\nLast error:\n{error}")
         } else {
