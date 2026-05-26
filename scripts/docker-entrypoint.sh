@@ -77,6 +77,20 @@ positive_int() {
   printf '%s' "$value"
 }
 
+bounded_int() {
+  name="$1"
+  value="$2"
+  min="$3"
+  max="$4"
+
+  value=$(positive_int "$name" "$value")
+  if [ "$value" -lt "$min" ] || [ "$value" -gt "$max" ]; then
+    fatal "$name must be between $min and $max."
+  fi
+
+  printf '%s' "$value"
+}
+
 patch_config_line() {
   section_re="$1"
   match_re="$2"
@@ -181,7 +195,9 @@ if [ ! -f "$CONFIG_PATH" ] || [ "${GENERATE_CONFIG:-0}" = "1" ]; then
   SAFE_AWS_DEFAULT_REGION=$(escape_toml "${AWS_DEFAULT_REGION:-ap-northeast-1}")
   SAFE_STS_EXTERNAL_ID=$(escape_toml "${STS_EXTERNAL_ID:-canopy}")
   SAFE_JWT_EXPIRY_SECONDS=$(positive_int "JWT_EXPIRY_SECONDS" "${JWT_EXPIRY_SECONDS:-3600}")
-  SAFE_AWS_SESSION_DURATION_SECONDS=$(positive_int "AWS_SESSION_DURATION_SECONDS" "${AWS_SESSION_DURATION_SECONDS:-3600}")
+  SAFE_AWS_SESSION_DURATION_SECONDS=$(
+    bounded_int "AWS_SESSION_DURATION_SECONDS" "${AWS_SESSION_DURATION_SECONDS:-3600}" 900 43200
+  )
 
   CLIENT_SECRET_LINE=""
   if [ -n "$OIDC_CLIENT_SECRET" ]; then

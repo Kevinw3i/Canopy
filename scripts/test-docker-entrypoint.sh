@@ -227,4 +227,20 @@ expect_entrypoint_failure \
   OIDC_CLIENT_ID='client' \
   AWS_SESSION_DURATION_SECONDS='0'
 
+expect_entrypoint_failure \
+  "aws-session-duration-too-short" \
+  "AWS_SESSION_DURATION_SECONDS must be between 900 and 43200" \
+  JWT_SECRET='jwt' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client' \
+  AWS_SESSION_DURATION_SECONDS='899'
+
+expect_entrypoint_failure \
+  "aws-session-duration-too-long" \
+  "AWS_SESSION_DURATION_SECONDS must be between 900 and 43200" \
+  JWT_SECRET='jwt' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client' \
+  AWS_SESSION_DURATION_SECONDS='43201'
+
 echo "docker-entrypoint generated config tests passed."
