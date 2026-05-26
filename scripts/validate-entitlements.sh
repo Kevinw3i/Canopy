@@ -3,11 +3,12 @@
 # Usage: ./scripts/validate-entitlements.sh <entitlements.toml> <terraform.tfvars>
 #
 # Checks:
+#   0. Active sample placeholders are rejected before production image builds
 #   1. If any account uses role_arn = "direct", enable_direct_access must be true in tfvars
 #   2. profile:* role_arn entries are rejected for ECS deployments
 #   3. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
 #   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
-#   5. Active sample placeholders are rejected before production image builds
+#   5. ECS Exec must imply ECS view, and ECS access rules need allowed_clusters
 set -euo pipefail
 
 usage() {
@@ -121,7 +122,7 @@ in_rule && /^[[:space:]]*id[[:space:]]*=/ {
   sub(/^[^"]*"/, "", rule_id)
   sub(/".*$/, "", rule_id)
 }
-in_rule && /can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
+in_rule && /^[[:space:]]*can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
   can_exec = 1
 }
 in_rule && /role_arn[[:space:]]*=[[:space:]]*"(direct|profile:[^"]*)"/ {
@@ -136,6 +137,65 @@ if [ -n "$ECS_EXEC_LOCAL_RULES" ]; then
   while IFS= read -r rule_id; do
     echo "ERROR: rule '$rule_id' enables can_use_ecs_exec but uses direct/profile credentials; ECS Exec deployments require an AssumeRole ARN"
   done <<< "$ECS_EXEC_LOCAL_RULES"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# Check 5: mirror control-plane ECS rule shape invariants before image build.
+ECS_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function flush_rule() {
+  if (in_rule && can_exec && !can_view) {
+    print rule_id "|exec_without_view"
+  }
+  if (in_rule && (can_view || can_exec) && !has_clusters) {
+    print rule_id "|missing_clusters"
+  }
+}
+/^[[:space:]]*\[\[rules\]\][[:space:]]*$/ {
+  flush_rule()
+  in_rule = 1
+  in_clusters = 0
+  can_view = 0
+  can_exec = 0
+  has_clusters = 0
+  rule_id = "<unknown>"
+  next
+}
+in_rule && /^[[:space:]]*id[[:space:]]*=/ {
+  rule_id = $0
+  sub(/^[^"]*"/, "", rule_id)
+  sub(/".*$/, "", rule_id)
+}
+in_rule && /^[[:space:]]*can_view_ecs[[:space:]]*=[[:space:]]*true/ {
+  can_view = 1
+}
+in_rule && /^[[:space:]]*can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
+  can_exec = 1
+}
+in_rule && /^[[:space:]]*allowed_clusters[[:space:]]*=/ {
+  in_clusters = 1
+}
+in_rule && in_clusters && /"[^"]+"/ {
+  has_clusters = 1
+}
+in_rule && in_clusters && /\]/ {
+  in_clusters = 0
+}
+END {
+  flush_rule()
+}
+')
+
+if [ -n "$ECS_RULE_SHAPE_ERRORS" ]; then
+  while IFS='|' read -r rule_id error_kind; do
+    case "$error_kind" in
+      exec_without_view)
+        echo "ERROR: rule '$rule_id' has can_use_ecs_exec=true but can_view_ecs=false; ECS Exec must imply ECS view in the same rule"
+        ;;
+      missing_clusters)
+        echo "ERROR: rule '$rule_id' grants ECS access but allowed_clusters is empty"
+        ;;
+    esac
+  done <<< "$ECS_RULE_SHAPE_ERRORS"
   ERRORS=$((ERRORS + 1))
 fi
 

@@ -24,10 +24,15 @@ write_entitlements() {
   cat > "$path" <<EOF
 [[rules]]
 id = "ecs"
+allowed_clusters = ["prod"]
+
+[rules.features]
 can_view_ecs = true
-allowed_accounts = [
-  { account_id = "123456789012", account_name = "prod", role_arn = "$role_arn" },
-]
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$role_arn"
 EOF
 }
 
@@ -179,16 +184,59 @@ expect_failure \
 cat > "$TMP_DIR/exec-direct-entitlements.toml" <<'EOF'
 [[rules]]
 id = "ecs-exec-direct"
+allowed_clusters = ["prod"]
+
+[rules.features]
 can_view_ecs = true
 can_use_ecs_exec = true
-allowed_accounts = [
-  { account_id = "123456789012", account_name = "prod", role_arn = "direct" },
-]
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
 EOF
 expect_failure \
   "exec-direct-role" \
   "$TMP_DIR/exec-direct-entitlements.toml" \
   "$TMP_DIR/direct-enabled.tfvars" \
   "enables can_use_ecs_exec but uses direct/profile credentials"
+
+cat > "$TMP_DIR/exec-without-view-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-exec-without-view"
+allowed_clusters = ["prod"]
+
+[rules.features]
+can_view_ecs = false
+can_use_ecs_exec = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "exec-without-view" \
+  "$TMP_DIR/exec-without-view-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "ECS Exec must imply ECS view"
+
+cat > "$TMP_DIR/ecs-without-clusters-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-without-clusters"
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "ecs-without-clusters" \
+  "$TMP_DIR/ecs-without-clusters-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "allowed_clusters is empty"
 
 echo "validate-entitlements tests passed."

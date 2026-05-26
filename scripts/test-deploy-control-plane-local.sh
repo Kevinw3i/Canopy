@@ -47,10 +47,15 @@ mkdir -p "$REPO_TMP_DIR/bin" "$REPO_TMP_DIR/infra"
 cat > "$REPO_TMP_DIR/entitlements.toml" <<'EOF'
 [[rules]]
 id = "ecs"
+allowed_clusters = ["canopy"]
+
+[rules.features]
 can_view_ecs = true
-allowed_accounts = [
-  { account_id = "123456789012", account_name = "prod", role_arn = "arn:aws:iam::123456789012:role/CanopyRole" },
-]
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "arn:aws:iam::123456789012:role/CanopyRole"
 EOF
 
 cat > "$REPO_TMP_DIR/infra/terraform.tfvars" <<'EOF'
