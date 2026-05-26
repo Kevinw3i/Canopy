@@ -14,6 +14,7 @@ private_subnet_ids = ["subnet-00000000000000003", "subnet-00000000000000004"]
 # vpc_cidr             = "10.200.0.0/16"
 # public_subnet_cidrs  = ["10.200.0.0/24", "10.200.1.0/24"]
 # private_subnet_cidrs = ["10.200.10.0/24", "10.200.11.0/24"]
+# Set false for one NAT per private subnet/AZ; requires at least as many public CIDRs as private CIDRs.
 # single_nat_gateway   = true
 
 acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"

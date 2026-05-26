@@ -21,6 +21,13 @@ resource "aws_vpc" "main" {
   enable_dns_hostnames = true
   enable_dns_support   = true
 
+  lifecycle {
+    precondition {
+      condition     = var.single_nat_gateway || length(var.public_subnet_cidrs) >= length(var.private_subnet_cidrs)
+      error_message = "public_subnet_cidrs must contain at least as many CIDR blocks as private_subnet_cidrs when single_nat_gateway = false."
+    }
+  }
+
   tags = {
     Name = "${var.project}-vpc"
   }

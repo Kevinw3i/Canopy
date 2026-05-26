@@ -259,3 +259,18 @@ run "rejects_reused_network_without_two_private_subnets" {
     aws_lb.control_plane,
   ]
 }
+
+run "rejects_nat_per_az_without_matching_public_subnets" {
+  command = plan
+
+  variables {
+    create_vpc           = true
+    single_nat_gateway   = false
+    public_subnet_cidrs  = ["10.200.0.0/24", "10.200.1.0/24"]
+    private_subnet_cidrs = ["10.200.10.0/24", "10.200.11.0/24", "10.200.12.0/24"]
+  }
+
+  expect_failures = [
+    aws_vpc.main,
+  ]
+}
