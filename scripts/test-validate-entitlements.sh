@@ -294,6 +294,23 @@ expect_failure \
   "$TMP_DIR/direct-enabled.tfvars" \
   "enables can_use_ecs_exec but uses direct/profile credentials"
 
+cat > "$TMP_DIR/exec-direct-inline-features-entitlements.toml" <<'EOF'
+[[rules]]
+id = "ecs-exec-direct-inline-features"
+allowed_clusters = ["prod"]
+features = { can_view_ecs = true, can_use_ecs_exec = true }
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "exec-direct-inline-features" \
+  "$TMP_DIR/exec-direct-inline-features-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "enables can_use_ecs_exec but uses direct/profile credentials"
+
 cat > "$TMP_DIR/exec-without-view-entitlements.toml" <<EOF
 [[rules]]
 id = "ecs-exec-without-view"
@@ -314,6 +331,23 @@ expect_failure \
   "$TMP_DIR/gov.tfvars" \
   "ECS Exec must imply ECS view"
 
+cat > "$TMP_DIR/exec-without-view-inline-features-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-exec-without-view-inline-features"
+allowed_clusters = ["prod"]
+features = { can_use_ecs_exec = true }
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "exec-without-view-inline-features" \
+  "$TMP_DIR/exec-without-view-inline-features-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "ECS Exec must imply ECS view"
+
 cat > "$TMP_DIR/ecs-without-clusters-entitlements.toml" <<EOF
 [[rules]]
 id = "ecs-without-clusters"
@@ -329,6 +363,22 @@ EOF
 expect_failure \
   "ecs-without-clusters" \
   "$TMP_DIR/ecs-without-clusters-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "allowed_clusters is empty"
+
+cat > "$TMP_DIR/ecs-without-clusters-inline-features-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-without-clusters-inline-features"
+features = { can_view_ecs = true }
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "ecs-without-clusters-inline-features" \
+  "$TMP_DIR/ecs-without-clusters-inline-features-entitlements.toml" \
   "$TMP_DIR/gov.tfvars" \
   "allowed_clusters is empty"
 
@@ -462,6 +512,22 @@ EOF
 expect_failure \
   "ssm-without-os-users" \
   "$TMP_DIR/ssm-without-os-users-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "can_use_ssm=true but no allowed_os_users"
+
+cat > "$TMP_DIR/ssm-without-os-users-inline-features-entitlements.toml" <<EOF
+[[rules]]
+id = "ssm-without-os-users-inline-features"
+features = { can_use_ssm = true }
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "ssm-without-os-users-inline-features" \
+  "$TMP_DIR/ssm-without-os-users-inline-features-entitlements.toml" \
   "$TMP_DIR/gov.tfvars" \
   "can_use_ssm=true but no allowed_os_users"
 

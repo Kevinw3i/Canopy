@@ -134,6 +134,10 @@ done
 # valid for inventory/logs, but the ECS exec route intentionally rejects
 # direct/profile credentials in non-mock deployments.
 ECS_EXEC_LOCAL_RULES=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function feature_true(line, key) {
+  return line ~ "^[[:space:]]*" key "[[:space:]]*=[[:space:]]*true([[:space:]]*$|[[:space:],}])" ||
+    line ~ "^[[:space:]]*features[[:space:]]*=[[:space:]]*[{].*" key "[[:space:]]*=[[:space:]]*true([[:space:]]*$|[[:space:],}])"
+}
 function flush_rule() {
   if (in_rule && can_exec && has_local_role) {
     print rule_id
@@ -152,7 +156,7 @@ in_rule && /^[[:space:]]*id[[:space:]]*=/ {
   sub(/^[^"]*"/, "", rule_id)
   sub(/".*$/, "", rule_id)
 }
-in_rule && /^[[:space:]]*can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
+in_rule && feature_true($0, "can_use_ecs_exec") {
   can_exec = 1
 }
 in_rule && /role_arn[[:space:]]*=[[:space:]]*["\047](direct|profile:[^"\047]*)["\047]/ {
@@ -172,6 +176,10 @@ fi
 
 # Check 6: mirror control-plane ECS rule shape invariants before image build.
 ECS_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function feature_true(line, key) {
+  return line ~ "^[[:space:]]*" key "[[:space:]]*=[[:space:]]*true([[:space:]]*$|[[:space:],}])" ||
+    line ~ "^[[:space:]]*features[[:space:]]*=[[:space:]]*[{].*" key "[[:space:]]*=[[:space:]]*true([[:space:]]*$|[[:space:],}])"
+}
 function cluster_name(pattern, rest, pos) {
   rest = pattern
   while ((pos = index(rest, "cluster/")) > 0) {
@@ -249,10 +257,10 @@ in_rule && /^[[:space:]]*id[[:space:]]*=/ {
   sub(/^[^"]*"/, "", rule_id)
   sub(/".*$/, "", rule_id)
 }
-in_rule && /^[[:space:]]*can_view_ecs[[:space:]]*=[[:space:]]*true/ {
+in_rule && feature_true($0, "can_view_ecs") {
   can_view = 1
 }
-in_rule && /^[[:space:]]*can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
+in_rule && feature_true($0, "can_use_ecs_exec") {
   can_exec = 1
 }
 in_rule && in_rule_table && /^[[:space:]]*allow_broad_cluster_discovery[[:space:]]*=[[:space:]]*true/ {
@@ -302,6 +310,10 @@ fi
 
 # Check 7: mirror SSM shell-scope invariant before image build.
 SSM_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function feature_true(line, key) {
+  return line ~ "^[[:space:]]*" key "[[:space:]]*=[[:space:]]*true([[:space:]]*$|[[:space:],}])" ||
+    line ~ "^[[:space:]]*features[[:space:]]*=[[:space:]]*[{].*" key "[[:space:]]*=[[:space:]]*true([[:space:]]*$|[[:space:],}])"
+}
 function flush_rule() {
   if (in_rule && can_ssm && !has_os_users) {
     print rule_id
@@ -326,7 +338,7 @@ in_rule && /^[[:space:]]*id[[:space:]]*=/ {
   sub(/^[^"]*"/, "", rule_id)
   sub(/".*$/, "", rule_id)
 }
-in_rule && /^[[:space:]]*can_use_ssm[[:space:]]*=[[:space:]]*true/ {
+in_rule && feature_true($0, "can_use_ssm") {
   can_ssm = 1
 }
 in_rule && in_rule_table && /^[[:space:]]*allowed_os_users[[:space:]]*=/ {
