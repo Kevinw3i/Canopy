@@ -248,6 +248,8 @@ jobs:
           set -euo pipefail
 
           image_uri="${{ steps.ecr.outputs.registry }}/${{ steps.platform.outputs.ecr_repository }}:${{ steps.meta.outputs.image_tag }}"
+          image_tag="${{ steps.meta.outputs.image_tag }}"
+          aws_region="${{ steps.platform.outputs.aws_region }}"
 
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## Control-plane image pushed
@@ -268,10 +270,23 @@ jobs:
 
           \`\`\`bash
           # If needed, export AWS_PROFILE=<write-profile>; otherwise Terraform uses the default credential chain.
+          VERSION=${image_tag}
+          AWS_REGION=${aws_region}
+
+          scripts/validate-terraform-tfvars.sh infra \\
+            -var="create_service=true" \\
+            -var="image_tag=\$VERSION"
+          scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
           terraform -chdir=infra plan \\
             -var="create_service=true" \\
-            -var="image_tag=${{ steps.meta.outputs.image_tag }}" \\
+            -var="image_tag=\$VERSION" \\
             -out=tfplan.phase2
           terraform -chdir=infra apply tfplan.phase2
+
+          aws ecs wait services-stable \\
+            --cluster \$(terraform -chdir=infra output -raw ecs_cluster_name) \\
+            --services \$(terraform -chdir=infra output -raw ecs_service_name) \\
+            --region "\$AWS_REGION"
           \`\`\`
           EOF
