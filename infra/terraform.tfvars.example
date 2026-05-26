@@ -36,6 +36,7 @@ alb_allowed_cidrs = ["10.0.0.0/16"]
 # alb_internal    = false  # set to false + office CIDRs for public access
 
 # Optional: Route 53 DNS record
+# Set both values to create the record; leave both commented to skip DNS.
 # route53_zone_id = "Z0123456789ABCDEFGHIJ"
 # domain_name     = "canopy.example.com"
 

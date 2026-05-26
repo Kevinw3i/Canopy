@@ -214,12 +214,22 @@ variable "route53_zone_id" {
   description = "Route 53 hosted zone ID (optional, set to empty string to skip DNS record)"
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.route53_zone_id == "" || can(regex("^Z[A-Z0-9]+$", var.route53_zone_id))
+    error_message = "route53_zone_id must be empty or a Route 53 hosted zone ID such as Z0123456789ABCDEFGHIJ."
+  }
 }
 
 variable "domain_name" {
   description = "FQDN for the control-plane (e.g. canopy.example.com)"
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.domain_name == "" || can(regex("^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\\.?$", var.domain_name))
+    error_message = "domain_name must be empty or a valid DNS name such as canopy.example.com."
+  }
 }
 
 # ── Secrets ─────────────────────────────────────────────

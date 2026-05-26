@@ -188,7 +188,7 @@ encrypt        = true
 | `sts_external_id` | No | 預設 `canopy`，跨帳號 AssumeRole 的 ExternalId；必須符合 STS ExternalId 格式限制 |
 | `jwt_expiry_seconds` | No | 預設 3600；必須是正整數 |
 | `aws_session_duration_seconds` | No | 預設 3600；STS AssumeRole session 秒數，必須介於 900 到 43200 |
-| `route53_zone_id` / `domain_name` | No | 設定後自動建 DNS record |
+| `route53_zone_id` / `domain_name` | No | 設定後自動建 DNS record；必須同時設定，或同時留空 |
 | `assumable_role_arns` | No | 跨帳號 AssumeRole 的目標 IAM role ARN 清單；不允許 wildcard |
 | `enable_direct_access` | No | 預設 `false`；設為 `true` 時允許 `role_arn = "direct"` 查看部署帳號的 EC2、ECS task inventory、CloudWatch Logs |
 | `log_retention_days` | No | 預設 90 天；必須是 CloudWatch Logs 支援的 retention 天數 |
