@@ -334,6 +334,7 @@ run_terraform plan \
   -out="$PLAN_FILE"
 
 PLAN_TEXT="$(run_terraform show -no-color "$PLAN_FILE")"
+printf '%s\n' "$PLAN_TEXT"
 
 if grep -Eq 'will be destroyed' <<< "$PLAN_TEXT"; then
   echo ""

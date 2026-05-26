@@ -229,6 +229,7 @@ fi
 
 grep -qF -- "AWS profile:       test-profile" "$PLAN_ONLY_OUT"
 grep -qF -- "AWS region:        us-west-2" "$PLAN_ONLY_OUT"
+grep -qF -- "No changes. Infrastructure is up-to-date." "$PLAN_ONLY_OUT"
 grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$PLAN_ONLY_OUT"
 if grep -qF -- "Resolve ECR repository" "$PLAN_ONLY_OUT"; then
   cat "$PLAN_ONLY_OUT" >&2
@@ -338,6 +339,7 @@ if run_plan_only "$DESTROY_PLAN_OUT" CANOPY_TERRAFORM_SHOW_TEXT='aws_ecs_service
   exit 1
 fi
 grep -qF -- "Terraform plan includes destroy actions" "$DESTROY_PLAN_OUT"
+grep -qF -- "aws_ecs_service.control_plane will be destroyed" "$DESTROY_PLAN_OUT"
 if grep -qF -- "Resolve ECR repository" "$DESTROY_PLAN_OUT"; then
   cat "$DESTROY_PLAN_OUT" >&2
   echo "ERROR: destroy plan should stop before resolving ECR." >&2
@@ -351,6 +353,7 @@ if ! run_plan_only "$REPLACE_PLAN_OUT" CANOPY_TERRAFORM_SHOW_TEXT='aws_ecs_task_
   exit 1
 fi
 grep -qF -- "WARNING: Terraform plan includes replacement actions" "$REPLACE_PLAN_OUT"
+grep -qF -- "aws_ecs_task_definition.control_plane must be replaced" "$REPLACE_PLAN_OUT"
 grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$REPLACE_PLAN_OUT"
 
 echo "deploy-control-plane-local validation tests passed."
