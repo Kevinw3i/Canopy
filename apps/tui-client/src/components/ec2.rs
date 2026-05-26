@@ -368,6 +368,7 @@ impl Ec2Screen {
         }
 
         self.view = target;
+        self.sanitize_scope_for_current_view();
         self.clear_instances();
         match self.view {
             InventoryView::Ec2 => Action::RefreshEc2,
@@ -813,56 +814,131 @@ impl Ec2Screen {
         self.search_input.clear();
     }
 
+    fn account_scope_options(&self) -> Vec<String> {
+        match self.view {
+            InventoryView::Ec2 => self.available_accounts.clone(),
+            InventoryView::Ecs => self.entitlements.as_ref().map_or_else(Vec::new, |ent| {
+                ecs_account_scope_options(ent, self.selected_region.as_deref())
+            }),
+        }
+    }
+
+    fn region_scope_options(&self) -> Vec<String> {
+        match self.view {
+            InventoryView::Ec2 => self.available_regions.clone(),
+            InventoryView::Ecs => self.entitlements.as_ref().map_or_else(Vec::new, |ent| {
+                ecs_region_scope_options(ent, self.selected_account_id.as_deref())
+            }),
+        }
+    }
+
+    fn sanitize_scope_for_current_view(&mut self) {
+        match self.view {
+            InventoryView::Ec2 => {
+                if self
+                    .selected_account_id
+                    .as_ref()
+                    .is_some_and(|account| !self.available_accounts.contains(account))
+                {
+                    self.selected_account_id = None;
+                }
+                if self
+                    .selected_region
+                    .as_ref()
+                    .is_some_and(|region| !self.available_regions.contains(region))
+                {
+                    self.selected_region = None;
+                }
+            }
+            InventoryView::Ecs => {
+                let Some(entitlements) = self.entitlements.as_ref() else {
+                    self.selected_account_id = None;
+                    self.selected_region = None;
+                    return;
+                };
+
+                let accounts = ecs_account_scope_options(entitlements, None);
+                if self
+                    .selected_account_id
+                    .as_ref()
+                    .is_some_and(|account| !accounts.contains(account))
+                {
+                    self.selected_account_id = None;
+                }
+
+                let regions = ecs_region_scope_options(entitlements, None);
+                if self
+                    .selected_region
+                    .as_ref()
+                    .is_some_and(|region| !regions.contains(region))
+                {
+                    self.selected_region = None;
+                }
+
+                if let (Some(account), Some(region)) = (
+                    self.selected_account_id.as_deref(),
+                    self.selected_region.as_deref(),
+                ) {
+                    if !ecs_scope_pair_matches(entitlements, account, region) {
+                        self.selected_region = None;
+                    }
+                }
+            }
+        }
+    }
+
     /// Cycle account: None (All) → first → second → … → None (All)
     fn cycle_account(&mut self, forward: bool) -> bool {
-        if self.available_accounts.is_empty() {
+        let accounts = self.account_scope_options();
+        if accounts.is_empty() {
             return false;
         }
         let cur_idx = self
             .selected_account_id
             .as_ref()
-            .and_then(|id| self.available_accounts.iter().position(|a| a == id));
+            .and_then(|id| accounts.iter().position(|a| a == id));
         let next = if forward {
             match cur_idx {
                 None => Some(0),
-                Some(i) if i + 1 < self.available_accounts.len() => Some(i + 1),
+                Some(i) if i + 1 < accounts.len() => Some(i + 1),
                 Some(_) => None,
             }
         } else {
             match cur_idx {
-                None => Some(self.available_accounts.len() - 1),
+                None => Some(accounts.len() - 1),
                 Some(0) => None,
                 Some(i) => Some(i - 1),
             }
         };
-        self.selected_account_id = next.map(|i| self.available_accounts[i].clone());
+        self.selected_account_id = next.map(|i| accounts[i].clone());
         self.clear_instances();
         true
     }
 
     /// Cycle region: None (All) → first → second → … → None (All)
     fn cycle_region(&mut self, forward: bool) -> bool {
-        if self.available_regions.is_empty() {
+        let regions = self.region_scope_options();
+        if regions.is_empty() {
             return false;
         }
         let cur_idx = self
             .selected_region
             .as_ref()
-            .and_then(|id| self.available_regions.iter().position(|r| r == id));
+            .and_then(|id| regions.iter().position(|r| r == id));
         let next = if forward {
             match cur_idx {
                 None => Some(0),
-                Some(i) if i + 1 < self.available_regions.len() => Some(i + 1),
+                Some(i) if i + 1 < regions.len() => Some(i + 1),
                 Some(_) => None,
             }
         } else {
             match cur_idx {
-                None => Some(self.available_regions.len() - 1),
+                None => Some(regions.len() - 1),
                 Some(0) => None,
                 Some(i) => Some(i - 1),
             }
         };
-        self.selected_region = next.map(|i| self.available_regions[i].clone());
+        self.selected_region = next.map(|i| regions[i].clone());
         self.clear_instances();
         true
     }
@@ -936,6 +1012,72 @@ fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
         })
         .map(|container| container.name.clone())
         .collect()
+}
+
+fn ecs_account_scope_options(
+    entitlements: &UserEntitlements,
+    selected_region: Option<&str>,
+) -> Vec<String> {
+    let mut accounts = std::collections::BTreeSet::new();
+    for pattern in &entitlements.allowed_clusters {
+        let Some((region, account)) = ecs_cluster_pattern_scope(pattern) else {
+            continue;
+        };
+        if account != "*"
+            && !account.is_empty()
+            && ecs_scope_part_matches_selection(region, selected_region)
+        {
+            accounts.insert(account.to_string());
+        }
+    }
+    accounts.into_iter().collect()
+}
+
+fn ecs_region_scope_options(
+    entitlements: &UserEntitlements,
+    selected_account: Option<&str>,
+) -> Vec<String> {
+    let mut regions = std::collections::BTreeSet::new();
+    for pattern in &entitlements.allowed_clusters {
+        let Some((region, account)) = ecs_cluster_pattern_scope(pattern) else {
+            continue;
+        };
+        if region != "*"
+            && !region.is_empty()
+            && ecs_scope_part_matches_selection(account, selected_account)
+        {
+            regions.insert(region.to_string());
+        }
+    }
+    regions.into_iter().collect()
+}
+
+fn ecs_scope_pair_matches(entitlements: &UserEntitlements, account: &str, region: &str) -> bool {
+    entitlements.allowed_clusters.iter().any(|pattern| {
+        ecs_cluster_pattern_scope(pattern).is_some_and(|(cluster_region, cluster_account)| {
+            cluster_account == account && cluster_region == region
+        })
+    })
+}
+
+fn ecs_cluster_pattern_scope(pattern: &str) -> Option<(&str, &str)> {
+    let mut parts = pattern.split(':');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("arn"), Some(_partition), Some("ecs"), Some(region), Some(account)) => {
+            Some((region, account))
+        }
+        _ => None,
+    }
+}
+
+fn ecs_scope_part_matches_selection(part: &str, selected: Option<&str>) -> bool {
+    selected.is_none_or(|selected| part != "*" && part == selected)
 }
 
 impl Component for Ec2Screen {
@@ -1302,14 +1444,16 @@ impl Component for Ec2Screen {
         self.search_input.render(main_chunks[0], buf);
 
         // Account/Region scope header
+        let account_options = self.account_scope_options();
+        let region_options = self.region_scope_options();
         let acct_display = self.selected_account_id.as_deref().unwrap_or("All");
         let region_display = self.selected_region.as_deref().unwrap_or("All");
-        let acct_label = if self.available_accounts.len() > 1 {
+        let acct_label = if account_options.len() > 1 {
             format!("Account [/]: {}", acct_display)
         } else {
             format!("Account: {}", acct_display)
         };
-        let region_label = if self.available_regions.len() > 1 {
+        let region_label = if region_options.len() > 1 {
             format!("Region {{/}}: {}", region_display)
         } else {
             format!("Region: {}", region_display)
@@ -1848,6 +1992,15 @@ mod tests {
         ent
     }
 
+    fn multi_scope_ecs_entitlements() -> UserEntitlements {
+        let mut ent = ecs_entitlements(true);
+        ent.allowed_clusters = vec![
+            "arn:aws:ecs:us-east-1:111:cluster/app".into(),
+            "arn:aws:ecs:eu-west-1:222:cluster/app".into(),
+        ];
+        ent
+    }
+
     fn power_entitlements() -> UserEntitlements {
         let mut ent = test_entitlements();
         ent.features.can_start_ec2 = true;
@@ -2064,6 +2217,86 @@ mod tests {
         assert!(matches!(action, Action::RefreshEcsTasks));
         let ecs_text = rendered_text(&mut screen);
         assert!(ecs_text.contains("Ctrl+E: EC2"));
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_uses_ecs_cluster_accounts_only() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+
+        assert!(screen.cycle_account(true));
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+        assert!(screen.cycle_account(true));
+        assert!(screen.selected_account_id.is_none());
+    }
+
+    #[test]
+    fn ecs_view_region_cycle_uses_ecs_cluster_regions_only() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+
+        assert!(screen.cycle_region(true));
+        assert_eq!(screen.selected_region.as_deref(), Some("us-east-1"));
+        assert!(screen.cycle_region(true));
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_respects_selected_region_pair() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(multi_scope_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_region = Some("eu-west-1".into());
+
+        assert!(screen.cycle_account(true));
+        assert_eq!(screen.selected_account_id.as_deref(), Some("222"));
+        assert!(screen.cycle_account(true));
+        assert!(screen.selected_account_id.is_none());
+    }
+
+    #[test]
+    fn ecs_view_region_cycle_respects_selected_account_pair() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(multi_scope_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_account_id = Some("111".into());
+
+        assert!(screen.cycle_region(true));
+        assert_eq!(screen.selected_region.as_deref(), Some("us-east-1"));
+        assert!(screen.cycle_region(true));
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn toggling_to_ecs_resets_ec2_only_scope_selection() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.selected_account_id = Some("222".into());
+        screen.selected_region = Some("eu-west-1".into());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert!(screen.selected_account_id.is_none());
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn toggling_to_ecs_resets_cross_pair_scope_selection() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(multi_scope_ecs_entitlements());
+        screen.selected_account_id = Some("111".into());
+        screen.selected_region = Some("eu-west-1".into());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+        assert!(screen.selected_region.is_none());
     }
 
     // ── State filter ──
