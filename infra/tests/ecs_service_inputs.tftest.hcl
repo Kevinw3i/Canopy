@@ -51,6 +51,87 @@ run "rejects_fractional_desired_count" {
   ]
 }
 
+run "rejects_latest_image_tag" {
+  command = plan
+
+  variables {
+    image_tag = "latest"
+  }
+
+  expect_failures = [
+    var.image_tag,
+  ]
+}
+
+run "rejects_service_without_image_tag" {
+  command = plan
+
+  variables {
+    create_service        = true
+    image_tag             = ""
+    jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
+run "accepts_service_launch_inputs" {
+  command = plan
+
+  variables {
+    create_service        = true
+    image_tag             = "cp-v0.1.0"
+    jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
+  }
+}
+
+run "rejects_service_without_jwt_secret_version_id" {
+  command = plan
+
+  variables {
+    create_service        = true
+    image_tag             = "cp-v0.1.0"
+    jwt_secret_version_id = ""
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
+run "rejects_oidc_secret_without_version_id" {
+  command = plan
+
+  variables {
+    create_service         = true
+    image_tag              = "cp-v0.1.0"
+    jwt_secret_version_id  = "00000000-0000-0000-0000-000000000000"
+    oidc_client_secret_arn = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/oidc-client-secret-XXXXXX"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
+run "rejects_invalid_fargate_cpu_memory_pair" {
+  command = plan
+
+  variables {
+    create_service        = true
+    image_tag             = "cp-v0.1.0"
+    jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
+    cpu                   = 256
+    memory                = 4096
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
 run "rejects_relative_entitlements_file" {
   command = plan
 
