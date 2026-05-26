@@ -290,17 +290,23 @@ encrypt        = true
 ## 監控
 
 ```bash
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
 # 查看 service 狀態
 aws ecs describe-services \
-  --cluster $(terraform output -raw ecs_cluster_name) \
-  --services $(terraform output -raw ecs_service_name) \
+  --cluster $(terraform -chdir=infra output -raw ecs_cluster_name) \
+  --services $(terraform -chdir=infra output -raw ecs_service_name) \
+  --region "$AWS_REGION" \
   --query 'services[0].{status:status,running:runningCount,desired:desiredCount}'
 
 # 查看容器日誌
-aws logs tail $(terraform output -raw log_group_name) --follow
+aws logs tail $(terraform -chdir=infra output -raw log_group_name) \
+  --region "$AWS_REGION" \
+  --follow
 
 # 測試 health endpoint
-curl -s https://$(terraform output -raw alb_dns_name)/health
+curl -s https://$(terraform -chdir=infra output -raw alb_dns_name)/health
 ```
 
 ## 銷毀
