@@ -910,13 +910,9 @@ impl Ec2Screen {
         if !task.enable_execute_command {
             return Action::ShowError("ECS Exec is not enabled for this task".into());
         }
-        let containers = task
-            .containers
-            .iter()
-            .map(|container| container.name.clone())
-            .collect::<Vec<_>>();
+        let containers = ecs_exec_ready_container_names(task);
         if containers.is_empty() {
-            return Action::ShowError("Task has no containers".into());
+            return Action::ShowError("No containers are ready for ECS Exec".into());
         }
 
         self.pending_ecs_exec = Some(PendingEcsExec {
@@ -930,6 +926,16 @@ impl Ec2Screen {
         self.focus = Ec2Focus::ContainerPicker;
         Action::Noop
     }
+}
+
+fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
+    task.containers
+        .iter()
+        .filter(|container| {
+            container.last_status == "RUNNING" && container.execute_command_agent_running
+        })
+        .map(|container| container.name.clone())
+        .collect()
 }
 
 impl Component for Ec2Screen {
@@ -1881,6 +1887,15 @@ mod tests {
     }
 
     fn ecs_task(containers: Vec<&str>) -> EcsTask {
+        ecs_task_with_containers(
+            containers
+                .into_iter()
+                .map(|name| (name, "RUNNING", true))
+                .collect(),
+        )
+    }
+
+    fn ecs_task_with_containers(containers: Vec<(&str, &str, bool)>) -> EcsTask {
         EcsTask {
             task_arn: "arn:aws:ecs:us-east-1:111:task/app/abc123".into(),
             cluster_arn: "arn:aws:ecs:us-east-1:111:cluster/app".into(),
@@ -1895,10 +1910,12 @@ mod tests {
             enable_execute_command: true,
             containers: containers
                 .into_iter()
-                .map(|name| shared::dto::ecs::EcsContainer {
-                    name: name.into(),
-                    last_status: "RUNNING".into(),
-                    execute_command_agent_running: true,
+                .map(|(name, last_status, execute_command_agent_running)| {
+                    shared::dto::ecs::EcsContainer {
+                        name: name.into(),
+                        last_status: last_status.into(),
+                        execute_command_agent_running,
+                    }
                 })
                 .collect(),
             tags: HashMap::new(),
@@ -2150,6 +2167,43 @@ mod tests {
 
         assert!(matches!(action, Action::ShowError(ref msg) if msg.contains("can_use_ecs_exec")));
         assert!(screen.pending_ecs_exec.is_some());
+    }
+
+    #[test]
+    fn container_picker_skips_containers_without_exec_agent() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("app", "RUNNING", true),
+            ("sidecar", "RUNNING", false),
+            ("worker", "STOPPED", true),
+        ])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::Noop));
+        let pending = screen.pending_ecs_exec.as_ref().unwrap();
+        assert_eq!(pending.containers, vec!["app"]);
+    }
+
+    #[test]
+    fn container_picker_errors_when_no_container_is_exec_ready() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("sidecar", "RUNNING", false),
+            ("worker", "STOPPED", true),
+        ])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            matches!(action, Action::ShowError(ref msg) if msg.contains("No containers are ready"))
+        );
+        assert!(screen.pending_ecs_exec.is_none());
+        assert_eq!(screen.test_focus(), "Table");
     }
 
     #[test]
