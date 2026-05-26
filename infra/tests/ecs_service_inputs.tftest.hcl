@@ -87,6 +87,18 @@ run "rejects_invalid_cpu_architecture" {
   ]
 }
 
+run "rejects_invalid_image_tag_format" {
+  command = plan
+
+  variables {
+    image_tag = "-bad"
+  }
+
+  expect_failures = [
+    var.image_tag,
+  ]
+}
+
 run "rejects_latest_image_tag" {
   command = plan
 
@@ -180,6 +192,30 @@ run "rejects_sts_external_id_with_space" {
 
   expect_failures = [
     var.sts_external_id,
+  ]
+}
+
+run "rejects_unsupported_log_retention_days" {
+  command = plan
+
+  variables {
+    log_retention_days = 2
+  }
+
+  expect_failures = [
+    var.log_retention_days,
+  ]
+}
+
+run "rejects_invalid_assumable_role_arn" {
+  command = plan
+
+  variables {
+    assumable_role_arns = ["arn:aws:iam::123456789012:policy/Canopy"]
+  }
+
+  expect_failures = [
+    var.assumable_role_arns,
   ]
 }
 
