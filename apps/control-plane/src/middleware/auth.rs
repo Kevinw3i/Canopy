@@ -129,6 +129,7 @@ mod tests {
             mock_aws_data: None,
             entitlements_file: None,
             entitlements_database_url: None,
+            mfa_database_url: None,
             audit_log: None,
             audit_export: Default::default(),
             cors_allowed_origins: vec![],
@@ -147,6 +148,7 @@ mod tests {
             entitlement_store: Arc::new(tokio::sync::RwLock::new(store)),
             audit_service: AuditService::new(),
             oidc_client: OidcClient::new(test_config().oidc),
+            mfa_store: crate::models::mfa::MfaStore::disabled(),
             base_aws_config,
             ready: std::sync::atomic::AtomicBool::new(true),
         })

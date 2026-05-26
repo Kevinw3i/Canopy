@@ -65,6 +65,7 @@ fn dev_config() -> AppConfig {
         mock_aws_data: None,
         entitlements_file: None,
         entitlements_database_url: None,
+        mfa_database_url: None,
         audit_log: None,
         audit_export: Default::default(),
         cors_allowed_origins: vec![],
@@ -78,6 +79,10 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
 fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_database_url(
+        config.mfa_database_url.as_deref(),
+    )
+    .unwrap();
 
     // Build a minimal SdkConfig without hitting real AWS
     let base_aws_config = aws_config::SdkConfig::builder()
@@ -89,6 +94,7 @@ fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService
         entitlement_store: Arc::new(tokio::sync::RwLock::new(entitlement_store)),
         audit_service,
         oidc_client,
+        mfa_store,
         base_aws_config,
         ready: std::sync::atomic::AtomicBool::new(true),
     })
@@ -662,6 +668,26 @@ async fn mfa_status_returns_provider_and_local_factor_readiness() {
     assert_eq!(json["local_step_up_available"], false);
     assert_eq!(json["factors"][0]["kind"], "totp");
     assert_eq!(json["factors"][1]["kind"], "web_authn");
+}
+
+#[tokio::test]
+async fn mfa_status_reports_configured_local_factor_store() {
+    let db = AuditFile::new("mfa-store");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_get_json(app, "/api/auth/mfa/status", &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["local_step_up_available"], false);
+    assert_eq!(json["factors"][0]["available"], true);
+    assert_eq!(json["factors"][0]["enrolled"], false);
+    assert_eq!(json["factors"][1]["available"], true);
+    assert_eq!(json["factors"][1]["enrolled"], false);
 }
 
 #[tokio::test]

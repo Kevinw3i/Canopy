@@ -1500,6 +1500,7 @@ mod tests {
             mock_aws_data: Some(false),
             entitlements_file: None,
             entitlements_database_url: None,
+            mfa_database_url: None,
             audit_log: None,
             audit_export: Default::default(),
             cors_allowed_origins: vec![],
@@ -1512,6 +1513,7 @@ mod tests {
             )),
             audit_service: crate::services::audit::AuditService::new(),
             oidc_client,
+            mfa_store: crate::models::mfa::MfaStore::disabled(),
             base_aws_config: aws_config::SdkConfig::builder()
                 .region(aws_types::region::Region::new("us-east-1"))
                 .build(),

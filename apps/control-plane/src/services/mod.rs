@@ -8,6 +8,7 @@ pub mod oidc;
 
 use crate::config::AppConfig;
 use crate::models::entitlements::EntitlementStore;
+use crate::models::mfa::MfaStore;
 use aws_config::SdkConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -77,6 +78,7 @@ pub struct AppState {
     pub entitlement_store: Arc<RwLock<EntitlementStore>>,
     pub audit_service: audit::AuditService,
     pub oidc_client: oidc::OidcClient,
+    pub mfa_store: MfaStore,
     pub base_aws_config: SdkConfig,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     pub ready: std::sync::atomic::AtomicBool,
@@ -106,6 +108,7 @@ impl AppState {
         };
 
         let oidc_client = oidc::OidcClient::new(config.oidc.clone());
+        let mfa_store = MfaStore::from_optional_database_url(config.mfa_database_url.as_deref())?;
 
         // Load the base AWS SDK config (uses ambient credentials: env vars,
         // instance profile, ~/.aws/credentials, etc.).
@@ -151,6 +154,7 @@ impl AppState {
             entitlement_store: Arc::new(RwLock::new(entitlement_store)),
             audit_service,
             oidc_client,
+            mfa_store,
             base_aws_config,
             ready: std::sync::atomic::AtomicBool::new(false),
         })

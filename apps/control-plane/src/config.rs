@@ -31,6 +31,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub entitlements_database_url: Option<String>,
 
+    /// SQLite local MFA factor database URL. Supported forms:
+    /// `sqlite:///absolute/path.db` or `sqlite://relative/path.db`.
+    /// If omitted, local TOTP/WebAuthn enrollment remains disabled.
+    #[serde(default)]
+    pub mfa_database_url: Option<String>,
+
     /// Path to the audit log file (JSON-lines). If set, all audit events
     /// are appended here in addition to structured tracing output.
     #[serde(default)]
@@ -253,6 +259,7 @@ impl AppConfig {
             mock_aws_data: None,
             entitlements_file: None,
             entitlements_database_url: None,
+            mfa_database_url: None,
             audit_log: None,
             audit_export: AuditExportConfig::default(),
             cors_allowed_origins: vec![],
@@ -297,6 +304,7 @@ mod tests {
         );
         assert_eq!(config.audit_export.queue_size, 1024);
         assert!(!config.audit_export.is_enabled());
+        assert_eq!(config.mfa_database_url, None);
         config.validate().unwrap();
     }
 
@@ -307,6 +315,7 @@ mod tests {
             dev_mode = true
             mock_aws_data = false
             entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
+            mfa_database_url = "sqlite:///var/lib/canopy/mfa.db"
             audit_log = "/tmp/audit.jsonl"
             cors_allowed_origins = ["http://localhost:3000"]
 
@@ -350,6 +359,10 @@ mod tests {
         assert_eq!(
             config.entitlements_database_url.as_deref(),
             Some("sqlite:///var/lib/canopy/entitlements.db")
+        );
+        assert_eq!(
+            config.mfa_database_url.as_deref(),
+            Some("sqlite:///var/lib/canopy/mfa.db")
         );
         assert_eq!(config.audit_log.as_deref(), Some("/tmp/audit.jsonl"));
         assert_eq!(config.audit_export.queue_size, 2048);

@@ -1,9 +1,10 @@
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use std::sync::Arc;
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::services::AppState;
-use shared::dto::auth::{MfaFactorKind, MfaFactorStatus, MfaStatusResponse};
+use shared::dto::auth::MfaStatusResponse;
+use shared::errors::ApiError;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/api/auth/mfa/status", get(status))
@@ -12,35 +13,37 @@ pub fn router() -> Router<Arc<AppState>> {
 async fn status(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
-) -> Json<MfaStatusResponse> {
+) -> Result<Json<MfaStatusResponse>, (StatusCode, Json<ApiError>)> {
     let provider_step_up_configured = provider_step_up_controls_configured(&state.config);
-    let message = if provider_step_up_configured {
+    let factors = state
+        .mfa_store
+        .factor_statuses(&claims.sub)
+        .map_err(|err| {
+            tracing::error!(error = %err, "Failed to load MFA factor status");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::internal("MFA status unavailable")),
+            )
+        })?;
+    let local_step_up_available = factors
+        .iter()
+        .any(|factor| factor.available && factor.enrolled);
+    let message = if state.mfa_store.is_enabled() {
+        "Local MFA factor store is configured. TOTP/WebAuthn enrollment and step-up enforcement are not enabled yet."
+    } else if provider_step_up_configured {
         "OIDC provider MFA/re-auth controls are configured. Local TOTP/WebAuthn enrollment is not configured yet."
     } else {
         "No OIDC provider MFA/re-auth controls are configured. Local TOTP/WebAuthn enrollment is not configured yet."
     };
 
-    Json(MfaStatusResponse {
+    Ok(Json(MfaStatusResponse {
         user_id: claims.sub,
         provider_step_up_configured,
-        local_step_up_available: false,
+        local_step_up_available,
         step_up_required: false,
-        factors: vec![
-            MfaFactorStatus {
-                kind: MfaFactorKind::Totp,
-                available: false,
-                enrolled: false,
-                label: Some("Authenticator app".into()),
-            },
-            MfaFactorStatus {
-                kind: MfaFactorKind::WebAuthn,
-                available: false,
-                enrolled: false,
-                label: Some("Security key".into()),
-            },
-        ],
+        factors,
         message: message.into(),
-    })
+    }))
 }
 
 fn provider_step_up_controls_configured(config: &crate::config::AppConfig) -> bool {
@@ -92,6 +95,7 @@ mod tests {
             mock_aws_data: None,
             entitlements_file: None,
             entitlements_database_url: None,
+            mfa_database_url: None,
             audit_log: None,
             audit_export: Default::default(),
             cors_allowed_origins: vec![],
