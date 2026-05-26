@@ -305,8 +305,9 @@ TUI                     Control Plane              OIDC Provider
 ### 5.7 設定畫面 (Settings)
 
 - 顯示目前設定：Control Plane URL、開發模式、刷新間隔、Live Tail scrollback
+- 顯示目前 theme preset 與 resolved semantic colors
 - 顯示目前 keybindings：dashboard 導航、quick nav、logout、settings back / change password
-- 提示設定檔路徑；自訂快捷鍵透過 TUI config 的 `[keybindings]` table 設定
+- 提示設定檔路徑；自訂主題與快捷鍵透過 TUI config 的 `[theme]` / `[keybindings]` table 設定
 
 ---
 
@@ -456,6 +457,12 @@ enable_live_tail = false
 auto_update = false              # 啟動時自動檢查 GitHub Releases 更新
 # update_repo_owner = "Kevinw3i" # GitHub owner（預設值）
 # update_repo_name = "Canopy"    # GitHub repo（預設值）
+
+[theme]
+preset = "default"              # default | mono | high_contrast
+# accent = "cyan"               # 色名、indexed:N、ansi:N 或 #RRGGBB
+# selected_bg = "indexed:24"
+# selected_fg = "white"
 
 [keybindings]
 quit = ["ctrl+c"]
@@ -627,5 +634,6 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - [x] OIDC Provider-driven Multi-factor Authentication 支援
 - [ ] 本機 TOTP/WebAuthn 註冊與 step-up UI
 - [x] 自訂快捷鍵設定（dashboard / settings）
-- [ ] 主題與配色自訂
+- [x] 主題與配色自訂（dashboard / settings shell）
+- [ ] 全工作流配色 token 化
 - [ ] 匯出稽核日誌至 CloudWatch Logs / S3

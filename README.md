@@ -292,6 +292,12 @@ auto_update = false            # true = check & apply updates on startup
 # update_repo_owner = "Kevinw3i"  # GitHub owner (default)
 # update_repo_name = "Canopy"     # GitHub repo  (default)
 
+[theme]
+preset = "default"              # default | mono | high_contrast
+# accent = "cyan"               # color name, indexed:N, ansi:N, or #RRGGBB
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
 [keybindings]
 quit = ["ctrl+c"]
 logout = ["ctrl+x"]
@@ -313,6 +319,8 @@ When `auto_update = true`, the TUI checks for new `tui-v*` releases on GitHub at
 - **Read-only install**: shows a banner suggesting a manual download.
 
 Press `Ctrl+D` to dismiss the update banner.
+
+Theme presets and overrides currently apply to the Dashboard and Settings shell. Deeper workflow screens still use their existing semantic status colors.
 
 **How it's loaded:**
 1. If `DEV_MODE=1` → use built-in defaults and ignore the OS config file

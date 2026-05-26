@@ -237,6 +237,7 @@ impl App {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
         let scrollback = config.live_tail_scrollback;
+        let theme = config.theme.resolve()?;
 
         Ok(Self {
             login: LoginScreen::new(config.dev_mode),
@@ -244,12 +245,13 @@ impl App {
                 config.enable_live_tail,
                 config.show_public_ip,
                 config.keybindings.clone(),
+                theme,
             ),
             ec2: Ec2Screen::new(),
             cloudwatch_search: CloudWatchSearchScreen::new(),
             live_tail: LiveTailScreen::new(scrollback),
             access: AccessScreen::new(),
-            settings: SettingsScreen::new(config.clone()),
+            settings: SettingsScreen::new(config.clone(), theme),
             connect_session: None,
             error_modal: ErrorModal::new(),
             config,
@@ -2215,6 +2217,7 @@ impl App {
             update_repo_name: "test".into(),
             change_password_url: None,
             keybindings: crate::keybindings::KeyBindings::default(),
+            theme: crate::theme::ThemeConfig::default(),
         }
     }
 

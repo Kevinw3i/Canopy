@@ -99,9 +99,10 @@ Canopy/
           cloudwatch_search.rs  Quick search + Insights (dual mode)
           live_tail.rs          Pause/resume state machine
           access.rs             User identity, groups, feature flags
-          settings.rs           Current config display
+          settings.rs           Current config and theme display
           error_modal.rs        Overlay error dialog
           loading.rs            Async loading spinner
+        theme.rs                TUI theme presets and color overrides
         widgets/
           input.rs              UTF-8 safe cursor (byte boundaries)
           table.rs              Keyboard-navigable table
@@ -423,6 +424,7 @@ No shared state -- survives restarts and multi-replica routing.
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |
 | `keybindings.*` | built-in defaults | (TUI) Dashboard/settings shortcut overrides |
+| `theme.*` | `default` preset | (TUI) Dashboard/settings theme preset and color overrides |
 
 ## Tests
 

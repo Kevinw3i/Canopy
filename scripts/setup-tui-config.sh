@@ -162,6 +162,12 @@ fi
 
 cat >> "$CONFIG_PATH" <<'TOML'
 
+[theme]
+preset = "default"
+# accent = "cyan"
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
 [keybindings]
 quit = ["ctrl+c"]
 logout = ["ctrl+x"]

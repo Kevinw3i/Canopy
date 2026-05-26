@@ -8,14 +8,16 @@ use super::Component;
 use crate::config::ClientConfig;
 use crate::event::Action;
 use crate::keybindings::KeyBindings;
+use crate::theme::{color_label, Theme};
 
 pub struct SettingsScreen {
     pub config: ClientConfig,
+    theme: Theme,
 }
 
 impl SettingsScreen {
-    pub fn new(config: ClientConfig) -> Self {
-        Self { config }
+    pub fn new(config: ClientConfig, theme: Theme) -> Self {
+        Self { config, theme }
     }
 }
 
@@ -46,47 +48,67 @@ impl Component for SettingsScreen {
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let heading_style = Style::default().fg(self.theme.accent).bold();
+        let label_style = Style::default().fg(self.theme.text).bold();
+        let muted_style = Style::default().fg(self.theme.muted);
+        let body_style = Style::default().fg(self.theme.text);
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" Settings ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(self.theme.accent));
         let inner = outer.inner(area);
         outer.render(area, buf);
 
         let mut lines = vec![
-            Line::from(Span::styled(
-                "Runtime",
-                Style::default().fg(Color::Cyan).bold(),
-            )),
+            Line::from(Span::styled("Runtime", heading_style)),
             Line::from(vec![
-                Span::styled("Control Plane URL:  ", Style::default().bold()),
+                Span::styled("Control Plane URL:  ", label_style),
                 Span::raw(&self.config.control_plane_url),
             ]),
             Line::from(vec![
-                Span::styled("Dev Mode:           ", Style::default().bold()),
+                Span::styled("Dev Mode:           ", label_style),
                 Span::raw(if self.config.dev_mode { "Yes" } else { "No" }),
             ]),
             Line::from(vec![
-                Span::styled("Refresh Interval:   ", Style::default().bold()),
+                Span::styled("Refresh Interval:   ", label_style),
                 Span::raw(format!("{}s", self.config.refresh_interval_secs)),
             ]),
             Line::from(vec![
-                Span::styled("Live Tail Scrollback:", Style::default().bold()),
+                Span::styled("Live Tail Scrollback:", label_style),
                 Span::raw(format!(" {}", self.config.live_tail_scrollback)),
             ]),
-            Line::from(""),
+            Line::from(Span::styled("Theme", heading_style)),
             Line::from(vec![
-                Span::styled("Change Password:    ", Style::default().bold()),
+                Span::styled("Preset:             ", label_style),
+                Span::raw(&self.config.theme.preset),
+            ]),
+            Line::from(vec![
+                Span::styled("Accent/Text/Muted:  ", label_style),
                 Span::raw(format!(
-                    "Press {} to open the password page",
-                    KeyBindings::first_label(&self.config.keybindings.settings_change_password)
+                    "{} / {} / {}",
+                    color_label(self.theme.accent),
+                    color_label(self.theme.text),
+                    color_label(self.theme.muted)
                 )),
             ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Keyboard Shortcuts",
-                Style::default().fg(Color::Cyan).bold(),
-            )),
+            Line::from(vec![
+                Span::styled("Selected:           ", label_style),
+                Span::raw(format!(
+                    "{} on {}",
+                    color_label(self.theme.selected_fg),
+                    color_label(self.theme.selected_bg)
+                )),
+            ]),
+            Line::from(vec![
+                Span::styled("Status:             ", label_style),
+                Span::raw(format!(
+                    "ok {} warn {} err {}",
+                    color_label(self.theme.success),
+                    color_label(self.theme.warning),
+                    color_label(self.theme.danger)
+                )),
+            ]),
+            Line::from(Span::styled("Keyboard Shortcuts", heading_style)),
         ];
 
         let rows = self.config.keybindings.settings_rows();
@@ -101,29 +123,38 @@ impl Component for SettingsScreen {
         }
 
         lines.extend([
-            Line::from(""),
             Line::from(vec![
-                Span::styled("Config File:        ", Style::default().bold()),
+                Span::styled("Config File:        ", label_style),
                 Span::raw(ClientConfig::config_path().display().to_string()),
             ]),
             Line::from(Span::styled(
-                "Edit [keybindings] in the OS config file to customize shortcuts",
-                Style::default().fg(Color::Gray),
+                "Edit [theme] or [keybindings] in the OS config file",
+                muted_style,
             )),
-            Line::from(""),
-            Line::from(format!(
-                "{}: change password | {}: back",
-                KeyBindings::first_label(&self.config.keybindings.settings_change_password),
-                KeyBindings::first_label(&self.config.keybindings.settings_back)
+            Line::from(Span::styled(
+                format!(
+                    "{}: change password | {}: back",
+                    KeyBindings::first_label(&self.config.keybindings.settings_change_password),
+                    KeyBindings::first_label(&self.config.keybindings.settings_back)
+                ),
+                muted_style,
             )),
         ]);
 
-        Paragraph::new(lines).render(inner, buf);
+        Paragraph::new(lines).style(body_style).render(inner, buf);
     }
 }
 
 fn shortcut_cell(name: &str, keys: &str) -> String {
     format!("{name}: {keys}")
+}
+
+#[cfg(test)]
+fn theme_from_config(config: &ClientConfig) -> Theme {
+    config
+        .theme
+        .resolve()
+        .expect("test configs should resolve a valid theme")
 }
 
 #[cfg(test)]
@@ -163,19 +194,35 @@ mod tests {
             update_repo_name: "Canopy".into(),
             change_password_url: None,
             keybindings: crate::keybindings::KeyBindings::default(),
+            theme: crate::theme::ThemeConfig::default(),
         }
+    }
+
+    fn test_theme() -> Theme {
+        theme_from_config(&test_config())
+    }
+
+    fn rendered_text(screen: &mut SettingsScreen) -> String {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        buf.content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
     }
 
     #[test]
     fn p_opens_change_password() {
-        let mut screen = SettingsScreen::new(test_config());
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
         let action = screen.handle_key(key(KeyCode::Char('p')));
         assert!(matches!(action, Action::ChangePassword));
     }
 
     #[test]
     fn modified_p_does_not_open_change_password() {
-        let mut screen = SettingsScreen::new(test_config());
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
         assert!(matches!(
             screen.handle_key(modified_key(KeyCode::Char('p'), KeyModifiers::CONTROL)),
             Action::Noop
@@ -188,7 +235,7 @@ mod tests {
 
     #[test]
     fn esc_and_q_go_back() {
-        let mut screen = SettingsScreen::new(test_config());
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
         assert!(matches!(
             screen.handle_key(key(KeyCode::Esc)),
             Action::GoBack
@@ -204,7 +251,8 @@ mod tests {
         let mut config = test_config();
         config.keybindings.settings_back = vec!["b".into()];
         config.keybindings.settings_change_password = vec!["P".into()];
-        let mut screen = SettingsScreen::new(config);
+        let theme = theme_from_config(&config);
+        let mut screen = SettingsScreen::new(config, theme);
 
         assert!(matches!(
             screen.handle_key(key(KeyCode::Char('q'))),
@@ -225,20 +273,30 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_keyboard_shortcuts() {
-        let mut screen = SettingsScreen::new(test_config());
-        let area = Rect::new(0, 0, 80, 24);
-        let mut buf = Buffer::empty(area);
-        screen.render(area, &mut buf);
+    fn render_shows_keyboard_shortcuts_and_theme_at_80x24() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        let text = rendered_text(&mut screen);
 
-        let text = buf
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
+        assert!(text.contains("Theme"));
+        assert!(text.contains("Preset:"));
         assert!(text.contains("Keyboard Shortcuts"));
         assert!(text.contains("Dashboard select"));
         assert!(text.contains("enter"));
         assert!(text.contains("Config File:"));
+        assert!(text.contains("change password"));
+    }
+
+    #[test]
+    fn render_shows_resolved_high_contrast_theme() {
+        let mut config = test_config();
+        config.theme.preset = "high_contrast".into();
+        let theme = theme_from_config(&config);
+        let mut screen = SettingsScreen::new(config, theme);
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("high_contrast"));
+        assert!(text.contains("yellow / white / white"));
+        assert!(text.contains("black on yellow"));
+        assert!(text.contains("err light_red"));
     }
 }

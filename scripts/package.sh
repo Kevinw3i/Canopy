@@ -82,6 +82,12 @@ enable_live_tail = false
 auto_update = true
 # change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"
 
+[theme]
+preset = "default"
+# accent = "cyan"
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
 [keybindings]
 quit = ["ctrl+c"]
 logout = ["ctrl+x"]

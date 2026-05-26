@@ -290,6 +290,12 @@ auto_update = false            # true = 啟動時檢查並套用更新
 # update_repo_owner = "Kevinw3i"  # GitHub owner（預設值）
 # update_repo_name = "Canopy"     # GitHub repo（預設值）
 
+[theme]
+preset = "default"              # default | mono | high_contrast
+# accent = "cyan"               # 色名、indexed:N、ansi:N 或 #RRGGBB
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
 [keybindings]
 quit = ["ctrl+c"]
 logout = ["ctrl+x"]
@@ -311,6 +317,8 @@ settings_change_password = ["p"]
 - **唯讀安裝**：顯示 banner 提示手動下載更新。
 
 按 `Ctrl+D` 關閉更新 banner。
+
+主題 preset 與覆寫目前套用在 Dashboard 與 Settings shell；較深層工作流畫面仍保留既有語意狀態色。
 
 **載入順序：**
 1. `DEV_MODE=1` → 用內建預設值，並忽略作業系統 config 路徑的設定檔
