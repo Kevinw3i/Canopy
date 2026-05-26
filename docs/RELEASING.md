@@ -242,10 +242,11 @@ Workflow 完成後會推送 image：
 ```
 
 ECR repository 是 immutable，同一個 tag 不能重複推送。需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
-Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先執行
-`scripts/validate-terraform-tfvars.sh infra` 驗證部署 preconditions，再驗證
-entitlements，最後推送到 `<project>/control-plane`。如果 `project` 不是 `canopy`，
-請同步調整 GitHub Actions ECR push role 的 repository ARN。
+Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先以
+`scripts/validate-terraform-tfvars.sh infra -var="create_service=true" -var="image_tag=<release-tag>"`
+驗證 Phase 2 部署 preconditions，再驗證 entitlements，最後推送到
+`<project>/control-plane`。如果 `project` 不是 `canopy`，請同步調整
+GitHub Actions ECR push role 的 repository ARN。
 
 ### 部署到 ECS
 
