@@ -40,6 +40,13 @@ pub enum Action {
     Ec2Loaded(Vec<shared::dto::ec2::Ec2Instance>, Vec<String>, u64), // instances, failed_scopes, generation
     Ec2FetchFailed(String, u64),                                     // error message, generation
     SelectInstance(usize),
+    PowerEc2 {
+        instance_id: String,
+        account_id: String,
+        region: String,
+        action: shared::dto::ec2::Ec2PowerAction,
+        confirmation_instance_id: String,
+    },
     ToggleEcsView,
     RefreshEcsTasks,
     EcsTasksLoaded {

@@ -425,6 +425,15 @@ impl ApiClient {
         .await
     }
 
+    pub async fn power_ec2(&self, request: &Ec2PowerRequest) -> ApiResult<Ec2PowerResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ec2/power", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
     // ── ECS ─────────────────────────────────────────────
 
     pub async fn list_ecs_tasks(&self, request: &EcsTasksRequest) -> ApiResult<EcsTasksResponse> {

@@ -52,10 +52,8 @@ Current actions:
 - `log_group_list`
 - `entitlements_view`
 
-<!-- PHASE2-REMOVE-START -->
-`ec2_power` is schema-reserved for EC2 power actions. The server does not emit
-this action until the Phase 2 control-plane route ships.
-<!-- PHASE2-REMOVE-END -->
+`ec2_power` is emitted by the control-plane when an authorized operator requests
+an EC2 start, stop, or reboot action.
 
 ## Common Metadata Fields
 

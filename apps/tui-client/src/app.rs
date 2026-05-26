@@ -1,6 +1,6 @@
 use anyhow::Result;
 use shared::dto::cloudwatch::FilterLogEventsRequest;
-use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
+use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest, Ec2PowerRequest};
 use shared::dto::ecs::{EcsExecRequest, EcsTasksRequest};
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::pty_spawn::PtySpawnSpec;
@@ -574,6 +574,22 @@ impl App {
             }
             Action::SelectInstance(_idx) => {
                 // handled in component
+            }
+            Action::PowerEc2 {
+                instance_id,
+                account_id,
+                region,
+                action,
+                confirmation_instance_id,
+            } => {
+                self.do_power_ec2(Ec2PowerRequest {
+                    instance_id,
+                    account_id,
+                    region,
+                    action,
+                    confirmation_instance_id,
+                })
+                .await;
             }
             Action::ToggleEcsView => {
                 let follow_up = self.ec2.toggle_inventory_view();
@@ -1340,6 +1356,24 @@ impl App {
                 }
             }
         });
+    }
+
+    async fn do_power_ec2(&mut self, req: Ec2PowerRequest) {
+        match self.api.power_ec2(&req).await {
+            Ok(resp) => {
+                self.error_modal.show(format!(
+                    "{}\nPrevious: {} → Requested: {}",
+                    resp.message, resp.previous_state, resp.requested_state
+                ));
+                self.spawn_ec2_fetch(None);
+            }
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| {
+                    app.error_modal
+                        .show(format!("EC2 power action failed: {}", msg));
+                });
+            }
+        }
     }
 
     fn suspend_for_external_command(&mut self) {

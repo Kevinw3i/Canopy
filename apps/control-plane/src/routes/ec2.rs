@@ -9,7 +9,7 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::services::audit::AuditRequestContext;
 use crate::services::ec2::{
     apply_user_filters, build_connect_command, filter_instances_by_entitlements, mock_instances,
-    AssumedRoleCredentials,
+    power_feature_enabled, requested_state_for_power_action, AssumedRoleCredentials,
 };
 use crate::services::entitlements::EntitlementService;
 use crate::services::AppState;
@@ -22,6 +22,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/ec2/list", post(list_instances))
         .route("/api/ec2/connect", post(connect_instance))
+        .route("/api/ec2/power", post(power_instance))
 }
 
 struct RequiredIamSimulation {
@@ -110,6 +111,174 @@ fn ec2_connect_metadata(ctx: &AuditRequestContext, req: &ConnectRequest) -> serd
         "method": &req.method,
         "os_user": req.os_user.as_deref(),
     }))
+}
+
+fn power_action_iam_name(action: Ec2PowerAction) -> &'static str {
+    match action {
+        Ec2PowerAction::Start => "ec2:StartInstances",
+        Ec2PowerAction::Stop => "ec2:StopInstances",
+        Ec2PowerAction::Reboot => "ec2:RebootInstances",
+    }
+}
+
+fn required_power_simulations(req: &Ec2PowerRequest) -> Vec<RequiredIamSimulation> {
+    vec![
+        RequiredIamSimulation {
+            action: "ec2:DescribeInstances",
+            resources: vec!["*".to_string()],
+        },
+        RequiredIamSimulation {
+            action: power_action_iam_name(req.action),
+            resources: vec![format!(
+                "arn:aws:ec2:{}:{}:instance/{}",
+                req.region, req.account_id, req.instance_id
+            )],
+        },
+    ]
+}
+
+fn required_describe_instance_simulations() -> [RequiredIamSimulation; 1] {
+    [RequiredIamSimulation {
+        action: "ec2:DescribeInstances",
+        resources: vec!["*".to_string()],
+    }]
+}
+
+fn is_local_account(account: &AllowedAccount) -> bool {
+    account.role_arn == "direct" || account.role_arn.starts_with("profile:")
+}
+
+async fn select_account_for_simulations(
+    state: &AppState,
+    candidates: &[AllowedAccount],
+    required_simulations: &[RequiredIamSimulation],
+) -> Option<AllowedAccount> {
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.iter().all(is_local_account) {
+        return candidates.first().cloned();
+    }
+
+    let iam_client = aws_sdk_iam::Client::new(&state.base_aws_config);
+    let mut chosen = None;
+    let mut local_fallback = None;
+    let mut first_assumable = None;
+    let mut all_sim_errored = true;
+
+    for candidate in candidates {
+        if is_local_account(candidate) {
+            if local_fallback.is_none() {
+                local_fallback = Some(candidate.clone());
+            }
+            continue;
+        }
+        if first_assumable.is_none() {
+            first_assumable = Some(candidate.clone());
+        }
+
+        let mut candidate_allowed = true;
+        let mut candidate_sim_errored = false;
+        for required in required_simulations {
+            let mut sim = iam_client
+                .simulate_principal_policy()
+                .policy_source_arn(&candidate.role_arn)
+                .action_names(required.action);
+            for resource in &required.resources {
+                sim = sim.resource_arns(resource);
+            }
+            match sim.send().await {
+                Ok(sim_resp) => {
+                    all_sim_errored = false;
+                    let allowed = sim_resp.evaluation_results().iter().all(|result| {
+                        matches!(
+                            result.eval_decision(),
+                            aws_sdk_iam::types::PolicyEvaluationDecisionType::Allowed
+                        )
+                    });
+                    if !allowed {
+                        candidate_allowed = false;
+                        break;
+                    }
+                }
+                Err(err) => {
+                    candidate_sim_errored = true;
+                    tracing::warn!(
+                        role = %candidate.role_arn,
+                        action = required.action,
+                        error = %err,
+                        "IAM simulation failed, skipping candidate"
+                    );
+                    break;
+                }
+            }
+        }
+        if candidate_sim_errored {
+            continue;
+        }
+        if candidate_allowed {
+            chosen = Some(candidate.clone());
+            break;
+        }
+    }
+
+    if chosen.is_none() && all_sim_errored {
+        if let Some(fallback) = first_assumable {
+            tracing::warn!(
+                "All IAM simulations failed — falling back to first role candidate {}",
+                fallback.role_arn
+            );
+            chosen = Some(fallback);
+        }
+    }
+
+    chosen.or(local_fallback)
+}
+
+fn ec2_power_metadata(
+    ctx: &AuditRequestContext,
+    req: &Ec2PowerRequest,
+    previous_state: Option<&InstanceState>,
+    requested_state: Option<&InstanceState>,
+) -> serde_json::Value {
+    ctx.metadata(serde_json::json!({
+        "power_action": &req.action,
+        "previous_state": previous_state,
+        "requested_state": requested_state,
+        "confirmation_present": !req.confirmation_instance_id.is_empty(),
+    }))
+}
+
+fn sdk_state_name_to_instance_state(
+    state: &aws_sdk_ec2::types::InstanceStateName,
+) -> InstanceState {
+    match state {
+        aws_sdk_ec2::types::InstanceStateName::Pending => InstanceState::Pending,
+        aws_sdk_ec2::types::InstanceStateName::Running => InstanceState::Running,
+        aws_sdk_ec2::types::InstanceStateName::ShuttingDown => InstanceState::ShuttingDown,
+        aws_sdk_ec2::types::InstanceStateName::Terminated => InstanceState::Terminated,
+        aws_sdk_ec2::types::InstanceStateName::Stopping => InstanceState::Stopping,
+        aws_sdk_ec2::types::InstanceStateName::Stopped => InstanceState::Stopped,
+        _ => InstanceState::Pending,
+    }
+}
+
+fn sdk_state_change_current_state(
+    state_change: Option<&aws_sdk_ec2::types::InstanceStateChange>,
+    fallback: InstanceState,
+) -> InstanceState {
+    state_change
+        .and_then(|change| change.current_state())
+        .and_then(|state| state.name())
+        .map(sdk_state_name_to_instance_state)
+        .unwrap_or(fallback)
+}
+
+fn power_success_message(req: &Ec2PowerRequest, requested_state: &InstanceState) -> String {
+    format!(
+        "{} requested for {} (AWS state: {})",
+        req.action, req.instance_id, requested_state
+    )
 }
 
 /// Fetch EC2 instances from real AWS across all allowed account+region pairs.
@@ -395,6 +564,536 @@ async fn list_instances(
         total_count,
         failed_scopes,
     }))
+}
+
+async fn power_instance(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<Ec2PowerRequest>,
+) -> Result<Json<Ec2PowerResponse>, (axum::http::StatusCode, Json<ApiError>)> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal(
+                "Audit logging is unavailable — privileged operations are suspended",
+            )),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let entitlements = ent_service.evaluate(&claims).await;
+
+    if req.confirmation_instance_id != req.instance_id {
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.instance_id))
+            .error(Some("confirmation_mismatch"))
+            .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+            .commit_best_effort();
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(
+                "Confirmation must exactly match the instance id",
+            )),
+        ));
+    }
+
+    if !ent_service
+        .has_feature_for_scope(
+            &claims,
+            &req.account_id,
+            Some(&req.region),
+            None,
+            None,
+            |features| power_feature_enabled(req.action, features),
+        )
+        .await
+    {
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.instance_id))
+            .error(Some("EC2 power action not authorized for this scope"))
+            .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+            .commit_best_effort();
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "EC2 power action not authorized for this scope",
+            )),
+        ));
+    }
+
+    let target_instance = if state.config.use_mock_aws() {
+        let Some(instance) = mock_instances().into_iter().find(|instance| {
+            instance.instance_id == req.instance_id
+                && instance.account_id == req.account_id
+                && instance.region == req.region
+        }) else {
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .error(Some("Instance not found or not authorized"))
+                .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+                .commit_best_effort();
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden("Power action not authorized")),
+            ));
+        };
+        instance
+    } else {
+        let scoped_power_tuples = ent_service
+            .scoped_accounts_for_feature(&claims, |features| {
+                power_feature_enabled(req.action, features)
+            })
+            .await;
+        let matching_accounts: Vec<_> = scoped_power_tuples
+            .into_iter()
+            .filter(|(account, regions)| {
+                account.account_id == req.account_id
+                    && (regions.is_empty() || regions.contains(&req.region))
+            })
+            .map(|(account, _)| account)
+            .collect();
+
+        if matching_accounts.is_empty() {
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .error(Some("Account not in power entitlements"))
+                .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+                .commit_best_effort();
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden("Account not authorized")),
+            ));
+        }
+
+        let describe_simulations = required_describe_instance_simulations();
+        let Some(describe_account) =
+            select_account_for_simulations(&state, &matching_accounts, &describe_simulations).await
+        else {
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .error(Some("No authorized role can describe target instance"))
+                .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+                .commit_best_effort();
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(format!(
+                    "None of the {} authorized roles for account {} can perform {:?}",
+                    matching_accounts.len(),
+                    req.account_id,
+                    simulated_action_names(&describe_simulations)
+                ))),
+            ));
+        };
+
+        let session_ctx = SessionContext {
+            user_id: entitlements.user_id.clone(),
+            team: entitlements
+                .groups
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            environment: state
+                .config
+                .aws
+                .default_region
+                .clone()
+                .unwrap_or_else(|| "production".to_string()),
+            session_duration_seconds: state.config.aws.session_duration_seconds,
+            sts_external_id: state.config.aws.sts_external_id.clone(),
+        };
+        let effective_config = crate::aws::credentials::resolve_aws_config(
+            &state.base_aws_config,
+            &describe_account,
+            &req.region,
+            &session_ctx,
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                "AWS config failed for power action {}: {}",
+                describe_account.role_arn,
+                err
+            );
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Failure)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .error(Some("Failed to get credentials for target account"))
+                .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+                .commit_best_effort();
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::internal(
+                    "Failed to get credentials for target account",
+                )),
+            )
+        })?;
+
+        let ec2_client = AwsClients::ec2(&effective_config);
+        let describe_resp = ec2_client
+            .describe_instances()
+            .instance_ids(&req.instance_id)
+            .send()
+            .await
+            .map_err(|err| {
+                tracing::error!(
+                    "DescribeInstances failed for power action {}: {}",
+                    req.instance_id,
+                    err
+                );
+                state
+                    .audit_service
+                    .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                    .account(Some(&req.account_id))
+                    .region(Some(&req.region))
+                    .target(Some(&req.instance_id))
+                    .error(Some("DescribeInstances failed or target not authorized"))
+                    .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+                    .commit_best_effort();
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden("Power action not authorized")),
+                )
+            })?;
+
+        let Some(sdk_instance) = describe_resp
+            .reservations()
+            .first()
+            .and_then(|reservation| reservation.instances().first())
+        else {
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .error(Some("Instance not found or not authorized"))
+                .metadata(ec2_power_metadata(&audit_ctx, &req, None, None))
+                .commit_best_effort();
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden("Power action not authorized")),
+            ));
+        };
+
+        convert_sdk_instance(sdk_instance, &req.account_id, &req.region)
+    };
+
+    let scoped_target_accounts = ent_service
+        .scoped_accounts_for_ec2_instance_feature(&claims, &target_instance, |features| {
+            power_feature_enabled(req.action, features)
+        })
+        .await;
+
+    if scoped_target_accounts.is_empty() {
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.instance_id))
+            .target_name(target_instance.name.as_deref())
+            .error(Some(
+                "Instance does not match any allowed power-action tag selector",
+            ))
+            .metadata(ec2_power_metadata(
+                &audit_ctx,
+                &req,
+                Some(&target_instance.state),
+                None,
+            ))
+            .commit_best_effort();
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "Instance does not match any allowed power-action tag selector",
+            )),
+        ));
+    }
+
+    let (selected_account, ec2_client) = if state.config.use_mock_aws() {
+        (
+            AllowedAccount {
+                account_id: req.account_id.clone(),
+                account_name: "mock".into(),
+                role_arn: "direct".into(),
+            },
+            None,
+        )
+    } else {
+        let required_simulations = required_power_simulations(&req);
+        let Some(account) =
+            select_account_for_simulations(&state, &scoped_target_accounts, &required_simulations)
+                .await
+        else {
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .target_name(target_instance.name.as_deref())
+                .error(Some("No authorized role can perform power action"))
+                .metadata(ec2_power_metadata(
+                    &audit_ctx,
+                    &req,
+                    Some(&target_instance.state),
+                    None,
+                ))
+                .commit_best_effort();
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(format!(
+                    "None of the {} matching roles for account {} can perform {:?}",
+                    scoped_target_accounts.len(),
+                    req.account_id,
+                    simulated_action_names(&required_simulations)
+                ))),
+            ));
+        };
+
+        let session_ctx = SessionContext {
+            user_id: entitlements.user_id.clone(),
+            team: entitlements
+                .groups
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            environment: state
+                .config
+                .aws
+                .default_region
+                .clone()
+                .unwrap_or_else(|| "production".to_string()),
+            session_duration_seconds: state.config.aws.session_duration_seconds,
+            sts_external_id: state.config.aws.sts_external_id.clone(),
+        };
+        let effective_config = crate::aws::credentials::resolve_aws_config(
+            &state.base_aws_config,
+            &account,
+            &req.region,
+            &session_ctx,
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!(
+                "AWS config failed for power action {}: {}",
+                account.role_arn,
+                err
+            );
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Failure)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .target_name(target_instance.name.as_deref())
+                .error(Some("Failed to get credentials for target account"))
+                .metadata(ec2_power_metadata(
+                    &audit_ctx,
+                    &req,
+                    Some(&target_instance.state),
+                    None,
+                ))
+                .commit_best_effort();
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::internal(
+                    "Failed to get credentials for target account",
+                )),
+            )
+        })?;
+
+        (account, Some(AwsClients::ec2(&effective_config)))
+    };
+
+    let requested_state = match requested_state_for_power_action(req.action, &target_instance.state)
+    {
+        Ok(state) => state,
+        Err(error_kind) => {
+            state
+                .audit_service
+                .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+                .account(Some(&req.account_id))
+                .region(Some(&req.region))
+                .target(Some(&req.instance_id))
+                .target_name(target_instance.name.as_deref())
+                .error(Some(error_kind))
+                .metadata(ec2_power_metadata(
+                    &audit_ctx,
+                    &req,
+                    Some(&target_instance.state),
+                    None,
+                ))
+                .commit_best_effort();
+            return Err((
+                axum::http::StatusCode::CONFLICT,
+                Json(ApiError::new("CONFLICT", error_kind)),
+            ));
+        }
+    };
+
+    let requested_state = if let Some(ec2_client) = ec2_client {
+        match req.action {
+            Ec2PowerAction::Start => {
+                let resp = ec2_client
+                    .start_instances()
+                    .instance_ids(&req.instance_id)
+                    .send()
+                    .await
+                    .map_err(|err| {
+                        tracing::error!("StartInstances failed for {}: {}", req.instance_id, err);
+                        state
+                            .audit_service
+                            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Failure)
+                            .account(Some(&req.account_id))
+                            .region(Some(&req.region))
+                            .target(Some(&req.instance_id))
+                            .target_name(target_instance.name.as_deref())
+                            .error(Some("AWS StartInstances failed"))
+                            .metadata(ec2_power_metadata(
+                                &audit_ctx,
+                                &req,
+                                Some(&target_instance.state),
+                                Some(&requested_state),
+                            ))
+                            .commit_best_effort();
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(ApiError::internal("AWS StartInstances failed")),
+                        )
+                    })?;
+                sdk_state_change_current_state(resp.starting_instances().first(), requested_state)
+            }
+            Ec2PowerAction::Stop => {
+                let resp = ec2_client
+                    .stop_instances()
+                    .instance_ids(&req.instance_id)
+                    .send()
+                    .await
+                    .map_err(|err| {
+                        tracing::error!("StopInstances failed for {}: {}", req.instance_id, err);
+                        state
+                            .audit_service
+                            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Failure)
+                            .account(Some(&req.account_id))
+                            .region(Some(&req.region))
+                            .target(Some(&req.instance_id))
+                            .target_name(target_instance.name.as_deref())
+                            .error(Some("AWS StopInstances failed"))
+                            .metadata(ec2_power_metadata(
+                                &audit_ctx,
+                                &req,
+                                Some(&target_instance.state),
+                                Some(&requested_state),
+                            ))
+                            .commit_best_effort();
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(ApiError::internal("AWS StopInstances failed")),
+                        )
+                    })?;
+                sdk_state_change_current_state(resp.stopping_instances().first(), requested_state)
+            }
+            Ec2PowerAction::Reboot => {
+                ec2_client
+                    .reboot_instances()
+                    .instance_ids(&req.instance_id)
+                    .send()
+                    .await
+                    .map_err(|err| {
+                        tracing::error!("RebootInstances failed for {}: {}", req.instance_id, err);
+                        state
+                            .audit_service
+                            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Failure)
+                            .account(Some(&req.account_id))
+                            .region(Some(&req.region))
+                            .target(Some(&req.instance_id))
+                            .target_name(target_instance.name.as_deref())
+                            .error(Some("AWS RebootInstances failed"))
+                            .metadata(ec2_power_metadata(
+                                &audit_ctx,
+                                &req,
+                                Some(&target_instance.state),
+                                Some(&requested_state),
+                            ))
+                            .commit_best_effort();
+                        (
+                            axum::http::StatusCode::BAD_GATEWAY,
+                            Json(ApiError::internal("AWS RebootInstances failed")),
+                        )
+                    })?;
+                requested_state
+            }
+        }
+    } else {
+        requested_state
+    };
+
+    let response = Ec2PowerResponse {
+        instance_id: req.instance_id.clone(),
+        action: req.action,
+        previous_state: target_instance.state.clone(),
+        requested_state: requested_state.clone(),
+        message: power_success_message(&req, &requested_state),
+    };
+
+    state
+        .audit_service
+        .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Success)
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .target(Some(&req.instance_id))
+        .target_name(target_instance.name.as_deref())
+        .metadata(ec2_power_metadata(
+            &audit_ctx,
+            &req,
+            Some(&response.previous_state),
+            Some(&response.requested_state),
+        ))
+        .commit_or_fail()
+        .map_err(|audit_err| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::internal(format!(
+                    "Power action blocked: audit write failed ({})",
+                    audit_err
+                ))),
+            )
+        })?;
+
+    tracing::info!(
+        role = %selected_account.role_arn,
+        instance_id = %req.instance_id,
+        action = %req.action,
+        "EC2 power action requested"
+    );
+
+    Ok(Json(response))
 }
 
 async fn connect_instance(

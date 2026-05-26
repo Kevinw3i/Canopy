@@ -81,8 +81,8 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # previous_state / requested_state / power_action / confirmation_present
 # （詳見 docs/AUDIT-SCHEMA.md）。
 #
-# ⚠ 此 rule 寫好之後，要等 Phase 2 control-plane `/api/ec2/power`
-#   endpoint 上線才會真正生效（在那之前只是準備權限資料）。
+# control-plane `/api/ec2/power` 會用這個獨立 rule 的 account / region /
+# tag selector scope 做二次授權，通過後才會呼叫 AWS power API。
 
 # [[rules]]
 # id = "rule-platform-eng-power"

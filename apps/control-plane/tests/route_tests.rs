@@ -1520,6 +1520,134 @@ async fn ec2_connect_audit_includes_target_resource_name() {
 }
 
 #[tokio::test]
+async fn ec2_power_stop_succeeds_in_mock_mode_and_audits() {
+    let audit = AuditFile::new("ec2-power-stop");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "i-0123456789abcdef0"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["instance_id"], "i-0123456789abcdef0");
+    assert_eq!(json["action"], "stop");
+    assert_eq!(json["previous_state"], "running");
+    assert_eq!(json["requested_state"], "stopping");
+    assert!(json["message"].as_str().unwrap().contains("stop requested"));
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_power")
+        .expect("ec2 power audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["target_resource_name"], "web-prod-01");
+    assert_eq!(event["metadata"]["power_action"], "stop");
+    assert_eq!(event["metadata"]["previous_state"], "running");
+    assert_eq!(event["metadata"]["requested_state"], "stopping");
+    assert_eq!(event["metadata"]["confirmation_present"], true);
+}
+
+#[tokio::test]
+async fn ec2_power_rejects_confirmation_mismatch_and_audits() {
+    let audit = AuditFile::new("ec2-power-confirmation-mismatch");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "wrong-instance"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BAD_REQUEST");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_power")
+        .expect("ec2 power denied audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["error_message"], "confirmation_mismatch");
+    assert_eq!(event["metadata"]["power_action"], "stop");
+    assert_eq!(event["metadata"]["confirmation_present"], true);
+}
+
+#[tokio::test]
+async fn ec2_power_denied_for_readonly_user() {
+    let config = dev_config();
+    let token = issue_readonly_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0cde3456fgh78901c",
+        "account_id": "222222222222",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "i-0cde3456fgh78901c"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn ec2_power_rejects_invalid_state_transition_and_audits() {
+    let audit = AuditFile::new("ec2-power-state-conflict");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "start",
+        "confirmation_instance_id": "i-0123456789abcdef0"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["code"], "CONFLICT");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_power")
+        .expect("ec2 power conflict audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["target_resource_name"], "web-prod-01");
+    assert_eq!(event["error_message"], "already_in_target_or_transition");
+    assert_eq!(event["metadata"]["power_action"], "start");
+    assert_eq!(event["metadata"]["previous_state"], "running");
+    assert!(event["metadata"]["requested_state"].is_null());
+}
+
+#[tokio::test]
 async fn ec2_connect_denied_for_readonly_user() {
     // readonly-ops group has can_use_ssm=false
     let config = dev_config();

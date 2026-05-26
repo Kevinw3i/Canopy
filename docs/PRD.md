@@ -294,6 +294,7 @@ TUI                     Control Plane              OIDC Provider
 | GET | `/api/entitlements` | 取得目前使用者的完整權限 |
 | POST | `/api/ec2/list` | 列出 EC2 執行個體（伺服器端過濾） |
 | POST | `/api/ec2/connect` | 取得連線指令與憑證 |
+| POST | `/api/ec2/power` | 對單一 EC2 執行 start / stop / reboot（需 typed confirmation） |
 | POST | `/api/cloudwatch/log-groups` | 列出允許的 Log Groups |
 | POST | `/api/cloudwatch/filter-events` | 執行 FilterLogEvents 搜尋 |
 | POST | `/api/cloudwatch/insights/start` | 啟動 Logs Insights 查詢 |
@@ -339,6 +340,7 @@ TUI                     Control Plane              OIDC Provider
 | 服務 | API | 用途 |
 |------|-----|------|
 | EC2 | `DescribeInstances` | 列出執行個體 |
+| EC2 | `StartInstances` / `StopInstances` / `RebootInstances` | 高風險 power actions |
 | CloudWatch Logs | `DescribeLogGroups` | 列出 Log Groups |
 | CloudWatch Logs | `FilterLogEvents` | 快速搜尋 |
 | CloudWatch Logs | `StartQuery` | 啟動 Insights 查詢 |

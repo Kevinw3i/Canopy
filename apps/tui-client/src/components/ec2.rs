@@ -3,7 +3,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Paragraph, Row, Wrap},
 };
-use shared::dto::ec2::Ec2Instance;
+use shared::dto::ec2::{Ec2Instance, Ec2PowerAction, InstanceState};
 use shared::dto::ecs::EcsTask;
 use shared::dto::entitlements::UserEntitlements;
 
@@ -20,6 +20,8 @@ enum Ec2Focus {
     OsUserSelect,
     /// ECS container picker before execute-command
     ContainerPicker,
+    /// EC2 start/stop/reboot confirmation popup
+    PowerConfirm,
 }
 
 /// Pending connect action waiting for OS user selection
@@ -51,6 +53,16 @@ struct PendingEcsExec {
     task_arn: String,
     containers: Vec<String>,
     selected: usize,
+}
+
+struct PendingPowerAction {
+    instance_id: String,
+    instance_name: Option<String>,
+    account_id: String,
+    region: String,
+    current_state: InstanceState,
+    action: Ec2PowerAction,
+    confirmation: TextInput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +128,7 @@ pub struct Ec2Screen {
     show_detail: bool,
     pending_connect: Option<PendingConnect>,
     pending_ecs_exec: Option<PendingEcsExec>,
+    pending_power: Option<PendingPowerAction>,
     state_filter: StateFilter,
 
     // Scope selection for account/region cycling
@@ -195,6 +208,7 @@ impl Ec2Screen {
             show_detail: false,
             pending_connect: None,
             pending_ecs_exec: None,
+            pending_power: None,
             state_filter: StateFilter::All,
             selected_account_id: None,
             selected_region: None,
@@ -439,6 +453,9 @@ impl Ec2Screen {
                 .as_ref()
                 .map(|e| e.features.can_use_ec2_instance_connect)
                 .unwrap_or(false);
+            let has_start = self.has_power_entitlement(Ec2PowerAction::Start);
+            let has_stop = self.has_power_entitlement(Ec2PowerAction::Stop);
+            let has_reboot = self.has_power_entitlement(Ec2PowerAction::Reboot);
 
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -537,6 +554,68 @@ impl Ec2Screen {
                         Style::default().fg(Color::Yellow),
                     )));
                 }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Power:",
+                Style::default().bold().fg(Color::Red),
+            )));
+            if has_start {
+                let (label, style) = if inst.state == InstanceState::Stopped {
+                    (" - ready", Style::default().fg(Color::Green))
+                } else {
+                    (" - requires stopped", Style::default().fg(Color::Gray))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  [S] ", Style::default().fg(Color::Green).bold()),
+                    Span::styled("Start", Style::default().fg(Color::White)),
+                    Span::styled(label, style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  [S] ", Style::default().fg(Color::Gray)),
+                    Span::styled("Start", Style::default().fg(Color::Gray)),
+                    Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                ]));
+            }
+
+            if has_stop {
+                let (label, style) = if inst.state == InstanceState::Running {
+                    (" - ready", Style::default().fg(Color::Green))
+                } else {
+                    (" - requires running", Style::default().fg(Color::Gray))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  [X] ", Style::default().fg(Color::Red).bold()),
+                    Span::styled("Stop", Style::default().fg(Color::White)),
+                    Span::styled(label, style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  [X] ", Style::default().fg(Color::Gray)),
+                    Span::styled("Stop", Style::default().fg(Color::Gray)),
+                    Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                ]));
+            }
+
+            if has_reboot {
+                let (label, style) = if inst.state == InstanceState::Running {
+                    (" - ready", Style::default().fg(Color::Green))
+                } else {
+                    (" - requires running", Style::default().fg(Color::Gray))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  [B] ", Style::default().fg(Color::Yellow).bold()),
+                    Span::styled("Reboot", Style::default().fg(Color::White)),
+                    Span::styled(label, style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  [B] ", Style::default().fg(Color::Gray)),
+                    Span::styled("Reboot", Style::default().fg(Color::Gray)),
+                    Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                ]));
             }
 
             Paragraph::new(lines)
@@ -639,6 +718,59 @@ impl Ec2Screen {
         Action::Noop
     }
 
+    fn has_power_entitlement(&self, action: Ec2PowerAction) -> bool {
+        self.entitlements
+            .as_ref()
+            .map(|entitlements| match action {
+                Ec2PowerAction::Start => entitlements.features.can_start_ec2,
+                Ec2PowerAction::Stop => entitlements.features.can_stop_ec2,
+                Ec2PowerAction::Reboot => entitlements.features.can_reboot_ec2,
+            })
+            .unwrap_or(false)
+    }
+
+    fn start_power_action(&mut self, action: Ec2PowerAction) -> Action {
+        if self.loading {
+            return Action::Noop;
+        }
+        let Some(inst) = self.selected_instance() else {
+            return Action::Noop;
+        };
+        if !self.has_power_entitlement(action) {
+            return Action::ShowError(format!("EC2 {} is not authorized for this user", action));
+        }
+
+        match action {
+            Ec2PowerAction::Start if inst.state != InstanceState::Stopped => {
+                return Action::ShowError("Start is only available for stopped instances".into());
+            }
+            Ec2PowerAction::Stop | Ec2PowerAction::Reboot
+                if inst.state != InstanceState::Running =>
+            {
+                return Action::ShowError(format!(
+                    "{} is only available for running instances",
+                    action
+                ));
+            }
+            _ => {}
+        }
+
+        let mut confirmation = TextInput::new("Type instance id to confirm");
+        confirmation.focused = true;
+
+        self.pending_power = Some(PendingPowerAction {
+            instance_id: inst.instance_id.clone(),
+            instance_name: inst.name.clone(),
+            account_id: inst.account_id.clone(),
+            region: inst.region.clone(),
+            current_state: inst.state.clone(),
+            action,
+            confirmation,
+        });
+        self.focus = Ec2Focus::PowerConfirm;
+        Action::Noop
+    }
+
     /// Clear instance list and selection to prevent stale cross-scope actions.
     fn clear_instances(&mut self) {
         // Advance generation first so any in-flight response is rejected
@@ -653,6 +785,7 @@ impl Ec2Screen {
         self.focus = Ec2Focus::Table;
         self.pending_connect = None;
         self.pending_ecs_exec = None;
+        self.pending_power = None;
         self.search_input.clear();
     }
 
@@ -886,6 +1019,44 @@ impl Component for Ec2Screen {
             }
         }
 
+        if matches!(self.focus, Ec2Focus::PowerConfirm) {
+            if let Some(ref mut pending) = self.pending_power {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.pending_power = None;
+                        self.focus = Ec2Focus::DetailPanel;
+                        return Action::Noop;
+                    }
+                    KeyCode::Enter => {
+                        if pending.confirmation.value != pending.instance_id {
+                            pending.confirmation.clear();
+                            return Action::ShowError(
+                                "Confirmation must exactly match the instance id".into(),
+                            );
+                        }
+                        let instance_id = pending.instance_id.clone();
+                        let account_id = pending.account_id.clone();
+                        let region = pending.region.clone();
+                        let action = pending.action;
+                        let confirmation_instance_id = pending.confirmation.value.clone();
+                        self.pending_power = None;
+                        self.focus = Ec2Focus::DetailPanel;
+                        return Action::PowerEc2 {
+                            instance_id,
+                            account_id,
+                            region,
+                            action,
+                            confirmation_instance_id,
+                        };
+                    }
+                    _ => {
+                        pending.confirmation.handle_key(key);
+                        return Action::Noop;
+                    }
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char('e')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -904,7 +1075,8 @@ impl Component for Ec2Screen {
                         self.focus = Ec2Focus::Table;
                     }
                     Ec2Focus::Table => return Action::GoBack,
-                    Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker => {} // handled above
+                    Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker | Ec2Focus::PowerConfirm => {
+                    } // handled above
                 }
                 Action::Noop
             }
@@ -934,9 +1106,10 @@ impl Component for Ec2Screen {
                     }
                     Action::Noop
                 }
-                Ec2Focus::DetailPanel | Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker => {
-                    Action::Noop
-                }
+                Ec2Focus::DetailPanel
+                | Ec2Focus::OsUserSelect
+                | Ec2Focus::ContainerPicker
+                | Ec2Focus::PowerConfirm => Action::Noop,
             },
             // `[` / `]` → cycle account
             KeyCode::Char('[') if !matches!(self.focus, Ec2Focus::SearchBox) => {
@@ -1025,6 +1198,24 @@ impl Component for Ec2Screen {
             {
                 self.start_connect(shared::dto::ec2::ConnectMethod::Ssh)
             }
+            KeyCode::Char('S')
+                if self.view == InventoryView::Ec2
+                    && matches!(self.focus, Ec2Focus::DetailPanel) =>
+            {
+                self.start_power_action(Ec2PowerAction::Start)
+            }
+            KeyCode::Char('X')
+                if self.view == InventoryView::Ec2
+                    && matches!(self.focus, Ec2Focus::DetailPanel) =>
+            {
+                self.start_power_action(Ec2PowerAction::Stop)
+            }
+            KeyCode::Char('B')
+                if self.view == InventoryView::Ec2
+                    && matches!(self.focus, Ec2Focus::DetailPanel) =>
+            {
+                self.start_power_action(Ec2PowerAction::Reboot)
+            }
             _ => {
                 match self.focus {
                     Ec2Focus::SearchBox => {
@@ -1037,7 +1228,8 @@ impl Component for Ec2Screen {
                             self.table.handle_key(key);
                         }
                     }
-                    Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker => {} // handled above
+                    Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker | Ec2Focus::PowerConfirm => {
+                    } // handled above
                 }
                 Action::Noop
             }
@@ -1048,6 +1240,12 @@ impl Component for Ec2Screen {
         if matches!(self.focus, Ec2Focus::SearchBox) {
             self.search_input
                 .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+        } else if matches!(self.focus, Ec2Focus::PowerConfirm) {
+            if let Some(ref mut pending) = self.pending_power {
+                pending
+                    .confirmation
+                    .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+            }
         }
         Action::Noop
     }
@@ -1134,7 +1332,7 @@ impl Component for Ec2Screen {
             )
         } else if self.show_detail {
             format!(
-                "{} | Ctrl+E: ECS | f: filter | s: SSM | e: EIC | c: SSH | r: refresh | Esc: close",
+                "{} | Ctrl+E: ECS | s/e/c: connect | S/X/B: power | r: refresh | Esc: close",
                 count_display
             )
         } else {
@@ -1173,6 +1371,10 @@ impl Component for Ec2Screen {
 
         if let Some(ref pending) = self.pending_ecs_exec {
             self.render_container_picker(inner, buf, pending);
+        }
+
+        if let Some(ref pending) = self.pending_power {
+            self.render_power_confirmation(inner, buf, pending);
         }
 
         // Scope transition overlay
@@ -1311,6 +1513,83 @@ impl Ec2Screen {
 
         Paragraph::new(lines).render(inner, buf);
     }
+
+    fn render_power_confirmation(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        pending: &PendingPowerAction,
+    ) {
+        use ratatui::widgets::Clear;
+
+        let popup_width = 72u16.min(area.width.saturating_sub(4));
+        let popup_height = 14u16.min(area.height.saturating_sub(4));
+        let popup_area = Rect {
+            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        Clear.render(popup_area, buf);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" EC2 {} — Confirm ", pending.action))
+            .border_style(Style::default().fg(Color::Red).bold());
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let action_style = match pending.action {
+            Ec2PowerAction::Start => Style::default().fg(Color::Green).bold(),
+            Ec2PowerAction::Stop => Style::default().fg(Color::Red).bold(),
+            Ec2PowerAction::Reboot => Style::default().fg(Color::Yellow).bold(),
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Action:   ", Style::default().fg(Color::Gray)),
+                Span::styled(pending.action.to_string(), action_style),
+            ]),
+            Line::from(vec![
+                Span::styled("Instance: ", Style::default().fg(Color::Gray)),
+                Span::styled(&pending.instance_id, Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(vec![
+                Span::styled("Name:     ", Style::default().fg(Color::Gray)),
+                Span::raw(pending.instance_name.as_deref().unwrap_or("-")),
+            ]),
+            Line::from(vec![
+                Span::styled("Scope:    ", Style::default().fg(Color::Gray)),
+                Span::raw(format!("{} / {}", pending.account_id, pending.region)),
+            ]),
+            Line::from(vec![
+                Span::styled("State:    ", Style::default().fg(Color::Gray)),
+                Span::raw(pending.current_state.to_string()),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Type the full instance id below. The typed value is never stored in audit logs.",
+                Style::default().fg(Color::Red),
+            )),
+        ];
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(chunks[0], buf);
+        pending.confirmation.render(chunks[1], buf);
+        Paragraph::new("Enter: submit | Esc: cancel")
+            .style(Style::default().fg(Color::Gray))
+            .render(chunks[2], buf);
+    }
 }
 
 #[cfg(test)]
@@ -1322,6 +1601,7 @@ impl Ec2Screen {
             Ec2Focus::DetailPanel => "DetailPanel",
             Ec2Focus::OsUserSelect => "OsUserSelect",
             Ec2Focus::ContainerPicker => "ContainerPicker",
+            Ec2Focus::PowerConfirm => "PowerConfirm",
         }
     }
 }
@@ -1501,6 +1781,14 @@ mod tests {
         ent.features.can_view_ecs = true;
         ent.features.can_use_ecs_exec = can_exec;
         ent.allowed_clusters = vec!["arn:aws:ecs:us-east-1:111:cluster/app".into()];
+        ent
+    }
+
+    fn power_entitlements() -> UserEntitlements {
+        let mut ent = test_entitlements();
+        ent.features.can_start_ec2 = true;
+        ent.features.can_stop_ec2 = true;
+        ent.features.can_reboot_ec2 = true;
         ent
     }
 
@@ -1772,6 +2060,82 @@ mod tests {
         ));
         assert!(screen.pending_ecs_exec.is_none());
         assert_eq!(screen.test_focus(), "Table");
+    }
+
+    #[test]
+    fn power_key_opens_confirmation_from_detail_panel() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.handle_key(key(KeyCode::Enter));
+
+        let action = screen.handle_key(key(KeyCode::Char('X')));
+
+        assert!(matches!(action, Action::Noop));
+        assert_eq!(screen.test_focus(), "PowerConfirm");
+        assert!(matches!(
+            screen.pending_power.as_ref().map(|pending| pending.action),
+            Some(Ec2PowerAction::Stop)
+        ));
+    }
+
+    #[test]
+    fn power_confirmation_dispatches_exact_instance_id() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Char('B')));
+        screen.handle_paste("i-1");
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::PowerEc2 {
+                ref instance_id,
+                action: Ec2PowerAction::Reboot,
+                ref confirmation_instance_id,
+                ..
+            } if instance_id == "i-1" && confirmation_instance_id == "i-1"
+        ));
+        assert!(screen.pending_power.is_none());
+        assert_eq!(screen.test_focus(), "DetailPanel");
+    }
+
+    #[test]
+    fn power_confirmation_rejects_mismatch_locally() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![stopped_instance("i-2")]);
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Char('S')));
+        screen.handle_paste("wrong");
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ShowError(ref msg) if msg.contains("exactly match")
+        ));
+        assert!(screen.pending_power.is_some());
+        assert_eq!(screen.test_focus(), "PowerConfirm");
+    }
+
+    #[test]
+    fn power_start_requires_stopped_instance() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.handle_key(key(KeyCode::Enter));
+
+        let action = screen.handle_key(key(KeyCode::Char('S')));
+
+        assert!(matches!(
+            action,
+            Action::ShowError(ref msg) if msg.contains("stopped")
+        ));
+        assert!(screen.pending_power.is_none());
     }
 
     #[test]
