@@ -21,6 +21,66 @@ variables {
   oidc_client_id  = "test-client-id"
 }
 
+run "rejects_invalid_aws_region" {
+  command = plan
+
+  variables {
+    aws_region = "not-a-region"
+  }
+
+  expect_failures = [
+    var.aws_region,
+  ]
+}
+
+run "rejects_invalid_project_name" {
+  command = plan
+
+  variables {
+    project = "Canopy"
+  }
+
+  expect_failures = [
+    var.project,
+  ]
+}
+
+run "rejects_non_canonical_vpc_cidr" {
+  command = plan
+
+  variables {
+    vpc_cidr = "10.200.0.1/16"
+  }
+
+  expect_failures = [
+    var.vpc_cidr,
+  ]
+}
+
+run "rejects_too_few_public_subnet_cidrs" {
+  command = plan
+
+  variables {
+    public_subnet_cidrs = ["10.200.0.0/24"]
+  }
+
+  expect_failures = [
+    var.public_subnet_cidrs,
+  ]
+}
+
+run "rejects_invalid_private_subnet_cidr" {
+  command = plan
+
+  variables {
+    private_subnet_cidrs = ["10.200.10.0/24", "10.200.999.0/24"]
+  }
+
+  expect_failures = [
+    var.private_subnet_cidrs,
+  ]
+}
+
 run "public_alb_rejects_world_cidr_without_opt_in" {
   command = plan
 
