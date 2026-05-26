@@ -228,8 +228,11 @@ curl -s https://$(terraform output -raw alb_dns_name)/health
 
 ## 銷毀
 
+`terraform destroy` 會刪除 Terraform 管理的 ECS/ALB/IAM/CloudWatch/Route 53
+資源。ECR repository 設有 `prevent_destroy = true` 且 `force_delete = false`，
+因此不會連同 image 被自動刪除；JWT/OIDC Secrets Manager secrets 也是
+out-of-band 建立並以 ARN 傳入，不會由 Terraform destroy 刪除。
+
 ```bash
 terraform destroy
 ```
-
-> 注意：這會刪除所有資源，包括 ECR 裡的 image 和 Secrets Manager 的 secret。
