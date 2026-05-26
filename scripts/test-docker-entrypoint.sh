@@ -25,6 +25,29 @@ cat "$CONFIG_PATH"
 SH
 chmod +x "$TMP_DIR/control-plane"
 
+expect_entrypoint_failure() {
+  local name="$1"
+  local expected="$2"
+  shift 2
+
+  set +e
+  env \
+    PATH="$TMP_DIR:$PATH" \
+    GENERATE_CONFIG=1 \
+    "$@" \
+    sh "$ENTRYPOINT" > "$TMP_DIR/$name.out" 2> "$TMP_DIR/$name.err"
+  status=$?
+  set -e
+
+  if [ "$status" -eq 0 ]; then
+    echo "ERROR: expected $name to fail." >&2
+    cat "$TMP_DIR/$name.out" >&2
+    exit 1
+  fi
+
+  grep -q -- "$expected" "$TMP_DIR/$name.err"
+}
+
 CONFIG_OUT="$TMP_DIR/generated.toml"
 
 env \
@@ -64,39 +87,37 @@ assert data["cors_allowed_origins"] == [
 ]
 PY
 
-set +e
-env \
-  PATH="$TMP_DIR:$PATH" \
-  GENERATE_CONFIG=1 \
+expect_entrypoint_failure \
+  "missing-jwt-secret" \
+  "JWT_SECRET is not set and no JWT_SECRET_ARN configured" \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client'
+
+expect_entrypoint_failure \
+  "missing-oidc-issuer" \
+  "OIDC_ISSUER_URL is required in generated config mode" \
+  JWT_SECRET='jwt' \
+  OIDC_CLIENT_ID='client'
+
+expect_entrypoint_failure \
+  "missing-oidc-client-id" \
+  "OIDC_CLIENT_ID is required in generated config mode" \
+  JWT_SECRET='jwt' \
+  OIDC_ISSUER_URL='https://issuer.example'
+
+expect_entrypoint_failure \
+  "newline" \
+  "TOML string values must not contain newlines" \
   JWT_SECRET='jwt' \
   OIDC_ISSUER_URL='https://issuer.example' \
-  OIDC_CLIENT_ID=$'client\nid' \
-  sh "$ENTRYPOINT" > "$TMP_DIR/newline.out" 2> "$TMP_DIR/newline.err"
-newline_status=$?
-set -e
+  OIDC_CLIENT_ID=$'client\nid'
 
-if [ "$newline_status" -eq 0 ]; then
-  echo "ERROR: expected newline-containing TOML value to fail." >&2
-  exit 1
-fi
-grep -q "TOML string values must not contain newlines" "$TMP_DIR/newline.err"
-
-set +e
-env \
-  PATH="$TMP_DIR:$PATH" \
-  GENERATE_CONFIG=1 \
+expect_entrypoint_failure \
+  "expiry" \
+  "JWT_EXPIRY_SECONDS must be a positive integer" \
   JWT_SECRET='jwt' \
   OIDC_ISSUER_URL='https://issuer.example' \
   OIDC_CLIENT_ID='client' \
-  JWT_EXPIRY_SECONDS='3600x' \
-  sh "$ENTRYPOINT" > "$TMP_DIR/expiry.out" 2> "$TMP_DIR/expiry.err"
-expiry_status=$?
-set -e
-
-if [ "$expiry_status" -eq 0 ]; then
-  echo "ERROR: expected non-numeric JWT_EXPIRY_SECONDS to fail." >&2
-  exit 1
-fi
-grep -q "JWT_EXPIRY_SECONDS must be a positive integer" "$TMP_DIR/expiry.err"
+  JWT_EXPIRY_SECONDS='3600x'
 
 echo "docker-entrypoint generated config tests passed."
