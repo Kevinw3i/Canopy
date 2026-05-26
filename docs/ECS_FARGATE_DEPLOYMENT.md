@@ -70,6 +70,9 @@ aws ecr get-login-password --region ap-northeast-1 | \
 
 ```bash
 # 在專案根目錄執行（因為 Dockerfile 需要 workspace context）
+# entitlements.toml 必須先準備完成；若尚未建立，先完成 Step 5。
+# Docker build 會把它 bake 進 image。
+test -s entitlements.toml
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 CPU_ARCH=${CPU_ARCH:-X86_64}
@@ -78,6 +81,11 @@ case "$CPU_ARCH" in
   ARM64) PLATFORM="linux/arm64" ;;
   *) echo "Unsupported CPU_ARCH: $CPU_ARCH"; exit 1 ;;
 esac
+
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
 DOCKER_BUILDKIT=1 docker build \
   --platform "$PLATFORM" \
@@ -153,6 +161,8 @@ ENTITLEMENTS_FILE=/etc/canopy/entitlements.toml
 
 ## Step 5: 準備 entitlements build secret
 
+這一步必須在 Step 2 build image 之前完成。
+
 `entitlements.toml` 不 commit 到 repo，也不要放進 Terraform state。正式 image
 build 時透過 BuildKit secret 注入，Dockerfile 會把檔案 bake 到
 `/etc/canopy/entitlements.toml` 並設為唯讀。
@@ -161,7 +171,10 @@ build 時透過 BuildKit secret 注入，Dockerfile 會把檔案 bake 到
 cp entitlements.sample.toml entitlements.toml
 vi entitlements.toml
 
-./scripts/validate-terraform-tfvars.sh infra
+VERSION=${VERSION:-$(git describe --tags --always)}
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
 
@@ -518,6 +531,8 @@ canopy.your-domain.com  CNAME  canopy-alb-xxxx.ap-northeast-1.elb.amazonaws.com
 
 ```bash
 # 1. Build & push 新 image
+VERSION=v0.2.0
+test -s entitlements.toml
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in
@@ -526,16 +541,21 @@ case "$CPU_ARCH" in
   *) echo "Unsupported CPU_ARCH: $CPU_ARCH"; exit 1 ;;
 esac
 
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
 DOCKER_BUILDKIT=1 docker build \
   --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
-  -t canopy/control-plane:v0.2.0 \
+  -t canopy/control-plane:$VERSION \
   -f apps/control-plane/Dockerfile .
-docker tag canopy/control-plane:v0.2.0 \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:v0.2.0
+docker tag canopy/control-plane:$VERSION \
+  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:$VERSION
 docker push \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:v0.2.0
+  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:$VERSION
 
 # 2. 更新 task definition 的 image tag
 #    （編輯 task-def.json 改 image tag，重新 register）
