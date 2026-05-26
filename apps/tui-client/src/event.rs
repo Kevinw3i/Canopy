@@ -135,6 +135,8 @@ pub enum Action {
     StopLiveTail,
     PauseLiveTail,
     ResumeLiveTail,
+    LiveTailConnected,
+    LiveTailReconnecting,
     RefreshLiveTailLogGroups,
     LiveTailLogGroupsLoaded {
         groups: Vec<shared::dto::cloudwatch::LogGroup>,

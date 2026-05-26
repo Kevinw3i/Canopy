@@ -887,11 +887,25 @@ impl App {
             Action::ResumeLiveTail => {
                 self.live_tail.set_connected();
             }
+            Action::LiveTailConnected => {
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.set_connected();
+                }
+            }
+            Action::LiveTailReconnecting => {
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.set_reconnecting();
+                }
+            }
             Action::LiveTailEvent(event) => {
-                self.live_tail.push_event(event);
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.push_event(event);
+                }
             }
             Action::LiveTailSessionUpdate { events_per_second } => {
-                self.live_tail.set_events_per_second(events_per_second);
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.set_events_per_second(events_per_second);
+                }
             }
             Action::RefreshLiveTailLogGroups => {
                 self.spawn_live_tail_log_groups_fetch();

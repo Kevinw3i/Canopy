@@ -500,9 +500,10 @@ impl Component for LiveTailScreen {
                 }
             }
             KeyCode::Char('s') => match self.state {
-                TailState::Stopped | TailState::Reconnecting => Action::StartLiveTail,
-                TailState::Running => Action::StopLiveTail,
-                TailState::Paused => Action::StopLiveTail,
+                TailState::Stopped => Action::StartLiveTail,
+                TailState::Running | TailState::Paused | TailState::Reconnecting => {
+                    Action::StopLiveTail
+                }
             },
             KeyCode::Char('p') => match self.state {
                 TailState::Running => Action::PauseLiveTail,
@@ -1194,6 +1195,14 @@ mod tests {
     fn s_stops_when_running() {
         let mut screen = LiveTailScreen::new(1000);
         screen.set_connected();
+        let action = screen.handle_key(key(KeyCode::Char('s')));
+        assert!(matches!(action, Action::StopLiveTail));
+    }
+
+    #[test]
+    fn s_stops_when_reconnecting() {
+        let mut screen = LiveTailScreen::new(1000);
+        screen.set_reconnecting();
         let action = screen.handle_key(key(KeyCode::Char('s')));
         assert!(matches!(action, Action::StopLiveTail));
     }
