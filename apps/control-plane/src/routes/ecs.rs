@@ -263,13 +263,25 @@ fn cluster_request_matches_any_rule_scope(
             return true;
         };
 
+        if let Some((cluster_region, cluster_account)) = cluster
+            .starts_with("arn:")
+            .then(|| ecs_arn_region_account(cluster))
+            .flatten()
+        {
+            return account_ids
+                .iter()
+                .any(|account_id| account_id == cluster_account)
+                && regions
+                    .iter()
+                    .any(|region| region == "*" || region == cluster_region)
+                && scope.cluster_patterns.iter().any(|pattern| {
+                    crate::services::ecs::cluster_matches_pattern(pattern, cluster)
+                });
+        }
+
         for account_id in &account_ids {
             for region in &regions {
-                let cluster_ref = if cluster.starts_with("arn:") {
-                    cluster.to_string()
-                } else {
-                    cluster_arn(region, account_id, cluster)
-                };
+                let cluster_ref = cluster_arn(region, account_id, cluster);
                 if scope.cluster_patterns.iter().any(|pattern| {
                     crate::services::ecs::cluster_matches_pattern(pattern, &cluster_ref)
                 }) {
@@ -1456,6 +1468,22 @@ mod tests {
             "us-east-1",
             &cluster_arn("us-east-1", "111111111111", "other-cluster")
         ));
+    }
+
+    #[test]
+    fn cluster_request_scope_rejects_cluster_arn_outside_rule_region() {
+        let mut scope = route_scope();
+        let cluster = cluster_arn("ap-northeast-1", "111111111111", "app");
+        scope.regions = vec!["us-east-1".into()];
+        scope.cluster_patterns = vec![cluster.clone()];
+        let req = EcsTasksRequest {
+            account_id: None,
+            region: None,
+            cluster: Some(cluster),
+            page_size: 50,
+        };
+
+        assert!(validate_tasks_request_scope(&req, &[scope]).is_err());
     }
 
     #[test]
