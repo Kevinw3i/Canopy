@@ -173,6 +173,10 @@ terraform -chdir=infra apply tfplan.phase2
 
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
+ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
+ECR_REPOSITORY=$(echo "$ECR_URL" | cut -d/ -f2-)
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
@@ -184,6 +188,29 @@ case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm
   -var="image_tag=$VERSION"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
+terraform -chdir=infra plan \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION" \
+  -out=tfplan.phase2
+
+if TAG_CHECK_OUTPUT=$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$VERSION" 2>&1); then
+  echo "$TAG_CHECK_OUTPUT"
+  echo "ECR image tag already exists: $VERSION"
+  exit 1
+else
+  TAG_CHECK_STATUS=$?
+  if ! grep -q "ImageNotFoundException" <<< "$TAG_CHECK_OUTPUT"; then
+    echo "$TAG_CHECK_OUTPUT"
+    exit "$TAG_CHECK_STATUS"
+  fi
+fi
+
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
 # Build + push（帶 platform 和 entitlements）
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
@@ -193,15 +220,13 @@ DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
 docker push "$ECR_URL:$VERSION"
 
 # 用新版 image tag 更新 Terraform（ECR 是 IMMUTABLE，不再使用 latest）
-cd infra
-terraform apply \
-  -var="create_service=true" \
-  -var="image_tag=$VERSION"
+terraform -chdir=infra apply tfplan.phase2
 
 # 等待部署完成
 aws ecs wait services-stable \
-  --cluster $(terraform output -raw ecs_cluster_name) \
-  --services $(terraform output -raw ecs_service_name)
+  --cluster $(cd infra && terraform output -raw ecs_cluster_name) \
+  --services $(cd infra && terraform output -raw ecs_service_name) \
+  --region "$AWS_REGION"
 ```
 
 ## 修改基礎設施
