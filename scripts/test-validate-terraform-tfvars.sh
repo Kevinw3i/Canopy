@@ -73,8 +73,29 @@ expect_failure() {
     exit 1
   fi
 
-  grep -q "$expected" "$TMP_DIR/$name.out"
+  grep -q -- "$expected" "$TMP_DIR/$name.out"
 }
+
+expect_failure_in_dir() {
+  local name="$1"
+  local expected="$2"
+  local terraform_dir="$3"
+  shift 3
+
+  if "$VALIDATOR" "$terraform_dir" "$@" > "$TMP_DIR/$name.out" 2>&1; then
+    cat "$TMP_DIR/$name.out" >&2
+    echo "ERROR: expected $name to fail." >&2
+    exit 1
+  fi
+
+  grep -q -- "$expected" "$TMP_DIR/$name.out"
+}
+
+expect_failure_in_dir "missing-terraform-dir" "Terraform dir not found" "$TMP_DIR/missing-infra"
+
+MISSING_TFVARS_DIR="$TMP_DIR/missing-tfvars"
+mkdir "$MISSING_TFVARS_DIR"
+expect_failure_in_dir "missing-tfvars" "Terraform tfvars not found" "$MISSING_TFVARS_DIR"
 
 write_valid_tfvars
 expect_success "valid-tfvars"
