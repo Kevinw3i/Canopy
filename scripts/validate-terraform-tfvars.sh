@@ -2,6 +2,9 @@
 set -euo pipefail
 
 TERRAFORM_DIR="${1:-infra}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
 TFVARS_PATH="$TERRAFORM_DIR/terraform.tfvars"
 
 fail() {
@@ -37,6 +40,6 @@ run "deployment_tfvars_plan" {
 EOF
 
 TF_DATA_DIR="$TF_DATA_DIR_PATH" terraform -chdir="$TERRAFORM_DIR" init -backend=false -input=false >/dev/null
-TF_DATA_DIR="$TF_DATA_DIR_PATH" terraform -chdir="$TERRAFORM_DIR" test -test-directory="$TEST_DIR"
+TF_DATA_DIR="$TF_DATA_DIR_PATH" terraform -chdir="$TERRAFORM_DIR" test -test-directory="$TEST_DIR" "$@"
 
 echo "Terraform deployment tfvars validation passed."

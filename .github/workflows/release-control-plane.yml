@@ -117,7 +117,9 @@ jobs:
           fi
 
           printf '%s' "${TERRAFORM_TFVARS_B64}" | base64 -d > infra/terraform.tfvars
-          ./scripts/validate-terraform-tfvars.sh infra
+          ./scripts/validate-terraform-tfvars.sh infra \
+            -var="create_service=true" \
+            -var="image_tag=${{ steps.meta.outputs.image_tag }}"
           ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
       - name: Resolve Terraform deployment settings

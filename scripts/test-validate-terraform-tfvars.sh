@@ -53,8 +53,9 @@ write_valid_tfvars() {
 
 expect_success() {
   local name="$1"
+  shift
 
-  if ! "$VALIDATOR" "$INFRA_DIR" > "$TMP_DIR/$name.out" 2>&1; then
+  if ! "$VALIDATOR" "$INFRA_DIR" "$@" > "$TMP_DIR/$name.out" 2>&1; then
     cat "$TMP_DIR/$name.out" >&2
     echo "ERROR: expected $name to pass." >&2
     exit 1
@@ -64,8 +65,9 @@ expect_success() {
 expect_failure() {
   local name="$1"
   local expected="$2"
+  shift 2
 
-  if "$VALIDATOR" "$INFRA_DIR" > "$TMP_DIR/$name.out" 2>&1; then
+  if "$VALIDATOR" "$INFRA_DIR" "$@" > "$TMP_DIR/$name.out" 2>&1; then
     cat "$TMP_DIR/$name.out" >&2
     echo "ERROR: expected $name to fail." >&2
     exit 1
@@ -76,6 +78,15 @@ expect_failure() {
 
 write_valid_tfvars
 expect_success "valid-tfvars"
+
+write_valid_tfvars
+cat >> "$INFRA_DIR/terraform.tfvars" <<'EOF'
+jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
+EOF
+expect_success \
+  "phase-two-overrides" \
+  -var="create_service=true" \
+  -var="image_tag=cp-v0.1.0"
 
 write_tfvars '["0.0.0.0/0"]' "false"
 expect_failure "public-world-cidr" "Public ALB cannot allow 0.0.0.0/0"
