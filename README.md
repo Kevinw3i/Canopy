@@ -499,8 +499,8 @@ Each operator runs one command:
 The script automatically:
 1. Installs the `canopy` binary to `/usr/local/bin/`
 2. Creates the TUI config file (URL already filled in, OS-specific path)
-3. Installs AWS CLI v2 if missing
-4. Installs Session Manager Plugin if missing
+3. Installs AWS CLI v2 if missing (needed for SSM/EIC/ECS Exec connection flows)
+4. Installs Session Manager Plugin if missing (needed for SSM/ECS Exec)
 5. Removes macOS Gatekeeper quarantine flag if needed
 6. Runs a full verification check
 
