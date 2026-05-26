@@ -515,10 +515,10 @@ Each operator runs one command:
 ```
 
 The script automatically:
-1. Installs the `canopy` binary to `/usr/local/bin/`
+1. Installs the `canopy` binary to `~/.local/bin/` by default (`CANOPY_BIN_DIR` can override it)
 2. Creates the TUI config file (URL already filled in, OS-specific path)
-3. Installs AWS CLI v2 if missing (needed for SSM/EIC/ECS Exec connection flows)
-4. Installs Session Manager Plugin if missing (needed for SSM/ECS Exec)
+3. Installs AWS CLI v2 if missing when installer verification is available; otherwise prompts for manual install (needed for SSM/EIC/ECS Exec connection flows)
+4. Installs Session Manager Plugin if missing on macOS; Linux operators get a manual install prompt until verified installer signature support is configured (needed for SSM/ECS Exec)
 5. Removes macOS Gatekeeper quarantine flag if needed
 6. Runs a full verification check
 

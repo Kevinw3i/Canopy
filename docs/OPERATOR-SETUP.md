@@ -99,10 +99,10 @@ cd canopy-dist
 
 完成。安裝腳本會自動：
 
-1. 安裝 `canopy` 二進位檔到 `/usr/local/bin/`
+1. 預設安裝 `canopy` 二進位檔到 `~/.local/bin/`（可用 `CANOPY_BIN_DIR` 覆寫）
 2. 建立 TUI 設定檔（URL 已預填，路徑依作業系統決定）
-3. 偵測 AWS CLI v2（用於 SSM/EIC/ECS Exec 連線），沒有就自動安裝
-4. 偵測 Session Manager Plugin（用於 SSM/ECS Exec），沒有就自動安裝
+3. 偵測 AWS CLI v2（用於 SSM/EIC/ECS Exec 連線）；可完成 installer 驗證時自動安裝，否則提示手動安裝
+4. 偵測 Session Manager Plugin（用於 SSM/ECS Exec）；macOS 會自動安裝，Linux 在可信簽章驗證支援完成前會提示手動安裝
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
 6. 跑完整驗證，逐項報告結果
 
@@ -121,7 +121,7 @@ canopy
 ```
 install.sh
 ├── 1. 偵測作業系統和 CPU 架構
-├── 2. 安裝二進位檔 → /usr/local/bin/canopy
+├── 2. 安裝二進位檔 → ${CANOPY_BIN_DIR:-$HOME/.local/bin}/canopy
 ├── 3. macOS: 移除 Gatekeeper 隔離標記
 ├── 4. 建立設定檔
 │      ├── macOS → ~/Library/Application Support/canopy/config.toml
@@ -129,10 +129,11 @@ install.sh
 │      （如果已存在則跳過，不覆寫）
 ├── 5. 檢查 AWS CLI v2（SSM/EIC/ECS Exec 連線需要）
 │      ├── 已安裝 → 跳過
-│      └── 未安裝 → 下載並安裝（macOS .pkg / Linux .zip）
+│      └── 未安裝 → 下載並驗證後安裝（macOS pkg 簽章 / Linux zip GPG 簽章；無 GnuPG 時提示手動安裝）
 ├── 6. 檢查 Session Manager Plugin（SSM/ECS Exec 需要）
 │      ├── 已安裝 → 跳過
-│      └── 未安裝 → 下載並安裝（macOS .pkg / Linux .deb/.rpm）
+│      ├── macOS 未安裝 → 下載並驗證 pkg 簽章後安裝
+│      └── Linux 未安裝 → 提示手動安裝（未設定可信 installer 簽章驗證）
 └── 7. 驗證
        ├── canopy 可執行
        ├── 設定檔存在且格式正確
@@ -179,7 +180,7 @@ echo $LANG    # 期望：包含 UTF-8
 ### Q: 想完全移除
 
 ```bash
-sudo rm /usr/local/bin/canopy
+rm -f ~/.local/bin/canopy
 rm -rf "$HOME/Library/Application Support/canopy"  # macOS
 rm -rf ~/.config/canopy ~/.local/share/canopy      # Linux
 ```
@@ -190,7 +191,7 @@ rm -rf ~/.config/canopy ~/.local/share/canopy      # Linux
 
 | 檔案 | 路徑 | 用途 |
 |------|------|------|
-| 二進位檔 | `/usr/local/bin/canopy` | TUI 主程式 |
+| 二進位檔 | `~/.local/bin/canopy`（或 `CANOPY_BIN_DIR`） | TUI 主程式 |
 | 設定檔（macOS） | `~/Library/Application Support/canopy/config.toml` | 客戶端設定（URL 已預填） |
 | 設定檔（Linux） | `${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml` | 客戶端設定（URL 已預填） |
 | Token 快取（macOS） | `~/Library/Application Support/canopy/token` | 登入後自動建立，權限 0600 |

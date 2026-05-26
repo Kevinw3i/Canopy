@@ -525,7 +525,7 @@ group = "platform-engineering"
 6. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
 7. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
 8. 分發 `dist/` 資料夾給維運人員
-9. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔、AWS CLI、SSM Plugin）
+9. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔；可驗證時自動安裝 AWS CLI；macOS 自動安裝 SSM Plugin，Linux 提示手動安裝）
 
 ECS 部署不需要 commit 或掛載生產 `config.toml`。Terraform task definition
 會設定 `GENERATE_CONFIG=1`，container entrypoint 會從環境變數與

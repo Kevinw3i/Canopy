@@ -18,6 +18,9 @@ Describe the change and why it is needed.
 - [ ] `bash -n scripts/deploy-control-plane-local.sh`
 - [ ] `bash -n scripts/test-deploy-control-plane-local.sh`
 - [ ] `scripts/test-deploy-control-plane-local.sh`
+- [ ] `bash -n scripts/package.sh`
+- [ ] `bash -n scripts/test-package.sh`
+- [ ] `scripts/test-package.sh`
 - [ ] `sh -n scripts/docker-entrypoint.sh`
 - [ ] `bash -n scripts/test-docker-entrypoint.sh`
 - [ ] `scripts/test-docker-entrypoint.sh`

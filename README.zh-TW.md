@@ -510,10 +510,10 @@ dist/
 ```
 
 腳本會自動：
-1. 安裝 `canopy` 二進位檔到 `/usr/local/bin/`
+1. 預設安裝 `canopy` 二進位檔到 `~/.local/bin/`（可用 `CANOPY_BIN_DIR` 覆寫）
 2. 建立 TUI 設定檔（URL 已預填，路徑依作業系統決定）
-3. 偵測並安裝 AWS CLI v2（如果沒有；SSM/EIC/ECS Exec 連線需要）
-4. 偵測並安裝 Session Manager Plugin（如果沒有；SSM/ECS Exec 需要）
+3. 偵測 AWS CLI v2；可完成 installer 驗證時自動安裝，否則提示手動安裝（SSM/EIC/ECS Exec 連線需要）
+4. macOS 會偵測並安裝 Session Manager Plugin；Linux 在可信簽章驗證支援完成前會提示手動安裝（SSM/ECS Exec 需要）
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
 6. 跑完整驗證檢查
 
