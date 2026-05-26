@@ -458,6 +458,25 @@ expect_failure \
   "$TMP_DIR/gov.tfvars" \
   "can_use_ssm=true but no allowed_os_users"
 
+cat > "$TMP_DIR/ssm-misplaced-os-users-entitlements.toml" <<EOF
+[[rules]]
+id = "ssm-misplaced-os-users"
+
+[rules.features]
+can_use_ssm = true
+allowed_os_users = ["ec2-user"]
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "ssm-misplaced-os-users" \
+  "$TMP_DIR/ssm-misplaced-os-users-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "can_use_ssm=true but no allowed_os_users"
+
 cat > "$TMP_DIR/single-quoted-os-users-entitlements.toml" <<EOF
 [[rules]]
 id = "single-quoted-os-users"
