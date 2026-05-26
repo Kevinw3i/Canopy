@@ -75,11 +75,12 @@ aws ecr get-login-password --region ap-northeast-1 | \
 test -s entitlements.toml
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in
   X86_64) PLATFORM="linux/amd64" ;;
   ARM64) PLATFORM="linux/arm64" ;;
-  *) echo "Unsupported CPU_ARCH: $CPU_ARCH"; exit 1 ;;
+  *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;;
 esac
 
 ./scripts/validate-terraform-tfvars.sh infra \
@@ -106,7 +107,7 @@ docker push \
 ECR tag 應使用 git tag 或 commit hash；不要使用 `latest`，因為 Terraform
 範本將 repository 設為 immutable。
 
-`CPU_ARCH` 必須和 ECS task definition 的 `runtimePlatform.cpuArchitecture`
+`--platform` 必須和 `terraform.tfvars` 中的 `cpu_architecture`
 一致：`X86_64` 對應 `linux/amd64`，`ARM64` 對應 `linux/arm64`。
 
 ---
@@ -536,11 +537,12 @@ canopy.your-domain.com  CNAME  canopy-alb-xxxx.ap-northeast-1.elb.amazonaws.com
 VERSION=v0.2.0
 test -s entitlements.toml
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in
   X86_64) PLATFORM="linux/amd64" ;;
   ARM64) PLATFORM="linux/arm64" ;;
-  *) echo "Unsupported CPU_ARCH: $CPU_ARCH"; exit 1 ;;
+  *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;;
 esac
 
 ./scripts/validate-terraform-tfvars.sh infra \
