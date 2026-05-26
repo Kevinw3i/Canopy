@@ -1,4 +1,6 @@
 aws_region         = "ap-northeast-1"
+# Project is used in ALB, target group, ECR, ECS, IAM, and log names.
+# project            = "canopy"
 
 # Networking:
 # Option A: use existing VPC/subnets.

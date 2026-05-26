@@ -10,6 +10,15 @@ variable "project" {
   description = "Project name used in resource naming"
   type        = string
   default     = "canopy"
+
+  validation {
+    condition = (
+      length(var.project) >= 1 &&
+      length(var.project) <= 28 &&
+      can(regex("^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", var.project))
+    )
+    error_message = "project must be 1-28 characters, use only lowercase letters, numbers, and hyphens, and not start or end with a hyphen."
+  }
 }
 
 # ── Networking ──────────────────────────────────────────

@@ -178,6 +178,7 @@ encrypt        = true
 | `jwt_secret_arn` | Yes | Secrets Manager ARN（JWT 簽署密鑰，須在 Terraform 外建立） |
 | `oidc_issuer_url` | Yes | OIDC provider URL |
 | `oidc_client_id` | Yes | OIDC client ID |
+| `project` | No | 預設 `canopy`；1-28 字元，僅 lowercase letters、numbers、hyphens，且不可頭尾 hyphen |
 | `image_tag` | Phase 2 | 版本 tag 或 git SHA（不可使用 `latest`）；`create_service = false` 的 Phase 1 可留空 |
 | `alb_allowed_cidrs` | Yes | ALB 入站允許的 IPv4 CIDR 清單 |
 | `aws_region` | No | 預設 `ap-northeast-1` |
