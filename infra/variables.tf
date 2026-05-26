@@ -318,10 +318,27 @@ variable "sts_external_id" {
   description = "STS ExternalId used in cross-account AssumeRole calls. Must match the target account's trust policy."
   type        = string
   default     = "canopy"
+
+  validation {
+    condition = (
+      length(var.sts_external_id) >= 2 &&
+      length(var.sts_external_id) <= 1224 &&
+      can(regex("^[A-Za-z0-9_+=,.@:/-]+$", var.sts_external_id))
+    )
+    error_message = "sts_external_id must be 2-1224 characters and may contain only alphanumeric characters plus _+=,.@:/-."
+  }
 }
 
 variable "assumable_role_arns" {
   description = "IAM role ARNs that the control-plane task role is allowed to assume (cross-account)"
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.assumable_role_arns :
+      can(regex("^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$", arn))
+    ])
+    error_message = "assumable_role_arns must contain concrete IAM role ARNs without wildcards."
+  }
 }
