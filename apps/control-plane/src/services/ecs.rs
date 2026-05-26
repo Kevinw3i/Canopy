@@ -292,6 +292,9 @@ pub fn build_ecs_exec_command(
             return Err("Container is excluded by ECS sidecar denylist".into());
         }
     }
+    if !task.enable_execute_command {
+        return Err("ECS Exec is not enabled for this task".into());
+    }
 
     let Some(container) = task
         .containers
@@ -558,6 +561,43 @@ mod tests {
         let err = build_ecs_exec_command(&req, &entitlements(), &task, None, &[rule_scope()])
             .unwrap_err();
         assert!(err.contains("sidecar denylist"));
+    }
+
+    #[test]
+    fn build_ecs_exec_command_denies_task_without_execute_command() {
+        let task = mock_tasks().remove(1);
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "worker".into(),
+        };
+
+        let err = build_ecs_exec_command(&req, &entitlements(), &task, None, &[rule_scope()])
+            .unwrap_err();
+
+        assert!(err.contains("ECS Exec is not enabled"));
+    }
+
+    #[test]
+    fn build_ecs_exec_command_checks_scope_before_task_exec_state() {
+        let task = mock_tasks().remove(1);
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "worker".into(),
+        };
+        let mut scope = rule_scope();
+        scope.allow_selectors = vec![TagSelector {
+            tags: HashMap::from([("Service".into(), vec!["web".into()])]),
+        }];
+
+        let err = build_ecs_exec_command(&req, &entitlements(), &task, None, &[scope]).unwrap_err();
+
+        assert!(err.contains("allowed ECS scope"));
     }
 
     #[test]
