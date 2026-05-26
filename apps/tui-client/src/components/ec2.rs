@@ -339,11 +339,35 @@ impl Ec2Screen {
         }
     }
 
-    pub fn toggle_inventory_view(&mut self) -> Action {
-        self.view = match self.view {
+    fn can_view_inventory(&self, view: InventoryView) -> bool {
+        match self.entitlements.as_ref() {
+            Some(ent) => match view {
+                InventoryView::Ec2 => ent.features.can_view_ec2,
+                InventoryView::Ecs => ent.features.can_view_ecs,
+            },
+            None => true,
+        }
+    }
+
+    fn toggle_target(&self) -> InventoryView {
+        match self.view {
             InventoryView::Ec2 => InventoryView::Ecs,
             InventoryView::Ecs => InventoryView::Ec2,
-        };
+        }
+    }
+
+    fn toggle_hint(&self) -> Option<&'static str> {
+        let target = self.toggle_target();
+        self.can_view_inventory(target).then_some(target.label())
+    }
+
+    pub fn toggle_inventory_view(&mut self) -> Action {
+        let target = self.toggle_target();
+        if !self.can_view_inventory(target) {
+            return Action::ShowError(format!("{} inventory is not authorized", target.label()));
+        }
+
+        self.view = target;
         self.clear_instances();
         match self.view {
             InventoryView::Ec2 => Action::RefreshEc2,
@@ -1321,25 +1345,47 @@ impl Component for Ec2Screen {
             format!("{}/{} [{}]", filtered_count, total_count, filter_label)
         };
 
+        let toggle_hint = self.toggle_hint();
         let status = if self.loading {
             format!("Loading {}...", self.view.label())
         } else if let Some(ref err) = self.error {
             format!("Error: {}", err)
         } else if self.view == InventoryView::Ecs {
-            format!(
-                "{} | Ctrl+E: EC2 | /: search | r: refresh | Enter: containers | Esc: back",
-                count_display
-            )
+            if let Some(target) = toggle_hint {
+                format!(
+                    "{} | Ctrl+E: {} | /: search | r: refresh | Enter: containers | Esc: back",
+                    count_display, target
+                )
+            } else {
+                format!(
+                    "{} | /: search | r: refresh | Enter: containers | Esc: back",
+                    count_display
+                )
+            }
         } else if self.show_detail {
-            format!(
-                "{} | Ctrl+E: ECS | s/e/c: connect | S/X/B: power | r: refresh | Esc: close",
-                count_display
-            )
+            if let Some(target) = toggle_hint {
+                format!(
+                    "{} | Ctrl+E: {} | s/e/c: connect | S/X/B: power | r: refresh | Esc: close",
+                    count_display, target
+                )
+            } else {
+                format!(
+                    "{} | s/e/c: connect | S/X/B: power | r: refresh | Esc: close",
+                    count_display
+                )
+            }
         } else {
-            format!(
-                "{} | Ctrl+E: ECS | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
-                count_display
-            )
+            if let Some(target) = toggle_hint {
+                format!(
+                    "{} | Ctrl+E: {} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
+                    count_display, target
+                )
+            } else {
+                format!(
+                    "{} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
+                    count_display
+                )
+            }
         };
 
         let status_style = if self.error.is_some() {
@@ -1736,6 +1782,18 @@ mod tests {
         }
     }
 
+    fn rendered_text(screen: &mut Ec2Screen) -> String {
+        let area = Rect::new(0, 0, 140, 40);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut out = String::new();
+        for cell in &buf.content {
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
     fn test_entitlements() -> UserEntitlements {
         UserEntitlements {
             user_id: "u1".into(),
@@ -1935,6 +1993,60 @@ mod tests {
         assert_eq!(screen.view, InventoryView::Ecs);
         let actions = screen.on_enter();
         assert!(actions.iter().any(|a| matches!(a, Action::RefreshEcsTasks)));
+    }
+
+    #[test]
+    fn ecs_view_only_user_cannot_toggle_to_ec2() {
+        let mut screen = Ec2Screen::new();
+        let mut ent = ecs_entitlements(false);
+        ent.features.can_view_ec2 = false;
+        screen.set_entitlements(ent);
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::ShowError(ref msg) if msg.contains("EC2")));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert!(screen.toggle_hint().is_none());
+    }
+
+    #[test]
+    fn ec2_view_only_user_cannot_toggle_to_ecs() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(test_entitlements());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::ShowError(ref msg) if msg.contains("ECS")));
+        assert_eq!(screen.view, InventoryView::Ec2);
+        assert!(screen.toggle_hint().is_none());
+    }
+
+    #[test]
+    fn status_hides_toggle_hint_without_target_entitlement() {
+        let mut screen = Ec2Screen::new();
+        let mut ent = ecs_entitlements(false);
+        ent.features.can_view_ec2 = false;
+        screen.set_entitlements(ent);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(!text.contains("Ctrl+E:"));
+        assert!(text.contains("/: search"));
+        assert!(text.contains("Enter: containers"));
+    }
+
+    #[test]
+    fn status_shows_toggle_hint_when_target_entitled() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+
+        let ec2_text = rendered_text(&mut screen);
+        assert!(ec2_text.contains("Ctrl+E: ECS"));
+
+        let action = screen.toggle_inventory_view();
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        let ecs_text = rendered_text(&mut screen);
+        assert!(ecs_text.contains("Ctrl+E: EC2"));
     }
 
     // ── State filter ──
