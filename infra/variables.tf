@@ -221,12 +221,22 @@ variable "jwt_expiry_seconds" {
   description = "Internal JWT expiry"
   type        = number
   default     = 3600
+
+  validation {
+    condition     = var.jwt_expiry_seconds > 0 && var.jwt_expiry_seconds == floor(var.jwt_expiry_seconds)
+    error_message = "jwt_expiry_seconds must be a positive whole number."
+  }
 }
 
 variable "aws_session_duration_seconds" {
   description = "STS AssumeRole session duration"
   type        = number
   default     = 3600
+
+  validation {
+    condition     = var.aws_session_duration_seconds >= 900 && var.aws_session_duration_seconds <= 43200 && var.aws_session_duration_seconds == floor(var.aws_session_duration_seconds)
+    error_message = "aws_session_duration_seconds must be a whole number between 900 and 43200 seconds."
+  }
 }
 
 variable "cors_allowed_origins" {

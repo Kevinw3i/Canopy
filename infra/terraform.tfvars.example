@@ -36,6 +36,10 @@ alb_allowed_cidrs = ["10.0.0.0/16"]
 oidc_issuer_url = "https://accounts.google.com"
 oidc_client_id  = "your-client-id"
 
+# Runtime defaults generated into config.toml by the ECS entrypoint.
+# jwt_expiry_seconds            = 3600
+# aws_session_duration_seconds  = 3600
+
 # STS ExternalId for cross-account AssumeRole (must match target trust policy)
 # sts_external_id = "my-custom-external-id"
 
