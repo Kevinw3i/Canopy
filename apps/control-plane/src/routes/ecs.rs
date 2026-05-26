@@ -1401,6 +1401,50 @@ async fn exec_task(
 mod tests {
     use super::*;
 
+    fn non_mock_exec_state() -> AppState {
+        let config = crate::config::AppConfig {
+            bind_address: "127.0.0.1:8443".into(),
+            oidc: crate::config::OidcConfig {
+                issuer_url: "https://example.com".into(),
+                client_id: "test-client".into(),
+                client_secret: None,
+                scopes: vec!["openid".into()],
+                authorization_endpoint: None,
+                token_endpoint: None,
+                device_authorization_endpoint: None,
+                userinfo_endpoint: None,
+                jwks_uri: None,
+            },
+            jwt: crate::config::JwtConfig {
+                secret: "test-secret-at-least-32-chars-long!!".into(),
+                expiry_seconds: 3600,
+            },
+            aws: crate::config::AwsConfig {
+                default_region: Some("us-east-1".into()),
+                session_duration_seconds: Some(3600),
+                sts_external_id: Some("canopy".into()),
+            },
+            dev_mode: true,
+            mock_aws_data: Some(false),
+            entitlements_file: None,
+            audit_log: None,
+            cors_allowed_origins: vec![],
+        };
+        let oidc_client = crate::services::oidc::OidcClient::new(config.oidc.clone());
+        AppState {
+            config,
+            entitlement_store: Arc::new(tokio::sync::RwLock::new(
+                crate::models::entitlements::EntitlementStore::dev_defaults(),
+            )),
+            audit_service: crate::services::audit::AuditService::new(),
+            oidc_client,
+            base_aws_config: aws_config::SdkConfig::builder()
+                .region(aws_types::region::Region::new("us-east-1"))
+                .build(),
+            ready: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
     fn route_scope() -> crate::services::ecs::EcsRuleScope {
         crate::services::ecs::EcsRuleScope {
             accounts: vec![AllowedAccount {
@@ -1713,6 +1757,35 @@ mod tests {
     fn first_assumable_account_returns_none_for_local_only_entries() {
         let accounts = vec![account("direct"), account("profile:ops")];
         assert!(first_assumable_account(&accounts).is_none());
+    }
+
+    #[test]
+    fn select_account_for_describe_rejects_local_only_credentials() {
+        let state = non_mock_exec_state();
+        let err = select_account_for_describe(
+            &state,
+            vec![account("direct"), account("profile:ops")],
+            &exec_req(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+        assert!(err.1 .0.message.contains("AssumeRole ARN"));
+    }
+
+    #[tokio::test]
+    async fn select_account_for_exec_rejects_local_only_credentials() {
+        let state = non_mock_exec_state();
+        let err = select_account_for_exec(
+            &state,
+            vec![account("direct"), account("profile:ops")],
+            &exec_req(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+        assert!(err.1 .0.message.contains("AssumeRole ARN"));
     }
 
     #[test]
