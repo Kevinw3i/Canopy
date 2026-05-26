@@ -40,6 +40,11 @@ can_use_ec2_instance_connect = true
 # can_start_ec2 = false
 # can_stop_ec2 = false
 # can_reboot_ec2 = false
+# ── ECS task inventory / exec（預設 false）────────────
+# 建議用下方獨立 ECS rule 授權，避免和 EC2 / CloudWatch
+# rule 的範圍混在一起。
+# can_view_ecs = false
+# can_use_ecs_exec = false
 
 [[rules.allowed_accounts]]
 account_id = "<ACCOUNT_ID>"                    # ← 改成你的 AWS 帳號 ID
@@ -98,6 +103,45 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # [[rules.instance_tag_selectors]]
 # [rules.instance_tag_selectors.tags]
 # Environment = ["staging"]
+
+
+# ── 群組 1C：平台工程 ECS task / exec（獨立 scope）────────
+#
+# `can_view_ecs` 只允許在 TUI 的 ECS view 看到授權 cluster/task。
+# `can_use_ecs_exec` 允許進入 task container，必須同時有
+# `can_view_ecs = true`，而且必須設定 allowed_clusters。
+#
+# ECS Exec 會固定執行 `/bin/sh`，不接受使用者自訂 command；
+# control-plane 會先檢查 task/container scope、sidecar denylist、
+# IAM simulation 與 audit fail-closed。
+#
+# [[rules]]
+# id = "rule-platform-eng-ecs"
+# group = "platform-engineering"
+# allowed_regions = ["ap-northeast-1"]
+# allowed_clusters = [
+#     "arn:aws:ecs:ap-northeast-1:<ACCOUNT_ID>:cluster/prod-app",
+# ]
+# excluded_container_names = ["envoy", "xray-daemon", "log-router"]
+#
+# [rules.features]
+# can_view_ecs = true
+# can_use_ecs_exec = true
+#
+# [[rules.allowed_accounts]]
+# account_id = "<ACCOUNT_ID>"
+# account_name = "production"
+# role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyEcsExecRole"
+#
+# # 強烈建議：用 task tag 限縮可看到 / 可 exec 的 task。
+# [[rules.task_tag_selectors]]
+# [rules.task_tag_selectors.tags]
+# Environment = ["production"]
+#
+# # 可選：排除敏感 task。
+# [[rules.excluded_task_tag_selectors]]
+# [rules.excluded_task_tag_selectors.tags]
+# Sensitivity = ["high"]
 
 
 # ── 群組 2：唯讀維運 ────────────────────────────────

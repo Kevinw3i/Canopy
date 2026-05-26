@@ -3,8 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use shared::dto::ec2::ConnectMethod;
-use std::collections::HashMap;
+use shared::dto::pty_spawn::PtySpawnSpec;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -90,10 +89,8 @@ pub(crate) struct ConnectSessionLaunch {
     pub instance_name: Option<String>,
     pub account_id: String,
     pub region: String,
-    pub method: ConnectMethod,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env_vars: HashMap<String, String>,
+    pub method_label: String,
+    pub spawn: PtySpawnSpec,
     pub max_session_seconds: u64,
     pub cols: u16,
     pub rows: u16,
@@ -207,7 +204,7 @@ pub(crate) struct ConnectSessionScreen {
     instance_name: Option<String>,
     account_id: String,
     region: String,
-    method: ConnectMethod,
+    method_label: String,
     max_session_seconds: u64,
     started_at: Instant,
     status: ConnectSessionStatus,
@@ -235,9 +232,9 @@ impl ConnectSessionScreen {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(pty_size)?;
 
-        let mut cmd = CommandBuilder::new(&launch.command);
-        cmd.args(&launch.args);
-        for (key, value) in &launch.env_vars {
+        let mut cmd = CommandBuilder::new(&launch.spawn.command);
+        cmd.args(&launch.spawn.args);
+        for (key, value) in &launch.spawn.env_vars {
             cmd.env(key, value);
         }
 
@@ -292,7 +289,7 @@ impl ConnectSessionScreen {
             instance_name: launch.instance_name,
             account_id: launch.account_id,
             region: launch.region,
-            method: launch.method,
+            method_label: launch.method_label,
             max_session_seconds: launch.max_session_seconds,
             started_at: Instant::now(),
             status: ConnectSessionStatus::Connecting,
@@ -770,15 +767,21 @@ impl ConnectSessionScreen {
 
     fn left_status_text(&self) -> String {
         let instance = instance_label(&self.instance_id, self.instance_name.as_deref());
+        let surface = if self.method_label == "ECS" {
+            "Canopy ECS"
+        } else {
+            "Canopy SSH"
+        };
         match self.status {
             ConnectSessionStatus::Connecting => format!(
-                "Canopy SSH  Connecting...  {}  {}/{}  [{}]",
-                instance, self.account_id, self.region, SESSION_HINTS
+                "{}  Connecting...  {}  {}/{}  [{}]",
+                surface, instance, self.account_id, self.region, SESSION_HINTS
             ),
             _ => format!(
-                "Canopy SSH  {}  {}  {}/{}  [{}]",
+                "{}  {}  {}  {}/{}  [{}]",
+                surface,
                 instance,
-                method_label(&self.method),
+                self.method_label.as_str(),
                 self.account_id,
                 self.region,
                 SESSION_HINTS
@@ -1188,14 +1191,6 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
         cols,
         pixel_width: 0,
         pixel_height: 0,
-    }
-}
-
-fn method_label(method: &ConnectMethod) -> &'static str {
-    match method {
-        ConnectMethod::Ssm => "SSM",
-        ConnectMethod::Ec2InstanceConnect => "EIC",
-        ConnectMethod::Ssh => "SSH",
     }
 }
 
@@ -1697,6 +1692,14 @@ mod tests {
 
     #[cfg(unix)]
     fn spawn_test_session(args: Vec<String>) -> ConnectSessionScreen {
+        spawn_test_session_with_method(args, "SSH")
+    }
+
+    #[cfg(unix)]
+    fn spawn_test_session_with_method(
+        args: Vec<String>,
+        method_label: &str,
+    ) -> ConnectSessionScreen {
         let (tx, _rx) = mpsc::unbounded_channel();
         ConnectSessionScreen::spawn(
             ConnectSessionLaunch {
@@ -1704,10 +1707,13 @@ mod tests {
                 instance_name: Some("web-prod-01".into()),
                 account_id: "123456789012".into(),
                 region: "ap-northeast-1".into(),
-                method: ConnectMethod::Ssh,
-                command: "/bin/sh".into(),
-                args,
-                env_vars: std::collections::HashMap::new(),
+                method_label: method_label.into(),
+                spawn: PtySpawnSpec {
+                    command: "/bin/sh".into(),
+                    args,
+                    env_vars: std::collections::HashMap::new(),
+                    max_session_seconds: Some(3600),
+                },
                 max_session_seconds: 3600,
                 cols: 80,
                 rows: 24,
@@ -1738,6 +1744,18 @@ mod tests {
         session.parser.screen_mut().set_scrollback(usize::MAX);
         assert!(session.parser.screen().scrollback() > 0);
         session.parser.screen_mut().set_scrollback(0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn left_status_text_uses_ecs_surface_for_ecs_method() {
+        let session = spawn_test_session_with_method(vec!["-c".into(), "sleep 30".into()], "ECS");
+
+        let text = session.left_status_text();
+
+        assert!(text.contains("Canopy ECS"));
+        assert!(!text.contains("Canopy SSH"));
+        cleanup_session(session);
     }
 
     #[test]

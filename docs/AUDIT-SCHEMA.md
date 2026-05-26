@@ -43,6 +43,8 @@ Current actions:
 - `ec2_list`
 - `ec2_connect`
 - `ec2_power`
+- `ecs_task_list`
+- `ecs_exec`
 - `cloudwatch_search`
 - `cloudwatch_insights_query`
 - `cloudwatch_live_tail_start`
@@ -97,6 +99,21 @@ EC2 metadata can include:
 - `method`
 - `os_user`
 
+ECS metadata can include:
+
+- `clusters_filter`
+- `clusters_returned`
+- `tasks_returned`
+- `truncated`
+- `failed_scopes`
+- `cluster_name`
+- `cluster_arn`
+- `task_arn`
+- `container_name`
+- `launch_type`
+- `broad_discovery`
+- `error_kind`
+
 EC2 power metadata (`action: "ec2_power"`) can include:
 
 - `power_action` — `start` / `stop` / `reboot`
@@ -141,6 +158,18 @@ Denied EC2 power action (entitlement / scope rejection):
 
 ```json
 {"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e5555","timestamp":"2026-05-08T02:19:30Z","actor":"example-cognito-sub","action":"ec2_power","account_id":"123456789012","region":"ap-northeast-1","target_resource":"i-0123456789abcdef0","outcome":"denied","error_message":"instance excluded by tag policy","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","power_action":"stop","confirmation_present":true}}
+```
+
+Successful ECS task listing:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e8888","timestamp":"2026-05-08T02:22:30Z","actor":"example-cognito-sub","action":"ecs_task_list","account_id":"123456789012","region":"ap-northeast-1","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","clusters_filter":null,"page_size":50,"clusters_returned":1,"tasks_returned":4,"truncated":false,"failed_scopes":[],"broad_discovery":false}}
+```
+
+Successful ECS Exec:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e9999","timestamp":"2026-05-08T02:23:30Z","actor":"example-cognito-sub","action":"ecs_exec","account_id":"123456789012","region":"ap-northeast-1","target_resource":"arn:aws:ecs:ap-northeast-1:123456789012:task/prod-app/abc123","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","cluster_name":"prod-app","cluster_arn":"arn:aws:ecs:ap-northeast-1:123456789012:cluster/prod-app","task_arn":"arn:aws:ecs:ap-northeast-1:123456789012:task/prod-app/abc123","container_name":"app","launch_type":"FARGATE","broad_discovery":false,"error_kind":null}}
 ```
 
 State-machine conflict (e.g. `start` while pending):

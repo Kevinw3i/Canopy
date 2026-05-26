@@ -160,6 +160,76 @@ impl EntitlementService {
             .collect()
     }
 
+    pub async fn ecs_rule_scopes_for_feature(
+        &self,
+        claims: &Claims,
+        feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
+    ) -> Vec<crate::services::ecs::EcsRuleScope> {
+        let store = self.store.read().await;
+        let user_groups: Vec<String> = store
+            .memberships
+            .iter()
+            .filter(|m| {
+                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
+            })
+            .map(|m| m.group.clone())
+            .collect();
+
+        store
+            .rules
+            .iter()
+            .filter(|rule| user_groups.contains(&rule.group) && feature_check(&rule.features))
+            .map(|rule| {
+                let account_ids: Vec<String> = rule
+                    .allowed_accounts
+                    .iter()
+                    .map(|account| account.account_id.clone())
+                    .collect();
+                crate::services::ecs::EcsRuleScope {
+                    accounts: rule.allowed_accounts.clone(),
+                    cluster_patterns: crate::services::ecs::normalize_cluster_patterns(
+                        &rule.allowed_clusters,
+                        &account_ids,
+                        &rule.allowed_regions,
+                    ),
+                    account_ids,
+                    regions: rule.allowed_regions.clone(),
+                    allow_selectors: rule.task_tag_selectors.clone(),
+                    deny_selectors: rule.excluded_task_tag_selectors.clone(),
+                    excluded_container_names: rule.excluded_container_names.clone(),
+                    allow_broad_cluster_discovery: rule.allow_broad_cluster_discovery,
+                }
+            })
+            .collect()
+    }
+
+    pub async fn ecs_has_feature_for_scope(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+        cluster_arn: &str,
+        feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
+    ) -> bool {
+        self.ecs_rule_scopes_for_feature(claims, feature_check)
+            .await
+            .into_iter()
+            .any(|scope| {
+                scope
+                    .account_ids
+                    .iter()
+                    .any(|account| account == account_id)
+                    && (scope.regions.is_empty()
+                        || scope
+                            .regions
+                            .iter()
+                            .any(|scope_region| scope_region == region))
+                    && scope.cluster_patterns.iter().any(|pattern| {
+                        crate::services::ecs::cluster_matches_pattern(pattern, cluster_arn)
+                    })
+            })
+    }
+
     /// Convenience: check feature + account only.
     pub async fn has_feature_for_account(
         &self,
@@ -355,6 +425,11 @@ mod tests {
                     allowed_log_group_arns: vec!["arn:aws:logs:*:111:log-group:/app/*".into()],
                     instance_tag_selectors: vec![],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![],
+                    task_tag_selectors: vec![],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec![],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec!["ec2-user".into()],
                     max_session_seconds: None,
                 },
@@ -380,6 +455,11 @@ mod tests {
                         tags: HashMap::from([("Env".into(), vec!["staging".into()])]),
                     }],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![],
+                    task_tag_selectors: vec![],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec![],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec!["ubuntu".into()],
                     max_session_seconds: Some(1800),
                 },
@@ -514,5 +594,60 @@ mod tests {
             .collect();
         assert!(ids.contains(&"111"));
         assert!(ids.contains(&"222"));
+    }
+
+    #[tokio::test]
+    async fn ecs_rule_scopes_for_feature_filters_by_feature_only() {
+        let svc = make_service();
+        let claims = test_claims("alice", "alice@example.com");
+        let scopes = svc
+            .ecs_rule_scopes_for_feature(&claims, |f| f.can_view_ecs)
+            .await;
+        assert!(scopes.is_empty(), "test fixture has no ECS grant");
+    }
+
+    #[tokio::test]
+    async fn ecs_rule_scope_keeps_role_with_matching_rule() {
+        let mut store = test_store();
+        store.rules.push(EntitlementRule {
+            id: "rule-eng-ecs".into(),
+            group: "eng".into(),
+            features: FeatureFlags {
+                can_view_ecs: true,
+                can_use_ecs_exec: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111".into(),
+                account_name: "prod".into(),
+                role_arn: "arn:aws:iam::111:role/EcsExec".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec!["app".into()],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+        });
+
+        let svc = EntitlementService::new(Arc::new(RwLock::new(store)));
+        let claims = test_claims("alice", "alice@example.com");
+        let scopes = svc
+            .ecs_rule_scopes_for_feature(&claims, |f| f.can_use_ecs_exec)
+            .await;
+
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(
+            scopes[0].accounts[0].role_arn,
+            "arn:aws:iam::111:role/EcsExec"
+        );
+        assert!(scopes[0]
+            .cluster_patterns
+            .contains(&"arn:aws:ecs:us-east-1:111:cluster/app".to_string()));
     }
 }

@@ -52,6 +52,14 @@ pub enum AuditAction {
     CloudwatchLiveTailStart,
     CloudwatchLiveTailStop,
     LogGroupList,
+    /// List ECS tasks visible through Canopy's ECS inventory view.
+    /// Cluster filters, returned counts, and broad-discovery context live in
+    /// metadata so list and exec events stay forensically distinct.
+    EcsTaskList,
+    /// Start an ECS Exec shell into a task container. The task ARN is the
+    /// target resource; cluster/container details and validation outcomes live
+    /// in metadata.
+    EcsExec,
     EntitlementsView,
 }
 
@@ -68,6 +76,8 @@ impl AuditAction {
             Self::CloudwatchLiveTailStart => "cloudwatch_live_tail_start",
             Self::CloudwatchLiveTailStop => "cloudwatch_live_tail_stop",
             Self::LogGroupList => "log_group_list",
+            Self::EcsTaskList => "ecs_task_list",
+            Self::EcsExec => "ecs_exec",
             Self::EntitlementsView => "entitlements_view",
         }
     }
@@ -99,6 +109,8 @@ mod tests {
             AuditAction::CloudwatchLiveTailStart,
             AuditAction::CloudwatchLiveTailStop,
             AuditAction::LogGroupList,
+            AuditAction::EcsTaskList,
+            AuditAction::EcsExec,
             AuditAction::EntitlementsView,
         ] {
             let json = serde_json::to_value(&action).unwrap();
@@ -123,6 +135,26 @@ mod tests {
 
         let back: AuditAction = serde_json::from_value(json).unwrap();
         assert!(matches!(back, AuditAction::Ec2Power));
+    }
+
+    #[test]
+    fn audit_action_ecs_task_list_roundtrip() {
+        let json = serde_json::to_value(AuditAction::EcsTaskList).unwrap();
+        assert_eq!(json, "ecs_task_list");
+        assert_eq!(AuditAction::EcsTaskList.wire_name(), "ecs_task_list");
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::EcsTaskList));
+    }
+
+    #[test]
+    fn audit_action_ecs_exec_roundtrip() {
+        let json = serde_json::to_value(AuditAction::EcsExec).unwrap();
+        assert_eq!(json, "ecs_exec");
+        assert_eq!(AuditAction::EcsExec.wire_name(), "ecs_exec");
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::EcsExec));
     }
 
     #[test]

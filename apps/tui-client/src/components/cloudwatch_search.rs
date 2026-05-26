@@ -1372,6 +1372,11 @@ mod tests {
             allowed_log_group_arns: vec!["arn:aws:logs:*:*:log-group:/app/web-service*".into()],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
         }

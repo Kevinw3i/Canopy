@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use shared::dto::ecs::DEV_MOCK_CLUSTER_NAME;
 use shared::dto::entitlements::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -46,6 +47,11 @@ impl EntitlementStore {
         let mut allowed_log_group_arns: Vec<String> = Vec::new();
         let mut instance_tag_selectors: Vec<TagSelector> = Vec::new();
         let mut excluded_tag_selectors: Vec<TagSelector> = Vec::new();
+        let mut allowed_clusters: Vec<String> = Vec::new();
+        let mut task_tag_selectors: Vec<TagSelector> = Vec::new();
+        let mut excluded_task_tag_selectors: Vec<TagSelector> = Vec::new();
+        let mut excluded_container_names: Vec<String> = Vec::new();
+        let mut allow_broad_cluster_discovery = false;
         let mut allowed_os_users: Vec<String> = Vec::new();
         let mut max_session_seconds: Option<u64> = None;
 
@@ -74,6 +80,8 @@ impl EntitlementStore {
             features.can_start_ec2 |= rule.features.can_start_ec2;
             features.can_stop_ec2 |= rule.features.can_stop_ec2;
             features.can_reboot_ec2 |= rule.features.can_reboot_ec2;
+            features.can_view_ecs |= rule.features.can_view_ecs;
+            features.can_use_ecs_exec |= rule.features.can_use_ecs_exec;
 
             for acct in &rule.allowed_accounts {
                 // Dedup by (account_id, role_arn) so that two groups
@@ -110,6 +118,33 @@ impl EntitlementStore {
                 }
             }
 
+            let normalized_clusters = normalize_allowed_clusters(
+                &rule.allowed_clusters,
+                &rule.allowed_accounts,
+                &rule.allowed_regions,
+            );
+            for cluster in normalized_clusters {
+                if !allowed_clusters.contains(&cluster) {
+                    allowed_clusters.push(cluster);
+                }
+            }
+            for selector in &rule.task_tag_selectors {
+                if !task_tag_selectors.contains(selector) {
+                    task_tag_selectors.push(selector.clone());
+                }
+            }
+            for selector in &rule.excluded_task_tag_selectors {
+                if !excluded_task_tag_selectors.contains(selector) {
+                    excluded_task_tag_selectors.push(selector.clone());
+                }
+            }
+            for container in &rule.excluded_container_names {
+                if !excluded_container_names.contains(container) {
+                    excluded_container_names.push(container.clone());
+                }
+            }
+            allow_broad_cluster_discovery |= rule.allow_broad_cluster_discovery;
+
             for user in &rule.allowed_os_users {
                 if !allowed_os_users.contains(user) {
                     allowed_os_users.push(user.clone());
@@ -136,6 +171,11 @@ impl EntitlementStore {
             allowed_log_group_arns,
             instance_tag_selectors,
             excluded_tag_selectors,
+            allowed_clusters,
+            task_tag_selectors,
+            excluded_task_tag_selectors,
+            excluded_container_names,
+            allow_broad_cluster_discovery,
             allowed_os_users,
             max_session_seconds,
         }
@@ -290,6 +330,36 @@ impl EntitlementStore {
                     rule.group
                 );
             }
+            if rule.features.can_use_ecs_exec && !rule.features.can_view_ecs {
+                anyhow::bail!(
+                    "Rule '{}' (group '{}') has can_use_ecs_exec=true but can_view_ecs=false. \
+                     ECS exec must imply ECS view in the same rule.",
+                    rule.id,
+                    rule.group
+                );
+            }
+            if (rule.features.can_view_ecs || rule.features.can_use_ecs_exec)
+                && rule.allowed_clusters.is_empty()
+            {
+                anyhow::bail!(
+                    "Rule '{}' (group '{}') grants ECS access but allowed_clusters is empty.",
+                    rule.id,
+                    rule.group
+                );
+            }
+            for cluster in &rule.allowed_clusters {
+                validate_cluster_pattern(cluster, rule.allow_broad_cluster_discovery).map_err(
+                    |reason| {
+                        anyhow::anyhow!(
+                            "Rule '{}' (group '{}') has invalid allowed_clusters entry '{}': {}",
+                            rule.id,
+                            rule.group,
+                            cluster,
+                            reason
+                        )
+                    },
+                )?;
+            }
         }
 
         Ok(store)
@@ -308,6 +378,8 @@ impl EntitlementStore {
                         can_use_cloudwatch_tail: true,
                         can_use_ssm: true,
                         can_use_ec2_instance_connect: true,
+                        can_view_ecs: true,
+                        can_use_ecs_exec: true,
                         ..Default::default()
                     },
                     allowed_accounts: vec![
@@ -338,6 +410,16 @@ impl EntitlementStore {
                         )]),
                     }],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![DEV_MOCK_CLUSTER_NAME.into()],
+                    task_tag_selectors: vec![TagSelector {
+                        tags: HashMap::from([(
+                            "Environment".into(),
+                            vec!["production".into(), "staging".into()],
+                        )]),
+                    }],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec!["xray-daemon".into()],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec!["ec2-user".into(), "ubuntu".into()],
                     max_session_seconds: None, // no limit for admin
                 },
@@ -375,6 +457,11 @@ impl EntitlementStore {
                         )]),
                     }],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![],
+                    task_tag_selectors: vec![],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec![],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec![],
                     max_session_seconds: None,
                 },
@@ -402,6 +489,11 @@ impl EntitlementStore {
                         tags: HashMap::from([("Environment".into(), vec!["staging".into()])]),
                     }],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![],
+                    task_tag_selectors: vec![],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec![],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec![],
                     max_session_seconds: Some(3600), // 60 min for readonly
                 },
@@ -420,12 +512,95 @@ impl EntitlementStore {
     }
 }
 
+fn validate_cluster_pattern(
+    pattern: &str,
+    allow_broad_cluster_discovery: bool,
+) -> anyhow::Result<()> {
+    if pattern == "*" {
+        anyhow::bail!("bare '*' is not allowed");
+    }
+
+    let cluster_name = pattern
+        .rsplit_once("cluster/")
+        .map(|(_, name)| name)
+        .unwrap_or(pattern);
+
+    for ch in ['?', '[', ']', '{', '}', '\\'] {
+        if cluster_name.contains(ch) {
+            anyhow::bail!("only literal characters and '*' are allowed in cluster name patterns");
+        }
+    }
+
+    if let Some(first_star) = cluster_name.find('*') {
+        let literal_prefix_len = cluster_name[..first_star].chars().count();
+        if literal_prefix_len < 3 && !allow_broad_cluster_discovery {
+            anyhow::bail!(
+                "wildcard cluster patterns require at least 3 literal characters before '*' \
+                 unless allow_broad_cluster_discovery=true"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_allowed_clusters(
+    entries: &[String],
+    accounts: &[AllowedAccount],
+    regions: &[String],
+) -> Vec<String> {
+    let effective_regions: Vec<&str> = if regions.is_empty() {
+        vec!["*"]
+    } else {
+        regions.iter().map(String::as_str).collect()
+    };
+
+    let mut patterns = Vec::new();
+    for entry in entries {
+        if entry.starts_with("arn:") {
+            if !patterns.contains(entry) {
+                patterns.push(entry.clone());
+            }
+            continue;
+        }
+
+        for account in accounts {
+            for region in &effective_regions {
+                let pattern = format!(
+                    "arn:aws:ecs:{}:{}:cluster/{}",
+                    region, account.account_id, entry
+                );
+                if !patterns.contains(&pattern) {
+                    patterns.push(pattern);
+                }
+            }
+        }
+    }
+    patterns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_store() -> EntitlementStore {
         EntitlementStore::dev_defaults()
+    }
+
+    fn load_from_temp_toml(content: &str) -> anyhow::Result<EntitlementStore> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "canopy-entitlements-test-{}-{nonce}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, content)?;
+        let result = EntitlementStore::load_from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        result
     }
 
     #[test]
@@ -440,8 +615,14 @@ mod tests {
         assert!(ent.features.can_start_ec2);
         assert!(ent.features.can_stop_ec2);
         assert!(ent.features.can_reboot_ec2);
+        assert!(ent.features.can_view_ecs);
+        assert!(ent.features.can_use_ecs_exec);
         assert_eq!(ent.allowed_accounts.len(), 4);
         assert_eq!(ent.allowed_regions.len(), 3);
+        assert!(ent.allowed_clusters.contains(&format!(
+            "arn:aws:ecs:us-east-1:111111111111:cluster/{DEV_MOCK_CLUSTER_NAME}"
+        )));
+        assert_eq!(ent.allowed_clusters.len(), 6);
     }
 
     #[test]
@@ -456,6 +637,8 @@ mod tests {
         assert!(!ent.features.can_start_ec2);
         assert!(!ent.features.can_stop_ec2);
         assert!(!ent.features.can_reboot_ec2);
+        assert!(!ent.features.can_view_ecs);
+        assert!(!ent.features.can_use_ecs_exec);
         assert_eq!(ent.allowed_accounts.len(), 1);
         assert_eq!(ent.allowed_regions.len(), 1);
     }
@@ -484,6 +667,8 @@ mod tests {
         assert!(ent.features.can_start_ec2);
         assert!(ent.features.can_stop_ec2);
         assert!(ent.features.can_reboot_ec2);
+        assert!(ent.features.can_view_ecs);
+        assert!(ent.features.can_use_ecs_exec);
         // 5 account entries: two read/connect roles, two operator roles,
         // plus the readonly staging role (distinct role ARNs are preserved).
         assert_eq!(ent.allowed_accounts.len(), 5);
@@ -564,6 +749,11 @@ mod tests {
             allowed_log_group_arns: vec![],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
         });
@@ -629,6 +819,11 @@ mod tests {
             allowed_log_group_arns: vec![],
             instance_tag_selectors: vec![duplicate_selector],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
         });
@@ -656,6 +851,181 @@ mod tests {
         assert!(
             ent.allowed_os_users.is_empty(),
             "readonly-ops should have no allowed OS users"
+        );
+    }
+
+    #[test]
+    fn ecs_cluster_and_task_scopes_merge_and_dedup() {
+        let mut store = test_store();
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "ecs-extra".into(),
+        });
+        store.rules.push(EntitlementRule {
+            id: "rule-ecs-extra".into(),
+            group: "ecs-extra".into(),
+            features: FeatureFlags {
+                can_view_ecs: true,
+                can_use_ecs_exec: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "333333333333".into(),
+                account_name: "demo".into(),
+                role_arn: "arn:aws:iam::333333333333:role/CanopyRole".into(),
+            }],
+            allowed_regions: vec!["ap-northeast-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![DEV_MOCK_CLUSTER_NAME.into(), "prod-*".into()],
+            task_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("Service".into(), vec!["api".into()])]),
+            }],
+            excluded_task_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("CanopyDeny".into(), vec!["true".into()])]),
+            }],
+            excluded_container_names: vec!["fluent-bit".into()],
+            allow_broad_cluster_discovery: true,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+        });
+
+        let ent = store.evaluate("dev-admin", "admin@example.com", "Admin", true);
+        assert!(ent.allowed_clusters.iter().any(|cluster| cluster
+            == &format!("arn:aws:ecs:us-east-1:111111111111:cluster/{DEV_MOCK_CLUSTER_NAME}")));
+        assert!(ent
+            .allowed_clusters
+            .contains(&"arn:aws:ecs:ap-northeast-1:333333333333:cluster/prod-*".to_string()));
+        assert_eq!(ent.task_tag_selectors.len(), 2);
+        assert_eq!(ent.excluded_task_tag_selectors.len(), 1);
+        assert!(ent.excluded_container_names.contains(&"fluent-bit".into()));
+        assert!(ent.allow_broad_cluster_discovery);
+    }
+
+    #[test]
+    fn validate_cluster_pattern_rejects_broad_wildcard_without_opt_in() {
+        assert!(
+            validate_cluster_pattern("arn:aws:ecs:us-east-1:111111111111:cluster/*", false)
+                .is_err()
+        );
+        assert!(validate_cluster_pattern("cluster/p*", false).is_err());
+        assert!(validate_cluster_pattern("cluster/prod*", false).is_ok());
+        assert!(validate_cluster_pattern("cluster/*", true).is_ok());
+    }
+
+    #[test]
+    fn validate_cluster_pattern_rejects_non_star_glob_chars() {
+        assert!(validate_cluster_pattern("cluster/p?od-*", true).is_err());
+        assert!(validate_cluster_pattern("cluster/pr[od]uction", true).is_err());
+    }
+
+    #[test]
+    fn load_from_file_rejects_ecs_exec_without_view() {
+        let err = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "ecs-exec-only"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+allowed_clusters = ["prod-*"]
+
+[rules.features]
+can_use_ecs_exec = true
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect_err("ECS exec must require ECS view in the same rule");
+
+        assert!(err.to_string().contains("can_use_ecs_exec=true"));
+    }
+
+    #[test]
+    fn load_from_file_rejects_ecs_access_without_clusters() {
+        let err = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "ecs-no-clusters"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+
+[rules.features]
+can_view_ecs = true
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect_err("ECS view must require an explicit cluster allowlist");
+
+        assert!(err.to_string().contains("allowed_clusters is empty"));
+    }
+
+    #[test]
+    fn load_from_file_rejects_broad_cluster_without_opt_in() {
+        let err = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "ecs-broad-cluster"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+allowed_clusters = ["cluster/*"]
+
+[rules.features]
+can_view_ecs = true
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect_err("broad ECS cluster discovery must require explicit opt-in");
+
+        assert!(err
+            .to_string()
+            .contains("allow_broad_cluster_discovery=true"));
+    }
+
+    #[test]
+    fn load_from_file_allows_mixed_ec2_ssm_and_ecs_rule_with_os_users() {
+        let store = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "mixed-ec2-ecs"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+allowed_clusters = ["prod-*"]
+allowed_os_users = ["ec2-user"]
+
+[rules.features]
+can_view_ec2 = true
+can_use_ssm = true
+can_view_ecs = true
+can_use_ecs_exec = true
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect("mixed EC2/SSM and ECS rules should load");
+
+        let ent = store.evaluate("alice", "alice@example.com", "Alice", true);
+        assert!(ent.features.can_use_ssm);
+        assert!(ent.features.can_view_ecs);
+        assert!(ent.features.can_use_ecs_exec);
+        assert_eq!(ent.allowed_os_users, vec!["ec2-user"]);
+        assert_eq!(
+            ent.allowed_clusters,
+            vec!["arn:aws:ecs:ap-northeast-1:111111111111:cluster/prod-*"]
         );
     }
 

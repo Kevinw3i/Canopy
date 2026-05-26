@@ -40,6 +40,17 @@ pub enum Action {
     Ec2Loaded(Vec<shared::dto::ec2::Ec2Instance>, Vec<String>, u64), // instances, failed_scopes, generation
     Ec2FetchFailed(String, u64),                                     // error message, generation
     SelectInstance(usize),
+    ToggleEcsView,
+    RefreshEcsTasks,
+    EcsTasksLoaded(Vec<shared::dto::ecs::EcsTask>, Vec<String>, u64),
+    EcsTasksFetchFailed(String, u64),
+    ConnectEcsExec {
+        account_id: String,
+        region: String,
+        cluster_arn: String,
+        task_arn: String,
+        container_name: String,
+    },
     ConnectSsm {
         instance_id: String,
         instance_name: Option<String>,

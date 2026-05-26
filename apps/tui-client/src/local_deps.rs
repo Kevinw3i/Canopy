@@ -1,4 +1,4 @@
-use shared::dto::ec2::ConnectResponse;
+use shared::dto::pty_spawn::PtySpawnSpec;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
@@ -140,7 +140,7 @@ pub fn is_aws_cli_v2_version(version_output: &str) -> bool {
     rest.chars().next().is_some_and(|ch| ch.is_ascii_digit())
 }
 
-pub fn required_dependencies_for_connect(resp: &ConnectResponse) -> Vec<LocalDependency> {
+pub fn required_dependencies_for_connect(resp: &PtySpawnSpec) -> Vec<LocalDependency> {
     let mut deps = BTreeSet::new();
 
     match normalized_command_name(&resp.command).as_deref() {
@@ -150,6 +150,9 @@ pub fn required_dependencies_for_connect(resp: &ConnectResponse) -> Vec<LocalDep
                 deps.insert(LocalDependency::Ssh);
             }
             if args_start_with(&resp.args, &["ssm", "start-session"]) {
+                deps.insert(LocalDependency::SessionManagerPlugin);
+            }
+            if args_start_with(&resp.args, &["ecs", "execute-command"]) {
                 deps.insert(LocalDependency::SessionManagerPlugin);
             }
         }
@@ -730,13 +733,11 @@ mod tests {
         output_with_status(true, stdout, stderr)
     }
 
-    fn connect_response(command: &str, args: &[&str]) -> ConnectResponse {
-        ConnectResponse {
-            authorized: true,
+    fn connect_response(command: &str, args: &[&str]) -> PtySpawnSpec {
+        PtySpawnSpec {
             command: command.into(),
             args: args.iter().map(|arg| (*arg).into()).collect(),
             env_vars: Default::default(),
-            error: None,
             max_session_seconds: None,
         }
     }
@@ -810,6 +811,33 @@ mod tests {
                 "i-123",
                 "--region",
                 "ap-northeast-1",
+            ],
+        );
+        assert_eq!(
+            required_dependencies_for_connect(&resp),
+            vec![
+                LocalDependency::AwsCliV2,
+                LocalDependency::SessionManagerPlugin
+            ]
+        );
+    }
+
+    #[test]
+    fn ecs_exec_requires_aws_cli_and_session_manager_plugin() {
+        let resp = connect_response(
+            "aws",
+            &[
+                "ecs",
+                "execute-command",
+                "--cluster",
+                "arn:aws:ecs:us-east-1:111111111111:cluster/prod",
+                "--task",
+                "arn:aws:ecs:us-east-1:111111111111:task/prod/abc",
+                "--container",
+                "app",
+                "--interactive",
+                "--command",
+                "/bin/sh",
             ],
         );
         assert_eq!(

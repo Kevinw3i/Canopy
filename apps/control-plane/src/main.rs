@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
     // Protected routes require auth middleware
     let protected = Router::new()
         .merge(routes::ec2::router())
+        .merge(routes::ecs::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
         .route_layer(axum_mw::from_fn_with_state(

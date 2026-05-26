@@ -83,7 +83,7 @@ impl DashboardScreen {
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {
-        self.items[0].enabled = ent.features.can_view_ec2;
+        self.items[0].enabled = ent.features.can_view_ec2 || ent.features.can_view_ecs;
         self.items[1].enabled = ent.features.can_use_cloudwatch_search;
         // Only enable live tail when the feature flag is on AND the user has
         // the entitlement.
@@ -236,8 +236,21 @@ impl Component for DashboardScreen {
                 (Style::default().fg(Color::White), "  ")
             };
 
+            let label = if item.screen == Screen::Ec2Inventory {
+                if let Some(ent) = self.entitlements.as_ref() {
+                    match (ent.features.can_view_ec2, ent.features.can_view_ecs) {
+                        (true, true) => "EC2 Inventory (EC2 + ECS)",
+                        (false, true) => "EC2 Inventory (ECS only)",
+                        _ => item.label,
+                    }
+                } else {
+                    item.label
+                }
+            } else {
+                item.label
+            };
             let status = if item.enabled { "" } else { " (disabled)" };
-            let text = format!("{} [{}] {}{}", prefix, item.key, item.label, status);
+            let text = format!("{} [{}] {}{}", prefix, item.key, label, status);
             Paragraph::new(text).style(style).render(item_area, buf);
         }
 
@@ -298,6 +311,11 @@ mod tests {
             allowed_log_group_arns: vec![],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
         }
@@ -324,6 +342,19 @@ mod tests {
         let visible = screen.visible_items();
         assert!(visible[0].enabled); // EC2
         assert!(visible[1].enabled); // CW
+    }
+
+    #[test]
+    fn set_entitlements_enables_inventory_for_ecs_view_only_user() {
+        let mut screen = DashboardScreen::new(false, false);
+        let mut ent = test_entitlements(false, false, false);
+        ent.features.can_view_ecs = true;
+        screen.set_entitlements(ent);
+
+        let visible = screen.visible_items();
+        assert!(visible[0].enabled);
+        let action = screen.handle_key(key(KeyCode::Char('1')));
+        assert!(matches!(action, Action::NavigateTo(Screen::Ec2Inventory)));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use crate::auth::SessionTokens;
 use shared::dto::auth::*;
 use shared::dto::cloudwatch::*;
 use shared::dto::ec2::*;
+use shared::dto::ecs::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::errors::ApiError;
 use shared::headers;
@@ -419,6 +420,26 @@ impl ApiClient {
         self.send_authenticated(|| {
             self.client
                 .post(format!("{}/api/ec2/connect", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    // ── ECS ─────────────────────────────────────────────
+
+    pub async fn list_ecs_tasks(&self, request: &EcsTasksRequest) -> ApiResult<EcsTasksResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ecs/tasks", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn ecs_exec(&self, request: &EcsExecRequest) -> ApiResult<EcsExecResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ecs/exec", self.base_url))
                 .json(request)
         })
         .await

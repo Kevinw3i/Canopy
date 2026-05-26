@@ -1,7 +1,9 @@
 use anyhow::Result;
 use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
+use shared::dto::ecs::{EcsExecRequest, EcsTasksRequest};
 use shared::dto::entitlements::UserEntitlements;
+use shared::dto::pty_spawn::PtySpawnSpec;
 use tokio::sync::mpsc;
 
 use crate::api_client::{ApiClient, ApiClientError};
@@ -180,6 +182,14 @@ struct ConnectTarget<'a> {
     region: &'a str,
     method: ConnectMethod,
     os_user: Option<&'a str>,
+}
+
+fn connect_method_label(method: &ConnectMethod) -> &'static str {
+    match method {
+        ConnectMethod::Ssm => "SSM",
+        ConnectMethod::Ec2InstanceConnect => "EIC",
+        ConnectMethod::Ssh => "SSH",
+    }
 }
 
 fn prompt_yes_no(prompt: &str) -> bool {
@@ -538,6 +548,50 @@ impl App {
             }
             Action::SelectInstance(_idx) => {
                 // handled in component
+            }
+            Action::ToggleEcsView => {
+                let follow_up = self.ec2.toggle_inventory_view();
+                let _ = self.action_tx.send(follow_up);
+            }
+            Action::RefreshEcsTasks => {
+                self.spawn_ecs_tasks_fetch();
+            }
+            Action::EcsTasksLoaded(tasks, failed_scopes, generation) => {
+                if generation != self.ec2.fetch_generation {
+                    return;
+                }
+                if !failed_scopes.is_empty() {
+                    self.error_modal.show(format!(
+                        "Some ECS scopes failed to respond:\n{}",
+                        failed_scopes.join("\n")
+                    ));
+                }
+                self.ec2.set_tasks(tasks);
+            }
+            Action::EcsTasksFetchFailed(err, generation) => {
+                if generation != self.ec2.fetch_generation {
+                    return;
+                }
+                self.ec2.set_error(err);
+            }
+            Action::ConnectEcsExec {
+                account_id,
+                region,
+                cluster_arn,
+                task_arn,
+                container_name,
+            } => {
+                self.do_ecs_exec(
+                    EcsExecRequest {
+                        account_id,
+                        region,
+                        cluster_arn,
+                        task_arn,
+                        container_name,
+                    },
+                    terminal,
+                )
+                .await;
             }
             Action::ConnectSsm {
                 instance_id,
@@ -1208,6 +1262,52 @@ impl App {
         });
     }
 
+    fn spawn_ecs_tasks_fetch(&mut self) {
+        if let Some(token) = self.ec2_fetch_cancel.take() {
+            token.cancel();
+        }
+
+        self.ec2.set_loading();
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        let generation = self.ec2.fetch_generation;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.ec2_fetch_cancel = Some(cancel.clone());
+
+        let req = EcsTasksRequest {
+            account_id: self.ec2.selected_account_id.clone(),
+            region: self.ec2.selected_region.clone(),
+            cluster: None,
+            page_size: 200,
+        };
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                r = api.list_ecs_tasks(&req) => r,
+            };
+
+            match result {
+                Ok(resp) => {
+                    let _ = tx.send(Action::EcsTasksLoaded(
+                        resp.tasks,
+                        resp.failed_scopes,
+                        generation,
+                    ));
+                }
+                Err(e) => {
+                    let action = Self::route_error_to_action(e, |msg| {
+                        Action::EcsTasksFetchFailed(
+                            format!("Failed to fetch ECS tasks: {msg}"),
+                            generation,
+                        )
+                    });
+                    let _ = tx.send(action);
+                }
+            }
+        });
+    }
+
     fn suspend_for_external_command(&mut self) {
         self.event_reader_paused
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1285,14 +1385,15 @@ impl App {
         match self.api.connect(&req).await {
             Ok(resp) => {
                 if resp.authorized {
+                    let spawn_spec: PtySpawnSpec = resp.into();
                     tracing::info!(
-                        command = %resp.command,
-                        args = ?resp.args,
+                        command = %spawn_spec.command,
+                        args = ?spawn_spec.args,
                         "Spawning connect command"
                     );
 
                     let runner = SystemCommandRunner;
-                    let required_deps = local_deps::required_dependencies_for_connect(&resp);
+                    let required_deps = local_deps::required_dependencies_for_connect(&spawn_spec);
                     let dependency_issues =
                         local_deps::check_required_dependencies(&required_deps, &runner);
                     let mut terminal_suspended = false;
@@ -1317,7 +1418,7 @@ impl App {
                     }
 
                     if let Some(max_session_seconds) =
-                        wrapper_session_limit(resp.max_session_seconds)
+                        wrapper_session_limit(spawn_spec.max_session_seconds)
                     {
                         if terminal_suspended {
                             self.resume_after_external_command(terminal);
@@ -1332,10 +1433,8 @@ impl App {
                                 instance_name: target.instance_name.map(String::from),
                                 account_id: target.account_id.to_string(),
                                 region: target.region.to_string(),
-                                method: target.method,
-                                command: resp.command,
-                                args: resp.args,
-                                env_vars: resp.env_vars,
+                                method_label: connect_method_label(&target.method).to_string(),
+                                spawn: spawn_spec,
                                 max_session_seconds,
                                 cols: size.width,
                                 rows: size.height,
@@ -1360,15 +1459,15 @@ impl App {
                     }
 
                     // Run the command
-                    let mut cmd = std::process::Command::new(&resp.command);
-                    cmd.args(&resp.args);
-                    for (k, v) in &resp.env_vars {
+                    let mut cmd = std::process::Command::new(&spawn_spec.command);
+                    cmd.args(&spawn_spec.args);
+                    for (k, v) in &spawn_spec.env_vars {
                         cmd.env(k, v);
                     }
 
                     // Pre-flight: TCP connectivity check for SSH with countdown
-                    if resp.command == "ssh" {
-                        if let Some(target) = resp.args.last() {
+                    if spawn_spec.command == "ssh" {
+                        if let Some(target) = spawn_spec.args.last() {
                             // Extract IP from "user@ip"
                             if let Some(ip) = target.split('@').nth(1) {
                                 let addr = format!("{}:22", ip);
@@ -1412,11 +1511,11 @@ impl App {
                         }
                     }
 
-                    if let Some(secs) = resp.max_session_seconds {
+                    if let Some(secs) = spawn_spec.max_session_seconds {
                         println!(
                             "--- Connecting to {} via {} (max {} min) ---\n",
                             target.instance_id,
-                            resp.command,
+                            spawn_spec.command,
                             secs / 60
                         );
                         println!("Session countdown: {}", render_session_countdown(secs, 0));
@@ -1425,7 +1524,7 @@ impl App {
                     } else {
                         println!(
                             "--- Connecting to {} via {} ---\n",
-                            target.instance_id, resp.command
+                            target.instance_id, spawn_spec.command
                         );
                     }
 
@@ -1435,7 +1534,7 @@ impl App {
 
                     match cmd.spawn() {
                         Ok(mut child) => {
-                            let session_limit = resp.max_session_seconds.filter(|&s| s > 0);
+                            let session_limit = spawn_spec.max_session_seconds.filter(|&s| s > 0);
                             let start = std::time::Instant::now();
                             let mut connected = false;
 
@@ -1529,10 +1628,10 @@ impl App {
                         Err(e) => {
                             let msg = match e.kind() {
                                 std::io::ErrorKind::NotFound => {
-                                    if resp.command == "aws" {
+                                    if spawn_spec.command == "aws" {
                                         "AWS CLI not found. Install it from https://aws.amazon.com/cli/".to_string()
                                     } else {
-                                        format!("Command '{}' not found", resp.command)
+                                        format!("Command '{}' not found", spawn_spec.command)
                                     }
                                 }
                                 _ => format!("Failed to execute command: {}", e),
@@ -1541,7 +1640,7 @@ impl App {
                         }
                     }
 
-                    if resp.max_session_seconds.is_some() {
+                    if spawn_spec.max_session_seconds.is_some() {
                         set_terminal_title("Canopy");
                     }
 
@@ -1568,6 +1667,125 @@ impl App {
             Err(e) => {
                 self.handle_route_error(e, |app, msg| {
                     app.error_modal.show(format!("Connect failed: {}", msg));
+                });
+            }
+        }
+    }
+
+    async fn do_ecs_exec(&mut self, req: EcsExecRequest, terminal: &mut Tui) {
+        match self.api.ecs_exec(&req).await {
+            Ok(resp) => {
+                let spawn_spec: PtySpawnSpec = resp.into();
+                tracing::info!(
+                    command = %spawn_spec.command,
+                    args = ?spawn_spec.args,
+                    "Spawning ECS exec command"
+                );
+
+                let runner = SystemCommandRunner;
+                let required_deps = local_deps::required_dependencies_for_connect(&spawn_spec);
+                let dependency_issues =
+                    local_deps::check_required_dependencies(&required_deps, &runner);
+                let mut terminal_suspended = false;
+
+                if !dependency_issues.is_empty() {
+                    self.suspend_for_external_command();
+                    terminal_suspended = true;
+
+                    if let Err(msg) = self.resolve_connect_dependencies(
+                        &required_deps,
+                        dependency_issues,
+                        &runner,
+                    ) {
+                        eprintln!("\nError: {}\n", msg);
+                        println!("Press Enter to return to the console...");
+                        let _ = std::io::stdin().read_line(&mut String::new());
+
+                        self.resume_after_external_command(terminal);
+                        self.error_modal.show(msg);
+                        return;
+                    }
+                }
+
+                let task_label = req
+                    .task_arn
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(req.task_arn.as_str())
+                    .to_string();
+
+                if let Some(max_session_seconds) =
+                    wrapper_session_limit(spawn_spec.max_session_seconds)
+                {
+                    if terminal_suspended {
+                        self.resume_after_external_command(terminal);
+                    }
+
+                    let size = terminal
+                        .size()
+                        .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
+                    match ConnectSessionScreen::spawn(
+                        ConnectSessionLaunch {
+                            instance_id: task_label,
+                            instance_name: Some(req.container_name),
+                            account_id: req.account_id,
+                            region: req.region,
+                            method_label: "ECS".into(),
+                            spawn: spawn_spec,
+                            max_session_seconds,
+                            cols: size.width,
+                            rows: size.height,
+                        },
+                        self.action_tx.clone(),
+                    ) {
+                        Ok(session) => {
+                            self.connect_session = Some(session);
+                            self.current_screen = Screen::ConnectSession;
+                        }
+                        Err(e) => {
+                            self.error_modal
+                                .show(format!("Failed to start ECS exec wrapper: {e}"));
+                        }
+                    }
+                    return;
+                }
+
+                if !terminal_suspended {
+                    self.suspend_for_external_command();
+                }
+
+                let mut cmd = std::process::Command::new(&spawn_spec.command);
+                cmd.args(&spawn_spec.args);
+                for (k, v) in &spawn_spec.env_vars {
+                    cmd.env(k, v);
+                }
+
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(e) => {
+                        let msg = match e.kind() {
+                            std::io::ErrorKind::NotFound if spawn_spec.command == "aws" => {
+                                "AWS CLI not found. Install it from https://aws.amazon.com/cli/"
+                                    .to_string()
+                            }
+                            std::io::ErrorKind::NotFound => {
+                                format!("Command '{}' not found", spawn_spec.command)
+                            }
+                            _ => format!("Failed to execute command: {}", e),
+                        };
+                        eprintln!("\nError: {}\n", msg);
+                    }
+                }
+
+                println!("\nPress Enter to return to the console...");
+                let _ = std::io::stdin().read_line(&mut String::new());
+                self.resume_after_external_command(terminal);
+            }
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| {
+                    app.error_modal.show(format!("ECS exec failed: {}", msg));
                 });
             }
         }
@@ -1956,6 +2174,11 @@ mod tests {
             max_session_seconds: None,
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
         }
     }

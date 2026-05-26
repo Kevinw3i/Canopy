@@ -128,6 +128,7 @@ fn read_audit_events(path: &Path) -> Vec<Value> {
 fn build_app(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .merge(routes::ec2::router())
+        .merge(routes::ecs::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
         .route_layer(axum_mw::from_fn_with_state(
@@ -158,6 +159,27 @@ fn issue_test_token(config: &AppConfig) -> String {
 async fn body_json(body: Body) -> Value {
     let bytes = body.collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn authed_post_json(
+    app: Router,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::post(path)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json = body_json(resp.into_body()).await;
+    (status, json)
 }
 
 struct RouteTestOidcKey {
@@ -607,6 +629,297 @@ async fn ec2_list_pagination_works() {
     if json["total_count"].as_u64().unwrap() > 1 {
         assert!(json["next_token"].is_string());
     }
+}
+
+#[tokio::test]
+async fn ecs_tasks_returns_mock_tasks_and_audits() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-success");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(app, "/api/ecs/tasks", &token, json!({})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let tasks = json["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(json["total_count"], 2);
+    assert_eq!(json["truncated"], false);
+    assert!(json.get("next_cursor").is_none());
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["metadata"]["tasks_returned"], 2);
+    assert_eq!(event["metadata"]["truncated"], false);
+}
+
+#[tokio::test]
+async fn ecs_tasks_denied_for_no_perms_user() {
+    let config = dev_config();
+    let token = issue_no_perms_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(app, "/api/ecs/tasks", &token, json!({})).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn ecs_tasks_denied_for_unauthorized_account_filter() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-unauthorized-account");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/ecs/tasks",
+        &token,
+        json!({"account_id": "999999999999"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_tasks_denied_for_unauthorized_cluster_filter() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-unauthorized-cluster");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/ecs/tasks",
+        &token,
+        json!({"account_id": "111111111111", "region": "us-east-1", "cluster": "other-cluster"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_tasks_rejects_bare_star_cluster_filter() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-star");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) =
+        authed_post_json(app, "/api/ecs/tasks", &token, json!({"cluster": "*"})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BAD_REQUEST");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_tasks_page_size_one_truncates_without_cursor() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) =
+        authed_post_json(app, "/api/ecs/tasks", &token, json!({"page_size": 1})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(json["total_count"], 2);
+    assert_eq!(json["truncated"], true);
+    assert!(json.get("next_cursor").is_none());
+}
+
+#[tokio::test]
+async fn ecs_exec_succeeds_in_mock_mode_and_audits() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-exec-success");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["command"], "aws");
+    let args = json["args"].as_array().unwrap();
+    assert!(args.iter().any(|arg| arg == "execute-command"));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == "--command" && pair[1] == "/bin/sh"));
+    assert_eq!(
+        json["env_vars"]["AWS_ACCESS_KEY_ID"],
+        "ASIADEVMOCK000000001"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_exec")
+        .expect("ecs exec audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["target_resource"], task["task_arn"]);
+    assert_eq!(event["metadata"]["container_name"], "app");
+    assert_eq!(event["metadata"]["broad_discovery"], false);
+    assert!(event["metadata"].get("task_id").is_none());
+}
+
+#[tokio::test]
+async fn ecs_exec_denies_sidecar_container() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-exec-sidecar");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "xray-daemon"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "ecs_exec"
+                && event["metadata"]["error_kind"] == "container_in_sidecar_denylist"
+        })
+        .expect("ecs exec sidecar denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_exec_rejects_cross_account_task_arn_before_authorization() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": "222222222222",
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn ecs_exec_execute_command_disabled_returns_422() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][1];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "worker"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json["code"], "execute_command_disabled");
+}
+
+#[tokio::test]
+async fn ecs_exec_denied_for_no_perms_user() {
+    let config = dev_config();
+    let admin_token = issue_test_token(&config);
+    let no_perms_token = issue_no_perms_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &admin_token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &no_perms_token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
 }
 
 #[tokio::test]

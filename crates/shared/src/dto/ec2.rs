@@ -1,3 +1,4 @@
+use crate::dto::pty_spawn::PtySpawnSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -146,6 +147,17 @@ pub struct ConnectResponse {
     /// The TUI enforces this by killing the spawned process after the timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_seconds: Option<u64>,
+}
+
+impl From<ConnectResponse> for PtySpawnSpec {
+    fn from(resp: ConnectResponse) -> Self {
+        Self {
+            command: resp.command,
+            args: resp.args,
+            env_vars: resp.env_vars,
+            max_session_seconds: resp.max_session_seconds,
+        }
+    }
 }
 
 // ── Power actions (start / stop / reboot) ──────────────────────────────

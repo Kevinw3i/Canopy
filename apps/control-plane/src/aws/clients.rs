@@ -1,6 +1,7 @@
 use aws_config::SdkConfig;
 use aws_sdk_cloudwatchlogs::Client as CwlClient;
 use aws_sdk_ec2::Client as Ec2Client;
+use aws_sdk_ecs::Client as EcsClient;
 
 /// Factory for AWS SDK clients from an assumed-role SdkConfig.
 ///
@@ -12,6 +13,10 @@ pub struct AwsClients;
 impl AwsClients {
     pub fn ec2(config: &SdkConfig) -> Ec2Client {
         Ec2Client::new(config)
+    }
+
+    pub fn ecs(config: &SdkConfig) -> EcsClient {
+        EcsClient::new(config)
     }
 
     pub fn cloudwatch_logs(config: &SdkConfig) -> CwlClient {
