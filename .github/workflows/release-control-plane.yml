@@ -129,12 +129,25 @@ jobs:
           set -euo pipefail
 
           cpu_architecture=""
+          aws_region=""
           project=""
           if [ ! -s infra/terraform.tfvars ]; then
             echo "::error::infra/terraform.tfvars was not written from CONTROL_PLANE_TFVARS_B64"
             exit 1
           fi
 
+          aws_region="$(
+            awk -F= '
+              /^[[:space:]]*#/ { next }
+              /^[[:space:]]*aws_region[[:space:]]*=/ {
+                value = $2
+                sub(/#.*/, "", value)
+                gsub(/[[:space:]"]/, "", value)
+                print value
+                exit
+              }
+            ' infra/terraform.tfvars
+          )"
           cpu_architecture="$(
             awk -F= '
               /^[[:space:]]*#/ { next }
@@ -159,6 +172,7 @@ jobs:
               }
             ' infra/terraform.tfvars
           )"
+          aws_region="${aws_region:-$AWS_REGION}"
           cpu_architecture="${cpu_architecture:-X86_64}"
           project="${project:-canopy}"
 
@@ -171,6 +185,7 @@ jobs:
               ;;
           esac
 
+          echo "aws_region=$aws_region" >> "$GITHUB_OUTPUT"
           echo "cpu_architecture=$cpu_architecture" >> "$GITHUB_OUTPUT"
           echo "platform=$platform" >> "$GITHUB_OUTPUT"
           echo "project=$project" >> "$GITHUB_OUTPUT"
@@ -180,7 +195,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_GHA_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ steps.platform.outputs.aws_region }}
 
       - name: Login to Amazon ECR
         id: ecr
@@ -195,7 +210,7 @@ jobs:
           output=$(aws ecr describe-images \
             --repository-name "${{ steps.platform.outputs.ecr_repository }}" \
             --image-ids "imageTag=${{ steps.meta.outputs.image_tag }}" \
-            --region "${AWS_REGION}" 2>&1)
+            --region "${{ steps.platform.outputs.aws_region }}" 2>&1)
           status=$?
           set -e
 
@@ -243,6 +258,8 @@ jobs:
           \`\`\`
 
           Platform: \`${{ steps.platform.outputs.platform }}\` (${{ steps.platform.outputs.cpu_architecture }})
+
+          AWS region: \`${{ steps.platform.outputs.aws_region }}\`
 
           Terraform project: \`${{ steps.platform.outputs.project }}\`
 

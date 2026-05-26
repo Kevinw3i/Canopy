@@ -14,7 +14,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Default is a placeholder so the script never ships an internal profile
 # name. Override with AWS_PROFILE env var or --profile flag.
 AWS_PROFILE_NAME="${AWS_PROFILE:-your-aws-profile}"
-AWS_REGION="${AWS_REGION:-ap-northeast-1}"
+AWS_REGION="${AWS_REGION:-}"
 TERRAFORM_DIR="${TERRAFORM_DIR:-infra}"
 ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-entitlements.toml}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-}"
@@ -42,7 +42,7 @@ Example:
 
 Options:
   --profile <name>        AWS CLI profile. Default: ${AWS_PROFILE_NAME}
-  --region <region>       AWS region. Default: ${AWS_REGION}
+  --region <region>       AWS region. Default: ${AWS_REGION:-Terraform aws_region, then ap-northeast-1}
   --entitlements <path>   Entitlements file in repo root. Default: ${ENTITLEMENTS_FILE}
   --platform <platform>   Docker platform. Default: auto from Terraform cpu_architecture
   --cargo-jobs <n>        Cargo parallel jobs inside Docker. Default: ${CARGO_BUILD_JOBS}
@@ -57,9 +57,9 @@ Options:
   -h, --help              Show this help.
 
 Environment overrides:
-  AWS_PROFILE, AWS_REGION, TERRAFORM_DIR, ENTITLEMENTS_FILE, DOCKER_PLATFORM,
-  CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME, TARGET_GROUP_ARN,
-  LOG_GROUP_NAME, PLAN_FILE
+  AWS_PROFILE, AWS_REGION, TF_VAR_aws_region, TERRAFORM_DIR, ENTITLEMENTS_FILE,
+  DOCKER_PLATFORM, CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME,
+  TARGET_GROUP_ARN, LOG_GROUP_NAME, PLAN_FILE
 EOF
 }
 
@@ -224,6 +224,20 @@ TF_PROJECT="$(
   ' "$TERRAFORM_DIR/terraform.tfvars"
 )"
 TF_PROJECT="${TF_PROJECT:-canopy}"
+
+TF_AWS_REGION="$(
+  awk -F= '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*aws_region[[:space:]]*=/ {
+      value = $2
+      sub(/#.*/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      print value
+      exit
+    }
+  ' "$TERRAFORM_DIR/terraform.tfvars"
+)"
+AWS_REGION="${AWS_REGION:-${TF_AWS_REGION:-${TF_VAR_aws_region:-ap-northeast-1}}}"
 
 if [ -z "$ECS_CLUSTER" ]; then
   ECS_CLUSTER="$(tf_output_raw ecs_cluster_name)"

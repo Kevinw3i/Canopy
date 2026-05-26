@@ -92,7 +92,9 @@ ECR_URL=$(terraform output -raw ecr_repository_url)
 
 # 登入 ECR
 ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
-aws ecr get-login-password --region ap-northeast-1 | \
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+aws ecr get-login-password --region "$AWS_REGION" | \
   docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 # Build & push（platform 須與 Terraform 的 cpu_architecture 一致）

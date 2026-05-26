@@ -55,6 +55,7 @@ EOF
 
 cat > "$REPO_TMP_DIR/infra/terraform.tfvars" <<'EOF'
 project = "canopy"
+aws_region = "us-west-2"
 cpu_architecture = "X86_64"
 enable_direct_access = false
 assumable_role_arns = [
@@ -124,6 +125,7 @@ run_plan_only() {
   env \
     PATH="$REPO_TMP_DIR/bin:$PATH" \
     TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+    AWS_REGION= \
     "$@" \
     "$DEPLOY_SCRIPT" cp-v0.1.0 \
     --plan-only \
@@ -141,12 +143,29 @@ if ! run_plan_only "$PLAN_ONLY_OUT"; then
   exit 1
 fi
 
+grep -qF -- "AWS region:        us-west-2" "$PLAN_ONLY_OUT"
 grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$PLAN_ONLY_OUT"
 if grep -qF -- "Resolve ECR repository" "$PLAN_ONLY_OUT"; then
   cat "$PLAN_ONLY_OUT" >&2
   echo "ERROR: --plan-only should stop before resolving ECR." >&2
   exit 1
 fi
+
+TF_VAR_REGION_OUT="$TMP_DIR/tf-var-region.out"
+if ! run_plan_only "$TF_VAR_REGION_OUT" TF_VAR_aws_region=ap-southeast-1; then
+  cat "$TF_VAR_REGION_OUT" >&2
+  echo "ERROR: expected terraform.tfvars region to take precedence over TF_VAR_aws_region." >&2
+  exit 1
+fi
+grep -qF -- "AWS region:        us-west-2" "$TF_VAR_REGION_OUT"
+
+REGION_OVERRIDE_OUT="$TMP_DIR/region-override.out"
+if ! run_plan_only "$REGION_OVERRIDE_OUT" AWS_REGION=eu-central-1; then
+  cat "$REGION_OVERRIDE_OUT" >&2
+  echo "ERROR: expected AWS_REGION override to pass." >&2
+  exit 1
+fi
+grep -qF -- "AWS region:        eu-central-1" "$REGION_OVERRIDE_OUT"
 
 PLATFORM_MISMATCH_OUT="$TMP_DIR/platform-mismatch.out"
 if env \

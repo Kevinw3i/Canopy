@@ -277,8 +277,10 @@ cd /path/to/Canopy
 
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
 
-aws ecr get-login-password --region ap-northeast-1 | \
+aws ecr get-login-password --region "$AWS_REGION" | \
   docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 VERSION=$(git describe --tags --always)
