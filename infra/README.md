@@ -90,12 +90,11 @@ VERSION=cp-v0.1.0
 # 取得 ECR URL
 ECR_URL=$(terraform output -raw ecr_repository_url)
 
-# 登入 ECR
+# 取得 ECR repository 與 region
 ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
+ECR_REPOSITORY=$(echo "$ECR_URL" | cut -d/ -f2-)
 AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' terraform.tfvars)
 AWS_REGION=${AWS_REGION:-ap-northeast-1}
-aws ecr get-login-password --region "$AWS_REGION" | \
-  docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 # Build & push（platform 須與 Terraform 的 cpu_architecture 一致）
 cd ..
@@ -110,17 +109,39 @@ case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm
   -var="create_service=true" \
   -var="image_tag=$VERSION"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+# 先產生 Phase 2 plan，確認不會 destroy 非預期資源。
+terraform -chdir=infra plan \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION" \
+  -out=tfplan.phase2
+
+# ECR 是 immutable；tag 已存在就換一個 VERSION。
+if TAG_CHECK_OUTPUT=$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$VERSION" 2>&1); then
+  echo "$TAG_CHECK_OUTPUT"
+  echo "ECR image tag already exists: $VERSION"
+  exit 1
+else
+  TAG_CHECK_STATUS=$?
+  if ! grep -q "ImageNotFoundException" <<< "$TAG_CHECK_OUTPUT"; then
+    echo "$TAG_CHECK_OUTPUT"
+    exit "$TAG_CHECK_STATUS"
+  fi
+fi
+
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 docker push "$ECR_URL:$VERSION"
 
-# 回到 infra，建立 ECS service
-cd infra
-terraform apply \
-  -var="create_service=true" \
-  -var="image_tag=$VERSION"
+terraform -chdir=infra apply tfplan.phase2
 ```
 
 ## 部署新版本
