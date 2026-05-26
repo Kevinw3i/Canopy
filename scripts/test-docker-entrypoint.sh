@@ -119,6 +119,33 @@ assert data["oidc"]["issuer_url"] == "https://issuer.example"
 assert data["oidc"]["client_id"] == "client-id"
 PY
 
+cat > "$TMP_DIR/aws" <<'SH'
+#!/bin/sh
+echo "ERROR: aws should not be called when JWT_SECRET is set" >&2
+exit 1
+SH
+chmod +x "$TMP_DIR/aws"
+
+DIRECT_SECRET_OUT="$TMP_DIR/generated-direct-secret.toml"
+env \
+  PATH="$TMP_DIR:$PATH" \
+  GENERATE_CONFIG=1 \
+  JWT_SECRET='direct-jwt-secret' \
+  JWT_SECRET_ARN='arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client-id' \
+  sh "$ENTRYPOINT" > "$DIRECT_SECRET_OUT"
+
+python3 - <<'PY' "$DIRECT_SECRET_OUT"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+
+assert data["jwt"]["secret"] == "direct-jwt-secret"
+PY
+
 PATCH_CONFIG="$TMP_DIR/existing-config.toml"
 cat > "$PATCH_CONFIG" <<'TOML'
 bind_address = "127.0.0.1:8443"
