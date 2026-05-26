@@ -1498,12 +1498,12 @@ impl Component for Ec2Screen {
         let acct_display = self.selected_account_id.as_deref().unwrap_or("All");
         let region_display = self.selected_region.as_deref().unwrap_or("All");
         let acct_label = if account_options.len() > 1 {
-            format!("Account [/]: {}", acct_display)
+            format!("Account [ / ]: {}", acct_display)
         } else {
             format!("Account: {}", acct_display)
         };
         let region_label = if region_options.len() > 1 {
-            format!("Region {{/}}: {}", region_display)
+            format!("Region {{ / }}: {}", region_display)
         } else {
             format!("Region: {}", region_display)
         };
@@ -2278,6 +2278,19 @@ mod tests {
         assert!(matches!(action, Action::RefreshEcsTasks));
         let ecs_text = rendered_text(&mut screen);
         assert!(ecs_text.contains("Ctrl+E: EC2"));
+    }
+
+    #[test]
+    fn scope_header_shows_literal_cycle_keys() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(test_entitlements());
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("Account [ / ]: All"));
+        assert!(text.contains("Region { / }: All"));
+        assert!(!text.contains("Account [/]"));
+        assert!(!text.contains("Region {/}"));
     }
 
     #[test]
