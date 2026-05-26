@@ -241,7 +241,8 @@ Workflow 完成後會推送 image：
 <AWS_ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:cp-v0.1.0
 ```
 
-ECR repository 是 immutable，同一個 tag 不能重複推送。需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
+ECR repository 是 immutable，同一個 tag 不能重複推送，且不可使用 `latest`。
+需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
 Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先以
 `scripts/validate-terraform-tfvars.sh infra -var="create_service=true" -var="image_tag=<release-tag>"`
 驗證 Phase 2 部署 preconditions，再驗證 entitlements，最後推送到

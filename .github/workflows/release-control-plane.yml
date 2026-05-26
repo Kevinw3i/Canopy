@@ -42,6 +42,11 @@ jobs:
             exit 1
           fi
 
+          if [ "${image_tag,,}" = "latest" ]; then
+            echo "::error::Using 'latest' is not allowed. Specify an explicit version tag or git SHA for deterministic deployments."
+            exit 1
+          fi
+
           echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
 
       - name: Validate Terraform
