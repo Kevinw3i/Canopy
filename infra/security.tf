@@ -4,6 +4,13 @@ resource "aws_security_group" "alb" {
   name        = "${var.project}-alb-sg"
   description = "ALB for ${var.project} control-plane"
   vpc_id      = local.network_vpc_id
+
+  lifecycle {
+    precondition {
+      condition     = var.create_vpc || var.vpc_id != ""
+      error_message = "vpc_id is required when create_vpc = false."
+    }
+  }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_https" {
