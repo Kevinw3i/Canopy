@@ -210,7 +210,7 @@ GitHub repo secrets：
 |--------|------|
 | `AWS_GHA_ECR_PUSH_ROLE_ARN` | GitHub Actions 要 assume 的 AWS role ARN |
 | `CONTROL_PLANE_ENTITLEMENTS_TOML_B64` | `entitlements.toml` 的 base64 內容，build image 時寫回檔案 |
-| `CONTROL_PLANE_TFVARS_B64` | 可選，`infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 entitlements |
+| `CONTROL_PLANE_TFVARS_B64` | 可選，`infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 entitlements，並依 `cpu_architecture` 決定 Docker platform。未設定時預設 `X86_64` / `linux/amd64` |
 
 設定 secrets：
 

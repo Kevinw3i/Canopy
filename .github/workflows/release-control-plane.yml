@@ -88,6 +88,43 @@ jobs:
           printf '%s' "${TERRAFORM_TFVARS_B64}" | base64 -d > infra/terraform.tfvars
           ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
+      - name: Resolve Docker platform
+        id: platform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cpu_architecture=""
+          if [ -f infra/terraform.tfvars ]; then
+            cpu_architecture="$(
+              awk -F= '
+                /^[[:space:]]*#/ { next }
+                /^[[:space:]]*cpu_architecture[[:space:]]*=/ {
+                  value = $2
+                  sub(/#.*/, "", value)
+                  gsub(/[[:space:]"]/, "", value)
+                  print value
+                  exit
+                }
+              ' infra/terraform.tfvars
+            )"
+          else
+            echo "::warning::infra/terraform.tfvars was not provided; defaulting Docker platform to X86_64 / linux/amd64"
+          fi
+          cpu_architecture="${cpu_architecture:-X86_64}"
+
+          case "$cpu_architecture" in
+            X86_64) platform="linux/amd64" ;;
+            ARM64) platform="linux/arm64" ;;
+            *)
+              echo "::error::Unsupported cpu_architecture: $cpu_architecture"
+              exit 1
+              ;;
+          esac
+
+          echo "cpu_architecture=$cpu_architecture" >> "$GITHUB_OUTPUT"
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -129,7 +166,7 @@ jobs:
         with:
           context: .
           file: apps/control-plane/Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ steps.platform.outputs.platform }}
           push: true
           build-args: |
             ENTITLEMENTS_SHA=${{ steps.entitlements.outputs.sha }}
@@ -153,6 +190,8 @@ jobs:
           \`\`\`text
           ${image_uri}
           \`\`\`
+
+          Platform: \`${{ steps.platform.outputs.platform }}\` (${{ steps.platform.outputs.cpu_architecture }})
 
           Next manual Terraform step:
 
