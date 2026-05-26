@@ -326,7 +326,7 @@ the only connect path that does not need AWS-scoped credentials.
 | 8 | Audit | Fail-closed on all endpoints (auth, EC2, ECS, CW, entitlements). Transient recovery without restart |
 | 9 | Config | dev_mode refuses non-loopback bind; CORS restricted with real AWS; SSM requires explicit allowed_os_users |
 | 10 | Insights token | HMAC-signed query auth (survives restart), rejects empty log_group_names |
-| 11 | IAM Simulation | SimulatePrincipalPolicy with full action+resource set; inconclusive ECS Exec simulations fall back only when every simulation errors |
+| 11 | IAM Simulation | SimulatePrincipalPolicy selects EC2 describe/power/connect and ECS Exec AssumeRole candidates with full action+resource sets; local direct/profile candidates are not simulated, and inconclusive AssumeRole simulations fall back only when every simulated candidate errors |
 | 12 | Session timeout | max_session_seconds per group, min 900s for STS, kill after timeout (strictest wins) |
 | 13 | Account identity | GetCallerIdentity verifies direct/profile/AssumeRole credentials match configured account_id |
 | 14 | Email verification | Entitlement email matching gated on IdP `email_verified` claim |

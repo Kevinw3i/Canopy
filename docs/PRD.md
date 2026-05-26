@@ -379,7 +379,7 @@ TUI                     Control Plane              OIDC Provider
 | EC2 | `StartInstances` / `StopInstances` / `RebootInstances` | 高風險 power actions |
 | ECS | `ListClusters` / `DescribeClusters` / `ListTasks` / `DescribeTasks` | 列出與驗證授權 tasks |
 | ECS | `ExecuteCommand` | 由 TUI 透過 control-plane 回傳的短期憑證啟動 ECS Exec |
-| IAM | `SimulatePrincipalPolicy` | ECS Exec 前檢查候選 role 是否具備必要動作 |
+| IAM | `SimulatePrincipalPolicy` | EC2 查詢/power/connect 與 ECS Exec 前檢查候選 role 是否具備必要動作 |
 | CloudWatch Logs | `DescribeLogGroups` | 列出 Log Groups |
 | CloudWatch Logs | `FilterLogEvents` | 快速搜尋 |
 | CloudWatch Logs | `StartQuery` | 啟動 Insights 查詢 |

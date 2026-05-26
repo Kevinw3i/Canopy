@@ -597,8 +597,8 @@ curl -s https://canopy.your-domain.com/health
 - [ ] JWT secret 從 Secrets Manager 注入（不寫死在 config）
 - [ ] OIDC `issuer_url` 和 `client_id` 設定正確
 - [ ] `cors_allowed_origins` 列出 TUI client 的 callback URL
-- [ ] Task Role 有 STS/EC2/CloudWatch 權限
+- [ ] Task Role 有 STS/IAM/EC2/ECS/CloudWatch 權限
 - [ ] ALB health check 指向 `/health`
 - [ ] CloudWatch Log Group 已建立
 - [ ] DNS 已指向 ALB
-- [ ] 目標帳號的 IAM Role trust policy 信任 Task Role（跨帳號情境）
+- [ ] 目標帳號的 IAM Role trust policy 信任 Task Role，並允許 `sts:TagSession` / 檢查 `sts:ExternalId`（跨帳號情境）
