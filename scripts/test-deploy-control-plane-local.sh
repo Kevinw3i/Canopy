@@ -81,6 +81,11 @@ cat > "$REPO_TMP_DIR/bin/terraform" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [ "${CANOPY_EXPECT_AWS_PROFILE_UNSET:-0}" = "1" ] && [ "${AWS_PROFILE+x}" = "x" ]; then
+  echo "expected AWS_PROFILE to be unset" >&2
+  exit 1
+fi
+
 chdir="."
 if [[ "${1:-}" == -chdir=* ]]; then
   chdir="${1#-chdir=}"
@@ -143,6 +148,7 @@ if ! run_plan_only "$PLAN_ONLY_OUT"; then
   exit 1
 fi
 
+grep -qF -- "AWS profile:       test-profile" "$PLAN_ONLY_OUT"
 grep -qF -- "AWS region:        us-west-2" "$PLAN_ONLY_OUT"
 grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$PLAN_ONLY_OUT"
 if grep -qF -- "Resolve ECR repository" "$PLAN_ONLY_OUT"; then
@@ -150,6 +156,25 @@ if grep -qF -- "Resolve ECR repository" "$PLAN_ONLY_OUT"; then
   echo "ERROR: --plan-only should stop before resolving ECR." >&2
   exit 1
 fi
+
+NO_PROFILE_OUT="$TMP_DIR/no-profile.out"
+if ! env \
+  PATH="$REPO_TMP_DIR/bin:$PATH" \
+  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+  AWS_PROFILE= \
+  CANOPY_EXPECT_AWS_PROFILE_UNSET=1 \
+  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+  --plan-only \
+  --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
+  --cluster canopy \
+  --service control-plane \
+  > "$NO_PROFILE_OUT" 2>&1; then
+  cat "$NO_PROFILE_OUT" >&2
+  echo "ERROR: expected default AWS credential chain scenario to pass." >&2
+  exit 1
+fi
+grep -qF -- "AWS profile:       default credential chain" "$NO_PROFILE_OUT"
+grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$NO_PROFILE_OUT"
 
 TF_VAR_REGION_OUT="$TMP_DIR/tf-var-region.out"
 if ! run_plan_only "$TF_VAR_REGION_OUT" TF_VAR_aws_region=ap-southeast-1; then

@@ -11,9 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Default is a placeholder so the script never ships an internal profile
-# name. Override with AWS_PROFILE env var or --profile flag.
-AWS_PROFILE_NAME="${AWS_PROFILE:-your-aws-profile}"
+# Use the default AWS credential chain unless AWS_PROFILE or --profile is set.
+AWS_PROFILE_NAME="${AWS_PROFILE:-}"
 AWS_REGION="${AWS_REGION:-}"
 TERRAFORM_DIR="${TERRAFORM_DIR:-infra}"
 ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-entitlements.toml}"
@@ -41,7 +40,7 @@ Example:
   $0 cp-v0.1.0 --yes
 
 Options:
-  --profile <name>        AWS CLI profile. Default: ${AWS_PROFILE_NAME}
+  --profile <name>        AWS CLI profile. Default: ${AWS_PROFILE_NAME:-default credential chain}
   --region <region>       AWS region. Default: ${AWS_REGION:-Terraform aws_region, then ap-northeast-1}
   --entitlements <path>   Entitlements file in repo root. Default: ${ENTITLEMENTS_FILE}
   --platform <platform>   Docker platform. Default: auto from Terraform cpu_architecture
@@ -87,12 +86,24 @@ confirm() {
   esac
 }
 
+run_with_aws_profile() {
+  if [ -n "$AWS_PROFILE_NAME" ]; then
+    AWS_PROFILE="$AWS_PROFILE_NAME" "$@"
+  else
+    env -u AWS_PROFILE "$@"
+  fi
+}
+
 run_aws() {
-  AWS_PROFILE="$AWS_PROFILE_NAME" aws "$@"
+  run_with_aws_profile aws "$@"
+}
+
+run_terraform() {
+  run_with_aws_profile terraform -chdir="$TERRAFORM_DIR" "$@"
 }
 
 tf_output_raw() {
-  AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" output -raw "$1" 2>/dev/null || true
+  run_terraform output -raw "$1" 2>/dev/null || true
 }
 
 while [ "$#" -gt 0 ]; do
@@ -291,7 +302,7 @@ fi
 ENTITLEMENTS_SHA="$(shasum -a 256 "$ENTITLEMENTS_FILE" | awk '{print $1}')"
 
 echo "== Canopy control-plane local deploy =="
-echo "AWS profile:       $AWS_PROFILE_NAME"
+echo "AWS profile:       ${AWS_PROFILE_NAME:-default credential chain}"
 echo "AWS region:        $AWS_REGION"
 echo "Terraform dir:     $TERRAFORM_DIR"
 echo "Image tag:         $IMAGE_TAG"
@@ -310,19 +321,19 @@ fi
 echo ""
 
 echo "== Validate Terraform inputs and entitlements =="
-"$SCRIPT_DIR/validate-terraform-tfvars.sh" "$TERRAFORM_DIR" \
+run_with_aws_profile "$SCRIPT_DIR/validate-terraform-tfvars.sh" "$TERRAFORM_DIR" \
   -var="create_service=true" \
   -var="image_tag=$IMAGE_TAG"
-"$SCRIPT_DIR/validate-entitlements.sh" "$ENTITLEMENTS_FILE" "$TERRAFORM_DIR/terraform.tfvars"
+run_with_aws_profile "$SCRIPT_DIR/validate-entitlements.sh" "$ENTITLEMENTS_FILE" "$TERRAFORM_DIR/terraform.tfvars"
 
 echo ""
 echo "== Terraform Phase 2 plan =="
-AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" plan \
+run_terraform plan \
   -var="create_service=true" \
   -var="image_tag=$IMAGE_TAG" \
   -out="$PLAN_FILE"
 
-PLAN_TEXT="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" show -no-color "$PLAN_FILE")"
+PLAN_TEXT="$(run_terraform show -no-color "$PLAN_FILE")"
 
 if grep -Eq 'will be destroyed' <<< "$PLAN_TEXT"; then
   echo ""
@@ -410,7 +421,7 @@ echo ""
 confirm "Apply Terraform Phase 2 plan and deploy ECS service '$ECS_SERVICE'?"
 
 echo "== Terraform Phase 2 apply =="
-AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" apply "$PLAN_FILE"
+run_terraform apply "$PLAN_FILE"
 
 echo ""
 echo "== Wait for ECS service to become stable =="
@@ -450,12 +461,16 @@ echo ""
 echo "== Done =="
 echo "Image deployed: $ECR_URL:$IMAGE_TAG"
 
-ALB_DNS="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" output -raw alb_dns_name 2>/dev/null || true)"
+ALB_DNS="$(run_terraform output -raw alb_dns_name 2>/dev/null || true)"
 if [ -n "$ALB_DNS" ]; then
   echo "ALB DNS:        $ALB_DNS"
   echo "Health check:   curl -k -I https://$ALB_DNS/health"
 fi
-echo "CloudWatch:     AWS_PROFILE=$AWS_PROFILE_NAME aws logs tail $LOG_GROUP_NAME --region $AWS_REGION --since 30m --follow"
+if [ -n "$AWS_PROFILE_NAME" ]; then
+  echo "CloudWatch:     AWS_PROFILE=$AWS_PROFILE_NAME aws logs tail $LOG_GROUP_NAME --region $AWS_REGION --since 30m --follow"
+else
+  echo "CloudWatch:     aws logs tail $LOG_GROUP_NAME --region $AWS_REGION --since 30m --follow"
+fi
 
 if [ "$TAIL_LOGS" -eq 1 ]; then
   echo ""
