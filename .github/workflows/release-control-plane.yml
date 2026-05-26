@@ -266,10 +266,11 @@ jobs:
           Next manual Terraform step:
 
           \`\`\`bash
-          AWS_PROFILE=your-aws-profile terraform -chdir=infra plan \\
+          # If needed, export AWS_PROFILE=<write-profile>; otherwise Terraform uses the default credential chain.
+          terraform -chdir=infra plan \\
             -var="create_service=true" \\
             -var="image_tag=${{ steps.meta.outputs.image_tag }}" \\
             -out=tfplan.phase2
-          AWS_PROFILE=your-aws-profile terraform -chdir=infra apply tfplan.phase2
+          terraform -chdir=infra apply tfplan.phase2
           \`\`\`
           EOF
