@@ -104,6 +104,9 @@ terraform apply -var="image_tag=$VERSION"
 > ```bash
 > ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 > ```
+>
+> 這個檢查會同時驗證 `assumable_role_arns`、`enable_direct_access`、部署時禁止的
+> `profile:*`，以及 ECS Exec rule 必須使用 AssumeRole ARN。
 
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)

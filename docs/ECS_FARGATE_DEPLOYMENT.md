@@ -164,6 +164,10 @@ vi entitlements.toml
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
 
+這個檢查會確認 AssumeRole ARN 已列在 `assumable_role_arns`、使用
+`direct` 時已啟用 `enable_direct_access`、`profile:*` 未被部署到 ECS，
+且 ECS Exec rule 不使用 direct/profile credentials。
+
 ---
 
 ## Step 6: 建立 IAM Roles
@@ -223,6 +227,7 @@ aws iam create-role \
 
 # control-plane 需要的權限：
 # - STS AssumeRole（跨帳號存取）
+# - IAM SimulatePrincipalPolicy（connect/ECS Exec 前檢查候選 AssumeRole）
 # - CloudWatch Logs（自身 log + 查詢）
 # - EC2 DescribeInstances, DescribeInstanceConnectEndpoints
 # - ECS task inventory（使用 `role_arn = "direct"` 查看部署帳號 ECS tasks 時）
@@ -235,7 +240,18 @@ aws iam put-role-policy \
       {
         "Sid": "AssumeTargetRoles",
         "Effect": "Allow",
-        "Action": "sts:AssumeRole",
+        "Action": [
+          "sts:AssumeRole",
+          "sts:TagSession"
+        ],
+        "Resource": [
+          "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"
+        ]
+      },
+      {
+        "Sid": "SimulatePolicy",
+        "Effect": "Allow",
+        "Action": "iam:SimulatePrincipalPolicy",
         "Resource": [
           "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"
         ]
@@ -263,11 +279,17 @@ aws iam put-role-policy \
 ```
 
 > **`role_arn = "direct"` 模式**：如果 entitlements 裡用 `"direct"`，
-> control-plane 會直接用 Task Role 的權限存取 AWS API，不走 AssumeRole。
-> 確保 Task Role 有足夠權限。
+> control-plane 會直接用 Task Role 的權限存取 inventory/logs 相關 AWS API，
+> 不走 AssumeRole。確保 Task Role 有足夠權限。
+>
+> ECS Exec 在非 mock deployment 中仍需要可 AssumeRole 的 IAM role ARN，
+> 因為 control-plane 必須回傳 scope 過的 STS credentials；不要用
+> `direct` 或 `profile:*` 開啟 ECS Exec。
 >
 > **跨帳號模式**：如果要存取其他帳號的資源，在 `AssumeTargetRoles` 加上對應的 role ARN，
-> 並在目標帳號的 role trust policy 信任這個 Task Role。
+> 並在目標帳號的 role trust policy 信任這個 Task Role。Canopy 的 AssumeRole
+> 會帶 ExternalId 與 STS session tags，所以 trust policy 也要允許
+> `sts:TagSession` 並檢查 `sts:ExternalId`。
 
 ---
 

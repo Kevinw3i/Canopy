@@ -404,7 +404,10 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
     "Principal": {
       "AWS": "arn:aws:iam::CONTROL_PLANE_ACCOUNT:role/CanopyBase"
     },
-    "Action": "sts:AssumeRole",
+    "Action": [
+      "sts:AssumeRole",
+      "sts:TagSession"
+    ],
     "Condition": {
       "StringEquals": {
         "sts:ExternalId": "canopy"
