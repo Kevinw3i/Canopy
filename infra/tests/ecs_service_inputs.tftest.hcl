@@ -99,6 +99,54 @@ run "rejects_disabled_generate_config" {
   ]
 }
 
+run "rejects_non_positive_jwt_expiry_seconds" {
+  command = plan
+
+  variables {
+    jwt_expiry_seconds = 0
+  }
+
+  expect_failures = [
+    var.jwt_expiry_seconds,
+  ]
+}
+
+run "rejects_short_aws_session_duration_seconds" {
+  command = plan
+
+  variables {
+    aws_session_duration_seconds = 899
+  }
+
+  expect_failures = [
+    var.aws_session_duration_seconds,
+  ]
+}
+
+run "rejects_cors_origin_with_path" {
+  command = plan
+
+  variables {
+    cors_allowed_origins = ["https://canopy.example.com/callback"]
+  }
+
+  expect_failures = [
+    var.cors_allowed_origins,
+  ]
+}
+
+run "rejects_sts_external_id_with_space" {
+  command = plan
+
+  variables {
+    sts_external_id = "bad external id"
+  }
+
+  expect_failures = [
+    var.sts_external_id,
+  ]
+}
+
 run "rejects_service_without_jwt_secret_version_id" {
   command = plan
 
