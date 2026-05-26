@@ -116,6 +116,22 @@ run "rejects_oidc_secret_without_version_id" {
   ]
 }
 
+run "rejects_oidc_version_without_secret_arn" {
+  command = plan
+
+  variables {
+    create_service                = true
+    image_tag                     = "cp-v0.1.0"
+    jwt_secret_version_id         = "00000000-0000-0000-0000-000000000000"
+    oidc_client_secret_arn        = ""
+    oidc_client_secret_version_id = "00000000-0000-0000-0000-000000000000"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
 run "rejects_invalid_fargate_cpu_memory_pair" {
   command = plan
 
