@@ -422,6 +422,8 @@ cors_allowed_origins = ["http://localhost:9876"]
 issuer_url = "https://accounts.google.com"
 client_id = "your-client-id"
 scopes = ["openid", "profile", "email"]
+# 若要使用長效登入，需依 OIDC provider 設定 refresh token 發放
+# （例如 offline access scope / provider policy），且 refresh grant 需回傳 id_token。
 
 [jwt]
 secret = "<generated-jwt-secret>"
@@ -559,7 +561,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - Live Tail 為 beta 功能，TUI WebSocket 客戶端目前支援 dev/mock 串流；production real-AWS streaming、自動重連與 log group picker 尚未完整
 - ECS 目前支援 task inventory 與 ECS Exec，不支援 ECS service/deployment 管理
 - ECS broad cluster discovery 需要明確 opt-in，且 response 仍受服務端上限保護
-- OIDC 刷新 Token 流程未完整
+- OIDC refresh token 流程已支援 PKCE/device-code 取得、TUI 401 refresh/retry 與 rotated token 持久化；仍要求 provider 發放 refresh token 並在 refresh grant 回傳 id_token
 - SSM 受管理狀態為啟發式判斷（有 IAM Role 且 Running）
 - EC2 Instance Connect 支援判斷為近似值
 - 未支援 AWS Organizations 自動帳號發現
