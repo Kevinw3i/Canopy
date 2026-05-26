@@ -400,10 +400,10 @@ TUI                     Control Plane              OIDC Provider
 連線操作產生的 STS 憑證附帶 inline session policy：
 
 - SSM：僅允許 `ssm:StartSession` 對目標執行個體
-- EIC：僅允許 `ec2-instance-connect:SendSSHPublicKey` 和 `ec2-instance-connect:OpenTunnel`
+- EIC：允許同區域 `ec2:DescribeInstances` 作為 AWS CLI preflight，並僅允許 `ec2-instance-connect:SendSSHPublicKey` 和 `ec2-instance-connect:OpenTunnel` 對目標 instance / EIC endpoint
 - ECS Exec：僅允許 `ecs:ExecuteCommand` 對目標 task，並以 `ecs:cluster` 條件限制目標 cluster；另允許同區域 `ecs:DescribeTasks` 與必要的同區域 `ssmmessages:*Channel`
-- 憑證有效期：900 秒（15 分鐘）
-- 不授予 `ec2:Describe*` 以防止客戶端繞過伺服器端過濾
+- 範圍限縮 STS 憑證預設 900 秒；若 entitlement 設定 `max_session_seconds`，使用最嚴格的非零上限，低於 STS 最小值 900 秒的非 SSH 連線會被拒絕
+- 除 EIC 必要的同區域 `ec2:DescribeInstances` 與 ECS Exec 必要的同區域 `ecs:DescribeTasks` 外，不授予額外 Describe 權限，以避免客戶端繞過伺服器端過濾
 
 ---
 
