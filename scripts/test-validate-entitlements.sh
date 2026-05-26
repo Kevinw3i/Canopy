@@ -58,10 +58,38 @@ expect_failure() {
   grep -qF -- "$expected" "$TMP_DIR/$name.out"
 }
 
+expect_command_failure() {
+  local name="$1"
+  local expected="$2"
+  shift 2
+
+  if "$SCRIPT_DIR/validate-entitlements.sh" "$@" > "$TMP_DIR/$name.out" 2>&1; then
+    cat "$TMP_DIR/$name.out" >&2
+    echo "ERROR: expected $name to fail." >&2
+    exit 1
+  fi
+
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
+}
+
+expect_command_failure "missing-args" "Usage:"
+
 GOV_ROLE="arn:aws-us-gov:iam::123456789012:role/path/CanopyRole"
 write_entitlements "$TMP_DIR/gov-entitlements.toml" "$GOV_ROLE"
 write_tfvars "$TMP_DIR/gov.tfvars" "$GOV_ROLE"
 expect_success "gov-partition" "$TMP_DIR/gov-entitlements.toml" "$TMP_DIR/gov.tfvars"
+
+expect_command_failure \
+  "missing-entitlements-file" \
+  "Entitlements file not found" \
+  "$TMP_DIR/no-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars"
+
+expect_command_failure \
+  "missing-tfvars-file" \
+  "Terraform tfvars not found" \
+  "$TMP_DIR/gov-entitlements.toml" \
+  "$TMP_DIR/no.tfvars"
 
 cat > "$TMP_DIR/missing.tfvars" <<'EOF'
 enable_direct_access = false

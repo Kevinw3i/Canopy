@@ -9,8 +9,25 @@
 #   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
 set -euo pipefail
 
-ENTITLEMENTS="${1:?Usage: $0 <entitlements.toml> <terraform.tfvars>}"
-TFVARS="${2:?Usage: $0 <entitlements.toml> <terraform.tfvars>}"
+usage() {
+  echo "Usage: $0 <entitlements.toml> <terraform.tfvars>" >&2
+}
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+if [ "$#" -ne 2 ]; then
+  usage
+  exit 1
+fi
+
+ENTITLEMENTS="$1"
+TFVARS="$2"
+
+[ -f "$ENTITLEMENTS" ] || fail "Entitlements file not found: $ENTITLEMENTS"
+[ -f "$TFVARS" ] || fail "Terraform tfvars not found: $TFVARS"
 
 ERRORS=0
 
