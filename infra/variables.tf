@@ -208,6 +208,11 @@ variable "alb_allowed_cidrs" {
 variable "acm_certificate_arn" {
   description = "ACM certificate ARN for HTTPS listener"
   type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[0-9a-fA-F-]{36}$", var.acm_certificate_arn))
+    error_message = "acm_certificate_arn must be a concrete ACM certificate ARN."
+  }
 }
 
 variable "route53_zone_id" {
@@ -237,18 +242,36 @@ variable "domain_name" {
 variable "jwt_secret_arn" {
   description = "Secrets Manager ARN for the JWT signing secret. Create the secret out-of-band to avoid exposing it in Terraform state."
   type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$", var.jwt_secret_arn))
+    error_message = "jwt_secret_arn must be a concrete Secrets Manager secret ARN."
+  }
 }
 
 variable "jwt_secret_version_id" {
   description = "Secrets Manager version ID for the JWT secret. Required when create_service = true so rolling deployments pin every task to the same key."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.jwt_secret_version_id == "" || can(regex("^[A-Za-z0-9-]{32,64}$", var.jwt_secret_version_id))
+    error_message = "jwt_secret_version_id must be empty or a Secrets Manager version ID."
+  }
 }
 
 variable "secrets_kms_key_arns" {
   description = "KMS key ARNs used to encrypt Secrets Manager secrets (jwt_secret, oidc_client_secret). Leave empty if using AWS-managed keys."
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.secrets_kms_key_arns :
+      can(regex("^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", arn))
+    ])
+    error_message = "secrets_kms_key_arns must contain only concrete KMS key ARNs."
+  }
 }
 
 # ── Application config ──────────────────────────────────
@@ -267,12 +290,22 @@ variable "oidc_client_secret_arn" {
   description = "Secrets Manager ARN for the OIDC client secret (for confidential clients). Leave empty for public clients."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.oidc_client_secret_arn == "" || can(regex("^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$", var.oidc_client_secret_arn))
+    error_message = "oidc_client_secret_arn must be empty or a concrete Secrets Manager secret ARN."
+  }
 }
 
 variable "oidc_client_secret_version_id" {
   description = "Secrets Manager version ID for the OIDC client secret. Required when oidc_client_secret_arn is set, for the same version-pinning reason as jwt_secret_version_id."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.oidc_client_secret_version_id == "" || can(regex("^[A-Za-z0-9-]{32,64}$", var.oidc_client_secret_version_id))
+    error_message = "oidc_client_secret_version_id must be empty or a Secrets Manager version ID."
+  }
 }
 
 variable "generate_config" {

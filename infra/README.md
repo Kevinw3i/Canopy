@@ -174,8 +174,8 @@ encrypt        = true
 | `vpc_id` | Yes | `create_vpc = false` 時必填的 VPC ID |
 | `public_subnet_ids` | Conditional | `create_vpc = false` 且 `alb_internal = false` 時必須至少 2 個 public subnets |
 | `private_subnet_ids` | Yes | `create_vpc = false` 時必須至少 2 個 private subnets；ECS task 所在 subnets |
-| `acm_certificate_arn` | Yes | HTTPS 憑證 ARN |
-| `jwt_secret_arn` | Yes | Secrets Manager ARN（JWT 簽署密鑰，須在 Terraform 外建立） |
+| `acm_certificate_arn` | Yes | HTTPS 憑證 ACM certificate ARN |
+| `jwt_secret_arn` | Yes | Secrets Manager secret ARN（JWT 簽署密鑰，須在 Terraform 外建立） |
 | `oidc_issuer_url` | Yes | OIDC provider URL |
 | `oidc_client_id` | Yes | OIDC client ID |
 | `project` | No | 預設 `canopy`；1-28 字元，僅 lowercase letters、numbers、hyphens，且不可頭尾 hyphen |

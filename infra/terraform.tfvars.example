@@ -16,7 +16,7 @@ private_subnet_ids = ["subnet-ccc", "subnet-ddd"]
 # private_subnet_cidrs = ["10.200.10.0/24", "10.200.11.0/24"]
 # single_nat_gateway   = true
 
-acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/xxxxxxxx"
+acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
 
 # Image tag (required — use a versioned tag or git SHA, not "latest")
 image_tag = "v0.1.0"
@@ -29,7 +29,7 @@ image_tag = "v0.1.0"
 # aws secretsmanager create-secret --name canopy/jwt-secret --secret-string "$(openssl rand -base64 44)"
 # aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secret --query 'Versions[?VersionStages[0]==`AWSCURRENT`].VersionId | [0]' --output text
 jwt_secret_arn        = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX"
-jwt_secret_version_id = "<JWT_SECRET_VERSION_ID>"
+jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
 
 # ALB defaults to internal. Provide at least one CIDR (e.g. your VPC CIDR for internal).
 alb_allowed_cidrs = ["10.0.0.0/16"]

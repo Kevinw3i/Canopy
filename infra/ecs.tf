@@ -41,6 +41,10 @@ resource "aws_ecs_task_definition" "control_plane" {
       error_message = "oidc_client_secret_version_id is required when oidc_client_secret_arn is set."
     }
     precondition {
+      condition     = var.oidc_client_secret_arn != "" || var.oidc_client_secret_version_id == ""
+      error_message = "oidc_client_secret_arn is required when oidc_client_secret_version_id is set."
+    }
+    precondition {
       condition     = contains(local.fargate_cpu_memory_pairs, "${var.cpu}:${var.memory}")
       error_message = "cpu and memory must be a valid AWS Fargate Linux task size combination."
     }
