@@ -45,7 +45,7 @@ expect_entrypoint_failure() {
     exit 1
   fi
 
-  grep -q -- "$expected" "$TMP_DIR/$name.err"
+  grep -qF -- "$expected" "$TMP_DIR/$name.err"
 }
 
 CONFIG_OUT="$TMP_DIR/generated.toml"

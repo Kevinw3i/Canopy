@@ -17,7 +17,7 @@ expect_failure() {
     exit 1
   fi
 
-  grep -q -- "$expected" "$TMP_DIR/$name.out"
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
 }
 
 expect_failure "missing-tag" "Usage:"

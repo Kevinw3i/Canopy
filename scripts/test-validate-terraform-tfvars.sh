@@ -73,7 +73,7 @@ expect_failure() {
     exit 1
   fi
 
-  grep -q -- "$expected" "$TMP_DIR/$name.out"
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
 }
 
 expect_failure_in_dir() {
@@ -88,7 +88,7 @@ expect_failure_in_dir() {
     exit 1
   fi
 
-  grep -q -- "$expected" "$TMP_DIR/$name.out"
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
 }
 
 expect_failure_in_dir "missing-terraform-dir" "Terraform dir not found" "$TMP_DIR/missing-infra"
