@@ -339,7 +339,12 @@ pub fn ecs_exec_session_policy(cluster_arn: &str, task_arn: &str, region: &str) 
                     "ssmmessages:OpenControlChannel",
                     "ssmmessages:OpenDataChannel"
                 ],
-                "Resource": "*"
+                "Resource": "*",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:RequestedRegion": region
+                    }
+                }
             }
         ]
     })
@@ -594,13 +599,18 @@ mod tests {
 
     #[test]
     fn ecs_exec_session_policy_contains_ssmmessages_actions() {
-        let policy = ecs_exec_session_policy("cluster", "task", "us-east-1");
+        let policy = ecs_exec_session_policy("cluster", "task", "ap-northeast-1");
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
-        let actions = v["Statement"][2]["Action"].as_array().unwrap();
+        let statement = &v["Statement"][2];
+        let actions = statement["Action"].as_array().unwrap();
         assert!(actions
             .iter()
             .any(|a| a == "ssmmessages:CreateControlChannel"));
         assert!(actions.iter().any(|a| a == "ssmmessages:OpenDataChannel"));
+        assert_eq!(
+            statement["Condition"]["StringEquals"]["aws:RequestedRegion"],
+            "ap-northeast-1"
+        );
     }
 
     #[test]

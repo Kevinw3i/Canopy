@@ -375,7 +375,8 @@ the only connect path that does not need AWS-scoped credentials.
       "ssmmessages:OpenControlChannel",
       "ssmmessages:OpenDataChannel"
     ],
-    "Resource": "*"
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:RequestedRegion": "{region}"}}
   }
 ]
 ```
