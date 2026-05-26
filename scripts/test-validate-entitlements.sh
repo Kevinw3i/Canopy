@@ -55,7 +55,7 @@ expect_failure() {
     exit 1
   fi
 
-  grep -q "$expected" "$TMP_DIR/$name.out"
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
 }
 
 GOV_ROLE="arn:aws-us-gov:iam::123456789012:role/path/CanopyRole"
@@ -80,5 +80,41 @@ expect_failure \
   "$TMP_DIR/invalid-entitlements.toml" \
   "$TMP_DIR/invalid.tfvars" \
   "concrete IAM role ARN"
+
+write_entitlements "$TMP_DIR/direct-entitlements.toml" "direct"
+write_tfvars "$TMP_DIR/direct-disabled.tfvars" "$GOV_ROLE"
+expect_failure \
+  "direct-disabled" \
+  "$TMP_DIR/direct-entitlements.toml" \
+  "$TMP_DIR/direct-disabled.tfvars" \
+  "enable_direct_access is not true"
+
+cat > "$TMP_DIR/direct-enabled.tfvars" <<'EOF'
+enable_direct_access = true
+assumable_role_arns = []
+EOF
+expect_success "direct-enabled" "$TMP_DIR/direct-entitlements.toml" "$TMP_DIR/direct-enabled.tfvars"
+
+write_entitlements "$TMP_DIR/profile-entitlements.toml" "profile:dev"
+expect_failure \
+  "profile-role" \
+  "$TMP_DIR/profile-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "profile:*"
+
+cat > "$TMP_DIR/exec-direct-entitlements.toml" <<'EOF'
+[[rules]]
+id = "ecs-exec-direct"
+can_view_ecs = true
+can_use_ecs_exec = true
+allowed_accounts = [
+  { account_id = "123456789012", account_name = "prod", role_arn = "direct" },
+]
+EOF
+expect_failure \
+  "exec-direct-role" \
+  "$TMP_DIR/exec-direct-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "enables can_use_ecs_exec but uses direct/profile credentials"
 
 echo "validate-entitlements tests passed."
