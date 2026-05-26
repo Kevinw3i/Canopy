@@ -88,10 +88,14 @@ impl AppState {
             anyhow::bail!("entitlements_file and entitlements_database_url are mutually exclusive");
         }
 
-        let entitlement_store = if let Some(ref url) = config.entitlements_database_url {
-            EntitlementStore::load_from_database_url(url)?
+        let mut entitlement_store = if let Some(ref url) = config.entitlements_database_url {
+            EntitlementStore::load_from_database_url_allowing_organization_account_placeholders(
+                url,
+            )?
         } else if let Some(ref path) = config.entitlements_file {
-            EntitlementStore::load_from_file(std::path::Path::new(path))?
+            EntitlementStore::load_from_file_allowing_organization_account_placeholders(
+                std::path::Path::new(path),
+            )?
         } else if config.dev_mode {
             EntitlementStore::dev_defaults()
         } else {
@@ -115,6 +119,26 @@ impl AppState {
             ))
             .load()
             .await;
+
+        if entitlement_store.has_organization_account_placeholders() {
+            tracing::info!("Discovering AWS Organizations accounts for entitlement expansion");
+            let accounts =
+                crate::aws::organizations::discover_active_accounts(&base_aws_config).await?;
+            let discovered_count = accounts.len();
+            if discovered_count == 0 {
+                anyhow::bail!(
+                    "AWS Organizations account discovery returned no ACTIVE accounts for entitlement expansion"
+                );
+            }
+            let expanded_count =
+                entitlement_store.expand_organization_account_placeholders(&accounts)?;
+            tracing::info!(
+                discovered_accounts = discovered_count,
+                expanded_accounts = expanded_count,
+                "Expanded AWS Organizations entitlement accounts"
+            );
+        }
+        entitlement_store.validate()?;
 
         let audit_service = if let Some(ref log_path) = config.audit_log {
             audit::AuditService::with_file(log_path)?

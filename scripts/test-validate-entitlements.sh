@@ -84,6 +84,81 @@ write_entitlements "$TMP_DIR/gov-entitlements.toml" "$GOV_ROLE"
 write_tfvars "$TMP_DIR/gov.tfvars" "$GOV_ROLE"
 expect_success "gov-partition" "$TMP_DIR/gov-entitlements.toml" "$TMP_DIR/gov.tfvars"
 
+ORG_ROLE_TEMPLATE="arn:aws:iam::{account_id}:role/CanopyRole"
+ORG_ROLE_PATTERN="arn:aws:iam::*:role/CanopyRole"
+cat > "$TMP_DIR/org-discovery-entitlements.toml" <<EOF
+[[rules]]
+id = "org-discovery"
+allowed_clusters = ["prod"]
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "*"
+account_name = "organization"
+role_arn = "$ORG_ROLE_TEMPLATE"
+EOF
+cat > "$TMP_DIR/org-discovery.tfvars" <<EOF
+enable_direct_access = false
+assumable_role_arns = []
+assumable_role_arn_patterns = [
+  "$ORG_ROLE_PATTERN",
+]
+EOF
+cat > "$TMP_DIR/org-discovery-missing-pattern.tfvars" <<'EOF'
+enable_direct_access = false
+assumable_role_arns = []
+assumable_role_arn_patterns = []
+EOF
+expect_success \
+  "org-discovery-role-template" \
+  "$TMP_DIR/org-discovery-entitlements.toml" \
+  "$TMP_DIR/org-discovery.tfvars"
+
+expect_failure \
+  "org-discovery-missing-role-pattern" \
+  "$TMP_DIR/org-discovery-entitlements.toml" \
+  "$TMP_DIR/org-discovery-missing-pattern.tfvars" \
+  "assumable_role_arn_patterns"
+
+cat > "$TMP_DIR/org-discovery-invalid-template-entitlements.toml" <<'EOF'
+[[rules]]
+id = "org-discovery-invalid-template"
+allowed_clusters = ["prod"]
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "*"
+account_name = "organization"
+role_arn = "arn:aws:iam::{account_id}:role/{account_id}/CanopyRole"
+EOF
+expect_failure \
+  "org-discovery-invalid-role-template" \
+  "$TMP_DIR/org-discovery-invalid-template-entitlements.toml" \
+  "$TMP_DIR/org-discovery.tfvars" \
+  "exactly one {account_id} token"
+
+cat > "$TMP_DIR/org-discovery-single-quoted-entitlements.toml" <<'EOF'
+[[rules]]
+id = "org-discovery-single-quoted"
+allowed_clusters = ["prod"]
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = '*'
+account_name = 'organization'
+role_arn = 'arn:aws:iam::{account_id}:role/CanopyRole'
+EOF
+expect_success \
+  "org-discovery-single-quoted-role-template" \
+  "$TMP_DIR/org-discovery-single-quoted-entitlements.toml" \
+  "$TMP_DIR/org-discovery.tfvars"
+
 expect_command_failure \
   "missing-entitlements-file" \
   "Entitlements file not found" \

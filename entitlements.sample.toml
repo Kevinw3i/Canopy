@@ -14,6 +14,7 @@
 #   "direct"              直接用本機/Task Role 的 AWS 憑證（不走 AssumeRole）
 #   "profile:NAME"        用 ~/.aws/credentials 裡指定的 profile（本機開發用）
 #   "arn:aws:iam::...:role/..."  AssumeRole 到該 IAM Role（生產環境用）
+#   "arn:aws:iam::{account_id}:role/..." AWS Organizations discovery template
 # ============================================================
 
 # ── 群組 1：平台工程（完整權限）───────────────────────
@@ -56,6 +57,14 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # account_id = "<ACCOUNT_ID_2>"
 # account_name = "staging"
 # role_arn = "arn:aws:iam::<ACCOUNT_ID_2>:role/CanopyRole"
+
+# AWS Organizations 自動帳號發現（取消註解後會在啟動時展開 ACTIVE accounts）：
+# Terraform 也需設定：
+# assumable_role_arn_patterns = ["arn:aws:iam::*:role/CanopyRole"]
+# [[rules.allowed_accounts]]
+# account_id = "*"
+# account_name = "organization"
+# role_arn = "arn:aws:iam::{account_id}:role/CanopyRole"
 
 # 只顯示特定 tag 的機器（取消註解啟用）：
 # [[rules.instance_tag_selectors]]

@@ -229,6 +229,7 @@ VERSION=${VERSION:-$(git describe --tags --always)}
 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
 ALB/DNS/subnet/service preconditions。第二個檢查會確認 active entitlements
 沒有 sample placeholder、AssumeRole ARN 已列在 `assumable_role_arns`、
+Organizations role template 已列在 `assumable_role_arn_patterns`、
 `role_arn` 格式有效且 IAM Role ARN 不含 wildcard、使用 `direct` 時已啟用
 `enable_direct_access`、`profile:*` 未被部署到 ECS、ECS Exec rule 不使用
 direct/profile credentials 且同時授權 ECS view、授予 ECS 存取的 rule 有明確
@@ -296,6 +297,7 @@ aws iam create-role \
 # - STS AssumeRole（跨帳號存取）
 # - STS GetCallerIdentity（startup preflight）
 # - IAM SimulatePrincipalPolicy（connect/ECS Exec 前檢查候選 AssumeRole）
+# - Organizations ListAccounts（使用 account_id="*" discovery 時）
 # - CloudWatch Logs（自身 log + 查詢）
 # - EC2 DescribeInstances, DescribeInstanceConnectEndpoints
 # - ECS task inventory（使用 `role_arn = "direct"` 查看部署帳號 ECS tasks 時）
@@ -323,6 +325,12 @@ aws iam put-role-policy \
         "Resource": [
           "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"
         ]
+      },
+      {
+        "Sid": "OrganizationsAccountDiscovery",
+        "Effect": "Allow",
+        "Action": "organizations:ListAccounts",
+        "Resource": "*"
       },
       {
         "Sid": "StsIdentity",
@@ -362,6 +370,11 @@ aws iam put-role-policy \
 > ECS Exec 的 inline session policy 只允許目標 task 的 `ecs:ExecuteCommand`，
 > 並以 `aws:RequestedRegion` 限制 `ecs:DescribeTasks` 與 `ssmmessages`
 > helper channel actions 到同一個 requested region。
+>
+> 若使用 AWS Organizations discovery，AssumeRole/SimulatePolicy 的 `Resource`
+> 可使用相同 role name 的 account wildcard，例如
+> `arn:aws:iam::*:role/CanopyRole`；Terraform 對應設定為
+> `assumable_role_arn_patterns`。
 >
 > **跨帳號模式**：如果要存取其他帳號的資源，在 `AssumeTargetRoles` 加上對應的 role ARN，
 > 並在目標帳號的 role trust policy 信任這個 Task Role。Canopy 的 AssumeRole

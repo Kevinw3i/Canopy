@@ -487,6 +487,21 @@ user_id = "alice@example.com"
 group = "platform-engineering"
 ```
 
+AWS Organizations 帳號自動發現可用 `account_id = "*"` 明確 opt-in；`role_arn`
+必須是包含 `{account_id}` 的 IAM role ARN template。Control Plane 啟動時會
+呼叫 `organizations:ListAccounts`，只展開 `ACTIVE` 帳號，並在路由使用前把
+placeholder 移除：
+
+```toml
+[[rules.allowed_accounts]]
+account_id = "*"
+account_name = "organization"
+role_arn = "arn:aws:iam::{account_id}:role/CanopyRole"
+```
+
+Terraform 需同時設定對應 pattern，例如
+`assumable_role_arn_patterns = ["arn:aws:iam::*:role/CanopyRole"]`。
+
 ### 9.4 SQLite 權限後端
 
 Control Plane 可改用 `entitlements_database_url = "sqlite:///path/to/entitlements.db"` 從 SQLite 載入權限。`entitlements_file` 與 `entitlements_database_url` 互斥；兩者同時設定時啟動失敗。SQLite schema 由 control-plane 內建，核心資料表如下：
@@ -495,7 +510,7 @@ Control Plane 可改用 `entitlements_database_url = "sqlite:///path/to/entitlem
 |--------|------|
 | `entitlement_rules` | rule id、group、feature flags、broad discovery opt-in、session limit |
 | `entitlement_memberships` | user id/email 到 group 的對應 |
-| `entitlement_allowed_accounts` | 每條 rule 的 AWS account / display name / role ARN |
+| `entitlement_allowed_accounts` | 每條 rule 的 AWS account / display name / role ARN；可用 `account_id="*"` + `{account_id}` role template 啟用 Organizations discovery |
 | `entitlement_allowed_regions` | 每條 rule 的 region allow-list |
 | `entitlement_allowed_log_group_arns` | 每條 rule 的 CloudWatch log group ARN patterns |
 | `entitlement_allowed_clusters` | 每條 rule 的 ECS cluster allow-list |
@@ -583,12 +598,12 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - OIDC refresh token 流程已支援 PKCE/device-code 取得、TUI 401 refresh/retry 與 rotated token 持久化；仍要求 provider 發放 refresh token 並在 refresh grant 回傳 id_token
 - SSM 受管理狀態為啟發式判斷（有 IAM Role 且 Running）
 - EC2 Instance Connect 支援判斷為近似值
-- 未支援 AWS Organizations 自動帳號發現
+- AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
 - 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
 
 ### 未來規劃
 
-- [ ] AWS Organizations 帳號自動發現
+- [x] AWS Organizations 帳號自動發現
 - [ ] SSM DescribeInstanceInformation 精確判斷受管理狀態
 - [ ] Multi-factor Authentication 支援
 - [ ] 自訂快捷鍵設定

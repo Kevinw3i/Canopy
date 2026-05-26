@@ -477,3 +477,17 @@ variable "assumable_role_arns" {
     error_message = "assumable_role_arns must contain concrete IAM role ARNs without wildcards."
   }
 }
+
+variable "assumable_role_arn_patterns" {
+  description = "IAM role ARN patterns used for AWS Organizations account discovery, for example arn:aws:iam::*:role/CanopyRole. Only a wildcard account-id segment is allowed."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.assumable_role_arn_patterns :
+      can(regex("^arn:aws[a-zA-Z-]*:iam::\\*:role/[A-Za-z0-9+=,.@_/-]+$", arn))
+    ])
+    error_message = "assumable_role_arn_patterns must use a wildcard account-id segment only, for example arn:aws:iam::*:role/CanopyRole."
+  }
+}

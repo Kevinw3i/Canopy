@@ -66,3 +66,9 @@ oidc_client_id  = "your-client-id"
 #   "arn:aws:iam::111111111111:role/CanopyRole",
 #   "arn:aws:iam::222222222222:role/CanopyRole",
 # ]
+#
+# Optional: allow AWS Organizations account discovery for same-named roles.
+# Use with entitlements account_id = "*" and role_arn containing {account_id}.
+# assumable_role_arn_patterns = [
+#   "arn:aws:iam::*:role/CanopyRole",
+# ]

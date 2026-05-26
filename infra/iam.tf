@@ -76,12 +76,36 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = var.assumable_role_arns
       }] : [],
 
+      # Cross-account AssumeRole patterns for AWS Organizations account discovery.
+      length(var.assumable_role_arn_patterns) > 0 ? [{
+        Sid      = "AssumeDiscoveredTargetRoles"
+        Effect   = "Allow"
+        Action   = ["sts:AssumeRole", "sts:TagSession"]
+        Resource = var.assumable_role_arn_patterns
+      }] : [],
+
       # SimulatePrincipalPolicy for cross-account role selection (always when roles configured)
       length(var.assumable_role_arns) > 0 ? [{
         Sid      = "SimulatePolicy"
         Effect   = "Allow"
         Action   = ["iam:SimulatePrincipalPolicy"]
         Resource = var.assumable_role_arns
+      }] : [],
+
+      # SimulatePrincipalPolicy for discovered role patterns.
+      length(var.assumable_role_arn_patterns) > 0 ? [{
+        Sid      = "SimulateDiscoveredPolicy"
+        Effect   = "Allow"
+        Action   = ["iam:SimulatePrincipalPolicy"]
+        Resource = var.assumable_role_arn_patterns
+      }] : [],
+
+      # Organizations account discovery is only needed when role patterns are configured.
+      length(var.assumable_role_arn_patterns) > 0 ? [{
+        Sid      = "OrganizationsAccountDiscovery"
+        Effect   = "Allow"
+        Action   = ["organizations:ListAccounts"]
+        Resource = "*"
       }] : [],
 
       # Direct AWS access in deployment account (opt-in via enable_direct_access)

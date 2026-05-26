@@ -7,7 +7,8 @@
 #   1. If any account uses role_arn = "direct", enable_direct_access must be true in tfvars
 #   2. profile:* role_arn entries are rejected for ECS deployments
 #   3. role_arn entries must be direct, profile:*, or concrete ARN values
-#   4. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
+#   4. All role ARNs in entitlements must appear in assumable_role_arns in tfvars,
+#      or AWS Organizations templates must appear in assumable_role_arn_patterns
 #   5. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
 #   6. ECS Exec must imply ECS view, ECS access rules need allowed_clusters,
 #      and broad ECS cluster wildcards require explicit opt-in
@@ -62,6 +63,27 @@ extract_assumable_role_arns() {
   ' | grep -oE '"arn:[^"]+"' | tr -d '"' | sort -u || true
 }
 
+extract_assumable_role_arn_patterns() {
+  strip_comments "$TFVARS" | awk '
+    /^[[:space:]]*assumable_role_arn_patterns[[:space:]]*=/ {
+      in_list = 1
+      line = $0
+      sub(/^[^=]*=/, "", line)
+      print line
+      if (line ~ /\]/) {
+        in_list = 0
+      }
+      next
+    }
+    in_list {
+      print
+      if ($0 ~ /\]/) {
+        in_list = 0
+      }
+    }
+  ' | grep -oE '"arn:[^"]+"' | tr -d '"' | sort -u || true
+}
+
 extract_role_arn_values() {
   printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
     {
@@ -75,6 +97,10 @@ extract_role_arn_values() {
       }
     }
   ' | sort -u || true
+}
+
+role_template_to_pattern() {
+  printf '%s\n' "$1" | sed 's/{account_id}/*/g'
 }
 
 ACTIVE_ENTITLEMENTS="$(strip_comments "$ENTITLEMENTS")"
@@ -101,6 +127,77 @@ fi
 
 ROLE_VALUES="$(extract_role_arn_values)"
 
+# Check 3a: Organizations account placeholders must be paired with a role template,
+# and role templates must only be used with account_id="*".
+ORG_ACCOUNT_TEMPLATE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function extract_value(line, key, value) {
+  if (match(line, key "[[:space:]]*=[[:space:]]*[\"\\047][^\"\\047]+[\"\\047]")) {
+    value = substr(line, RSTART, RLENGTH)
+    sub(/^[^"\047]*["\047]/, "", value)
+    sub(/["\047]$/, "", value)
+    return value
+  }
+  return ""
+}
+function flush_account() {
+  if (!in_account) {
+    return
+  }
+  if (account_id == "*" && role_arn !~ /\{account_id\}/) {
+    print "placeholder_without_template"
+  }
+  if (account_id != "" && account_id != "*" && role_arn ~ /\{account_id\}/) {
+    print "template_without_placeholder"
+  }
+}
+{
+  inline_account_id = extract_value($0, "account_id")
+  inline_role_arn = extract_value($0, "role_arn")
+  if (inline_account_id != "" || inline_role_arn != "") {
+    if (inline_account_id == "*" && inline_role_arn != "" && inline_role_arn !~ /\{account_id\}/) {
+      print "placeholder_without_template"
+    }
+    if (inline_account_id != "" && inline_account_id != "*" && inline_role_arn ~ /\{account_id\}/) {
+      print "template_without_placeholder"
+    }
+  }
+}
+/^[[:space:]]*\[\[rules\.allowed_accounts\]\][[:space:]]*$/ {
+  flush_account()
+  in_account = 1
+  account_id = ""
+  role_arn = ""
+  next
+}
+in_account && /^[[:space:]]*\[/ {
+  flush_account()
+  in_account = 0
+}
+in_account && /^[[:space:]]*account_id[[:space:]]*=/ {
+  account_id = extract_value($0, "account_id")
+}
+in_account && /^[[:space:]]*role_arn[[:space:]]*=/ {
+  role_arn = extract_value($0, "role_arn")
+}
+END {
+  flush_account()
+}
+')
+
+if [ -n "$ORG_ACCOUNT_TEMPLATE_ERRORS" ]; then
+  while IFS= read -r error_kind; do
+    case "$error_kind" in
+      placeholder_without_template)
+        echo "ERROR: account_id=\"*\" requires an AWS Organizations role_arn template containing {account_id}"
+        ;;
+      template_without_placeholder)
+        echo "ERROR: role_arn templates containing {account_id} require account_id=\"*\""
+        ;;
+    esac
+  done <<< "$ORG_ACCOUNT_TEMPLATE_ERRORS"
+  ERRORS=$((ERRORS + 1))
+fi
+
 # Check 3: role_arn entries must use a supported credential mode.
 while IFS= read -r role_value; do
   [ -n "$role_value" ] || continue
@@ -116,8 +213,25 @@ done <<< "$ROLE_VALUES"
 # Check 4: all role ARNs present in assumable_role_arns (uncommented lines only)
 ROLE_ARNS=$(printf '%s\n' "$ROLE_VALUES" | grep -E '^arn:' || true)
 ASSUMABLE_ROLE_ARNS="$(extract_assumable_role_arns)"
+ASSUMABLE_ROLE_ARN_PATTERNS="$(extract_assumable_role_arn_patterns)"
 
 for arn in $ROLE_ARNS; do
+  if grep -qF '{account_id}' <<< "$arn"; then
+    TOKEN_COUNT=$(grep -oF '{account_id}' <<< "$arn" | wc -l | tr -d '[:space:]')
+    if [ "$TOKEN_COUNT" != "1" ] || ! grep -qE '^arn:aws[a-zA-Z-]*:iam::\{account_id\}:role/[A-Za-z0-9+=,.@_/-]+$' <<< "$arn"; then
+      echo "ERROR: AWS Organizations role_arn template must be an IAM role ARN with exactly one {account_id} token in the account-id segment (value redacted)"
+      ERRORS=$((ERRORS + 1))
+      continue
+    fi
+
+    arn_pattern="$(role_template_to_pattern "$arn")"
+    if ! grep -qxF "$arn_pattern" <<< "$ASSUMABLE_ROLE_ARN_PATTERNS"; then
+      echo "ERROR: an AWS Organizations role_arn template in entitlements is not listed in $TFVARS assumable_role_arn_patterns (value redacted)"
+      ERRORS=$((ERRORS + 1))
+    fi
+    continue
+  fi
+
   if ! grep -qE '^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$' <<< "$arn"; then
     echo "ERROR: role_arn in entitlements must be a concrete IAM role ARN without wildcards (value redacted)"
     ERRORS=$((ERRORS + 1))

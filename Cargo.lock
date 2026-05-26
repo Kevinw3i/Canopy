@@ -269,6 +269,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-organizations"
+version = "1.113.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2dcc51ddb264f7a391858ac8408b1f509eb665703d1230dbf821b9ec2caa2df"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sso"
 version = "1.97.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -809,6 +833,7 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-ecs",
  "aws-sdk-iam",
+ "aws-sdk-organizations",
  "aws-sdk-sts",
  "aws-types",
  "axum",

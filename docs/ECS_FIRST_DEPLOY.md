@@ -254,7 +254,8 @@ Phase 1 還沒有 image，部署前先用 `create_service=false` 確認 Terrafor
 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
 ALB/DNS/subnet/service preconditions。第二個檢查會同時驗證 active
 entitlements 沒有 sample placeholder、AssumeRole ARN 都列在
-`assumable_role_arns`、`role_arn` 格式有效且 IAM Role ARN 不含 wildcard、
+`assumable_role_arns`、Organizations role template 都列在
+`assumable_role_arn_patterns`、`role_arn` 格式有效且 IAM Role ARN 不含 wildcard、
 使用 `direct` 時已啟用 `enable_direct_access`、部署時禁止的 `profile:*`、
 ECS Exec rule 必須使用 AssumeRole ARN 並同時授權 ECS view、授予 ECS
 存取的 rule 必須有明確 `allowed_clusters` 且寬鬆 wildcard 需要

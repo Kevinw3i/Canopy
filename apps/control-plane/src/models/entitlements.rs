@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 use serde::Deserialize;
 use shared::dto::ecs::DEV_MOCK_CLUSTER_NAME;
 use shared::dto::entitlements::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// In-memory entitlement store. In production, loaded from an entitlements
@@ -11,6 +11,15 @@ use std::path::Path;
 pub struct EntitlementStore {
     pub rules: Vec<EntitlementRule>,
     pub memberships: Vec<GroupMembership>,
+}
+
+pub const ORGANIZATION_ACCOUNT_PLACEHOLDER: &str = "*";
+pub const ORGANIZATION_ACCOUNT_ID_TOKEN: &str = "{account_id}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredOrganizationAccount {
+    pub account_id: String,
+    pub account_name: String,
 }
 
 const SQLITE_SCHEMA: &str = r#"
@@ -437,8 +446,95 @@ impl EntitlementStore {
         SQLITE_SCHEMA
     }
 
+    pub fn has_organization_account_placeholders(&self) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.allowed_accounts
+                .iter()
+                .any(is_organization_account_placeholder)
+        })
+    }
+
+    /// Expand `account_id = "*"` entries by replacing `{account_id}` in the
+    /// role ARN template with each ACTIVE account discovered from AWS
+    /// Organizations. Placeholder entries are removed before the store is used
+    /// by routes, so runtime scope checks only see concrete account IDs.
+    pub fn expand_organization_account_placeholders(
+        &mut self,
+        accounts: &[DiscoveredOrganizationAccount],
+    ) -> anyhow::Result<usize> {
+        let mut expanded_count = 0usize;
+
+        for rule in &mut self.rules {
+            let mut expanded_accounts = Vec::new();
+            let mut seen: HashSet<(String, String)> = HashSet::new();
+
+            for account in &rule.allowed_accounts {
+                if is_organization_account_placeholder(account) {
+                    validate_organization_account_placeholder(account, &rule.id, &rule.group)?;
+                    for discovered in accounts {
+                        let role_arn = render_organization_role_arn_template(
+                            &account.role_arn,
+                            &discovered.account_id,
+                            &rule.id,
+                            &rule.group,
+                        )?;
+                        let key = (discovered.account_id.clone(), role_arn.clone());
+                        if seen.insert(key) {
+                            expanded_accounts.push(AllowedAccount {
+                                account_id: discovered.account_id.clone(),
+                                account_name: discovered.account_name.clone(),
+                                role_arn,
+                            });
+                            expanded_count += 1;
+                        }
+                    }
+                    continue;
+                }
+
+                if account.role_arn.contains(ORGANIZATION_ACCOUNT_ID_TOKEN) {
+                    anyhow::bail!(
+                        "Rule '{}' (group '{}') uses {} in role_arn for concrete account '{}'. \
+                         Set account_id=\"*\" to opt in to AWS Organizations account discovery.",
+                        rule.id,
+                        rule.group,
+                        ORGANIZATION_ACCOUNT_ID_TOKEN,
+                        account.account_id
+                    );
+                }
+
+                let key = (account.account_id.clone(), account.role_arn.clone());
+                if seen.insert(key) {
+                    expanded_accounts.push(account.clone());
+                }
+            }
+
+            rule.allowed_accounts = expanded_accounts;
+        }
+
+        Ok(expanded_count)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_with_options(false)
+    }
+
+    pub fn validate_allowing_organization_account_placeholders(&self) -> anyhow::Result<()> {
+        self.validate_with_options(true)
+    }
+
+    fn validate_with_options(
+        &self,
+        allow_organization_account_placeholders: bool,
+    ) -> anyhow::Result<()> {
         for rule in &self.rules {
+            for account in &rule.allowed_accounts {
+                validate_account_entry(
+                    account,
+                    &rule.id,
+                    &rule.group,
+                    allow_organization_account_placeholders,
+                )?;
+            }
             if rule.features.can_use_ssm && rule.allowed_os_users.is_empty() {
                 anyhow::bail!(
                     "Rule '{}' (group '{}') has can_use_ssm=true but no allowed_os_users. \
@@ -503,7 +599,38 @@ impl EntitlementStore {
         Ok(store)
     }
 
+    /// Load entitlements before startup account discovery. This accepts
+    /// organization placeholders, but callers must expand them and then call
+    /// `validate()` before exposing the store to routes.
+    pub fn load_from_file_allowing_organization_account_placeholders(
+        path: &Path,
+    ) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read entitlements file {:?}: {}", path, e))?;
+        let store: EntitlementStore = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse entitlements file {:?}: {}", path, e))?;
+
+        tracing::info!(
+            rules = store.rules.len(),
+            memberships = store.memberships.len(),
+            "Loaded entitlements from {:?}",
+            path
+        );
+
+        store.validate_allowing_organization_account_placeholders()?;
+
+        Ok(store)
+    }
+
     pub fn load_from_database_url(url: &str) -> anyhow::Result<Self> {
+        let store = Self::load_from_database_url_allowing_organization_account_placeholders(url)?;
+        store.validate()?;
+        Ok(store)
+    }
+
+    pub fn load_from_database_url_allowing_organization_account_placeholders(
+        url: &str,
+    ) -> anyhow::Result<Self> {
         let path = sqlite_path_from_url(url)?;
         let conn = Connection::open(&path)
             .map_err(|e| anyhow::anyhow!("Failed to open entitlement database '{}': {}", url, e))?;
@@ -515,7 +642,7 @@ impl EntitlementStore {
             memberships = store.memberships.len(),
             "Loaded entitlements from database"
         );
-        store.validate()?;
+        store.validate_allowing_organization_account_placeholders()?;
         Ok(store)
     }
 
@@ -912,6 +1039,104 @@ fn validate_cluster_pattern(
     Ok(())
 }
 
+fn is_organization_account_placeholder(account: &AllowedAccount) -> bool {
+    account.account_id == ORGANIZATION_ACCOUNT_PLACEHOLDER
+}
+
+fn validate_account_entry(
+    account: &AllowedAccount,
+    rule_id: &str,
+    group: &str,
+    allow_organization_account_placeholders: bool,
+) -> anyhow::Result<()> {
+    if is_organization_account_placeholder(account) {
+        if !allow_organization_account_placeholders {
+            anyhow::bail!(
+                "Rule '{}' (group '{}') has unresolved AWS Organizations account placeholder. \
+                 Startup must expand account_id=\"*\" before the entitlement store is used.",
+                rule_id,
+                group
+            );
+        }
+        validate_organization_account_placeholder(account, rule_id, group)?;
+    } else if account.role_arn.contains(ORGANIZATION_ACCOUNT_ID_TOKEN) {
+        anyhow::bail!(
+            "Rule '{}' (group '{}') uses {} in role_arn for concrete account '{}'. \
+             Set account_id=\"*\" to opt in to AWS Organizations account discovery.",
+            rule_id,
+            group,
+            ORGANIZATION_ACCOUNT_ID_TOKEN,
+            account.account_id
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_organization_account_placeholder(
+    account: &AllowedAccount,
+    rule_id: &str,
+    group: &str,
+) -> anyhow::Result<()> {
+    if account.role_arn == "direct" || account.role_arn.starts_with("profile:") {
+        anyhow::bail!(
+            "Rule '{}' (group '{}') has account_id=\"*\" but role_arn uses local credentials. \
+             AWS Organizations discovery requires an IAM role ARN template containing {}.",
+            rule_id,
+            group,
+            ORGANIZATION_ACCOUNT_ID_TOKEN
+        );
+    }
+
+    let token_count = account
+        .role_arn
+        .matches(ORGANIZATION_ACCOUNT_ID_TOKEN)
+        .count();
+    if token_count != 1 {
+        anyhow::bail!(
+            "Rule '{}' (group '{}') has account_id=\"*\" but role_arn does not contain exactly one {} token.",
+            rule_id,
+            group,
+            ORGANIZATION_ACCOUNT_ID_TOKEN
+        );
+    }
+
+    let rendered = account
+        .role_arn
+        .replace(ORGANIZATION_ACCOUNT_ID_TOKEN, "123456789012");
+    if !rendered.starts_with("arn:") || !rendered.contains(":iam::123456789012:role/") {
+        anyhow::bail!(
+            "Rule '{}' (group '{}') has account_id=\"*\" but role_arn is not an IAM role ARN template.",
+            rule_id,
+            group
+        );
+    }
+
+    Ok(())
+}
+
+fn render_organization_role_arn_template(
+    template: &str,
+    account_id: &str,
+    rule_id: &str,
+    group: &str,
+) -> anyhow::Result<String> {
+    if !is_valid_account_id(account_id) {
+        anyhow::bail!(
+            "AWS Organizations returned invalid account id '{}' while expanding rule '{}' (group '{}')",
+            account_id,
+            rule_id,
+            group
+        );
+    }
+
+    Ok(template.replace(ORGANIZATION_ACCOUNT_ID_TOKEN, account_id))
+}
+
+fn is_valid_account_id(account_id: &str) -> bool {
+    account_id.len() == 12 && account_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn normalize_allowed_clusters(
     entries: &[String],
     accounts: &[AllowedAccount],
@@ -980,6 +1205,29 @@ mod tests {
             "canopy-entitlements-{name}-{}-{nonce}.db",
             std::process::id()
         ))
+    }
+
+    fn minimal_rule_with_accounts(accounts: Vec<AllowedAccount>) -> EntitlementRule {
+        EntitlementRule {
+            id: "org-discovery".into(),
+            group: "ops".into(),
+            features: FeatureFlags {
+                can_view_ec2: true,
+                ..Default::default()
+            },
+            allowed_accounts: accounts,
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+        }
     }
 
     #[test]
@@ -1150,6 +1398,130 @@ mod tests {
             })
             .count();
         assert_eq!(prod_count, 1, "Same account+role should appear only once");
+    }
+
+    #[test]
+    fn organization_account_placeholder_expands_to_concrete_accounts() {
+        let mut store = EntitlementStore {
+            rules: vec![minimal_rule_with_accounts(vec![
+                AllowedAccount {
+                    account_id: "999999999999".into(),
+                    account_name: "explicit".into(),
+                    role_arn: "arn:aws:iam::999999999999:role/CanopyRole".into(),
+                },
+                AllowedAccount {
+                    account_id: ORGANIZATION_ACCOUNT_PLACEHOLDER.into(),
+                    account_name: "organization".into(),
+                    role_arn: "arn:aws:iam::{account_id}:role/CanopyRole".into(),
+                },
+            ])],
+            memberships: vec![GroupMembership {
+                user_id: "alice".into(),
+                group: "ops".into(),
+            }],
+        };
+
+        store
+            .validate_allowing_organization_account_placeholders()
+            .unwrap();
+        let expanded = store
+            .expand_organization_account_placeholders(&[
+                DiscoveredOrganizationAccount {
+                    account_id: "111111111111".into(),
+                    account_name: "prod".into(),
+                },
+                DiscoveredOrganizationAccount {
+                    account_id: "222222222222".into(),
+                    account_name: "staging".into(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(expanded, 2);
+        assert!(!store.has_organization_account_placeholders());
+        store.validate().unwrap();
+
+        let ent = store.evaluate("alice", "alice@example.com", "Alice", true);
+        let account_ids: Vec<&str> = ent
+            .allowed_accounts
+            .iter()
+            .map(|account| account.account_id.as_str())
+            .collect();
+        assert_eq!(
+            account_ids,
+            vec!["999999999999", "111111111111", "222222222222"]
+        );
+        assert_eq!(
+            ent.allowed_accounts[1].role_arn,
+            "arn:aws:iam::111111111111:role/CanopyRole"
+        );
+    }
+
+    #[test]
+    fn strict_validation_rejects_unexpanded_organization_placeholder() {
+        let store = EntitlementStore {
+            rules: vec![minimal_rule_with_accounts(vec![AllowedAccount {
+                account_id: ORGANIZATION_ACCOUNT_PLACEHOLDER.into(),
+                account_name: "organization".into(),
+                role_arn: "arn:aws:iam::{account_id}:role/CanopyRole".into(),
+            }])],
+            memberships: vec![],
+        };
+
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("unresolved AWS Organizations account placeholder"));
+    }
+
+    #[test]
+    fn organization_placeholder_requires_role_template() {
+        let store = EntitlementStore {
+            rules: vec![minimal_rule_with_accounts(vec![AllowedAccount {
+                account_id: ORGANIZATION_ACCOUNT_PLACEHOLDER.into(),
+                account_name: "organization".into(),
+                role_arn: "arn:aws:iam::123456789012:role/CanopyRole".into(),
+            }])],
+            memberships: vec![],
+        };
+
+        let err = store
+            .validate_allowing_organization_account_placeholders()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not contain exactly one {account_id} token"));
+    }
+
+    #[test]
+    fn organization_placeholder_deduplicates_explicit_account() {
+        let mut store = EntitlementStore {
+            rules: vec![minimal_rule_with_accounts(vec![
+                AllowedAccount {
+                    account_id: "111111111111".into(),
+                    account_name: "prod-explicit".into(),
+                    role_arn: "arn:aws:iam::111111111111:role/CanopyRole".into(),
+                },
+                AllowedAccount {
+                    account_id: ORGANIZATION_ACCOUNT_PLACEHOLDER.into(),
+                    account_name: "organization".into(),
+                    role_arn: "arn:aws:iam::{account_id}:role/CanopyRole".into(),
+                },
+            ])],
+            memberships: vec![],
+        };
+
+        let expanded = store
+            .expand_organization_account_placeholders(&[DiscoveredOrganizationAccount {
+                account_id: "111111111111".into(),
+                account_name: "prod-discovered".into(),
+            }])
+            .unwrap();
+
+        assert_eq!(expanded, 0);
+        assert!(!store.has_organization_account_placeholders());
+        assert_eq!(store.rules[0].allowed_accounts.len(), 1);
+        assert_eq!(
+            store.rules[0].allowed_accounts[0].account_name,
+            "prod-explicit"
+        );
     }
 
     #[test]

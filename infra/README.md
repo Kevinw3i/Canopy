@@ -171,7 +171,8 @@ terraform -chdir=infra apply tfplan.phase2
 > 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
 > ALB/DNS/subnet/service preconditions。第二個檢查會同時驗證 active
 > entitlements 沒有 sample placeholder、AssumeRole ARN 都列在
-> `assumable_role_arns`、`role_arn` 格式有效且 IAM Role ARN 不含 wildcard、
+> `assumable_role_arns`、Organizations role template 都列在
+> `assumable_role_arn_patterns`、`role_arn` 格式有效且 IAM Role ARN 不含 wildcard、
 > 使用 `direct` 時已啟用 `enable_direct_access`、部署時禁止的 `profile:*`、
 > ECS Exec rule 必須使用 AssumeRole ARN 並同時授權 ECS view、授予 ECS
 > 存取的 rule 必須有明確 `allowed_clusters` 且寬鬆 wildcard 需要
@@ -290,6 +291,7 @@ encrypt        = true
 | `entitlements_file` | No | 預設 `/etc/canopy/entitlements.toml`；必須是容器內絕對路徑 |
 | `route53_zone_id` / `domain_name` | No | 設定後自動建 DNS record；必須同時設定，或同時留空 |
 | `assumable_role_arns` | No | 跨帳號 AssumeRole 的目標 IAM role ARN 清單；不允許 wildcard |
+| `assumable_role_arn_patterns` | No | AWS Organizations 帳號 discovery 用的 AssumeRole ARN pattern；只允許 account-id segment 為 `*`，例如 `arn:aws:iam::*:role/CanopyRole` |
 | `enable_direct_access` | No | 預設 `false`；設為 `true` 時允許 `role_arn = "direct"` 查看部署帳號的 EC2、ECS task inventory、CloudWatch Logs |
 | `log_retention_days` | No | 預設 90 天；必須是 CloudWatch Logs 支援的 retention 天數 |
 | `cors_allowed_origins` | No | CORS 允許的 origins；只接受 scheme + host + optional port |

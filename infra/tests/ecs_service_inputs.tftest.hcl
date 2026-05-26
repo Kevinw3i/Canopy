@@ -219,6 +219,26 @@ run "rejects_invalid_assumable_role_arn" {
   ]
 }
 
+run "accepts_organization_assumable_role_pattern" {
+  command = plan
+
+  variables {
+    assumable_role_arn_patterns = ["arn:aws:iam::*:role/CanopyRole"]
+  }
+}
+
+run "rejects_invalid_organization_assumable_role_pattern" {
+  command = plan
+
+  variables {
+    assumable_role_arn_patterns = ["arn:aws:iam::123456789012:role/Canopy*"]
+  }
+
+  expect_failures = [
+    var.assumable_role_arn_patterns,
+  ]
+}
+
 run "rejects_invalid_jwt_secret_arn" {
   command = plan
 
