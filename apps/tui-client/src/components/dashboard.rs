@@ -40,7 +40,7 @@ impl DashboardScreen {
             items: vec![
                 MenuItem {
                     key: '1',
-                    label: "EC2 Inventory",
+                    label: "Inventory",
                     screen: Screen::Ec2Inventory,
                     enabled: false,
                     hidden: false,
@@ -237,15 +237,7 @@ impl Component for DashboardScreen {
             };
 
             let label = if item.screen == Screen::Ec2Inventory {
-                if let Some(ent) = self.entitlements.as_ref() {
-                    match (ent.features.can_view_ec2, ent.features.can_view_ecs) {
-                        (true, true) => "EC2 Inventory (EC2 + ECS)",
-                        (false, true) => "EC2 Inventory (ECS only)",
-                        _ => item.label,
-                    }
-                } else {
-                    item.label
-                }
+                inventory_label(self.entitlements.as_ref(), item.label)
             } else {
                 item.label
             };
@@ -266,6 +258,18 @@ impl Component for DashboardScreen {
         } else {
             vec![]
         }
+    }
+}
+
+fn inventory_label(
+    entitlements: Option<&UserEntitlements>,
+    fallback: &'static str,
+) -> &'static str {
+    match entitlements.map(|ent| (ent.features.can_view_ec2, ent.features.can_view_ecs)) {
+        Some((true, true)) => "Inventory (EC2 + ECS)",
+        Some((true, false)) => "Inventory (EC2)",
+        Some((false, true)) => "Inventory (ECS)",
+        _ => fallback,
     }
 }
 
@@ -321,14 +325,26 @@ mod tests {
         }
     }
 
+    fn rendered_text(screen: &mut DashboardScreen) -> String {
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut out = String::new();
+        for cell in &buf.content {
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
     #[test]
     fn initial_state_all_menu_items_except_access_settings_disabled() {
         let screen = DashboardScreen::new(false, false);
         let visible = screen.visible_items();
-        // Items: EC2(disabled), CW(disabled), Access(enabled), Settings(enabled)
+        // Items: Inventory(disabled), CW(disabled), Access(enabled), Settings(enabled)
         // Live Tail is hidden when enable_live_tail=false
         assert_eq!(visible.len(), 4);
-        assert!(!visible[0].enabled); // EC2
+        assert!(!visible[0].enabled); // Inventory
         assert!(!visible[1].enabled); // CW
         assert!(visible[2].enabled); // Access
         assert!(visible[3].enabled); // Settings
@@ -355,6 +371,31 @@ mod tests {
         assert!(visible[0].enabled);
         let action = screen.handle_key(key(KeyCode::Char('1')));
         assert!(matches!(action, Action::NavigateTo(Screen::Ec2Inventory)));
+    }
+
+    #[test]
+    fn dashboard_inventory_label_is_ecs_aware() {
+        let mut both = DashboardScreen::new(false, false);
+        let mut both_ent = test_entitlements(true, false, false);
+        both_ent.features.can_view_ecs = true;
+        both.set_entitlements(both_ent);
+        let both_text = rendered_text(&mut both);
+        assert!(both_text.contains("Inventory (EC2 + ECS)"));
+        assert!(!both_text.contains("EC2 Inventory"));
+
+        let mut ecs_only = DashboardScreen::new(false, false);
+        let mut ecs_ent = test_entitlements(false, false, false);
+        ecs_ent.features.can_view_ecs = true;
+        ecs_only.set_entitlements(ecs_ent);
+        let ecs_text = rendered_text(&mut ecs_only);
+        assert!(ecs_text.contains("Inventory (ECS)"));
+        assert!(!ecs_text.contains("EC2 Inventory"));
+
+        let mut ec2_only = DashboardScreen::new(false, false);
+        ec2_only.set_entitlements(test_entitlements(true, false, false));
+        let ec2_text = rendered_text(&mut ec2_only);
+        assert!(ec2_text.contains("Inventory (EC2)"));
+        assert!(!ec2_text.contains("EC2 Inventory"));
     }
 
     #[test]
