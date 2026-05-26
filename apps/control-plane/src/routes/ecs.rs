@@ -391,7 +391,6 @@ fn session_context(
 fn effective_task_fetch_regions(
     req: &EcsTasksRequest,
     rule_regions: &[String],
-    entitlement_regions: &[String],
     cluster_pattern_regions: &[String],
     default_region: String,
 ) -> Vec<String> {
@@ -401,8 +400,6 @@ fn effective_task_fetch_regions(
         rule_regions.to_vec()
     } else if !cluster_pattern_regions.is_empty() {
         cluster_pattern_regions.to_vec()
-    } else if !entitlement_regions.is_empty() {
-        entitlement_regions.to_vec()
     } else {
         vec![default_region]
     }
@@ -436,7 +433,6 @@ async fn fetch_tasks_from_aws(
         let effective_regions = effective_task_fetch_regions(
             req,
             rule_regions,
-            &entitlements.allowed_regions,
             &cluster_pattern_regions,
             default_region,
         );
@@ -1482,7 +1478,7 @@ mod tests {
         };
 
         assert_eq!(
-            effective_task_fetch_regions(&req, &[], &[], &[], "us-east-1".into()),
+            effective_task_fetch_regions(&req, &[], &[], "us-east-1".into()),
             vec!["ap-northeast-1"]
         );
     }
@@ -1498,30 +1494,23 @@ mod tests {
         let cluster_regions = vec!["ap-northeast-1".into(), "us-west-2".into()];
 
         assert_eq!(
-            effective_task_fetch_regions(&req, &[], &[], &cluster_regions, "us-east-1".into()),
+            effective_task_fetch_regions(&req, &[], &cluster_regions, "us-east-1".into()),
             cluster_regions
         );
     }
 
     #[test]
-    fn effective_regions_use_concrete_cluster_regions_before_merged_entitlement_regions() {
+    fn effective_regions_use_default_region_instead_of_merged_entitlement_regions() {
         let req = EcsTasksRequest {
             account_id: Some("111111111111".into()),
             region: None,
             cluster: None,
             page_size: 50,
         };
-        let cluster_regions = vec!["ap-northeast-1".into()];
 
         assert_eq!(
-            effective_task_fetch_regions(
-                &req,
-                &[],
-                &["us-east-1".into()],
-                &cluster_regions,
-                "us-west-2".into()
-            ),
-            cluster_regions
+            effective_task_fetch_regions(&req, &[], &[], "us-west-2".into()),
+            vec!["us-west-2"]
         );
     }
 
