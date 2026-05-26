@@ -84,15 +84,20 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
-        let entitlement_store = if let Some(ref path) = config.entitlements_file {
-            // Explicit entitlements file always takes priority (dev or production)
+        if config.entitlements_file.is_some() && config.entitlements_database_url.is_some() {
+            anyhow::bail!("entitlements_file and entitlements_database_url are mutually exclusive");
+        }
+
+        let entitlement_store = if let Some(ref url) = config.entitlements_database_url {
+            EntitlementStore::load_from_database_url(url)?
+        } else if let Some(ref path) = config.entitlements_file {
             EntitlementStore::load_from_file(std::path::Path::new(path))?
         } else if config.dev_mode {
             EntitlementStore::dev_defaults()
         } else {
             anyhow::bail!(
-                "entitlements_file is required in production mode. \
-                 Set dev_mode = true or provide an entitlements config path."
+                "entitlements_file or entitlements_database_url is required in production mode. \
+                 Set dev_mode = true or provide an entitlement backend."
             );
         };
 

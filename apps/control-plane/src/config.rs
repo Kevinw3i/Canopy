@@ -21,9 +21,15 @@ pub struct AppConfig {
     pub mock_aws_data: Option<bool>,
 
     /// Path to the entitlements config file (rules + memberships).
-    /// Required in production mode; ignored in dev mode.
+    /// Production mode requires either this or `entitlements_database_url`.
     #[serde(default)]
     pub entitlements_file: Option<String>,
+
+    /// SQLite entitlement database URL. Supported forms:
+    /// `sqlite:///absolute/path.db` or `sqlite://relative/path.db`.
+    /// Mutually exclusive with `entitlements_file`.
+    #[serde(default)]
+    pub entitlements_database_url: Option<String>,
 
     /// Path to the audit log file (JSON-lines). If set, all audit events
     /// are appended here in addition to structured tracing output.
@@ -144,6 +150,7 @@ impl AppConfig {
             dev_mode: true,
             mock_aws_data: None,
             entitlements_file: None,
+            entitlements_database_url: None,
             audit_log: None,
             cors_allowed_origins: vec![],
         }
@@ -188,7 +195,7 @@ mod tests {
             bind_address = "0.0.0.0:9090"
             dev_mode = true
             mock_aws_data = false
-            entitlements_file = "ent.toml"
+            entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
             audit_log = "/tmp/audit.jsonl"
             cors_allowed_origins = ["http://localhost:3000"]
 
@@ -211,6 +218,11 @@ mod tests {
         assert_eq!(config.bind_address, "0.0.0.0:9090");
         assert!(config.dev_mode);
         assert_eq!(config.mock_aws_data, Some(false));
+        assert_eq!(config.entitlements_file, None);
+        assert_eq!(
+            config.entitlements_database_url.as_deref(),
+            Some("sqlite:///var/lib/canopy/entitlements.db")
+        );
         assert_eq!(config.jwt.expiry_seconds, 7200);
         assert_eq!(config.oidc.client_secret.as_deref(), Some("csecret"));
         assert_eq!(config.aws.default_region.as_deref(), Some("eu-west-1"));

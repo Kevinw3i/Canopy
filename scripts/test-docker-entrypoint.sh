@@ -110,6 +110,27 @@ assert data["cors_allowed_origins"] == [
 ]
 PY
 
+DB_CONFIG_OUT="$TMP_DIR/generated-db.toml"
+env \
+  PATH="$TMP_DIR:$PATH" \
+  GENERATE_CONFIG=1 \
+  JWT_SECRET='jwt-secret' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client-id' \
+  ENTITLEMENTS_DATABASE_URL='sqlite:///var/lib/canopy/entitlements.db' \
+  sh "$ENTRYPOINT" > "$DB_CONFIG_OUT"
+
+python3 - <<'PY' "$DB_CONFIG_OUT"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+
+assert "entitlements_file" not in data
+assert data["entitlements_database_url"] == "sqlite:///var/lib/canopy/entitlements.db"
+PY
+
 ARN_CONFIG_OUT="$TMP_DIR/generated-from-arn.toml"
 env \
   PATH="$TMP_DIR:$PATH" \
@@ -258,5 +279,14 @@ expect_entrypoint_failure \
   OIDC_ISSUER_URL='https://issuer.example' \
   OIDC_CLIENT_ID='client' \
   AWS_SESSION_DURATION_SECONDS='43201'
+
+expect_entrypoint_failure \
+  "entitlement-backend-conflict" \
+  "ENTITLEMENTS_FILE and ENTITLEMENTS_DATABASE_URL are mutually exclusive" \
+  JWT_SECRET='jwt' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client' \
+  ENTITLEMENTS_FILE='/etc/canopy/entitlements.toml' \
+  ENTITLEMENTS_DATABASE_URL='sqlite:///var/lib/canopy/entitlements.db'
 
 echo "docker-entrypoint generated config tests passed."

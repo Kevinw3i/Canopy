@@ -123,6 +123,7 @@ mod tests {
             dev_mode: true,
             mock_aws_data: None,
             entitlements_file: None,
+            entitlements_database_url: None,
             audit_log: None,
             cors_allowed_origins: vec![],
         }

@@ -1,3 +1,4 @@
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use shared::dto::ecs::DEV_MOCK_CLUSTER_NAME;
 use shared::dto::entitlements::*;
@@ -11,6 +12,135 @@ pub struct EntitlementStore {
     pub rules: Vec<EntitlementRule>,
     pub memberships: Vec<GroupMembership>,
 }
+
+const SQLITE_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS entitlement_rules (
+    id TEXT PRIMARY KEY,
+    group_name TEXT NOT NULL,
+    can_view_ec2 INTEGER NOT NULL DEFAULT 0 CHECK (can_view_ec2 IN (0, 1)),
+    can_use_cloudwatch_search INTEGER NOT NULL DEFAULT 0 CHECK (can_use_cloudwatch_search IN (0, 1)),
+    can_use_cloudwatch_tail INTEGER NOT NULL DEFAULT 0 CHECK (can_use_cloudwatch_tail IN (0, 1)),
+    can_use_ssm INTEGER NOT NULL DEFAULT 0 CHECK (can_use_ssm IN (0, 1)),
+    can_use_ec2_instance_connect INTEGER NOT NULL DEFAULT 0 CHECK (can_use_ec2_instance_connect IN (0, 1)),
+    can_start_ec2 INTEGER NOT NULL DEFAULT 0 CHECK (can_start_ec2 IN (0, 1)),
+    can_stop_ec2 INTEGER NOT NULL DEFAULT 0 CHECK (can_stop_ec2 IN (0, 1)),
+    can_reboot_ec2 INTEGER NOT NULL DEFAULT 0 CHECK (can_reboot_ec2 IN (0, 1)),
+    can_view_ecs INTEGER NOT NULL DEFAULT 0 CHECK (can_view_ecs IN (0, 1)),
+    can_use_ecs_exec INTEGER NOT NULL DEFAULT 0 CHECK (can_use_ecs_exec IN (0, 1)),
+    allow_broad_cluster_discovery INTEGER NOT NULL DEFAULT 0 CHECK (allow_broad_cluster_discovery IN (0, 1)),
+    max_session_seconds INTEGER CHECK (max_session_seconds IS NULL OR max_session_seconds >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_rules_group_name
+    ON entitlement_rules(group_name);
+
+CREATE TABLE IF NOT EXISTS entitlement_memberships (
+    user_id TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    PRIMARY KEY (user_id, group_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_memberships_group_name
+    ON entitlement_memberships(group_name);
+
+CREATE TABLE IF NOT EXISTS entitlement_allowed_accounts (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    account_id TEXT NOT NULL,
+    account_name TEXT NOT NULL,
+    role_arn TEXT NOT NULL,
+    PRIMARY KEY (rule_id, account_id, role_arn)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_allowed_accounts_rule
+    ON entitlement_allowed_accounts(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_allowed_regions (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    region TEXT NOT NULL,
+    PRIMARY KEY (rule_id, region)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_allowed_regions_rule
+    ON entitlement_allowed_regions(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_allowed_log_group_arns (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    arn TEXT NOT NULL,
+    PRIMARY KEY (rule_id, arn)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_allowed_log_groups_rule
+    ON entitlement_allowed_log_group_arns(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_allowed_os_users (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    os_user TEXT NOT NULL,
+    PRIMARY KEY (rule_id, os_user)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_allowed_os_users_rule
+    ON entitlement_allowed_os_users(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_allowed_clusters (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    cluster TEXT NOT NULL,
+    PRIMARY KEY (rule_id, cluster)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_allowed_clusters_rule
+    ON entitlement_allowed_clusters(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_excluded_container_names (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    container_name TEXT NOT NULL,
+    PRIMARY KEY (rule_id, container_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_excluded_containers_rule
+    ON entitlement_excluded_container_names(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_instance_tag_selectors (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    selector_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_instance_tag_selectors_rule
+    ON entitlement_instance_tag_selectors(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_excluded_tag_selectors (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    selector_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_excluded_tag_selectors_rule
+    ON entitlement_excluded_tag_selectors(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_task_tag_selectors (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    selector_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_task_tag_selectors_rule
+    ON entitlement_task_tag_selectors(rule_id, position);
+
+CREATE TABLE IF NOT EXISTS entitlement_excluded_task_tag_selectors (
+    rule_id TEXT NOT NULL REFERENCES entitlement_rules(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    selector_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlement_excluded_task_tag_selectors_rule
+    ON entitlement_excluded_task_tag_selectors(rule_id, position);
+"#;
 
 impl EntitlementStore {
     /// Evaluate all entitlements for a user by merging rules from all their groups.
@@ -303,23 +433,12 @@ impl EntitlementStore {
         )
     }
 
-    /// Load entitlements from a TOML file.
-    pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read entitlements file {:?}: {}", path, e))?;
-        let store: EntitlementStore = toml::from_str(&content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse entitlements file {:?}: {}", path, e))?;
+    pub fn sqlite_schema() -> &'static str {
+        SQLITE_SCHEMA
+    }
 
-        tracing::info!(
-            rules = store.rules.len(),
-            memberships = store.memberships.len(),
-            "Loaded entitlements from {:?}",
-            path
-        );
-
-        // Validate: reject rules that enable SSM without explicit OS users
-        // unless "*" is set as an explicit opt-in for unrestricted shells.
-        for rule in &store.rules {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for rule in &self.rules {
             if rule.features.can_use_ssm && rule.allowed_os_users.is_empty() {
                 anyhow::bail!(
                     "Rule '{}' (group '{}') has can_use_ssm=true but no allowed_os_users. \
@@ -362,7 +481,136 @@ impl EntitlementStore {
             }
         }
 
+        Ok(())
+    }
+
+    /// Load entitlements from a TOML file.
+    pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read entitlements file {:?}: {}", path, e))?;
+        let store: EntitlementStore = toml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse entitlements file {:?}: {}", path, e))?;
+
+        tracing::info!(
+            rules = store.rules.len(),
+            memberships = store.memberships.len(),
+            "Loaded entitlements from {:?}",
+            path
+        );
+
+        store.validate()?;
+
         Ok(store)
+    }
+
+    pub fn load_from_database_url(url: &str) -> anyhow::Result<Self> {
+        let path = sqlite_path_from_url(url)?;
+        let conn = Connection::open(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to open entitlement database '{}': {}", url, e))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        let store = Self::load_from_sqlite_connection(&conn)?;
+        tracing::info!(
+            rules = store.rules.len(),
+            memberships = store.memberships.len(),
+            "Loaded entitlements from database"
+        );
+        store.validate()?;
+        Ok(store)
+    }
+
+    fn load_from_sqlite_connection(conn: &Connection) -> anyhow::Result<Self> {
+        let mut stmt = conn.prepare(
+            "SELECT id, group_name, can_view_ec2, can_use_cloudwatch_search,
+                    can_use_cloudwatch_tail, can_use_ssm, can_use_ec2_instance_connect,
+                    can_start_ec2, can_stop_ec2, can_reboot_ec2, can_view_ecs,
+                    can_use_ecs_exec, allow_broad_cluster_discovery, max_session_seconds
+             FROM entitlement_rules
+             ORDER BY id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut rules = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let id: String = row.get("id")?;
+            let max_session_seconds = sqlite_optional_u64(row.get("max_session_seconds")?)?;
+            rules.push(EntitlementRule {
+                id: id.clone(),
+                group: row.get("group_name")?,
+                features: FeatureFlags {
+                    can_view_ec2: sqlite_bool(row.get("can_view_ec2")?),
+                    can_use_cloudwatch_search: sqlite_bool(row.get("can_use_cloudwatch_search")?),
+                    can_use_cloudwatch_tail: sqlite_bool(row.get("can_use_cloudwatch_tail")?),
+                    can_use_ssm: sqlite_bool(row.get("can_use_ssm")?),
+                    can_use_ec2_instance_connect: sqlite_bool(
+                        row.get("can_use_ec2_instance_connect")?,
+                    ),
+                    can_start_ec2: sqlite_bool(row.get("can_start_ec2")?),
+                    can_stop_ec2: sqlite_bool(row.get("can_stop_ec2")?),
+                    can_reboot_ec2: sqlite_bool(row.get("can_reboot_ec2")?),
+                    can_view_ecs: sqlite_bool(row.get("can_view_ecs")?),
+                    can_use_ecs_exec: sqlite_bool(row.get("can_use_ecs_exec")?),
+                },
+                allowed_accounts: load_allowed_accounts(conn, &id)?,
+                allowed_regions: load_string_list(
+                    conn,
+                    "entitlement_allowed_regions",
+                    "region",
+                    &id,
+                )?,
+                allowed_log_group_arns: load_string_list(
+                    conn,
+                    "entitlement_allowed_log_group_arns",
+                    "arn",
+                    &id,
+                )?,
+                instance_tag_selectors: load_tag_selectors(
+                    conn,
+                    "entitlement_instance_tag_selectors",
+                    &id,
+                )?,
+                excluded_tag_selectors: load_tag_selectors(
+                    conn,
+                    "entitlement_excluded_tag_selectors",
+                    &id,
+                )?,
+                allowed_clusters: load_string_list(
+                    conn,
+                    "entitlement_allowed_clusters",
+                    "cluster",
+                    &id,
+                )?,
+                task_tag_selectors: load_tag_selectors(
+                    conn,
+                    "entitlement_task_tag_selectors",
+                    &id,
+                )?,
+                excluded_task_tag_selectors: load_tag_selectors(
+                    conn,
+                    "entitlement_excluded_task_tag_selectors",
+                    &id,
+                )?,
+                excluded_container_names: load_string_list(
+                    conn,
+                    "entitlement_excluded_container_names",
+                    "container_name",
+                    &id,
+                )?,
+                allow_broad_cluster_discovery: sqlite_bool(
+                    row.get("allow_broad_cluster_discovery")?,
+                ),
+                allowed_os_users: load_string_list(
+                    conn,
+                    "entitlement_allowed_os_users",
+                    "os_user",
+                    &id,
+                )?,
+                max_session_seconds,
+            });
+        }
+
+        let memberships = load_memberships(conn)?;
+        Ok(Self { rules, memberships })
     }
 
     /// Sample data for development
@@ -512,6 +760,126 @@ impl EntitlementStore {
     }
 }
 
+fn sqlite_path_from_url(url: &str) -> anyhow::Result<String> {
+    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+        return Ok(":memory:".into());
+    }
+
+    let path = if let Some(path) = url.strip_prefix("sqlite://") {
+        path
+    } else if let Some(path) = url.strip_prefix("sqlite:") {
+        path
+    } else {
+        anyhow::bail!("Only sqlite entitlement database URLs are supported");
+    };
+
+    if path.is_empty() {
+        anyhow::bail!("SQLite entitlement database URL must include a path");
+    }
+
+    Ok(path.to_string())
+}
+
+fn sqlite_bool(value: i64) -> bool {
+    value != 0
+}
+
+fn sqlite_optional_u64(value: Option<i64>) -> anyhow::Result<Option<u64>> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                anyhow::anyhow!("SQLite entitlement max_session_seconds must be non-negative")
+            })
+        })
+        .transpose()
+}
+
+fn load_allowed_accounts(conn: &Connection, rule_id: &str) -> anyhow::Result<Vec<AllowedAccount>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id, account_name, role_arn
+         FROM entitlement_allowed_accounts
+         WHERE rule_id = ?1
+         ORDER BY position, account_id, role_arn",
+    )?;
+    let rows = stmt.query_map(params![rule_id], |row| {
+        Ok(AllowedAccount {
+            account_id: row.get(0)?,
+            account_name: row.get(1)?,
+            role_arn: row.get(2)?,
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn load_string_list(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    rule_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let sql = format!(
+        "SELECT {column}
+         FROM {table}
+         WHERE rule_id = ?1
+         ORDER BY position, {column}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![rule_id], |row| row.get::<_, String>(0))?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+fn load_tag_selectors(
+    conn: &Connection,
+    table: &str,
+    rule_id: &str,
+) -> anyhow::Result<Vec<TagSelector>> {
+    let sql = format!(
+        "SELECT selector_json
+         FROM {table}
+         WHERE rule_id = ?1
+         ORDER BY position"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![rule_id], |row| row.get::<_, String>(0))?;
+    let mut selectors = Vec::new();
+
+    for row in rows {
+        let json = row?;
+        selectors.push(parse_tag_selector(&json)?);
+    }
+
+    Ok(selectors)
+}
+
+fn parse_tag_selector(json: &str) -> anyhow::Result<TagSelector> {
+    serde_json::from_str::<TagSelector>(json).or_else(|_| {
+        serde_json::from_str::<HashMap<String, Vec<String>>>(json)
+            .map(|tags| TagSelector { tags })
+            .map_err(Into::into)
+    })
+}
+
+fn load_memberships(conn: &Connection) -> anyhow::Result<Vec<GroupMembership>> {
+    let mut stmt = conn.prepare(
+        "SELECT user_id, group_name
+         FROM entitlement_memberships
+         ORDER BY user_id, group_name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(GroupMembership {
+            user_id: row.get(0)?,
+            group: row.get(1)?,
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 fn validate_cluster_pattern(
     pattern: &str,
     allow_broad_cluster_discovery: bool,
@@ -601,6 +969,17 @@ mod tests {
         let result = EntitlementStore::load_from_file(&path);
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    fn temp_sqlite_path(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "canopy-entitlements-{name}-{}-{nonce}.db",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1027,6 +1406,133 @@ group = "ops"
             ent.allowed_clusters,
             vec!["arn:aws:ecs:ap-northeast-1:111111111111:cluster/prod-*"]
         );
+    }
+
+    #[test]
+    fn load_from_sqlite_database_matches_entitlement_shape() -> anyhow::Result<()> {
+        let path = temp_sqlite_path("load");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(EntitlementStore::sqlite_schema())?;
+        conn.execute(
+            "INSERT INTO entitlement_rules (
+                id, group_name, can_view_ec2, can_use_cloudwatch_search,
+                can_use_cloudwatch_tail, can_use_ssm, can_use_ec2_instance_connect,
+                can_view_ecs, can_use_ecs_exec, max_session_seconds
+            ) VALUES (?1, ?2, 1, 1, 1, 1, 1, 1, 1, ?3)",
+            params!["db-platform", "platform", 1800_i64],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_allowed_accounts
+                (rule_id, position, account_id, account_name, role_arn)
+             VALUES (?1, 0, ?2, ?3, ?4)",
+            params![
+                "db-platform",
+                "111111111111",
+                "production",
+                "arn:aws:iam::111111111111:role/CanopyRole"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_allowed_regions (rule_id, position, region)
+             VALUES (?1, 0, ?2)",
+            params!["db-platform", "ap-northeast-1"],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_allowed_log_group_arns (rule_id, position, arn)
+             VALUES (?1, 0, ?2)",
+            params![
+                "db-platform",
+                "arn:aws:logs:*:111111111111:log-group:/app/*"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_allowed_os_users (rule_id, position, os_user)
+             VALUES (?1, 0, ?2)",
+            params!["db-platform", "ec2-user"],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_allowed_clusters (rule_id, position, cluster)
+             VALUES (?1, 0, ?2)",
+            params!["db-platform", "prod-*"],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_instance_tag_selectors (rule_id, position, selector_json)
+             VALUES (?1, 0, ?2)",
+            params!["db-platform", r#"{"tags":{"Environment":["production"]}}"#],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_task_tag_selectors (rule_id, position, selector_json)
+             VALUES (?1, 0, ?2)",
+            params!["db-platform", r#"{"Service":["api"]}"#],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_memberships (user_id, group_name)
+             VALUES (?1, ?2)",
+            params!["alice@example.com", "platform"],
+        )?;
+        drop(conn);
+
+        let store =
+            EntitlementStore::load_from_database_url(&format!("sqlite://{}", path.display()))?;
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(store.rules.len(), 1);
+        assert_eq!(store.memberships.len(), 1);
+        let ent = store.evaluate("alice", "alice@example.com", "Alice", true);
+        assert_eq!(ent.groups, vec!["platform"]);
+        assert!(ent.features.can_use_cloudwatch_tail);
+        assert!(ent.features.can_use_ecs_exec);
+        assert_eq!(ent.allowed_accounts.len(), 1);
+        assert_eq!(ent.allowed_regions, vec!["ap-northeast-1"]);
+        assert_eq!(ent.allowed_os_users, vec!["ec2-user"]);
+        assert_eq!(ent.max_session_seconds, Some(1800));
+        assert_eq!(
+            ent.allowed_clusters,
+            vec!["arn:aws:ecs:ap-northeast-1:111111111111:cluster/prod-*"]
+        );
+        assert_eq!(
+            ent.instance_tag_selectors[0].tags["Environment"],
+            vec!["production"]
+        );
+        assert_eq!(ent.task_tag_selectors[0].tags["Service"], vec!["api"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_from_sqlite_database_reuses_entitlement_validation() -> anyhow::Result<()> {
+        let path = temp_sqlite_path("invalid");
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(EntitlementStore::sqlite_schema())?;
+        conn.execute(
+            "INSERT INTO entitlement_rules (id, group_name, can_use_ssm)
+             VALUES (?1, ?2, 1)",
+            params!["invalid-ssm", "ops"],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_allowed_accounts
+                (rule_id, position, account_id, account_name, role_arn)
+             VALUES (?1, 0, ?2, ?3, ?4)",
+            params![
+                "invalid-ssm",
+                "111111111111",
+                "production",
+                "arn:aws:iam::111111111111:role/CanopyRole"
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO entitlement_memberships (user_id, group_name)
+             VALUES (?1, ?2)",
+            params!["alice", "ops"],
+        )?;
+        drop(conn);
+
+        let err = EntitlementStore::load_from_database_url(&format!("sqlite://{}", path.display()))
+            .expect_err("SQLite backend must share entitlement validation");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(err.to_string().contains("allowed_os_users"));
+        Ok(())
     }
 
     #[test]

@@ -206,10 +206,20 @@ if [ ! -f "$CONFIG_PATH" ] || [ "${GENERATE_CONFIG:-0}" = "1" ]; then
     CLIENT_SECRET_LINE="client_secret = \"${SAFE_OIDC_SECRET}\""
   fi
 
-  # Default to the path baked into the image by the Dockerfile
-  ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-/etc/canopy/entitlements.toml}"
-  SAFE_ENTITLEMENTS_FILE=$(escape_toml "$ENTITLEMENTS_FILE")
-  ENTITLEMENTS_LINE="entitlements_file = \"${SAFE_ENTITLEMENTS_FILE}\""
+  # Default to the path baked into the image by the Dockerfile. A SQLite
+  # entitlement database can be selected instead, but the two backends are
+  # mutually exclusive.
+  if [ -n "${ENTITLEMENTS_DATABASE_URL:-}" ]; then
+    if [ -n "${ENTITLEMENTS_FILE:-}" ]; then
+      fatal "ENTITLEMENTS_FILE and ENTITLEMENTS_DATABASE_URL are mutually exclusive."
+    fi
+    SAFE_ENTITLEMENTS_DATABASE_URL=$(escape_toml "$ENTITLEMENTS_DATABASE_URL")
+    ENTITLEMENTS_LINE="entitlements_database_url = \"${SAFE_ENTITLEMENTS_DATABASE_URL}\""
+  else
+    ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-/etc/canopy/entitlements.toml}"
+    SAFE_ENTITLEMENTS_FILE=$(escape_toml "$ENTITLEMENTS_FILE")
+    ENTITLEMENTS_LINE="entitlements_file = \"${SAFE_ENTITLEMENTS_FILE}\""
+  fi
 
   CORS_LINE=""
   if [ -n "$CORS_ALLOWED_ORIGINS" ]; then

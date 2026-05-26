@@ -121,6 +121,10 @@ docker push \
   <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
 ```
 
+若改用 SQLite 權限後端，可省略 `ENTITLEMENTS_SHA` 與
+`--secret id=entitlements_toml,...`，但 ECS task 必須設定
+`ENTITLEMENTS_DATABASE_URL`，且該 SQLite 檔案需由 volume 或 image 外部程序提供。
+
 ECR tag 應使用 git tag 或 commit hash；不要使用 `latest`，因為 Terraform
 範本將 repository 設為 immutable。
 
@@ -197,6 +201,8 @@ JWT_SECRET=<injected by ECS secrets>
 OIDC_ISSUER_URL=https://accounts.google.com
 OIDC_CLIENT_ID=<client id>
 ENTITLEMENTS_FILE=/etc/canopy/entitlements.toml
+# 或改用 SQLite 權限後端（不可同時設定 ENTITLEMENTS_FILE）：
+# ENTITLEMENTS_DATABASE_URL=sqlite:///var/lib/canopy/entitlements.db
 ```
 
 ---
@@ -688,8 +694,8 @@ curl -s https://canopy.your-domain.com/health
 
 - [ ] `bind_address` 設為 `0.0.0.0:8443`
 - [ ] `dev_mode = false`
-- [ ] `entitlements_file` 指向容器內的路徑
-- [ ] `entitlements.toml` 已通過 `scripts/validate-entitlements.sh`
+- [ ] `entitlements_file` 指向容器內路徑，或 `ENTITLEMENTS_DATABASE_URL` 指向 SQLite 權限資料庫
+- [ ] 若使用 TOML backend，`entitlements.toml` 已通過 `scripts/validate-entitlements.sh`
 - [ ] 授予 ECS 存取的 rule 有明確 `allowed_clusters`
 - [ ] 寬鬆 ECS cluster wildcard 已明確設定 `allow_broad_cluster_discovery=true`
 - [ ] SSM rule 有明確 `allowed_os_users`

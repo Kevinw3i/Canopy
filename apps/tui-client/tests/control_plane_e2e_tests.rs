@@ -43,6 +43,7 @@ fn dev_config() -> AppConfig {
         dev_mode: true,
         mock_aws_data: Some(true),
         entitlements_file: None,
+        entitlements_database_url: None,
         audit_log: None,
         cors_allowed_origins: vec![],
     }

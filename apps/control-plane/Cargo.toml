@@ -38,6 +38,7 @@ hex.workspace = true
 base64.workspace = true
 toml = "0.8"
 dashmap = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

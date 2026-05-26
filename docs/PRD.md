@@ -415,6 +415,8 @@ TUI                     Control Plane              OIDC Provider
 bind_address = "127.0.0.1:8443"
 dev_mode = false
 entitlements_file = "entitlements.toml"
+# 或使用 SQLite 權限後端：
+# entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
 audit_log = "/var/log/canopy/audit.jsonl"
 cors_allowed_origins = ["http://localhost:9876"]
 
@@ -484,6 +486,23 @@ Environment = ["production"]
 user_id = "alice@example.com"
 group = "platform-engineering"
 ```
+
+### 9.4 SQLite 權限後端
+
+Control Plane 可改用 `entitlements_database_url = "sqlite:///path/to/entitlements.db"` 從 SQLite 載入權限。`entitlements_file` 與 `entitlements_database_url` 互斥；兩者同時設定時啟動失敗。SQLite schema 由 control-plane 內建，核心資料表如下：
+
+| 資料表 | 用途 |
+|--------|------|
+| `entitlement_rules` | rule id、group、feature flags、broad discovery opt-in、session limit |
+| `entitlement_memberships` | user id/email 到 group 的對應 |
+| `entitlement_allowed_accounts` | 每條 rule 的 AWS account / display name / role ARN |
+| `entitlement_allowed_regions` | 每條 rule 的 region allow-list |
+| `entitlement_allowed_log_group_arns` | 每條 rule 的 CloudWatch log group ARN patterns |
+| `entitlement_allowed_clusters` | 每條 rule 的 ECS cluster allow-list |
+| `entitlement_allowed_os_users` | 每條 rule 的 OS user allow-list |
+| `entitlement_*_tag_selectors` | EC2/ECS allow/deny tag selectors，`selector_json` 可用 `{"tags": {...}}` 或 `{...}` |
+
+Control Plane 啟動時會一次載入 SQLite 內容並套用與 TOML 相同的 validation（例如 SSM 必須明確設定 OS users、ECS exec 必須同 rule 啟用 ECS view）。常用 lookup 欄位已建立 index：`group_name`、`user_id`、各 child table 的 `(rule_id, position)`。
 
 ---
 
@@ -565,11 +584,10 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - SSM 受管理狀態為啟發式判斷（有 IAM Role 且 Running）
 - EC2 Instance Connect 支援判斷為近似值
 - 未支援 AWS Organizations 自動帳號發現
-- 權限規則僅支援 TOML 檔案，無資料庫後端
+- 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
 
 ### 未來規劃
 
-- [ ] 資料庫後端的權限管理
 - [ ] AWS Organizations 帳號自動發現
 - [ ] SSM DescribeInstanceInformation 精確判斷受管理狀態
 - [ ] Multi-factor Authentication 支援

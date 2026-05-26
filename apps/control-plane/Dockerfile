@@ -71,23 +71,31 @@ COPY --from=builder /out/control-plane /usr/local/bin/control-plane
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Entitlements config — REQUIRED for production builds.
-# Pass it as a BuildKit secret so it is not sent in the Docker build context.
+# Entitlements config for TOML-backed deployments. Pass it as a BuildKit secret
+# so it is not sent in the Docker build context. SQLite-backed deployments may
+# omit this secret and set ENTITLEMENTS_DATABASE_URL at runtime instead.
 ARG ENTITLEMENTS_SHA
-RUN --mount=type=secret,id=entitlements_toml,target=/tmp/entitlements.toml,required=true \
-    if [ -z "$ENTITLEMENTS_SHA" ]; then \
-      echo "ERROR: ENTITLEMENTS_SHA build arg is required to invalidate the entitlements cache."; \
-      exit 1; \
+RUN --mount=type=secret,id=entitlements_toml,target=/tmp/entitlements.toml,required=false \
+    if [ -s /tmp/entitlements.toml ]; then \
+      if [ -z "$ENTITLEMENTS_SHA" ]; then \
+        echo "ERROR: ENTITLEMENTS_SHA build arg is required to invalidate the entitlements cache."; \
+        exit 1; \
+      fi; \
+      printf '%s\n' "entitlements_sha=${ENTITLEMENTS_SHA}" > /etc/canopy/entitlements.sha; \
+      if sed 's/#.*$//' /tmp/entitlements.toml | grep -Eq '<[^>]+>|REPLACE(_ME)?|example\.com'; then \
+        echo "ERROR: entitlements_toml contains sample placeholder values in active configuration."; \
+        exit 1; \
+      fi; \
+      cp /tmp/entitlements.toml /etc/canopy/entitlements.toml; \
+      chown canopy:canopy /etc/canopy/entitlements.toml; \
+      chmod 0400 /etc/canopy/entitlements.toml; \
+    else \
+      if [ -n "$ENTITLEMENTS_SHA" ]; then \
+        echo "ERROR: ENTITLEMENTS_SHA was set but entitlements_toml secret is missing or empty."; \
+        exit 1; \
+      fi; \
+      printf '%s\n' "entitlements_sha=not-baked" > /etc/canopy/entitlements.sha; \
     fi \
- && printf '%s\n' "entitlements_sha=${ENTITLEMENTS_SHA}" > /etc/canopy/entitlements.sha \
- && test -s /tmp/entitlements.toml \
- && if sed 's/#.*$//' /tmp/entitlements.toml | grep -Eq '<[^>]+>|REPLACE(_ME)?|example\.com'; then \
-      echo "ERROR: entitlements_toml contains sample placeholder values in active configuration."; \
-      exit 1; \
-    fi \
- && cp /tmp/entitlements.toml /etc/canopy/entitlements.toml \
- && chown canopy:canopy /etc/canopy/entitlements.toml \
- && chmod 0400 /etc/canopy/entitlements.toml \
  && chmod 0444 /etc/canopy/entitlements.sha
 
 ENV CONFIG_PATH=/etc/canopy/config.toml \
