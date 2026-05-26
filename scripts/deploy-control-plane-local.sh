@@ -5,7 +5,7 @@
 # Usage:
 #   ./scripts/deploy-control-plane-local.sh cp-v0.1.0
 #   ./scripts/deploy-control-plane-local.sh cp-v0.1.0 --yes
-#   AWS_PROFILE=your-aws-profile ./scripts/deploy-control-plane-local.sh cp-v0.1.0
+#   ./scripts/deploy-control-plane-local.sh cp-v0.1.0 --profile write-profile
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
