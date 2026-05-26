@@ -44,12 +44,11 @@ cargo test        # 39 個測試，應全部通過
 ### 第二步：啟動 Control Plane（終端機 1）
 
 ```bash
-CONFIG_PATH=config.dev.toml cargo run -p control-plane
+DEV_MODE=1 cargo run -p control-plane
 ```
 
 看到以下訊息就是成功：
 ```
-Loaded entitlements from "entitlements.dev.toml": 2 rules, 2 memberships
 Control-plane listening on 127.0.0.1:8443
 ```
 
@@ -75,7 +74,7 @@ DEV_MODE=1 cargo run -p tui-client
 
 ### 開發用帳號
 
-`entitlements.dev.toml` 預設了兩個使用者：
+內建 dev defaults 預設了兩個使用者：
 
 | 使用者名稱 | 群組 | 可以做什麼 |
 |-----------|------|-----------|
@@ -90,9 +89,8 @@ DEV_MODE=1 cargo run -p tui-client
 
 ```
 Canopy/
-├── config.dev.toml            ← Control Plane 設定（本機開發用）
 ├── config.sample.toml         ← Control Plane 設定（生產環境範本）
-├── entitlements.dev.toml      ← 權限規則（本機開發用）
+├── entitlements.sample.toml   ← 權限規則範本
 ├── .env.example               ← 環境變數參考
 ├── Cargo.toml                 ← Workspace 根設定
 │
@@ -122,7 +120,7 @@ Canopy/
 
 ## 設定參考
 
-### Control Plane 設定（`config.dev.toml` / `config.toml`）
+### Control Plane 設定（`DEV_MODE=1` / `config.toml`）
 
 ```toml
 # ── 伺服器 ──────────────────────────────────────────
@@ -140,7 +138,7 @@ dev_mode = true                    # true = 啟用 dev-login
 # 權限規則檔案路徑（TOML 格式）
 # dev_mode = false 時必填
 # dev_mode = true 時可選（沒填就用內建預設值）
-entitlements_file = "entitlements.dev.toml"
+entitlements_file = "entitlements.toml"
 
 # ── 稽核日誌 ────────────────────────────────────────
 # 可選。設定後每個操作會以 JSON-lines 格式寫入此檔案。
@@ -186,7 +184,7 @@ session_duration_seconds = 3600   # AssumeRole 會話時長
 3. 否則如果 `DEV_MODE=1` → 用內建預設值（不需要檔案）
 4. 以上都沒有 → 報錯
 
-### 權限規則檔（`entitlements.dev.toml`）
+### 權限規則檔（`entitlements.sample.toml` / `entitlements.toml`）
 
 定義「誰可以存取什麼」。結構：
 
@@ -349,10 +347,10 @@ session_duration_seconds = 3600
 
 ### 第三步：建立 `entitlements.toml`
 
-以開發檔為起點：
+以範本檔為起點：
 
 ```bash
-cp entitlements.dev.toml entitlements.toml
+cp entitlements.sample.toml entitlements.toml
 ```
 
 修改以下欄位：

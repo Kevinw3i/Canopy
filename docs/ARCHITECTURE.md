@@ -36,7 +36,7 @@
 Canopy/
   Cargo.toml                    Workspace root
   config.sample.toml            Production-safe config template
-  entitlements.dev.toml         Dev entitlements sample
+  entitlements.sample.toml      Entitlements sample
   .env.example                  Environment variables reference
 
   crates/

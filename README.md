@@ -45,12 +45,11 @@ cargo test        # 39 tests, should all pass
 ### Step 2: Start the control-plane (Terminal 1)
 
 ```bash
-CONFIG_PATH=config.dev.toml cargo run -p control-plane
+DEV_MODE=1 cargo run -p control-plane
 ```
 
 You should see:
 ```
-Loaded entitlements from "entitlements.dev.toml": 2 rules, 2 memberships
 Control-plane listening on 127.0.0.1:8443
 ```
 
@@ -76,7 +75,7 @@ Press `Esc` to go back, `Ctrl+x` on Dashboard to log out, `q` to quit.
 
 ### Dev users
 
-Two users are pre-configured in `entitlements.dev.toml`:
+Two users are pre-configured in the built-in dev defaults:
 
 | Username | Group | What they can do |
 |----------|-------|-----------------|
@@ -91,9 +90,8 @@ Try logging in as `dev-readonly` to see how the UI hides features the user doesn
 
 ```
 Canopy/
-├── config.dev.toml            ← Control-plane config (local dev)
 ├── config.sample.toml         ← Control-plane config (production template)
-├── entitlements.dev.toml      ← Permission rules (local dev)
+├── entitlements.sample.toml   ← Permission rules template
 ├── .env.example               ← Environment variables reference
 ├── Cargo.toml                 ← Workspace root
 │
@@ -123,7 +121,7 @@ Canopy/
 
 ## Configuration reference
 
-### Control-plane config (`config.dev.toml` / `config.toml`)
+### Control-plane config (`DEV_MODE=1` / `config.toml`)
 
 ```toml
 # ── Server ──────────────────────────────────────────
@@ -141,7 +139,7 @@ dev_mode = true                    # true = enables dev-login
 # Path to the permission rules file (TOML).
 # Required when dev_mode = false.
 # Optional when dev_mode = true (falls back to built-in dev defaults).
-entitlements_file = "entitlements.dev.toml"
+entitlements_file = "entitlements.toml"
 
 # ── Audit ───────────────────────────────────────────
 # Optional. When set, every action is appended to this file as JSON-lines.
@@ -187,7 +185,7 @@ session_duration_seconds = 3600   # AssumeRole session duration
 3. Else if `DEV_MODE=1` → use built-in defaults (no file needed)
 4. Else → error
 
-### Entitlements file (`entitlements.dev.toml`)
+### Entitlements file (`entitlements.sample.toml` / `entitlements.toml`)
 
 Defines who can access what. Structure:
 
@@ -352,10 +350,10 @@ session_duration_seconds = 3600
 
 ### Step 3: Create `entitlements.toml`
 
-Copy and edit the dev file as a starting point:
+Copy and edit the sample file as a starting point:
 
 ```bash
-cp entitlements.dev.toml entitlements.toml
+cp entitlements.sample.toml entitlements.toml
 ```
 
 Change:
