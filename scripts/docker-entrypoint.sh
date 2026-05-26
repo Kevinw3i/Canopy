@@ -2,6 +2,12 @@
 set -e
 
 CONFIG_PATH="${CONFIG_PATH:-/etc/canopy/config.toml}"
+JWT_SECRET="${JWT_SECRET:-}"
+JWT_SECRET_ARN="${JWT_SECRET_ARN:-}"
+OIDC_ISSUER_URL="${OIDC_ISSUER_URL:-}"
+OIDC_CLIENT_ID="${OIDC_CLIENT_ID:-}"
+OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:-}"
+CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-}"
 
 # ── Helper: escape a value for TOML double-quoted strings ──
 escape_toml() {
