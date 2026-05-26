@@ -70,7 +70,7 @@ if grep -Eq '<[^>]+>|REPLACE(_ME)?|example\.com' <<< "$ACTIVE_ENTITLEMENTS"; the
 fi
 
 # Check 1: direct access (only in uncommented lines)
-if grep -qE 'role_arn\s*=\s*"direct"' <<< "$ACTIVE_ENTITLEMENTS"; then
+if grep -qE "role_arn[[:space:]]*=[[:space:]]*['\"]direct['\"]" <<< "$ACTIVE_ENTITLEMENTS"; then
   if ! strip_comments "$TFVARS" | grep -qE 'enable_direct_access\s*=\s*true'; then
     echo "ERROR: entitlements uses role_arn = \"direct\" but enable_direct_access is not true in $TFVARS"
     ERRORS=$((ERRORS + 1))
@@ -78,15 +78,21 @@ if grep -qE 'role_arn\s*=\s*"direct"' <<< "$ACTIVE_ENTITLEMENTS"; then
 fi
 
 # Check 2: local AWS profiles cannot work inside the ECS task.
-if grep -qE 'role_arn\s*=\s*"profile:[^"]*"' <<< "$ACTIVE_ENTITLEMENTS"; then
+if grep -qE "role_arn[[:space:]]*=[[:space:]]*['\"]profile:[^'\"]*['\"]" <<< "$ACTIVE_ENTITLEMENTS"; then
   echo "ERROR: entitlements uses role_arn = \"profile:*\", which is local-development only and cannot be deployed to ECS"
   ERRORS=$((ERRORS + 1))
 fi
 
 # Check 3: all role ARNs present in assumable_role_arns (uncommented lines only)
 ROLE_ARNS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | \
-  grep -oE 'role_arn\s*=\s*"arn:[^"]+"' | \
-  sed 's/role_arn[[:space:]]*=[[:space:]]*//' | tr -d '"' | sort -u || true)
+  awk '
+    match($0, /role_arn[[:space:]]*=[[:space:]]*["\047]arn:[^"\047]+["\047]/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^[^"\047]*["\047]/, "", value)
+      sub(/["\047]$/, "", value)
+      print value
+    }
+  ' | sort -u || true)
 ASSUMABLE_ROLE_ARNS="$(extract_assumable_role_arns)"
 
 for arn in $ROLE_ARNS; do
@@ -127,7 +133,7 @@ in_rule && /^[[:space:]]*id[[:space:]]*=/ {
 in_rule && /^[[:space:]]*can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
   can_exec = 1
 }
-in_rule && /role_arn[[:space:]]*=[[:space:]]*"(direct|profile:[^"]*)"/ {
+in_rule && /role_arn[[:space:]]*=[[:space:]]*["\047](direct|profile:[^"\047]*)["\047]/ {
   has_local_role = 1
 }
 END {

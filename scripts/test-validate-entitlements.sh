@@ -156,6 +156,24 @@ expect_failure \
   "$TMP_DIR/misleading.tfvars" \
   "not listed"
 
+cat > "$TMP_DIR/single-quoted-role-entitlements.toml" <<EOF
+[[rules]]
+id = "single-quoted-role"
+allowed_clusters = ["prod"]
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = '$GOV_ROLE'
+EOF
+expect_success \
+  "single-quoted-role" \
+  "$TMP_DIR/single-quoted-role-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars"
+
 write_entitlements "$TMP_DIR/invalid-entitlements.toml" "arn:aws:s3:::not-a-role"
 write_tfvars "$TMP_DIR/invalid.tfvars" "arn:aws-us-gov:iam::123456789012:role/path/CanopyRole"
 expect_failure \
@@ -172,12 +190,42 @@ expect_failure \
   "$TMP_DIR/direct-disabled.tfvars" \
   "enable_direct_access is not true"
 
+cat > "$TMP_DIR/single-quoted-direct-entitlements.toml" <<'EOF'
+[[rules]]
+id = "single-quoted-direct"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = 'direct'
+EOF
+expect_failure \
+  "single-quoted-direct-disabled" \
+  "$TMP_DIR/single-quoted-direct-entitlements.toml" \
+  "$TMP_DIR/direct-disabled.tfvars" \
+  "enable_direct_access is not true"
+
 expect_success "direct-enabled" "$TMP_DIR/direct-entitlements.toml" "$TMP_DIR/direct-enabled.tfvars"
 
 write_entitlements "$TMP_DIR/profile-entitlements.toml" "profile:dev"
 expect_failure \
   "profile-role" \
   "$TMP_DIR/profile-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "profile:*"
+
+cat > "$TMP_DIR/single-quoted-profile-entitlements.toml" <<'EOF'
+[[rules]]
+id = "single-quoted-profile"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = 'profile:dev'
+EOF
+expect_failure \
+  "single-quoted-profile-role" \
+  "$TMP_DIR/single-quoted-profile-entitlements.toml" \
   "$TMP_DIR/direct-enabled.tfvars" \
   "profile:*"
 
@@ -198,6 +246,26 @@ EOF
 expect_failure \
   "exec-direct-role" \
   "$TMP_DIR/exec-direct-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "enables can_use_ecs_exec but uses direct/profile credentials"
+
+cat > "$TMP_DIR/exec-profile-single-quoted-entitlements.toml" <<'EOF'
+[[rules]]
+id = "ecs-exec-single-quoted-profile"
+allowed_clusters = ["prod"]
+
+[rules.features]
+can_view_ecs = true
+can_use_ecs_exec = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = 'profile:dev'
+EOF
+expect_failure \
+  "exec-single-quoted-profile-role" \
+  "$TMP_DIR/exec-profile-single-quoted-entitlements.toml" \
   "$TMP_DIR/direct-enabled.tfvars" \
   "enables can_use_ecs_exec but uses direct/profile credentials"
 
