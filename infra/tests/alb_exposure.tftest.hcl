@@ -13,6 +13,10 @@ variables {
   route53_zone_id     = ""
   domain_name         = ""
 
+  alb_internal                = true
+  alb_allowed_cidrs           = ["10.0.0.0/16"]
+  allow_public_alb_world_cidr = false
+
   oidc_issuer_url = "https://accounts.google.com"
   oidc_client_id  = "test-client-id"
 }
@@ -49,4 +53,65 @@ run "public_alb_accepts_scoped_cidr_without_opt_in" {
     alb_allowed_cidrs           = ["203.0.113.0/24"]
     allow_public_alb_world_cidr = false
   }
+}
+
+run "rejects_reused_network_without_vpc_id" {
+  command = plan
+
+  variables {
+    vpc_id = ""
+  }
+
+  expect_failures = [
+    aws_security_group.alb,
+  ]
+}
+
+run "rejects_domain_without_route53_zone" {
+  command = plan
+
+  variables {
+    domain_name = "canopy.example.com"
+  }
+
+  expect_failures = [
+    aws_lb.control_plane,
+  ]
+}
+
+run "rejects_route53_zone_without_domain" {
+  command = plan
+
+  variables {
+    route53_zone_id = "Z0123456789ABCDEFGHIJ"
+  }
+
+  expect_failures = [
+    aws_lb.control_plane,
+  ]
+}
+
+run "rejects_public_alb_without_two_public_subnets" {
+  command = plan
+
+  variables {
+    alb_internal      = false
+    public_subnet_ids = ["subnet-00000000000000001"]
+  }
+
+  expect_failures = [
+    aws_lb.control_plane,
+  ]
+}
+
+run "rejects_reused_network_without_two_private_subnets" {
+  command = plan
+
+  variables {
+    private_subnet_ids = ["subnet-00000000000000003"]
+  }
+
+  expect_failures = [
+    aws_lb.control_plane,
+  ]
 }
