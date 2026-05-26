@@ -55,6 +55,54 @@ run "public_alb_accepts_scoped_cidr_without_opt_in" {
   }
 }
 
+run "rejects_invalid_vpc_id" {
+  command = plan
+
+  variables {
+    vpc_id = "vpc-nothex"
+  }
+
+  expect_failures = [
+    var.vpc_id,
+  ]
+}
+
+run "rejects_invalid_public_subnet_id" {
+  command = plan
+
+  variables {
+    public_subnet_ids = ["subnet-00000000000000001", "subnet-nothex"]
+  }
+
+  expect_failures = [
+    var.public_subnet_ids,
+  ]
+}
+
+run "rejects_invalid_private_subnet_id" {
+  command = plan
+
+  variables {
+    private_subnet_ids = ["subnet-00000000000000003", "subnet-nothex"]
+  }
+
+  expect_failures = [
+    var.private_subnet_ids,
+  ]
+}
+
+run "rejects_invalid_alb_allowed_cidr" {
+  command = plan
+
+  variables {
+    alb_allowed_cidrs = ["999.0.0.0/16"]
+  }
+
+  expect_failures = [
+    var.alb_allowed_cidrs,
+  ]
+}
+
 run "rejects_reused_network_without_vpc_id" {
   command = plan
 
