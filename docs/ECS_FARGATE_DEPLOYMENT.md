@@ -225,6 +225,7 @@ aws iam create-role \
 # - STS AssumeRole（跨帳號存取）
 # - CloudWatch Logs（自身 log + 查詢）
 # - EC2 DescribeInstances, DescribeInstanceConnectEndpoints
+# - ECS task inventory（使用 `role_arn = "direct"` 查看部署帳號 ECS tasks 時）
 aws iam put-role-policy \
   --role-name canopy-task-role \
   --policy-name canopy-permissions \
@@ -245,6 +246,10 @@ aws iam put-role-policy \
         "Action": [
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceConnectEndpoints",
+          "ecs:DescribeClusters",
+          "ecs:DescribeTasks",
+          "ecs:ListClusters",
+          "ecs:ListTasks",
           "logs:DescribeLogGroups",
           "logs:FilterLogEvents",
           "logs:StartQuery",

@@ -90,6 +90,10 @@ resource "aws_iam_role_policy" "task_permissions" {
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
+          "ecs:DescribeClusters",
+          "ecs:DescribeTasks",
+          "ecs:ListClusters",
+          "ecs:ListTasks",
           "logs:DescribeLogGroups",
           "logs:FilterLogEvents",
           "logs:StartQuery",
