@@ -284,7 +284,9 @@ echo "Image tag: $VERSION"
 
 ```bash
 cd infra
-terraform apply -var="image_tag=$VERSION"
+terraform apply \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
 ```
 
 Terraform 會建立 ECS Task Definition + Service，Fargate 拉取你剛 push 的 image 並啟動。
@@ -335,7 +337,9 @@ DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
 docker push "$ECR_URL:$VERSION"
 
 cd infra
-terraform apply -var="image_tag=$VERSION"
+terraform apply \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
 ```
 
 > **Entitlements 變更注意：** entitlements 是 bake 進 image 的，rolling update 期間

@@ -88,9 +88,11 @@ DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" -t "$ECR_URL:$VERSION" \
   -f apps/control-plane/Dockerfile .
 docker push "$ECR_URL:$VERSION"
 
-# 回到 infra，建立 ECS service（create_service 預設 true）
+# 回到 infra，建立 ECS service
 cd infra
-terraform apply -var="image_tag=$VERSION"
+terraform apply \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
 ```
 
 ## 部署新版本
@@ -126,7 +128,9 @@ docker push "$ECR_URL:$VERSION"
 
 # 用新版 image tag 更新 Terraform（ECR 是 IMMUTABLE，不再使用 latest）
 cd infra
-terraform apply -var="image_tag=$VERSION"
+terraform apply \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
 
 # 等待部署完成
 aws ecs wait services-stable \
