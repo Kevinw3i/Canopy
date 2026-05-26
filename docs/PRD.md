@@ -472,12 +472,17 @@ group = "platform-engineering"
 
 ### 11.2 生產部署步驟
 
-1. 設定 `config.toml`（OIDC、JWT、AWS）
-2. 建立 `entitlements.toml`（權限規則）
-3. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
-4. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
-5. 分發 `dist/` 資料夾給維運人員
-6. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔、AWS CLI、SSM Plugin）
+1. 建立 OIDC client 與 Secrets Manager secret（JWT secret，必要時也包含 OIDC client secret）
+2. 填寫 `infra/terraform.tfvars`（VPC/subnet/ACM、OIDC、secret ARN/version、AWS region、CPU architecture）
+3. 建立 `entitlements.toml`（權限規則），並執行 `scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars`
+4. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
+5. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
+6. 分發 `dist/` 資料夾給維運人員
+7. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔、AWS CLI、SSM Plugin）
+
+ECS 部署不需要 commit 或掛載生產 `config.toml`。Terraform task definition
+會設定 `GENERATE_CONFIG=1`，container entrypoint 會從環境變數與
+ECS-native secrets 在啟動時產生 control-plane 設定。
 
 > 詳細操作見 `docs/OPERATOR-SETUP.md`
 
