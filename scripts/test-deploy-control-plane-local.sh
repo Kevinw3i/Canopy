@@ -98,7 +98,7 @@ case "$cmd" in
     [ -n "$out" ] && printf 'stub plan\n' > "$chdir/$out"
     ;;
   show)
-    printf 'No changes. Infrastructure is up-to-date.\n'
+    printf '%s\n' "${CANOPY_TERRAFORM_SHOW_TEXT:-No changes. Infrastructure is up-to-date.}"
     ;;
   *)
     echo "unexpected terraform command: $cmd" >&2
@@ -108,17 +108,25 @@ esac
 SH
 chmod +x "$REPO_TMP_DIR/bin/terraform"
 
-PLAN_ONLY_OUT="$TMP_DIR/plan-only.out"
-if ! env \
-  PATH="$REPO_TMP_DIR/bin:$PATH" \
-  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
-  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+run_plan_only() {
+  local output="$1"
+  shift
+
+  env \
+    PATH="$REPO_TMP_DIR/bin:$PATH" \
+    TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+    "$@" \
+    "$DEPLOY_SCRIPT" cp-v0.1.0 \
     --plan-only \
     --profile test-profile \
     --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
     --cluster canopy \
     --service control-plane \
-    > "$PLAN_ONLY_OUT" 2>&1; then
+    > "$output" 2>&1
+}
+
+PLAN_ONLY_OUT="$TMP_DIR/plan-only.out"
+if ! run_plan_only "$PLAN_ONLY_OUT"; then
   cat "$PLAN_ONLY_OUT" >&2
   echo "ERROR: expected plan-only to pass without calling aws/docker." >&2
   exit 1
@@ -130,5 +138,27 @@ if grep -qF -- "Resolve ECR repository" "$PLAN_ONLY_OUT"; then
   echo "ERROR: --plan-only should stop before resolving ECR." >&2
   exit 1
 fi
+
+DESTROY_PLAN_OUT="$TMP_DIR/plan-destroy.out"
+if run_plan_only "$DESTROY_PLAN_OUT" CANOPY_TERRAFORM_SHOW_TEXT='aws_ecs_service.control_plane will be destroyed'; then
+  cat "$DESTROY_PLAN_OUT" >&2
+  echo "ERROR: expected destroy plan to fail." >&2
+  exit 1
+fi
+grep -qF -- "Terraform plan includes destroy actions" "$DESTROY_PLAN_OUT"
+if grep -qF -- "Resolve ECR repository" "$DESTROY_PLAN_OUT"; then
+  cat "$DESTROY_PLAN_OUT" >&2
+  echo "ERROR: destroy plan should stop before resolving ECR." >&2
+  exit 1
+fi
+
+REPLACE_PLAN_OUT="$TMP_DIR/plan-replace.out"
+if ! run_plan_only "$REPLACE_PLAN_OUT" CANOPY_TERRAFORM_SHOW_TEXT='aws_ecs_task_definition.control_plane must be replaced'; then
+  cat "$REPLACE_PLAN_OUT" >&2
+  echo "ERROR: expected replacement plan to warn and pass." >&2
+  exit 1
+fi
+grep -qF -- "WARNING: Terraform plan includes replacement actions" "$REPLACE_PLAN_OUT"
+grep -qF -- "Plan written to .canopy-test-deploy-$$/infra/tfplan.phase2" "$REPLACE_PLAN_OUT"
 
 echo "deploy-control-plane-local validation tests passed."
