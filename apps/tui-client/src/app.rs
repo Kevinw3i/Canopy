@@ -20,11 +20,13 @@ use crate::components::Component;
 use crate::config::ClientConfig;
 use crate::event::{Action, Event, EventReader, Screen};
 use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRunner};
+use crate::theme::Theme;
 use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
 pub struct App {
     config: ClientConfig,
+    theme: Theme,
     api: ApiClient,
     current_screen: Screen,
     screen_stack: Vec<Screen>,
@@ -240,21 +242,22 @@ impl App {
         let theme = config.theme.resolve()?;
 
         Ok(Self {
-            login: LoginScreen::new(config.dev_mode),
+            login: LoginScreen::with_theme(config.dev_mode, theme),
             dashboard: DashboardScreen::new(
                 config.enable_live_tail,
                 config.show_public_ip,
                 config.keybindings.clone(),
                 theme,
             ),
-            ec2: Ec2Screen::new(),
-            cloudwatch_search: CloudWatchSearchScreen::new(),
-            live_tail: LiveTailScreen::new(scrollback),
-            access: AccessScreen::new(),
+            ec2: Ec2Screen::with_theme(theme),
+            cloudwatch_search: CloudWatchSearchScreen::with_theme(theme),
+            live_tail: LiveTailScreen::with_theme(scrollback, theme),
+            access: AccessScreen::with_theme(theme),
             settings: SettingsScreen::new(config.clone(), theme),
             connect_session: None,
-            error_modal: ErrorModal::new(),
+            error_modal: ErrorModal::new().with_theme(theme),
             config,
+            theme,
             api,
             current_screen: Screen::Login,
             screen_stack: Vec::new(),
@@ -366,14 +369,14 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green));
+                    .border_style(self.theme.success_style());
                 let inner = block.inner(banner_area);
                 block.render(banner_area, buf);
 
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" ↑ ", Style::default().fg(Color::Green).bold()),
-                    Span::styled(msg.as_str(), Style::default().fg(Color::Green).bold()),
-                    Span::styled("  (Ctrl+D: dismiss)", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ↑ ", self.theme.success_style().bold()),
+                    Span::styled(msg.as_str(), self.theme.success_style().bold()),
+                    Span::styled("  (Ctrl+D: dismiss)", self.theme.muted_style()),
                 ]))
                 .render(inner, buf);
                 connect_cursor = None;
@@ -1013,9 +1016,9 @@ impl App {
         // results from the prior session are rejected.
         let ec2_gen = self.ec2.fetch_generation + 1;
         let cw_gen = self.cloudwatch_search.fetch_generation + 1;
-        self.ec2 = Ec2Screen::new();
+        self.ec2 = Ec2Screen::with_theme(self.theme);
         self.ec2.fetch_generation = ec2_gen;
-        self.cloudwatch_search = CloudWatchSearchScreen::new();
+        self.cloudwatch_search = CloudWatchSearchScreen::with_theme(self.theme);
         self.cloudwatch_search.fetch_generation = cw_gen;
         self.dashboard.public_ip = None;
         self.dashboard.ip_fetch_generation += 1;
@@ -1534,7 +1537,7 @@ impl App {
                         let size = terminal
                             .size()
                             .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
-                        match ConnectSessionScreen::spawn(
+                        match ConnectSessionScreen::spawn_with_theme(
                             ConnectSessionLaunch {
                                 instance_id: target.instance_id.to_string(),
                                 instance_name: target.instance_name.map(String::from),
@@ -1547,6 +1550,7 @@ impl App {
                                 rows: size.height,
                             },
                             self.action_tx.clone(),
+                            self.theme,
                         ) {
                             Ok(session) => {
                                 self.connect_session = Some(session);
@@ -1831,7 +1835,7 @@ impl App {
                     let size = terminal
                         .size()
                         .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
-                    match ConnectSessionScreen::spawn(
+                    match ConnectSessionScreen::spawn_with_theme(
                         ConnectSessionLaunch {
                             instance_id: task_label,
                             instance_name: Some(req.container_name),
@@ -1844,6 +1848,7 @@ impl App {
                             rows: size.height,
                         },
                         self.action_tx.clone(),
+                        self.theme,
                     ) {
                         Ok(session) => {
                             self.connect_session = Some(session);
@@ -2668,9 +2673,9 @@ mod tests {
         // because it needs a Tui, so we replicate the key state changes)
         let ec2_gen = app.ec2.fetch_generation + 1;
         let cw_gen = app.cloudwatch_search.fetch_generation + 1;
-        app.ec2 = Ec2Screen::new();
+        app.ec2 = Ec2Screen::with_theme(app.theme);
         app.ec2.fetch_generation = ec2_gen;
-        app.cloudwatch_search = CloudWatchSearchScreen::new();
+        app.cloudwatch_search = CloudWatchSearchScreen::with_theme(app.theme);
         app.cloudwatch_search.fetch_generation = cw_gen;
         app.entitlements = None;
         app.current_screen = Screen::Login;

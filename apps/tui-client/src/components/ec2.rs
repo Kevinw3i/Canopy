@@ -9,6 +9,7 @@ use shared::dto::entitlements::UserEntitlements;
 
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
 use crate::event::Action;
+use crate::theme::Theme;
 use crate::widgets::input::TextInput;
 use crate::widgets::table::SelectableTable;
 
@@ -143,6 +144,7 @@ pub struct Ec2Screen {
     loading_spinner: LoadingIndicator,
     /// Monotonically increasing counter to detect stale async responses
     pub fetch_generation: u64,
+    theme: Theme,
 }
 
 impl Default for Ec2Screen {
@@ -153,6 +155,10 @@ impl Default for Ec2Screen {
 
 impl Ec2Screen {
     pub fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
         Self {
             instances: Vec::new(),
             tasks: Vec::new(),
@@ -162,7 +168,7 @@ impl Ec2Screen {
             loading: false,
             error: None,
             entitlements: None,
-            search_input: TextInput::new("Search (name, id, ip)"),
+            search_input: TextInput::new("Search (name, id, ip)").with_theme(theme),
             table: SelectableTable::new(
                 vec![
                     "Instance ID".into(),
@@ -186,7 +192,8 @@ impl Ec2Screen {
                     Constraint::Length(5),
                     Constraint::Length(12),
                 ],
-            ),
+            )
+            .with_theme(theme),
             ecs_table: SelectableTable::new(
                 vec![
                     "Cluster".into(),
@@ -208,7 +215,8 @@ impl Ec2Screen {
                     Constraint::Length(14),
                     Constraint::Length(14),
                 ],
-            ),
+            )
+            .with_theme(theme),
             view: InventoryView::Ec2,
             focus: Ec2Focus::Table,
             show_detail: false,
@@ -221,8 +229,9 @@ impl Ec2Screen {
             available_accounts: Vec::new(),
             available_regions: Vec::new(),
             scope_transition: None,
-            loading_spinner: LoadingIndicator::new("Loading EC2 instances..."),
+            loading_spinner: LoadingIndicator::new("Loading EC2 instances...").with_theme(theme),
             fetch_generation: 0,
+            theme,
         }
     }
 
@@ -447,27 +456,27 @@ impl Ec2Screen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Instance Detail ")
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(self.theme.focused_border_style());
         let inner = block.inner(area);
         block.render(area, buf);
 
         if let Some(inst) = self.selected_instance() {
             let state_style = match inst.state {
-                shared::dto::ec2::InstanceState::Running => Style::default().fg(Color::Green),
-                shared::dto::ec2::InstanceState::Stopped => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Yellow),
+                shared::dto::ec2::InstanceState::Running => self.theme.success_style(),
+                shared::dto::ec2::InstanceState::Stopped => self.theme.danger_style(),
+                _ => self.theme.warning_style(),
             };
 
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("Instance ID: ", Style::default().bold()),
-                    Span::styled(&inst.instance_id, Style::default().fg(Color::Yellow)),
+                    Span::styled(&inst.instance_id, self.theme.warning_style()),
                 ]),
                 Line::from(vec![
                     Span::styled("Name:        ", Style::default().bold()),
                     Span::styled(
                         inst.name.as_deref().unwrap_or("-"),
-                        Style::default().fg(Color::White).bold(),
+                        self.theme.text_style().bold(),
                     ),
                 ]),
                 Line::from(vec![
@@ -552,60 +561,54 @@ impl Ec2Screen {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Connect:",
-                Style::default().bold().fg(Color::Cyan),
+                self.theme.accent_style().bold(),
             )));
 
             if !is_running {
                 lines.push(Line::from(Span::styled(
                     "  Instance is not running",
-                    Style::default().fg(Color::Red),
+                    self.theme.danger_style(),
                 )));
             } else {
                 // SSM
                 if inst.ssm_managed && has_ssm {
                     lines.push(Line::from(vec![
-                        Span::styled("  [s] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled("SSM Session Manager", Style::default().fg(Color::White)),
-                        Span::styled(" - ready", Style::default().fg(Color::Green)),
+                        Span::styled("  [s] ", self.theme.success_style().bold()),
+                        Span::styled("SSM Session Manager", self.theme.text_style()),
+                        Span::styled(" - ready", self.theme.success_style()),
                     ]));
                 } else if inst.ssm_managed && !has_ssm {
                     lines.push(Line::from(vec![
-                        Span::styled("  [s] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSM Session Manager", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                        Span::styled("  [s] ", self.theme.muted_style()),
+                        Span::styled("SSM Session Manager", self.theme.muted_style()),
+                        Span::styled(" - not authorized", self.theme.danger_style()),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("  [s] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSM Session Manager", Style::default().fg(Color::Gray)),
-                        Span::styled(
-                            " - not available (no SSM agent)",
-                            Style::default().fg(Color::Gray),
-                        ),
+                        Span::styled("  [s] ", self.theme.muted_style()),
+                        Span::styled("SSM Session Manager", self.theme.muted_style()),
+                        Span::styled(" - not available (no SSM agent)", self.theme.muted_style()),
                     ]));
                 }
 
                 // EC2 Instance Connect
                 if inst.instance_connect_capable && has_eic {
                     lines.push(Line::from(vec![
-                        Span::styled("  [e] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled(
-                            "EC2 Instance Connect SSH",
-                            Style::default().fg(Color::White),
-                        ),
-                        Span::styled(" - ready", Style::default().fg(Color::Green)),
+                        Span::styled("  [e] ", self.theme.success_style().bold()),
+                        Span::styled("EC2 Instance Connect SSH", self.theme.text_style()),
+                        Span::styled(" - ready", self.theme.success_style()),
                     ]));
                 } else if inst.instance_connect_capable && !has_eic {
                     lines.push(Line::from(vec![
-                        Span::styled("  [e] ", Style::default().fg(Color::Gray)),
-                        Span::styled("EC2 Instance Connect SSH", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                        Span::styled("  [e] ", self.theme.muted_style()),
+                        Span::styled("EC2 Instance Connect SSH", self.theme.muted_style()),
+                        Span::styled(" - not authorized", self.theme.danger_style()),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("  [e] ", Style::default().fg(Color::Gray)),
-                        Span::styled("EC2 Instance Connect SSH", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not available", Style::default().fg(Color::Gray)),
+                        Span::styled("  [e] ", self.theme.muted_style()),
+                        Span::styled("EC2 Instance Connect SSH", self.theme.muted_style()),
+                        Span::styled(" - not available", self.theme.muted_style()),
                     ]));
                 }
 
@@ -618,24 +621,21 @@ impl Ec2Screen {
                         .or(inst.private_ip.as_deref())
                         .unwrap_or("?");
                     lines.push(Line::from(vec![
-                        Span::styled("  [c] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled("SSH (your key)", Style::default().fg(Color::White)),
-                        Span::styled(
-                            format!(" - {}", ip_display),
-                            Style::default().fg(Color::Green),
-                        ),
+                        Span::styled("  [c] ", self.theme.success_style().bold()),
+                        Span::styled("SSH (your key)", self.theme.text_style()),
+                        Span::styled(format!(" - {}", ip_display), self.theme.success_style()),
                     ]));
                 } else if has_ip && !has_ssm {
                     lines.push(Line::from(vec![
-                        Span::styled("  [c] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSH (your key)", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                        Span::styled("  [c] ", self.theme.muted_style()),
+                        Span::styled("SSH (your key)", self.theme.muted_style()),
+                        Span::styled(" - not authorized", self.theme.danger_style()),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("  [c] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSH (your key)", Style::default().fg(Color::Gray)),
-                        Span::styled(" - no IP address", Style::default().fg(Color::Gray)),
+                        Span::styled("  [c] ", self.theme.muted_style()),
+                        Span::styled("SSH (your key)", self.theme.muted_style()),
+                        Span::styled(" - no IP address", self.theme.muted_style()),
                     ]));
                 }
 
@@ -643,7 +643,7 @@ impl Ec2Screen {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         "  No connect method available for this instance",
-                        Style::default().fg(Color::Yellow),
+                        self.theme.warning_style(),
                     )));
                 }
             }
@@ -651,62 +651,62 @@ impl Ec2Screen {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Power:",
-                Style::default().bold().fg(Color::Red),
+                self.theme.danger_style().bold(),
             )));
             if has_start {
                 let (label, style) = if inst.state == InstanceState::Stopped {
-                    (" - ready", Style::default().fg(Color::Green))
+                    (" - ready", self.theme.success_style())
                 } else {
-                    (" - requires stopped", Style::default().fg(Color::Gray))
+                    (" - requires stopped", self.theme.muted_style())
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("  [S] ", Style::default().fg(Color::Green).bold()),
-                    Span::styled("Start", Style::default().fg(Color::White)),
+                    Span::styled("  [S] ", self.theme.success_style().bold()),
+                    Span::styled("Start", self.theme.text_style()),
                     Span::styled(label, style),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled("  [S] ", Style::default().fg(Color::Gray)),
-                    Span::styled("Start", Style::default().fg(Color::Gray)),
-                    Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                    Span::styled("  [S] ", self.theme.muted_style()),
+                    Span::styled("Start", self.theme.muted_style()),
+                    Span::styled(" - not authorized", self.theme.danger_style()),
                 ]));
             }
 
             if has_stop {
                 let (label, style) = if inst.state == InstanceState::Running {
-                    (" - ready", Style::default().fg(Color::Green))
+                    (" - ready", self.theme.success_style())
                 } else {
-                    (" - requires running", Style::default().fg(Color::Gray))
+                    (" - requires running", self.theme.muted_style())
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("  [X] ", Style::default().fg(Color::Red).bold()),
-                    Span::styled("Stop", Style::default().fg(Color::White)),
+                    Span::styled("  [X] ", self.theme.danger_style().bold()),
+                    Span::styled("Stop", self.theme.text_style()),
                     Span::styled(label, style),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled("  [X] ", Style::default().fg(Color::Gray)),
-                    Span::styled("Stop", Style::default().fg(Color::Gray)),
-                    Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                    Span::styled("  [X] ", self.theme.muted_style()),
+                    Span::styled("Stop", self.theme.muted_style()),
+                    Span::styled(" - not authorized", self.theme.danger_style()),
                 ]));
             }
 
             if has_reboot {
                 let (label, style) = if inst.state == InstanceState::Running {
-                    (" - ready", Style::default().fg(Color::Green))
+                    (" - ready", self.theme.success_style())
                 } else {
-                    (" - requires running", Style::default().fg(Color::Gray))
+                    (" - requires running", self.theme.muted_style())
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("  [B] ", Style::default().fg(Color::Yellow).bold()),
-                    Span::styled("Reboot", Style::default().fg(Color::White)),
+                    Span::styled("  [B] ", self.theme.warning_style().bold()),
+                    Span::styled("Reboot", self.theme.text_style()),
                     Span::styled(label, style),
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::styled("  [B] ", Style::default().fg(Color::Gray)),
-                    Span::styled("Reboot", Style::default().fg(Color::Gray)),
-                    Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                    Span::styled("  [B] ", self.theme.muted_style()),
+                    Span::styled("Reboot", self.theme.muted_style()),
+                    Span::styled(" - not authorized", self.theme.danger_style()),
                 ]));
             }
 
@@ -715,7 +715,7 @@ impl Ec2Screen {
                 .render(inner, buf);
         } else {
             Paragraph::new("No instance selected")
-                .style(Style::default().fg(Color::Gray))
+                .style(self.theme.muted_style())
                 .render(inner, buf);
         }
     }
@@ -1541,7 +1541,7 @@ impl Component for Ec2Screen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} Inventory ", self.view.label()))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -1576,9 +1576,9 @@ impl Component for Ec2Screen {
         };
         let scope_line = Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled(acct_label, Style::default().fg(Color::Yellow)),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(region_label, Style::default().fg(Color::Cyan)),
+            Span::styled(acct_label, self.theme.warning_style()),
+            Span::styled(" │ ", self.theme.muted_style()),
+            Span::styled(region_label, self.theme.accent_style()),
         ]);
         Paragraph::new(scope_line).render(main_chunks[1], buf);
 
@@ -1653,11 +1653,11 @@ impl Component for Ec2Screen {
         };
 
         let status_style = if self.error.is_some() {
-            Style::default().fg(Color::Red)
+            self.theme.danger_style()
         } else if self.loading || self.has_ecs_result_warning() {
-            Style::default().fg(Color::Yellow)
+            self.theme.warning_style()
         } else {
-            Style::default().fg(Color::Gray)
+            self.theme.muted_style()
         };
 
         Paragraph::new(status)
@@ -1689,7 +1689,7 @@ impl Component for Ec2Screen {
 
         // Scope transition overlay
         if let Some(ref t) = self.scope_transition {
-            t.render(inner, buf);
+            t.render_with_theme(inner, buf, self.theme);
         }
     }
 
@@ -1733,22 +1733,16 @@ impl Ec2Screen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} — Select User ", method_name))
-            .border_style(Style::default().fg(Color::Cyan).bold());
+            .border_style(self.theme.accent_style().bold());
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
         let mut lines = Vec::new();
         for (i, user) in pending.users.iter().enumerate() {
             let (prefix, style) = if i == pending.selected {
-                (
-                    ">> ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Indexed(24))
-                        .bold(),
-                )
+                (">> ", self.theme.selected_plain_style())
             } else {
-                ("   ", Style::default().fg(Color::White))
+                ("   ", self.theme.text_style())
             };
             lines.push(Line::from(Span::styled(
                 format!("{}{}", prefix, user),
@@ -1758,7 +1752,7 @@ impl Ec2Screen {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "j/k: select | Enter: connect | Esc: cancel",
-            Style::default().fg(Color::Gray),
+            self.theme.muted_style(),
         )));
 
         Paragraph::new(lines).render(inner, buf);
@@ -1781,7 +1775,7 @@ impl Ec2Screen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" ECS Exec — Select Container ")
-            .border_style(Style::default().fg(Color::Cyan).bold());
+            .border_style(self.theme.accent_style().bold());
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
@@ -1792,22 +1786,16 @@ impl Ec2Screen {
             .next()
             .unwrap_or(pending.task_arn.as_str());
         lines.push(Line::from(vec![
-            Span::styled("Task: ", Style::default().fg(Color::Gray)),
-            Span::styled(task_label, Style::default().fg(Color::Yellow)),
+            Span::styled("Task: ", self.theme.muted_style()),
+            Span::styled(task_label, self.theme.warning_style()),
         ]));
         lines.push(Line::from(""));
 
         for (i, container) in pending.containers.iter().enumerate() {
             let (prefix, style) = if i == pending.selected {
-                (
-                    ">> ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Indexed(24))
-                        .bold(),
-                )
+                (">> ", self.theme.selected_plain_style())
             } else {
-                ("   ", Style::default().fg(Color::White))
+                ("   ", self.theme.text_style())
             };
             lines.push(Line::from(Span::styled(
                 format!("{}{}", prefix, container),
@@ -1818,7 +1806,7 @@ impl Ec2Screen {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "j/k: select | Enter: exec | Esc: cancel",
-            Style::default().fg(Color::Gray),
+            self.theme.muted_style(),
         )));
 
         Paragraph::new(lines).render(inner, buf);
@@ -1846,7 +1834,7 @@ impl Ec2Screen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" EC2 {} — Confirm ", pending.action))
-            .border_style(Style::default().fg(Color::Red).bold());
+            .border_style(self.theme.danger_style().bold());
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
@@ -1860,35 +1848,35 @@ impl Ec2Screen {
             .split(inner);
 
         let action_style = match pending.action {
-            Ec2PowerAction::Start => Style::default().fg(Color::Green).bold(),
-            Ec2PowerAction::Stop => Style::default().fg(Color::Red).bold(),
-            Ec2PowerAction::Reboot => Style::default().fg(Color::Yellow).bold(),
+            Ec2PowerAction::Start => self.theme.success_style().bold(),
+            Ec2PowerAction::Stop => self.theme.danger_style().bold(),
+            Ec2PowerAction::Reboot => self.theme.warning_style().bold(),
         };
         let lines = vec![
             Line::from(vec![
-                Span::styled("Action:   ", Style::default().fg(Color::Gray)),
+                Span::styled("Action:   ", self.theme.muted_style()),
                 Span::styled(pending.action.to_string(), action_style),
             ]),
             Line::from(vec![
-                Span::styled("Instance: ", Style::default().fg(Color::Gray)),
-                Span::styled(&pending.instance_id, Style::default().fg(Color::Yellow)),
+                Span::styled("Instance: ", self.theme.muted_style()),
+                Span::styled(&pending.instance_id, self.theme.warning_style()),
             ]),
             Line::from(vec![
-                Span::styled("Name:     ", Style::default().fg(Color::Gray)),
+                Span::styled("Name:     ", self.theme.muted_style()),
                 Span::raw(pending.instance_name.as_deref().unwrap_or("-")),
             ]),
             Line::from(vec![
-                Span::styled("Scope:    ", Style::default().fg(Color::Gray)),
+                Span::styled("Scope:    ", self.theme.muted_style()),
                 Span::raw(format!("{} / {}", pending.account_id, pending.region)),
             ]),
             Line::from(vec![
-                Span::styled("State:    ", Style::default().fg(Color::Gray)),
+                Span::styled("State:    ", self.theme.muted_style()),
                 Span::raw(pending.current_state.to_string()),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Type the full instance id below. The typed value is never stored in audit logs.",
-                Style::default().fg(Color::Red),
+                self.theme.danger_style(),
             )),
         ];
 
@@ -1897,7 +1885,7 @@ impl Ec2Screen {
             .render(chunks[0], buf);
         pending.confirmation.render(chunks[1], buf);
         Paragraph::new("Enter: submit | Esc: cancel")
-            .style(Style::default().fg(Color::Gray))
+            .style(self.theme.muted_style())
             .render(chunks[2], buf);
     }
 }
@@ -1930,26 +1918,26 @@ impl Ec2Screen {
             .filter(|i| filter.matches(&i.state))
             .map(|inst| {
                 let state_style = match inst.state {
-                    shared::dto::ec2::InstanceState::Running => Style::default().fg(Color::Green),
-                    shared::dto::ec2::InstanceState::Stopped => Style::default().fg(Color::Red),
-                    _ => Style::default().fg(Color::Yellow),
+                    shared::dto::ec2::InstanceState::Running => self.theme.success_style(),
+                    shared::dto::ec2::InstanceState::Stopped => self.theme.danger_style(),
+                    _ => self.theme.warning_style(),
                 };
 
                 Row::new(vec![
-                    Cell::from(inst.instance_id.as_str()).style(Style::default().fg(Color::Yellow)),
+                    Cell::from(inst.instance_id.as_str()).style(self.theme.warning_style()),
                     Cell::from(inst.name.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::White).bold()),
+                        .style(self.theme.text_style().bold()),
                     Cell::from(inst.private_ip.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::White)),
+                        .style(self.theme.text_style()),
                     Cell::from(inst.public_ip.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::White)),
+                        .style(self.theme.text_style()),
                     Cell::from(inst.state.to_string()).style(state_style),
-                    Cell::from(inst.instance_type.as_str()).style(Style::default().fg(Color::Gray)),
+                    Cell::from(inst.instance_type.as_str()).style(self.theme.muted_style()),
                     Cell::from(if inst.ssm_managed { "Yes" } else { "No" }).style(
                         if inst.ssm_managed {
-                            Style::default().fg(Color::Green)
+                            self.theme.success_style()
                         } else {
-                            Style::default().fg(Color::Gray)
+                            self.theme.muted_style()
                         },
                     ),
                     Cell::from(if inst.instance_connect_capable {
@@ -1958,12 +1946,12 @@ impl Ec2Screen {
                         "No"
                     })
                     .style(if inst.instance_connect_capable {
-                        Style::default().fg(Color::Green)
+                        self.theme.success_style()
                     } else {
-                        Style::default().fg(Color::Gray)
+                        self.theme.muted_style()
                     }),
                     Cell::from(inst.environment.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::Cyan)),
+                        .style(self.theme.accent_style()),
                 ])
             })
             .collect();
@@ -1988,9 +1976,9 @@ impl Ec2Screen {
             .into_iter()
             .map(|task| {
                 let status_style = if ecs_status_is_running(&task.last_status) {
-                    Style::default().fg(Color::Green)
+                    self.theme.success_style()
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    self.theme.warning_style()
                 };
                 let containers = task
                     .containers
@@ -2002,16 +1990,16 @@ impl Ec2Screen {
                     .join(",");
 
                 Row::new(vec![
-                    Cell::from(task.cluster_name.clone()).style(Style::default().fg(Color::Cyan)),
+                    Cell::from(task.cluster_name.clone()).style(self.theme.accent_style()),
                     Cell::from(task.family.clone().unwrap_or_else(|| "-".into()))
-                        .style(Style::default().fg(Color::White).bold()),
+                        .style(self.theme.text_style().bold()),
                     Cell::from(task.task_id.clone().unwrap_or_else(|| "-".into()))
-                        .style(Style::default().fg(Color::Yellow)),
-                    Cell::from(task.launch_type.clone()).style(Style::default().fg(Color::Gray)),
+                        .style(self.theme.warning_style()),
+                    Cell::from(task.launch_type.clone()).style(self.theme.muted_style()),
                     Cell::from(task.last_status.clone()).style(status_style),
-                    Cell::from(containers).style(Style::default().fg(Color::White)),
-                    Cell::from(task.account_id.clone()).style(Style::default().fg(Color::Gray)),
-                    Cell::from(task.region.clone()).style(Style::default().fg(Color::Gray)),
+                    Cell::from(containers).style(self.theme.text_style()),
+                    Cell::from(task.account_id.clone()).style(self.theme.muted_style()),
+                    Cell::from(task.region.clone()).style(self.theme.muted_style()),
                 ])
             })
             .collect();

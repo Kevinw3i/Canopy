@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::theme::Theme;
 use crate::widgets::input::TextInput;
 
 use super::time_range::{
@@ -41,6 +42,7 @@ pub struct TimeRangeModal {
     pub end: TextInput,
     pub active: ModalField,
     pub error: Option<String>,
+    theme: Theme,
 }
 
 impl TimeRangeModal {
@@ -48,8 +50,12 @@ impl TimeRangeModal {
     /// range, the inputs are populated with its values; otherwise the inputs
     /// default to `start = now - 1h`, `end = now`.
     pub fn open(current: &TimeRange) -> Self {
-        let mut start = TextInput::new("Start (UTC, YYYY-MM-DD HH:MM)");
-        let mut end = TextInput::new("End (UTC, YYYY-MM-DD HH:MM)");
+        Self::open_with_theme(current, Theme::default())
+    }
+
+    pub fn open_with_theme(current: &TimeRange, theme: Theme) -> Self {
+        let mut start = TextInput::new("Start (UTC, YYYY-MM-DD HH:MM)").with_theme(theme);
+        let mut end = TextInput::new("End (UTC, YYYY-MM-DD HH:MM)").with_theme(theme);
 
         let (start_secs, end_secs) = match current {
             TimeRange::Custom {
@@ -79,6 +85,7 @@ impl TimeRangeModal {
             end,
             active: ModalField::Start,
             error: None,
+            theme,
         }
     }
 
@@ -184,7 +191,7 @@ impl TimeRangeModal {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Custom Range (UTC) ")
-            .border_style(Style::default().fg(Color::Cyan).bold());
+            .border_style(self.theme.accent_style().bold());
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
 
@@ -202,26 +209,26 @@ impl TimeRangeModal {
         self.end.render(chunks[1], buf);
 
         let error_line = match &self.error {
-            Some(msg) => Line::from(Span::styled(msg.as_str(), Style::default().fg(Color::Red))),
+            Some(msg) => Line::from(Span::styled(msg.as_str(), self.theme.danger_style())),
             None => Line::from(Span::styled(
                 "Range max 30 days. Both fields are UTC.",
-                Style::default().fg(Color::DarkGray),
+                self.theme.muted_style(),
             )),
         };
         Paragraph::new(error_line).render(chunks[2], buf);
 
         let hint = Line::from(vec![
-            Span::styled("Tab/↑↓", Style::default().fg(Color::Cyan)),
+            Span::styled("Tab/↑↓", self.theme.accent_style()),
             Span::raw(" switch  "),
-            Span::styled("Enter", Style::default().fg(Color::Cyan)),
+            Span::styled("Enter", self.theme.accent_style()),
             Span::raw(" submit  "),
-            Span::styled("Esc", Style::default().fg(Color::Cyan)),
+            Span::styled("Esc", self.theme.accent_style()),
             Span::raw(" cancel  "),
-            Span::styled("Ctrl+R", Style::default().fg(Color::Cyan)),
+            Span::styled("Ctrl+R", self.theme.accent_style()),
             Span::raw(" reset to 1h"),
         ]);
         Paragraph::new(hint)
-            .style(Style::default().fg(Color::Gray))
+            .style(self.theme.muted_style())
             .render(chunks[3], buf);
     }
 }

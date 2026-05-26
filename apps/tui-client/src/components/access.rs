@@ -7,6 +7,7 @@ use shared::dto::entitlements::UserEntitlements;
 
 use super::Component;
 use crate::event::Action;
+use crate::theme::Theme;
 
 fn selector_summary(selectors: &[shared::dto::entitlements::TagSelector]) -> String {
     if selectors.is_empty() {
@@ -28,14 +29,27 @@ fn selector_summary(selectors: &[shared::dto::entitlements::TagSelector]) -> Str
         .join("; ")
 }
 
-#[derive(Default)]
 pub struct AccessScreen {
     pub entitlements: Option<UserEntitlements>,
+    theme: Theme,
+}
+
+impl Default for AccessScreen {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AccessScreen {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_theme(Theme::default())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
+        Self {
+            entitlements: None,
+            theme,
+        }
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {
@@ -58,13 +72,13 @@ impl Component for AccessScreen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" Access / Current Identity ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
         let Some(ref ent) = self.entitlements else {
             Paragraph::new("Loading entitlements...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(self.theme.warning_style())
                 .render(inner, buf);
             return;
         };
@@ -101,25 +115,25 @@ impl Component for AccessScreen {
         let identity_lines = vec![
             Line::from(vec![
                 Span::styled("User ID:      ", Style::default().bold()),
-                Span::raw(&ent.user_id),
+                Span::styled(&ent.user_id, self.theme.text_style()),
             ]),
             Line::from(vec![
                 Span::styled("Email:        ", Style::default().bold()),
-                Span::raw(&ent.email),
+                Span::styled(&ent.email, self.theme.text_style()),
             ]),
             Line::from(vec![
                 Span::styled("Display Name: ", Style::default().bold()),
-                Span::raw(&ent.display_name),
+                Span::styled(&ent.display_name, self.theme.text_style()),
             ]),
             Line::from(vec![
                 Span::styled("Groups:       ", Style::default().bold()),
-                Span::raw(ent.groups.join(", ")),
+                Span::styled(ent.groups.join(", "), self.theme.text_style()),
             ]),
         ];
         let identity_block = Block::default()
             .borders(Borders::ALL)
             .title(" Identity ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(identity_lines)
             .block(identity_block)
             .render(chunks[0], buf);
@@ -129,9 +143,9 @@ impl Component for AccessScreen {
         let check = |b: bool| if b { "Yes" } else { "No " };
         let feat_style = |b: bool| {
             if b {
-                Style::default().fg(Color::Green)
+                self.theme.success_style()
             } else {
-                Style::default().fg(Color::Red)
+                self.theme.danger_style()
             }
         };
 
@@ -180,7 +194,7 @@ impl Component for AccessScreen {
         let feature_block = Block::default()
             .borders(Borders::ALL)
             .title(" Feature Flags ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(feature_lines)
             .block(feature_block)
             .render(left_chunks[0], buf);
@@ -202,7 +216,7 @@ impl Component for AccessScreen {
                 " Allowed Accounts ({}) ",
                 ent.allowed_accounts.len()
             ))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(account_lines)
             .block(accounts_block)
             .wrap(Wrap { trim: true })
@@ -212,7 +226,7 @@ impl Component for AccessScreen {
         let regions_block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" Allowed Regions ({}) ", ent.allowed_regions.len()))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(ent.allowed_regions.join(", "))
             .block(regions_block)
             .render(right_chunks[1], buf);
@@ -255,7 +269,7 @@ impl Component for AccessScreen {
         let ecs_block = Block::default()
             .borders(Borders::ALL)
             .title(" ECS Scope ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(ecs_lines)
             .block(ecs_block)
             .wrap(Wrap { trim: true })
@@ -273,7 +287,7 @@ impl Component for AccessScreen {
                 " Allowed Log Group Patterns ({}) ",
                 ent.allowed_log_group_arns.len()
             ))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(lg_lines)
             .block(lg_block)
             .wrap(Wrap { trim: true })
@@ -281,7 +295,7 @@ impl Component for AccessScreen {
 
         // Help
         Paragraph::new("Esc/q: back")
-            .style(Style::default().fg(Color::Gray))
+            .style(self.theme.muted_style())
             .render(chunks[2], buf);
     }
 }

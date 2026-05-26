@@ -308,6 +308,7 @@ TUI                     Control Plane              OIDC Provider
 - 顯示目前 theme preset 與 resolved semantic colors
 - 顯示目前 keybindings：dashboard 導航、quick nav、logout、settings back / change password
 - 提示設定檔路徑；自訂主題與快捷鍵透過 TUI config 的 `[theme]` / `[keybindings]` table 設定
+- 主題 token 套用到登入、Dashboard、Settings、Access、EC2/ECS inventory、CloudWatch search、Live Tail、modal 與 connect-session chrome；connect-session 內的遠端 terminal 輸出保留 VT100 色彩
 
 ---
 
@@ -648,5 +649,5 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - [ ] 本機 TOTP/WebAuthn 註冊與 step-up UI
 - [x] 自訂快捷鍵設定（dashboard / settings）
 - [x] 主題與配色自訂（dashboard / settings shell）
-- [ ] 全工作流配色 token 化
+- [x] 全工作流配色 token 化
 - [x] 匯出稽核日誌至 CloudWatch Logs / S3

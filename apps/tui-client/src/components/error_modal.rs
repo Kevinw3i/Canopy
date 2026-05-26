@@ -5,11 +5,13 @@ use ratatui::{
 };
 
 use crate::event::Action;
+use crate::theme::Theme;
 
 /// Modal overlay that shows error messages
 pub struct ErrorModal {
     pub message: Option<String>,
     title: String,
+    theme: Theme,
 }
 
 impl Default for ErrorModal {
@@ -23,7 +25,13 @@ impl ErrorModal {
         Self {
             message: None,
             title: " Error ".into(),
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn show(&mut self, message: String) {
@@ -61,6 +69,14 @@ impl ErrorModal {
     }
 
     fn message_lines(message: &str, max_lines: usize) -> Vec<Line<'static>> {
+        Self::message_lines_with_theme(message, max_lines, Theme::default())
+    }
+
+    fn message_lines_with_theme(
+        message: &str,
+        max_lines: usize,
+        theme: Theme,
+    ) -> Vec<Line<'static>> {
         let max_lines = max_lines.max(1);
         let mut raw_lines = message.lines().map(str::to_string).collect::<Vec<_>>();
         if raw_lines.is_empty() {
@@ -76,7 +92,7 @@ impl ErrorModal {
 
         raw_lines
             .into_iter()
-            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Red))))
+            .map(|line| Line::from(Span::styled(line, theme.danger_style())))
             .collect()
     }
 
@@ -107,17 +123,21 @@ impl ErrorModal {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(self.title.as_str())
-            .border_style(Style::default().fg(Color::Red).bold());
+            .border_style(self.theme.danger_style().bold());
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
 
         let max_message_lines = inner.height.saturating_sub(3).max(1) as usize;
         let mut text = vec![Line::from("")];
-        text.extend(Self::message_lines(message, max_message_lines));
+        text.extend(Self::message_lines_with_theme(
+            message,
+            max_message_lines,
+            self.theme,
+        ));
         text.push(Line::from(""));
         text.push(Line::from(Span::styled(
             "Press Esc or Enter to dismiss",
-            Style::default().fg(Color::Gray),
+            self.theme.muted_style(),
         )));
 
         Paragraph::new(text)

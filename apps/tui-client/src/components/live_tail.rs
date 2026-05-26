@@ -9,6 +9,7 @@ use std::collections::{HashSet, VecDeque};
 
 use super::Component;
 use crate::event::Action;
+use crate::theme::Theme;
 use crate::widgets::input::TextInput;
 use crate::widgets::table::{
     selected_row_style, table_border_style, SelectableTable, SELECTED_ROW_SYMBOL,
@@ -48,10 +49,15 @@ pub struct LiveTailScreen {
     picker_filter_active: bool,
     log_groups_loading: bool,
     log_groups_error: Option<String>,
+    theme: Theme,
 }
 
 impl LiveTailScreen {
     pub fn new(scrollback_limit: usize) -> Self {
+        Self::with_theme(scrollback_limit, Theme::default())
+    }
+
+    pub fn with_theme(scrollback_limit: usize, theme: Theme) -> Self {
         Self {
             events: VecDeque::with_capacity(scrollback_limit),
             scrollback_limit,
@@ -66,11 +72,11 @@ impl LiveTailScreen {
             log_groups: Vec::new(),
             fetch_generation: 0,
             state: TailState::Stopped,
-            filter_input: TextInput::new("Local filter"),
+            filter_input: TextInput::new("Local filter").with_theme(theme),
             filter_active: false,
             auto_scroll: true,
             scroll_offset: 0,
-            log_group_filter: TextInput::new("Search log groups..."),
+            log_group_filter: TextInput::new("Search log groups...").with_theme(theme),
             filtered_log_group_indices: Vec::new(),
             log_group_table: SelectableTable::new(
                 vec!["Log Group".into(), "Retention".into(), "Size".into()],
@@ -79,11 +85,13 @@ impl LiveTailScreen {
                     Constraint::Length(12),
                     Constraint::Length(12),
                 ],
-            ),
+            )
+            .with_theme(theme),
             picker_active: false,
             picker_filter_active: false,
             log_groups_loading: false,
             log_groups_error: None,
+            theme,
         }
     }
 
@@ -428,13 +436,13 @@ impl LiveTailScreen {
 
     fn colorize_message<'a>(&self, message: &'a str) -> Span<'a> {
         if message.contains("ERROR") || message.contains("\"level\":\"ERROR\"") {
-            Span::styled(message, Style::default().fg(Color::Red))
+            Span::styled(message, self.theme.danger_style())
         } else if message.contains("WARN") || message.contains("\"level\":\"WARN\"") {
-            Span::styled(message, Style::default().fg(Color::Yellow))
+            Span::styled(message, self.theme.warning_style())
         } else if message.contains("INFO") || message.contains("\"level\":\"INFO\"") {
-            Span::styled(message, Style::default().fg(Color::Green))
+            Span::styled(message, self.theme.success_style())
         } else if message.contains("DEBUG") || message.contains("\"level\":\"DEBUG\"") {
-            Span::styled(message, Style::default().fg(Color::Cyan))
+            Span::styled(message, self.theme.accent_style())
         } else {
             Span::raw(message)
         }
@@ -565,7 +573,7 @@ impl Component for LiveTailScreen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" Live Tail ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -594,10 +602,10 @@ impl Component for LiveTailScreen {
 
         // Connection status
         let conn_style = match self.state {
-            TailState::Running => Style::default().fg(Color::Green),
-            TailState::Paused => Style::default().fg(Color::Yellow),
-            TailState::Reconnecting => Style::default().fg(Color::Yellow),
-            TailState::Stopped => Style::default().fg(Color::Red),
+            TailState::Running => self.theme.success_style(),
+            TailState::Paused => self.theme.warning_style(),
+            TailState::Reconnecting => self.theme.warning_style(),
+            TailState::Stopped => self.theme.danger_style(),
         };
         let conn_text = format!(
             "{} | {:.1} events/sec | {} events buffered",
@@ -630,7 +638,7 @@ impl Component for LiveTailScreen {
             } else {
                 " Logs (manual scroll) "
             })
-            .border_style(Style::default().fg(Color::Gray));
+            .border_style(self.theme.muted_style());
         let log_inner = log_block.inner(chunks[log_idx]);
         log_block.render(chunks[log_idx], buf);
 
@@ -653,10 +661,10 @@ impl Component for LiveTailScreen {
                     .unwrap_or_default();
 
                 Line::from(vec![
-                    Span::styled(format!("{} ", ts), Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{} ", ts), self.theme.muted_style()),
                     Span::styled(
                         format!("[{}] ", ev.log_stream_name),
-                        Style::default().fg(Color::Cyan),
+                        self.theme.accent_style(),
                     ),
                     self.colorize_message(&ev.message),
                 ])
@@ -669,7 +677,7 @@ impl Component for LiveTailScreen {
         Paragraph::new(
             "s start/stop | p pause | l logs | [/]/{/} scope | / filter | a auto | c clear | Esc back",
         )
-        .style(Style::default().fg(Color::Gray))
+        .style(self.theme.muted_style())
         .render(chunks[status_idx], buf);
     }
 }
@@ -691,14 +699,14 @@ impl LiveTailScreen {
         let line = Line::from(vec![
             Span::styled(
                 format!("Account [/]: {}", self.selected_account_id),
-                Style::default().fg(Color::Yellow),
+                self.theme.warning_style(),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ ", self.theme.muted_style()),
             Span::styled(
                 format!("Region {{/}}: {}", self.selected_region),
-                Style::default().fg(Color::Cyan),
+                self.theme.accent_style(),
             ),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" │ ", self.theme.muted_style()),
             Span::styled("Log group: ", Style::default().bold()),
             Span::raw(target.to_string()),
         ]);
@@ -727,7 +735,7 @@ impl LiveTailScreen {
                 .map(format_bytes)
                 .unwrap_or_else(|| "-".into());
             let style = if group.arn == selected_arn {
-                selected_row_style()
+                selected_row_style(self.theme)
             } else {
                 Style::default()
             };
@@ -742,9 +750,12 @@ impl LiveTailScreen {
             self.filtered_log_group_indices.len(),
             self.log_groups.len()
         );
-        let header = Row::new(self.log_group_table.headers.iter().map(|header| {
-            Cell::from(header.as_str()).style(Style::default().bold().fg(Color::Cyan))
-        }))
+        let header = Row::new(
+            self.log_group_table
+                .headers
+                .iter()
+                .map(|header| Cell::from(header.as_str()).style(self.theme.accent_style().bold())),
+        )
         .height(1);
         let table = ratatui::widgets::Table::new(rows, &self.log_group_table.column_widths)
             .header(header)
@@ -752,9 +763,9 @@ impl LiveTailScreen {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {title} "))
-                    .border_style(table_border_style(!self.picker_filter_active)),
+                    .border_style(table_border_style(!self.picker_filter_active, self.theme)),
             )
-            .highlight_style(selected_row_style())
+            .highlight_style(selected_row_style(self.theme))
             .highlight_symbol(SELECTED_ROW_SYMBOL);
         ratatui::widgets::StatefulWidget::render(
             table,

@@ -334,7 +334,7 @@ When `auto_update = true`, the TUI checks for new `tui-v*` releases on GitHub at
 
 Press `Ctrl+D` to dismiss the update banner.
 
-Theme presets and overrides currently apply to the Dashboard and Settings shell. Deeper workflow screens still use their existing semantic status colors.
+Theme presets and overrides apply across the TUI workflow chrome: login, dashboard, settings, access, EC2/ECS inventory, CloudWatch search, live tail, modals, and connect-session status/help/copy surfaces. Remote terminal output in connect sessions keeps the VT100 colors sent by the remote process.
 
 **How it's loaded:**
 1. If `DEV_MODE=1` → use built-in defaults and ignore the OS config file

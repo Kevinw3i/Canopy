@@ -6,6 +6,7 @@ use ratatui::{
 
 use super::Component;
 use crate::event::Action;
+use crate::theme::Theme;
 use crate::widgets::input::TextInput;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,11 +22,16 @@ pub struct LoginScreen {
     focus: LoginFocus,
     status_message: Option<String>,
     dev_mode: bool,
+    theme: Theme,
 }
 
 impl LoginScreen {
     pub fn new(dev_mode: bool) -> Self {
-        let mut input = TextInput::new("Username");
+        Self::with_theme(dev_mode, Theme::default())
+    }
+
+    pub fn with_theme(dev_mode: bool, theme: Theme) -> Self {
+        let mut input = TextInput::new("Username").with_theme(theme);
         input.value = "dev-admin".to_string();
         input.cursor_pos = 9;
 
@@ -43,6 +49,7 @@ impl LoginScreen {
             focus: initial_focus,
             status_message: None,
             dev_mode,
+            theme,
         }
     }
 
@@ -139,7 +146,7 @@ impl Component for LoginScreen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" Canopy - Login ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
 
         let inner = outer.inner(area);
         outer.render(area, buf);
@@ -176,12 +183,12 @@ impl Component for LoginScreen {
         let title = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Operations Console",
-                Style::default().bold().fg(Color::Cyan),
+                self.theme.accent_style().bold(),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "Sign in to continue",
-                Style::default().fg(Color::Gray),
+                self.theme.muted_style(),
             )),
         ])
         .alignment(Alignment::Center);
@@ -194,22 +201,19 @@ impl Component for LoginScreen {
 
         // Buttons
         let dev_btn_style = if self.focus == LoginFocus::LoginButton {
-            Style::default()
-                .bg(Color::Indexed(24))
-                .fg(Color::White)
-                .bold()
+            self.theme.selected_plain_style()
         } else {
-            Style::default().fg(Color::Cyan)
+            self.theme.accent_style()
         };
         let sso_btn_style = if self.focus == LoginFocus::SsoButton {
-            Style::default().bg(Color::Green).fg(Color::White).bold()
+            self.theme.selected_plain_style()
         } else {
-            Style::default().fg(Color::Green)
+            self.theme.success_style()
         };
         let dc_btn_style = if self.focus == LoginFocus::DeviceCodeButton {
-            Style::default().bg(Color::Yellow).fg(Color::Black).bold()
+            self.theme.selected_plain_style()
         } else {
-            Style::default().fg(Color::Yellow)
+            self.theme.warning_style()
         };
 
         if self.dev_mode {
@@ -238,9 +242,9 @@ impl Component for LoginScreen {
         // Status message
         if let Some(ref msg) = self.status_message {
             let style = if msg.contains("error") || msg.contains("failed") {
-                Style::default().fg(Color::Red)
+                self.theme.danger_style()
             } else {
-                Style::default().fg(Color::Yellow)
+                self.theme.warning_style()
             };
             Paragraph::new(Line::from(Span::styled(msg.as_str(), style)))
                 .alignment(Alignment::Center)

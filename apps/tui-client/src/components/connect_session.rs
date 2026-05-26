@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::event::Action;
+use crate::theme::Theme;
 
 const STATUS_RIGHT_PADDING: u16 = 1;
 const STATUS_GAP: u16 = 2;
@@ -219,12 +220,21 @@ pub(crate) struct ConnectSessionScreen {
     clipboard: Arc<dyn ClipboardWriter>,
     pty_cols: u16,
     pty_rows: u16,
+    theme: Theme,
 }
 
 impl ConnectSessionScreen {
     pub(crate) fn spawn(
         launch: ConnectSessionLaunch,
         action_tx: mpsc::UnboundedSender<Action>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_theme(launch, action_tx, Theme::default())
+    }
+
+    pub(crate) fn spawn_with_theme(
+        launch: ConnectSessionLaunch,
+        action_tx: mpsc::UnboundedSender<Action>,
+        theme: Theme,
     ) -> anyhow::Result<Self> {
         let pty_cols = launch.cols.max(1);
         let pty_rows = launch.rows.saturating_sub(1).max(1);
@@ -309,6 +319,7 @@ impl ConnectSessionScreen {
             clipboard: Arc::new(SystemClipboardWriter),
             pty_cols,
             pty_rows,
+            theme,
         })
     }
 
@@ -530,7 +541,7 @@ impl ConnectSessionScreen {
                 }
                 buf[(terminal_area.x + i as u16, y)]
                     .set_char(ch)
-                    .set_style(Style::default().fg(Color::Yellow).bold());
+                    .set_style(self.theme.warning_style().bold());
             }
         }
 
@@ -564,7 +575,7 @@ impl ConnectSessionScreen {
         for col in 0..area.width {
             buf[(area.x + col, area.y)]
                 .set_char(' ')
-                .set_style(Style::default().bg(Color::DarkGray));
+                .set_style(self.theme.muted_style().bg(self.theme.selected_bg));
         }
 
         let (right_text, right_style) = self.status_label();
@@ -573,7 +584,7 @@ impl ConnectSessionScreen {
         for (i, ch) in layout.left_text.chars().enumerate() {
             buf[(area.x + i as u16, area.y)]
                 .set_char(ch)
-                .set_style(Style::default().fg(Color::White).bg(Color::DarkGray).bold());
+                .set_style(self.theme.text_style().bg(self.theme.selected_bg).bold());
         }
 
         for (i, ch) in right_text.chars().enumerate() {
@@ -643,44 +654,44 @@ impl ConnectSessionScreen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Connect Session Help ")
-            .border_style(Style::default().fg(Color::Cyan).bold());
+            .border_style(self.theme.accent_style().bold());
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("PageUp", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("PageUp", self.theme.warning_style().bold()),
                 Span::raw("        scroll up one page"),
             ]),
             Line::from(vec![
-                Span::styled("PageDown", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("PageDown", self.theme.warning_style().bold()),
                 Span::raw("      scroll down one page"),
             ]),
             Line::from(vec![
-                Span::styled("Shift+Up", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("Shift+Up", self.theme.warning_style().bold()),
                 Span::raw("      scroll up one line"),
             ]),
             Line::from(vec![
-                Span::styled("Shift+Down", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("Shift+Down", self.theme.warning_style().bold()),
                 Span::raw("    scroll down one line"),
             ]),
             Line::from(vec![
-                Span::styled("End", Style::default().fg(Color::Yellow).bold()),
+                Span::styled("End", self.theme.warning_style().bold()),
                 Span::raw("           return to live view"),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("F2", Style::default().fg(Color::Green).bold()),
+                Span::styled("F2", self.theme.success_style().bold()),
                 Span::raw("            copy remote file to local clipboard"),
             ]),
             Line::from(vec![
-                Span::styled("Ctrl+] / Ctrl+5", Style::default().fg(Color::Red).bold()),
+                Span::styled("Ctrl+] / Ctrl+5", self.theme.danger_style().bold()),
                 Span::raw(" disconnect"),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 "Esc / Enter closes this help.",
-                Style::default().fg(Color::DarkGray),
+                self.theme.muted_style(),
             )),
         ];
 
@@ -701,24 +712,24 @@ impl ConnectSessionScreen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Copy remote file ")
-            .border_style(Style::default().fg(Color::Green).bold());
+            .border_style(self.theme.success_style().bold());
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
 
-        let input_line = copy_prompt_line(input, cursor);
+        let input_line = copy_prompt_line(input, cursor, self.theme);
         let mut lines = vec![
             Line::from("Remote file path"),
             input_line,
             Line::from(""),
             Line::from(Span::styled(
                 "Enter: copy to clipboard  Esc: cancel",
-                Style::default().fg(Color::DarkGray),
+                self.theme.muted_style(),
             )),
         ];
         if let Some(error) = error {
             lines.insert(
                 3,
-                Line::from(Span::styled(error, Style::default().fg(Color::Red))),
+                Line::from(Span::styled(error, self.theme.danger_style())),
             );
         }
 
@@ -739,23 +750,27 @@ impl ConnectSessionScreen {
         let modal_area = centered_rect(area, 70, 7);
         Clear.render(modal_area, buf);
 
-        let color = if is_error { Color::Red } else { Color::Green };
+        let style = if is_error {
+            self.theme.danger_style()
+        } else {
+            self.theme.success_style()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(color).bold());
+            .border_style(style.bold());
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
 
         let mut lines = vec![
             Line::from(""),
-            Line::from(Span::styled(message, Style::default().fg(color))),
+            Line::from(Span::styled(message, style)),
             Line::from(""),
         ];
         if dismissible {
             lines.push(Line::from(Span::styled(
                 "Press Esc or Enter to dismiss.",
-                Style::default().fg(Color::DarkGray),
+                self.theme.muted_style(),
             )));
         }
 
@@ -793,28 +808,25 @@ impl ConnectSessionScreen {
         match self.status {
             ConnectSessionStatus::Closed => (
                 "CLOSED".into(),
-                Style::default().fg(Color::Gray).bg(Color::DarkGray).bold(),
+                self.theme.muted_style().bg(self.theme.selected_bg).bold(),
             ),
             ConnectSessionStatus::Disconnected => (
                 "DISCONNECTED".into(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::DarkGray)
-                    .bold(),
+                self.theme.warning_style().bg(self.theme.selected_bg).bold(),
             ),
             ConnectSessionStatus::Failed => (
                 "FAILED".into(),
-                Style::default().fg(Color::Red).bg(Color::DarkGray).bold(),
+                self.theme.danger_style().bg(self.theme.selected_bg).bold(),
             ),
             ConnectSessionStatus::TimedOut => (
                 "SESSION EXPIRED".into(),
-                Style::default()
-                    .fg(Color::Red)
-                    .bg(Color::White)
+                self.theme
+                    .danger_style()
+                    .bg(self.theme.selected_fg)
                     .add_modifier(Modifier::BOLD | Modifier::REVERSED),
             ),
             ConnectSessionStatus::Connecting | ConnectSessionStatus::Connected => {
-                let (timer, style) = countdown_status(self.remaining_secs());
+                let (timer, style) = countdown_status_with_theme(self.remaining_secs(), self.theme);
                 let scrollback = self.parser.screen().scrollback();
                 let copying = self.copy_capture.is_some();
                 if scrollback > 0 {
@@ -1221,7 +1233,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn copy_prompt_line(input: &str, cursor: usize) -> Line<'static> {
+fn copy_prompt_line(input: &str, cursor: usize, theme: Theme) -> Line<'static> {
     let cursor = cursor.min(input.chars().count());
     let byte_split = char_to_byte(input, cursor);
     let (before, after) = input.split_at(byte_split);
@@ -1235,7 +1247,7 @@ fn copy_prompt_line(input: &str, cursor: usize) -> Line<'static> {
             } else {
                 after[..cursor_char_len].to_string()
             },
-            Style::default().bg(Color::White).fg(Color::Black),
+            theme.cursor_style(),
         ),
         Span::raw(if cursor_char_len < after.len() {
             after[cursor_char_len..].to_string()
@@ -1440,30 +1452,31 @@ fn format_countdown_duration(secs: u64) -> String {
 }
 
 fn countdown_status(remaining_secs: u64) -> (String, Style) {
+    countdown_status_with_theme(remaining_secs, Theme::default())
+}
+
+fn countdown_status_with_theme(remaining_secs: u64, theme: Theme) -> (String, Style) {
     if remaining_secs == 0 {
         return (
             "SESSION EXPIRED".into(),
-            Style::default()
-                .fg(Color::Red)
-                .bg(Color::White)
+            theme
+                .danger_style()
+                .bg(theme.selected_fg)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED),
         );
     }
 
-    let (prefix, color, critical) = if remaining_secs <= 60 {
-        ("!", Color::Red, true)
+    let (prefix, style, critical) = if remaining_secs <= 60 {
+        ("!", theme.danger_style(), true)
     } else if remaining_secs <= 5 * 60 {
-        ("!", Color::Red, false)
+        ("!", theme.danger_style(), false)
     } else if remaining_secs <= 15 * 60 {
-        ("▲", Color::Yellow, false)
+        ("▲", theme.warning_style(), false)
     } else {
-        ("●", Color::Cyan, false)
+        ("●", theme.accent_style(), false)
     };
 
-    let mut style = Style::default()
-        .fg(color)
-        .bg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
+    let mut style = style.bg(theme.selected_bg).add_modifier(Modifier::BOLD);
     if critical {
         style = style.add_modifier(Modifier::REVERSED);
     }

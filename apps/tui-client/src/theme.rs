@@ -1,4 +1,4 @@
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +67,53 @@ impl Default for Theme {
             warning: Color::Yellow,
             danger: Color::Red,
         }
+    }
+}
+
+impl Theme {
+    pub fn accent_style(self) -> Style {
+        Style::default().fg(self.accent)
+    }
+
+    pub fn text_style(self) -> Style {
+        Style::default().fg(self.text)
+    }
+
+    pub fn muted_style(self) -> Style {
+        Style::default().fg(self.muted)
+    }
+
+    pub fn selected_style(self) -> Style {
+        self.selected_plain_style()
+    }
+
+    pub fn selected_plain_style(self) -> Style {
+        Style::default()
+            .fg(self.selected_fg)
+            .bg(self.selected_bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn focused_border_style(self) -> Style {
+        Style::default()
+            .fg(self.warning)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn success_style(self) -> Style {
+        Style::default().fg(self.success)
+    }
+
+    pub fn warning_style(self) -> Style {
+        Style::default().fg(self.warning)
+    }
+
+    pub fn danger_style(self) -> Style {
+        Style::default().fg(self.danger)
+    }
+
+    pub fn cursor_style(self) -> Style {
+        Style::default().fg(self.selected_fg).bg(self.selected_bg)
     }
 }
 

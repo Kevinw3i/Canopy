@@ -332,7 +332,7 @@ settings_change_password = ["p"]
 
 按 `Ctrl+D` 關閉更新 banner。
 
-主題 preset 與覆寫目前套用在 Dashboard 與 Settings shell；較深層工作流畫面仍保留既有語意狀態色。
+主題 preset 與覆寫會套用在整個 TUI workflow chrome：登入、Dashboard、Settings、Access、EC2/ECS inventory、CloudWatch search、Live Tail、modal，以及連線 session 的狀態列、help、copy 畫面。連線 session 內的遠端 terminal 輸出仍保留遠端程序送出的 VT100 顏色。
 
 **載入順序：**
 1. `DEV_MODE=1` → 用內建預設值，並忽略作業系統 config 路徑的設定檔
