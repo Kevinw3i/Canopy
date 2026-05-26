@@ -1524,18 +1524,16 @@ impl Component for Ec2Screen {
                     count_display
                 )
             }
+        } else if let Some(target) = toggle_hint {
+            format!(
+                "{} | Ctrl+E: {} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
+                count_display, target
+            )
         } else {
-            if let Some(target) = toggle_hint {
-                format!(
-                    "{} | Ctrl+E: {} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
-                    count_display, target
-                )
-            } else {
-                format!(
-                    "{} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
-                    count_display
-                )
-            }
+            format!(
+                "{} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
+                count_display
+            )
         };
 
         let status_style = if self.error.is_some() {
