@@ -156,6 +156,24 @@ expect_failure \
   "$TMP_DIR/misleading.tfvars" \
   "not listed"
 
+SECOND_ROLE="arn:aws:iam::123456789012:role/CanopySecondRole"
+cat > "$TMP_DIR/two-inline-roles-entitlements.toml" <<EOF
+[[rules]]
+id = "two-inline-roles"
+allowed_clusters = ["prod"]
+allowed_accounts = [
+  { account_id = "123456789012", account_name = "prod", role_arn = "$GOV_ROLE" }, { account_id = "123456789012", account_name = "prod-second", role_arn = "$SECOND_ROLE" },
+]
+
+[rules.features]
+can_view_ecs = true
+EOF
+expect_failure \
+  "second-inline-role-missing" \
+  "$TMP_DIR/two-inline-roles-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "not listed"
+
 cat > "$TMP_DIR/single-quoted-role-entitlements.toml" <<EOF
 [[rules]]
 id = "single-quoted-role"

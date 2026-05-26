@@ -86,11 +86,15 @@ fi
 # Check 3: all role ARNs present in assumable_role_arns (uncommented lines only)
 ROLE_ARNS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | \
   awk '
-    match($0, /role_arn[[:space:]]*=[[:space:]]*["\047]arn:[^"\047]+["\047]/) {
-      value = substr($0, RSTART, RLENGTH)
-      sub(/^[^"\047]*["\047]/, "", value)
-      sub(/["\047]$/, "", value)
-      print value
+    {
+      line = $0
+      while (match(line, /role_arn[[:space:]]*=[[:space:]]*["\047]arn:[^"\047]+["\047]/)) {
+        value = substr(line, RSTART, RLENGTH)
+        sub(/^[^"\047]*["\047]/, "", value)
+        sub(/["\047]$/, "", value)
+        print value
+        line = substr(line, RSTART + RLENGTH)
+      }
     }
   ' | sort -u || true)
 ASSUMABLE_ROLE_ARNS="$(extract_assumable_role_arns)"
