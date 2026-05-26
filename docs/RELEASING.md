@@ -262,10 +262,24 @@ GitHub Actions 只負責 build/push image，不會自動修改 ECS。image 推�
 
 ```bash
 # 若需要指定 profile，先 export AWS_PROFILE=<write-profile>；未設定時使用 default credential chain。
+VERSION=cp-v0.1.0
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
+scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
 terraform -chdir=infra plan \
   -var="create_service=true" \
-  -var="image_tag=cp-v0.1.0" \
+  -var="image_tag=$VERSION" \
   -out=tfplan.phase2
 
 terraform -chdir=infra apply tfplan.phase2
+
+aws ecs wait services-stable \
+  --cluster $(terraform -chdir=infra output -raw ecs_cluster_name) \
+  --services $(terraform -chdir=infra output -raw ecs_service_name) \
+  --region "$AWS_REGION"
 ```
