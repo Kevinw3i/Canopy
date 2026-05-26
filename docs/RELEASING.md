@@ -250,9 +250,11 @@ Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先
 驗證 Phase 2 部署 preconditions，再驗證 entitlements，最後推送到
 `aws_region` 的 `<project>/control-plane`。請確認 GitHub Actions ECR push role
 的 repository ARN 與允許區域也使用同一組 `aws_region` / `project`。
-entitlements 檢查會拒絕部署用 `profile:*`、ECS Exec 使用 direct/profile
-credentials、授予 ECS 存取但缺少 `allowed_clusters` 的 rule、未明確 opt-in
-的寬鬆 cluster wildcard，以及缺少 `allowed_os_users` 的 SSM rule。
+entitlements 檢查會拒絕 active sample placeholder、格式錯誤或含 wildcard
+的 IAM Role ARN、部署用 `profile:*`、ECS Exec 使用 direct/profile
+credentials、ECS Exec 未同時授權 ECS view、授予 ECS 存取但缺少
+`allowed_clusters` 的 rule、未明確 opt-in 的寬鬆 cluster wildcard，以及缺少
+`allowed_os_users` 的 SSM rule。
 
 ### 部署到 ECS
 
