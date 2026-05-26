@@ -212,7 +212,7 @@ variable "generate_config" {
 }
 
 variable "entitlements_file" {
-  description = "Path to the entitlements TOML file inside the container (baked via --build-arg or mounted)"
+  description = "Path to the entitlements TOML file inside the container. Production images bake this file via BuildKit secret."
   type        = string
   default     = "/etc/canopy/entitlements.toml"
 }
