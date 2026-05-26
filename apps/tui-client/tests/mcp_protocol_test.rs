@@ -103,7 +103,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .and(body_partial_json(json!({
             "protocol_version": "2025-06-18",
             "client_name": "canopy-local-mcp",
-            "product_phase": "phase_2_discovery"
+            "product_phase": "phase_3_data_tools"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "canopy_mcp_session_id": expected_sid,
@@ -227,6 +227,104 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .mount(&mock)
         .await;
 
+    // CloudWatch preflight — assert Phase 3 data tools carry sid/lsg and scoped intent.
+    Mock::given(method("POST"))
+        .and(path("/api/mcp/cloudwatch/preflight"))
+        .and(header("Authorization", "Bearer fake-jwt-for-tui-test"))
+        .and(body_partial_json(json!({
+            "canopy_mcp_session_id": expected_sid,
+            "local_secret_generation": expected_lsg,
+            "tool_name": "canopy_search_logs",
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_name": "/app/web-service",
+            "filter_pattern": "ERROR",
+            "start_time": 1000,
+            "end_time": 2000,
+            "limit": 2
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tool_name": "canopy_search_logs",
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_names": ["/app/web-service"],
+            "preflight_token": "pf-token-1",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "guardrails": {
+                "max_request_body_bytes": 262144,
+                "max_log_group_list_results": 200,
+                "max_describe_log_groups_pages": 5,
+                "max_discovery_results_scanned": 1000,
+                "discovery_cursor_ttl_seconds": 600,
+                "preflight_token_ttl_seconds": 300,
+                "search_cursor_ttl_seconds": 600,
+                "insights_query_token_ttl_seconds": 900,
+                "max_search_window_seconds": 21600,
+                "max_search_events": 1000,
+                "max_response_bytes": 1048576,
+                "max_event_message_bytes": 16384,
+                "max_insights_timeout_seconds": 60,
+                "default_insights_timeout_seconds": 30,
+                "max_concurrent_mcp_tool_calls_per_session": 4,
+                "max_concurrent_insights_queries_per_actor": 2,
+                "max_mcp_tool_calls_per_actor_per_minute": 30,
+                "max_insights_starts_per_actor_per_minute": 10
+            }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // CloudWatch search — assert only the preflight token is forwarded for initial mode.
+    Mock::given(method("POST"))
+        .and(path("/api/mcp/cloudwatch/search"))
+        .and(header("Authorization", "Bearer fake-jwt-for-tui-test"))
+        .and(body_partial_json(json!({
+            "canopy_mcp_session_id": expected_sid,
+            "local_secret_generation": expected_lsg,
+            "preflight_token": "pf-token-1"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_name": "/app/web-service",
+            "events": [{
+                "timestamp": 1000,
+                "message": "{\"level\":\"ERROR\",\"msg\":\"Connection refused\"}",
+                "log_stream_name": "worker-prod-01/application",
+                "ingestion_time": 1100,
+                "event_id": "ev-test-1"
+            }],
+            "returned_count": 1,
+            "truncated": false
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    // CloudWatch Insights — assert the query starter forwards its preflight token.
+    Mock::given(method("POST"))
+        .and(path("/api/mcp/cloudwatch/insights"))
+        .and(header("Authorization", "Bearer fake-jwt-for-tui-test"))
+        .and(body_partial_json(json!({
+            "canopy_mcp_session_id": expected_sid,
+            "local_secret_generation": expected_lsg,
+            "preflight_token": "pf-token-1"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_names": ["/app/web-service"],
+            "query_token": "query-token-1",
+            "status": "Running",
+            "results": [],
+            "terminal": false,
+            "next_action_hint": "Use query_token to poll this exact Insights query."
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
     // Query database — assert (sid, lsg, scope, sql) make it through.
     Mock::given(method("POST"))
         .and(path("/api/mcp/database/query"))
@@ -328,7 +426,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
             "params": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {},
-                "clientInfo": {"name": "p2-test", "version": "0.0.1"}
+                "clientInfo": {"name": "p3-test", "version": "0.0.1"}
             }
         }))
         .send()
@@ -384,6 +482,9 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         "canopy_describe_capabilities",
         "canopy_get_guidance",
         "canopy_list_allowed_log_groups",
+        "canopy_preflight_request",
+        "canopy_search_logs",
+        "canopy_run_insights_query",
         "canopy_list_database_scopes",
         "canopy_query_database",
     ] {
@@ -412,7 +513,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .as_str()
         .expect("content[0].text");
     let payload: Value = serde_json::from_str(payload_text).unwrap();
-    assert_eq!(payload["mcp_product_phase"], "phase_2_discovery");
+    assert_eq!(payload["mcp_product_phase"], "phase_3_data_tools");
 
     // 3.9 tools/call canopy_get_guidance → forwards to control-plane
     //     `/api/mcp/guidance/delivered` with the workflow guidance id.
@@ -448,7 +549,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     assert_eq!(payload["version"], "2026-05-13");
 
     // 3.10 tools/call canopy_list_allowed_log_groups → forwards to mock
-    //      control-plane; it is Phase 2 discovery and does not require
+    //      control-plane; it is discovery and does not require
     //      a preflight token.
     let resp = client
         .post(&endpoint)
@@ -478,7 +579,90 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     assert_eq!(payload["log_groups"][0]["name"], "/app/web-service");
     assert_eq!(payload["truncated"], false);
 
-    // 3.11 tools/call canopy_list_database_scopes → forwards to mock
+    // 3.11 tools/call canopy_preflight_request → forwards scoped CloudWatch data intent.
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(&bearer)
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &proto_session_id)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": "canopy_preflight_request",
+                "arguments": {
+                    "tool_name": "canopy_search_logs",
+                    "account_id": "111111111111",
+                    "region": "us-east-1",
+                    "log_group_name": "/app/web-service",
+                    "filter_pattern": "ERROR",
+                    "start_time": 1000,
+                    "end_time": 2000,
+                    "limit": 2
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let payload_text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text on cloudwatch preflight");
+    let payload: Value = serde_json::from_str(payload_text).unwrap();
+    assert_eq!(payload["preflight_token"], "pf-token-1");
+
+    // 3.12 tools/call canopy_search_logs → forwards preflight token.
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(&bearer)
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &proto_session_id)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "params": {
+                "name": "canopy_search_logs",
+                "arguments": {"preflight_token": "pf-token-1"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let payload_text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text on cloudwatch search");
+    let payload: Value = serde_json::from_str(payload_text).unwrap();
+    assert_eq!(payload["events"][0]["event_id"], "ev-test-1");
+    assert_eq!(payload["truncated"], false);
+
+    // 3.13 tools/call canopy_run_insights_query → forwards preflight token.
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(&bearer)
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &proto_session_id)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {
+                "name": "canopy_run_insights_query",
+                "arguments": {"preflight_token": "pf-token-1"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let payload_text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text on cloudwatch insights");
+    let payload: Value = serde_json::from_str(payload_text).unwrap();
+    assert_eq!(payload["query_token"], "query-token-1");
+    assert_eq!(payload["status"], "Running");
+
+    // 3.14 tools/call canopy_list_database_scopes → forwards to mock
     //     control-plane; we verify the response shape AND that the mock
     //     actually saw the request below.
     let resp = client
@@ -487,7 +671,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .header("Content-Type", "application/json")
         .header("Mcp-Session-Id", &proto_session_id)
         .json(&json!({
-            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
             "params": {"name": "canopy_list_database_scopes", "arguments": {}}
         }))
         .send()
@@ -501,7 +685,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     let payload: Value = serde_json::from_str(payload_text).unwrap();
     assert_eq!(payload["scopes"][0]["name"], "orders_prod_readonly");
 
-    // 3.12 tools/call canopy_query_database → control-plane returns 400
+    // 3.15 tools/call canopy_query_database → control-plane returns 400
     //      which the TUI MCP server should surface as a structured
     //      JSON-RPC error, not a 5xx.
     let resp = client
@@ -510,7 +694,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .header("Content-Type", "application/json")
         .header("Mcp-Session-Id", &proto_session_id)
         .json(&json!({
-            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
             "params": {
                 "name": "canopy_query_database",
                 "arguments": {
@@ -538,6 +722,9 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         "/api/mcp/session/register",
         "/api/mcp/guidance/delivered",
         "/api/mcp/cloudwatch/log-groups",
+        "/api/mcp/cloudwatch/preflight",
+        "/api/mcp/cloudwatch/search",
+        "/api/mcp/cloudwatch/insights",
         "/api/mcp/database/scopes",
         "/api/mcp/database/query",
     ]
@@ -563,6 +750,18 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         path_counts["/api/mcp/cloudwatch/log-groups"] >= 1,
         "list_allowed_log_groups tool must forward to control-plane"
     );
+    assert_eq!(
+        path_counts["/api/mcp/cloudwatch/preflight"], 1,
+        "preflight tool must forward to control-plane exactly once"
+    );
+    assert_eq!(
+        path_counts["/api/mcp/cloudwatch/search"], 1,
+        "search tool must forward to control-plane exactly once"
+    );
+    assert_eq!(
+        path_counts["/api/mcp/cloudwatch/insights"], 1,
+        "insights tool must forward to control-plane exactly once"
+    );
     assert!(
         path_counts["/api/mcp/database/scopes"] >= 1,
         "list_scopes tool must forward to control-plane"
@@ -587,7 +786,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         serde_json::from_slice(&register_req.body).expect("register body should be JSON");
     assert_eq!(register_body["protocol_version"], "2025-06-18");
     assert_eq!(register_body["client_name"], "canopy-local-mcp");
-    assert_eq!(register_body["product_phase"], "phase_2_discovery");
+    assert_eq!(register_body["product_phase"], "phase_3_data_tools");
     assert_eq!(
         register_body["local_secret_generation"], expected_lsg,
         "register must carry the runtime-generated local_secret_generation"

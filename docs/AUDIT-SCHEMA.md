@@ -52,6 +52,9 @@ Current actions:
 - `mcp_session_register`
 - `mcp_guidance_sync`
 - `mcp_cloudwatch_discovery`
+- `mcp_cloudwatch_preflight`
+- `mcp_cloudwatch_search`
+- `mcp_cloudwatch_insights`
 - `mcp_database_scope_list`
 - `mcp_database_query`
 
@@ -116,12 +119,15 @@ EC2 power metadata (`action: "ec2_power"`) can include:
 
 Entitlements metadata usually contains the common request context fields only.
 
-MCP metadata is additive and is recorded inside `metadata`. Product Phase 2
+MCP metadata is additive and is recorded inside `metadata`. Product Phase 3
 uses dedicated top-level MCP actions:
 
 - `mcp_session_register` for MCP session registration.
 - `mcp_guidance_sync` for guidance delivery sync.
 - `mcp_cloudwatch_discovery` for MCP CloudWatch log-group discovery.
+- `mcp_cloudwatch_preflight` for CloudWatch data preflight token issuance and denial.
+- `mcp_cloudwatch_search` for MCP CloudWatch FilterLogEvents attempt/success/failure/denial.
+- `mcp_cloudwatch_insights` for MCP CloudWatch Logs Insights start/poll lifecycle events.
 - `mcp_database_scope_list` for MCP Database v1 scope discovery.
 - `mcp_database_query` for MCP Database v1 query events.
 
@@ -155,6 +161,23 @@ MCP CloudWatch discovery metadata can include:
 - `scanned_count`
 - `truncated`
 - `cursor_issued`
+
+MCP CloudWatch data metadata can include:
+
+- `mcp_event_kind`: `cloudwatch_preflight`, `cloudwatch_search`, or
+  `cloudwatch_insights`.
+- `mcp_outcome_kind`: `attempt`, `success`, `started`, `complete`,
+  `invalid_token_mode`, token validation reasons, entitlement/scope denial
+  reasons, or AWS failure reasons.
+- `tool_name`: `canopy_preflight_request`, `canopy_search_logs`, or
+  `canopy_run_insights_query`.
+- `log_group_name` / `log_group_names`
+- `filter_pattern_raw` / `query_string_raw`: present only after the relevant
+  guidance and preflight gates pass; denial paths redact raw input as
+  `[redacted: denial path]`.
+- `has_preflight_token`, `has_search_cursor`, `has_query_token`
+- `aws_execution_planned` / `aws_execution_attempted`
+- `returned_count`, `row_count`, `status`, `truncated`, `cursor_issued`
 
 MCP Database v1 metadata can include:
 
