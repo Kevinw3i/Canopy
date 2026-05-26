@@ -399,10 +399,10 @@ fn effective_task_fetch_regions(
         vec![region.clone()]
     } else if !rule_regions.is_empty() {
         rule_regions.to_vec()
-    } else if !entitlement_regions.is_empty() {
-        entitlement_regions.to_vec()
     } else if !cluster_pattern_regions.is_empty() {
         cluster_pattern_regions.to_vec()
+    } else if !entitlement_regions.is_empty() {
+        entitlement_regions.to_vec()
     } else {
         vec![default_region]
     }
@@ -1499,6 +1499,28 @@ mod tests {
 
         assert_eq!(
             effective_task_fetch_regions(&req, &[], &[], &cluster_regions, "us-east-1".into()),
+            cluster_regions
+        );
+    }
+
+    #[test]
+    fn effective_regions_use_concrete_cluster_regions_before_merged_entitlement_regions() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: None,
+            cluster: None,
+            page_size: 50,
+        };
+        let cluster_regions = vec!["ap-northeast-1".into()];
+
+        assert_eq!(
+            effective_task_fetch_regions(
+                &req,
+                &[],
+                &["us-east-1".into()],
+                &cluster_regions,
+                "us-west-2".into()
+            ),
             cluster_regions
         );
     }
