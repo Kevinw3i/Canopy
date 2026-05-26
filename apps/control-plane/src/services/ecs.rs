@@ -274,12 +274,22 @@ pub fn build_ecs_exec_command(
     if req.cluster_arn != task.cluster_arn || req.task_arn != task.task_arn {
         return Err("Task does not match requested cluster/task".into());
     }
-    if !rule_scopes.is_empty()
-        && !rule_scopes
+    if !rule_scopes.is_empty() {
+        let matching_scopes = rule_scopes
             .iter()
-            .any(|scope| task_matches_rule_scope(task, scope))
-    {
-        return Err("Task does not match any allowed ECS scope".into());
+            .filter(|scope| task_matches_rule_scope(task, scope))
+            .collect::<Vec<_>>();
+        if matching_scopes.is_empty() {
+            return Err("Task does not match any allowed ECS scope".into());
+        }
+        if !matching_scopes.iter().any(|scope| {
+            !scope
+                .excluded_container_names
+                .iter()
+                .any(|excluded| excluded == &req.container_name)
+        }) {
+            return Err("Container is excluded by ECS sidecar denylist".into());
+        }
     }
 
     let Some(container) = task
@@ -531,6 +541,51 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--container", "app"]));
         assert!(!resp.env_vars.contains_key("AWS_PROFILE"));
+    }
+
+    #[test]
+    fn build_ecs_exec_command_denies_excluded_container() {
+        let task = mock_tasks().remove(0);
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "xray-daemon".into(),
+        };
+
+        let err = build_ecs_exec_command(&req, &entitlements(), &task, None, &[rule_scope()])
+            .unwrap_err();
+        assert!(err.contains("sidecar denylist"));
+    }
+
+    #[test]
+    fn per_rule_container_deny_does_not_hide_container_authorized_by_another_rule() {
+        let task = mock_tasks().remove(0);
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "xray-daemon".into(),
+        };
+        let denying_scope = rule_scope();
+        let mut allowing_scope = rule_scope();
+        allowing_scope.excluded_container_names.clear();
+
+        let resp = build_ecs_exec_command(
+            &req,
+            &entitlements(),
+            &task,
+            None,
+            &[denying_scope, allowing_scope],
+        )
+        .unwrap();
+
+        assert!(resp
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--container", "xray-daemon"]));
     }
 
     #[test]

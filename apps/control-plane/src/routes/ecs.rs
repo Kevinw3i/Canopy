@@ -839,6 +839,22 @@ fn validate_task_for_exec(
     Ok(())
 }
 
+fn container_eligible_rule_scopes<'a>(
+    matching_scopes: &[&'a crate::services::ecs::EcsRuleScope],
+    container_name: &str,
+) -> Vec<&'a crate::services::ecs::EcsRuleScope> {
+    matching_scopes
+        .iter()
+        .copied()
+        .filter(|scope| {
+            !scope
+                .excluded_container_names
+                .iter()
+                .any(|excluded| excluded == container_name)
+        })
+        .collect()
+}
+
 async fn select_account_for_exec(
     state: &AppState,
     accounts: Vec<AllowedAccount>,
@@ -1157,10 +1173,8 @@ async fn exec_task(
         return Err((status, Json(ApiError::new(kind, message))));
     }
 
-    if matching_scopes
-        .iter()
-        .any(|scope| scope.excluded_container_names.contains(&req.container_name))
-    {
+    let eligible_scopes = container_eligible_rule_scopes(&matching_scopes, &req.container_name);
+    if eligible_scopes.is_empty() {
         audit_deny(
             &state,
             "Container is excluded by ECS sidecar denylist",
@@ -1174,7 +1188,7 @@ async fn exec_task(
         ));
     }
 
-    let scoped_accounts = matching_scopes
+    let scoped_accounts = eligible_scopes
         .iter()
         .flat_map(|scope| scope.accounts.iter().cloned())
         .filter(|account| account.account_id == req.account_id)
@@ -1265,12 +1279,17 @@ async fn exec_task(
         })
     };
 
+    let eligible_rule_scopes = eligible_scopes
+        .into_iter()
+        .cloned()
+        .collect::<Vec<crate::services::ecs::EcsRuleScope>>();
+
     let response = build_ecs_exec_command(
         &req,
         &entitlements,
         &task,
         credentials.as_ref(),
-        &rule_scopes,
+        &eligible_rule_scopes,
     )
     .map_err(|message| {
         audit_deny(&state, &message, Some("command_denied"));
@@ -1523,5 +1542,32 @@ mod tests {
     fn first_assumable_account_returns_none_for_local_only_entries() {
         let accounts = vec![account("direct"), account("profile:ops")];
         assert!(first_assumable_account(&accounts).is_none());
+    }
+
+    #[test]
+    fn container_eligible_scopes_keep_rule_local_denylist() {
+        let mut denying = route_scope();
+        denying.excluded_container_names = vec!["app".into()];
+        denying.accounts[0].role_arn = "arn:aws:iam::111111111111:role/DenyApp".into();
+        let mut allowing = route_scope();
+        allowing.accounts[0].role_arn = "arn:aws:iam::111111111111:role/AllowApp".into();
+        let matching = vec![&denying, &allowing];
+
+        let eligible = container_eligible_rule_scopes(&matching, "app");
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(
+            eligible[0].accounts[0].role_arn,
+            "arn:aws:iam::111111111111:role/AllowApp"
+        );
+    }
+
+    #[test]
+    fn container_eligible_scopes_empty_when_all_matching_rules_exclude_container() {
+        let mut denying = route_scope();
+        denying.excluded_container_names = vec!["app".into()];
+        let matching = vec![&denying];
+
+        assert!(container_eligible_rule_scopes(&matching, "app").is_empty());
     }
 }

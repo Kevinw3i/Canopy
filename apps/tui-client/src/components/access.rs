@@ -219,7 +219,7 @@ impl Component for AccessScreen {
                 selector_summary(&ent.excluded_task_tag_selectors)
             )),
             Line::from(format!(
-                "  excluded_container_names: {}",
+                "  rule_local_excluded_container_names: {}",
                 if ent.excluded_container_names.is_empty() {
                     "-".into()
                 } else {
@@ -329,6 +329,7 @@ mod tests {
         assert!(text.contains("arn:aws:ecs:us-east-1:111:cluster/prod-*"));
         assert!(text.contains("Environment=[production]"));
         assert!(text.contains("CanopyDeny=[true]"));
+        assert!(text.contains("rule_local_excluded_container_names"));
         assert!(text.contains("envoy"));
         assert!(text.contains("allow_broad_cluster_discovery: false"));
     }
