@@ -1540,7 +1540,9 @@ mod tests {
             page_size: 50,
         };
 
-        assert!(validate_tasks_request_scope(&req, &[scope]).is_err());
+        let err = validate_tasks_request_scope(&req, &[scope]).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0.message, "ECS task scope not authorized");
     }
 
     #[test]
@@ -1556,6 +1558,23 @@ mod tests {
         };
 
         assert!(validate_tasks_request_scope(&req, &[scope]).is_ok());
+    }
+
+    #[test]
+    fn cluster_request_scope_rejects_short_cluster_outside_concrete_pattern_region() {
+        let mut scope = route_scope();
+        scope.regions.clear();
+        scope.cluster_patterns = vec![cluster_arn("ap-northeast-1", "111111111111", "app")];
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: Some("us-east-1".into()),
+            cluster: Some("app".into()),
+            page_size: 50,
+        };
+
+        let err = validate_tasks_request_scope(&req, &[scope]).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.1 .0.message, "ECS task scope not authorized");
     }
 
     #[test]

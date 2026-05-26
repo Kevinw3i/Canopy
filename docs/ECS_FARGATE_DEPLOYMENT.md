@@ -303,6 +303,9 @@ aws iam put-role-policy \
 > ECS Exec 在非 mock deployment 中仍需要可 AssumeRole 的 IAM role ARN，
 > 因為 control-plane 必須回傳 scope 過的 STS credentials；不要用
 > `direct` 或 `profile:*` 開啟 ECS Exec。
+> ECS Exec 的 inline session policy 只允許目標 task 的 `ecs:ExecuteCommand`，
+> 並以 `aws:RequestedRegion` 限制 `ecs:DescribeTasks` 與 `ssmmessages`
+> helper channel actions 到同一個 requested region。
 >
 > **跨帳號模式**：如果要存取其他帳號的資源，在 `AssumeTargetRoles` 加上對應的 role ARN，
 > 並在目標帳號的 role trust policy 信任這個 Task Role。Canopy 的 AssumeRole

@@ -143,7 +143,7 @@ TUI                     Control Plane              OIDC Provider
 
 - **伺服器端過濾**：EC2、ECS tasks、CloudWatch data 在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **短期憑證**：透過 STS AssumeRole 取得暫時性憑證，附帶 Session Tags 供稽核
-- **連線範圍限縮**：連線操作使用 inline session policy 將主要動作限縮到目標執行個體或 ECS task；ECS Exec 只額外授予必要的 task 描述與 `ssmmessages` channel 動作
+- **連線範圍限縮**：連線操作使用 inline session policy 將主要動作限縮到目標執行個體或 ECS task；ECS Exec 只額外授予同區域必要的 task 描述與 `ssmmessages` channel 動作
 - **ECS scope 不跨規則拼接**：ECS task list / exec 的 account、role、region、cluster、task tag、container denylist 必須來自同一授權規則
 - **稽核失敗則拒絕 (fail-closed)**：當稽核日誌寫入失敗時，後端拒絕處理請求
 - **開發模式防護**：禁止在非 loopback 位址啟用 dev_mode（除非明確覆寫）
@@ -401,7 +401,7 @@ TUI                     Control Plane              OIDC Provider
 
 - SSM：僅允許 `ssm:StartSession` 對目標執行個體
 - EIC：僅允許 `ec2-instance-connect:SendSSHPublicKey` 和 `ec2-instance-connect:OpenTunnel`
-- ECS Exec：僅允許 `ecs:ExecuteCommand` 對目標 task，並以 `ecs:cluster` 條件限制目標 cluster；另允許同區域 `ecs:DescribeTasks` 與必要的 `ssmmessages:*Channel`
+- ECS Exec：僅允許 `ecs:ExecuteCommand` 對目標 task，並以 `ecs:cluster` 條件限制目標 cluster；另允許同區域 `ecs:DescribeTasks` 與必要的同區域 `ssmmessages:*Channel`
 - 憑證有效期：900 秒（15 分鐘）
 - 不授予 `ec2:Describe*` 以防止客戶端繞過伺服器端過濾
 
