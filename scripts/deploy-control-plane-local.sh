@@ -185,6 +185,11 @@ if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
   fail "Invalid Docker image tag: $IMAGE_TAG"
 fi
 
+IMAGE_TAG_LOWER="$(printf '%s' "$IMAGE_TAG" | tr '[:upper:]' '[:lower:]')"
+if [ "$IMAGE_TAG_LOWER" = "latest" ]; then
+  fail "Using 'latest' is not allowed. Specify an explicit version tag or git SHA for deterministic deployments."
+fi
+
 if [[ ! "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
   fail "--cargo-jobs must be a positive integer: $CARGO_BUILD_JOBS"
 fi
