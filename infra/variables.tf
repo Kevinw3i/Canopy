@@ -438,7 +438,7 @@ variable "log_retention_days" {
 # ── Cross-account access ────────────────────────────────
 
 variable "enable_direct_access" {
-  description = "Allow the control-plane to directly access EC2, ECS task inventory, CloudWatch Logs, and STS in the deployment account (role_arn = \"direct\" in entitlements). Defaults to false for least-privilege. ECS Exec still requires an assumable role."
+  description = "Allow the control-plane to directly access EC2, SSM managed-instance inventory, ECS task inventory, CloudWatch Logs, and STS in the deployment account (role_arn = \"direct\" in entitlements). Defaults to false for least-privilege. ECS Exec still requires an assumable role."
   type        = bool
   default     = false
 }

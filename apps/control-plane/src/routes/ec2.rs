@@ -1,6 +1,6 @@
 use aws_credential_types::provider::ProvideCredentials;
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::aws::clients::AwsClients;
 use crate::aws::credentials::{assume_role_scoped, connect_session_policy, SessionContext};
@@ -281,6 +281,52 @@ fn power_success_message(req: &Ec2PowerRequest, requested_state: &InstanceState)
     )
 }
 
+async fn fetch_ssm_managed_instance_ids(
+    ssm_client: &aws_sdk_ssm::Client,
+    account_id: &str,
+    region: &str,
+) -> anyhow::Result<HashSet<String>> {
+    let mut managed_ids = HashSet::new();
+    let mut next_token: Option<String> = None;
+
+    loop {
+        let mut req = ssm_client.describe_instance_information();
+        if let Some(token) = next_token.take() {
+            req = req.next_token(token);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "DescribeInstanceInformation failed for account {} region {}: {}",
+                account_id,
+                region,
+                e
+            )
+        })?;
+
+        for info in resp.instance_information_list() {
+            if let Some(instance_id) = info.instance_id() {
+                managed_ids.insert(instance_id.to_string());
+            }
+        }
+
+        match resp.next_token() {
+            Some(t) if !t.is_empty() => {
+                next_token = Some(t.to_string());
+            }
+            _ => break,
+        }
+    }
+
+    Ok(managed_ids)
+}
+
+fn apply_ssm_managed_status(instances: &mut [Ec2Instance], managed_ids: &HashSet<String>) {
+    for instance in instances {
+        instance.ssm_managed = managed_ids.contains(&instance.instance_id);
+    }
+}
+
 /// Fetch EC2 instances from real AWS across all allowed account+region pairs.
 async fn fetch_instances_from_aws(
     state: &AppState,
@@ -361,6 +407,10 @@ async fn fetch_instances_from_aws(
                 .await?;
 
                 let ec2_client = AwsClients::ec2(&effective_config);
+                let ssm_client = AwsClients::ssm(&effective_config);
+                let managed_instance_ids =
+                    fetch_ssm_managed_instance_ids(&ssm_client, &account.account_id, &region)
+                        .await?;
 
                 let mut instances = Vec::new();
                 let mut next_token: Option<String> = None;
@@ -397,6 +447,7 @@ async fn fetch_instances_from_aws(
                         _ => break,
                     }
                 }
+                apply_ssm_managed_status(&mut instances, &managed_instance_ids);
 
                 Ok::<Vec<Ec2Instance>, anyhow::Error>(instances)
             }));
@@ -1731,6 +1782,7 @@ async fn connect_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     fn connect_req(method: ConnectMethod, os_user: Option<&str>) -> ConnectRequest {
         ConnectRequest {
@@ -1740,6 +1792,43 @@ mod tests {
             method,
             os_user: os_user.map(str::to_string),
         }
+    }
+
+    fn ec2_instance(instance_id: &str, ssm_managed: bool) -> Ec2Instance {
+        Ec2Instance {
+            instance_id: instance_id.into(),
+            account_id: "111111111111".into(),
+            region: "ap-northeast-1".into(),
+            name: None,
+            private_ip: None,
+            public_ip: None,
+            state: InstanceState::Running,
+            platform: Some("Linux/UNIX".into()),
+            instance_type: "t3.micro".into(),
+            ssm_managed,
+            instance_connect_capable: true,
+            environment: None,
+            tags: HashMap::new(),
+            launch_time: None,
+            vpc_id: Some("vpc-123".into()),
+            subnet_id: None,
+            security_groups: vec![],
+            iam_role: Some("CanopyRole".into()),
+        }
+    }
+
+    #[test]
+    fn ssm_managed_status_overwrites_converter_heuristic() {
+        let mut instances = vec![
+            ec2_instance("i-managed", false),
+            ec2_instance("i-not-managed", true),
+        ];
+        let managed_ids = HashSet::from(["i-managed".to_string()]);
+
+        apply_ssm_managed_status(&mut instances, &managed_ids);
+
+        assert!(instances[0].ssm_managed);
+        assert!(!instances[1].ssm_managed);
     }
 
     #[test]

@@ -376,6 +376,7 @@ TUI                     Control Plane              OIDC Provider
 | 服務 | API | 用途 |
 |------|-----|------|
 | EC2 | `DescribeInstances` | 列出執行個體 |
+| SSM | `DescribeInstanceInformation` | 精確判斷 EC2 instance 是否為 SSM managed |
 | EC2 | `StartInstances` / `StopInstances` / `RebootInstances` | 高風險 power actions |
 | ECS | `ListClusters` / `DescribeClusters` / `ListTasks` / `DescribeTasks` | 列出與驗證授權 tasks |
 | ECS | `ExecuteCommand` | 由 TUI 透過 control-plane 回傳的短期憑證啟動 ECS Exec |
@@ -392,7 +393,7 @@ TUI                     Control Plane              OIDC Provider
 - 每個允許的帳號對應一個 IAM Role ARN
 - Control Plane 使用 base AWS 憑證（環境變數、instance profile 等）呼叫 STS AssumeRole
 - 附帶 Session Tags：`canopy-user`、`canopy-team`、`canopy-environment`
-- EC2 查詢使用扇出 (fan-out) 模式：對每個 (帳號, role, 區域) 組合並行查詢
+- EC2 查詢使用扇出 (fan-out) 模式：對每個 (帳號, role, 區域) 組合並行查詢 `DescribeInstances`，並用同 scope 的 SSM `DescribeInstanceInformation` 標示 managed 狀態
 - 結果以 instance_id 去重
 
 ### 8.3 連線憑證範圍限縮
@@ -596,7 +597,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - ECS 目前支援 task inventory 與 ECS Exec，不支援 ECS service/deployment 管理
 - ECS broad cluster discovery 需要明確 opt-in，且 response 仍受服務端上限保護
 - OIDC refresh token 流程已支援 PKCE/device-code 取得、TUI 401 refresh/retry 與 rotated token 持久化；仍要求 provider 發放 refresh token 並在 refresh grant 回傳 id_token
-- SSM 受管理狀態為啟發式判斷（有 IAM Role 且 Running）
+- EC2 inventory 會用 SSM `DescribeInstanceInformation` 精確標示 SSM 受管理狀態；需目標 role 具備 `ssm:DescribeInstanceInformation`
 - EC2 Instance Connect 支援判斷為近似值
 - AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
 - 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
@@ -604,7 +605,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 ### 未來規劃
 
 - [x] AWS Organizations 帳號自動發現
-- [ ] SSM DescribeInstanceInformation 精確判斷受管理狀態
+- [x] SSM DescribeInstanceInformation 精確判斷受管理狀態
 - [ ] Multi-factor Authentication 支援
 - [ ] 自訂快捷鍵設定
 - [ ] 主題與配色自訂

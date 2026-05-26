@@ -3,6 +3,7 @@ use aws_sdk_cloudwatchlogs::Client as CwlClient;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_ecs::Client as EcsClient;
 use aws_sdk_organizations::Client as OrganizationsClient;
+use aws_sdk_ssm::Client as SsmClient;
 
 /// Factory for AWS SDK clients from an assumed-role SdkConfig.
 ///
@@ -26,5 +27,9 @@ impl AwsClients {
 
     pub fn organizations(config: &SdkConfig) -> OrganizationsClient {
         OrganizationsClient::new(config)
+    }
+
+    pub fn ssm(config: &SdkConfig) -> SsmClient {
+        SsmClient::new(config)
     }
 }

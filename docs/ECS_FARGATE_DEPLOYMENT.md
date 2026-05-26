@@ -300,6 +300,7 @@ aws iam create-role \
 # - Organizations ListAccounts（使用 account_id="*" discovery 時）
 # - CloudWatch Logs（自身 log + 查詢）
 # - EC2 DescribeInstances, DescribeInstanceConnectEndpoints
+# - SSM DescribeInstanceInformation（EC2 inventory 精確標示 SSM managed 狀態）
 # - ECS task inventory（使用 `role_arn = "direct"` 查看部署帳號 ECS tasks 時）
 aws iam put-role-policy \
   --role-name canopy-task-role \
@@ -344,6 +345,7 @@ aws iam put-role-policy \
         "Action": [
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceConnectEndpoints",
+          "ssm:DescribeInstanceInformation",
           "ecs:DescribeClusters",
           "ecs:DescribeTasks",
           "ecs:ListClusters",
@@ -380,6 +382,9 @@ aws iam put-role-policy \
 > 並在目標帳號的 role trust policy 信任這個 Task Role。Canopy 的 AssumeRole
 > 會帶 ExternalId 與 STS session tags，所以 trust policy 也要允許
 > `sts:TagSession` 並檢查 `sts:ExternalId`。
+> 目標帳號 role 也需允許 inventory 所需的 `ec2:DescribeInstances` 與
+> `ssm:DescribeInstanceInformation`；否則該 account/region scope 會被視為
+> fetch 失敗，而不是回傳不精確的 SSM managed 狀態。
 
 ---
 
@@ -715,7 +720,7 @@ curl -s https://canopy.your-domain.com/health
 - [ ] JWT secret 從 Secrets Manager 注入（不寫死在 config）
 - [ ] OIDC `issuer_url` 和 `client_id` 設定正確
 - [ ] `cors_allowed_origins` 列出 TUI client 的 callback URL
-- [ ] Task Role 有 STS/IAM/EC2/ECS/CloudWatch 權限
+- [ ] Task Role 有 STS/IAM/EC2/SSM/ECS/CloudWatch 權限；跨帳號目標 role 也有 inventory 所需的 EC2/SSM 權限
 - [ ] ALB health check 指向 `/health`
 - [ ] CloudWatch Log Group 已建立
 - [ ] DNS 已指向 ALB
