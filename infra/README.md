@@ -43,16 +43,23 @@ terraform apply
 ### Phase 1: 建立基礎設施 + ECR（不含 ECS service）
 
 ```bash
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
 # 建立 JWT signing secret（只需做一次）
 aws secretsmanager create-secret \
   --name canopy/jwt-secret \
   --secret-string "$(openssl rand -base64 44)" \
-  --region ap-northeast-1
+  --region "$AWS_REGION"
 
 # 取得 secret ARN 和 version ID，填入 terraform.tfvars
-JWT_ARN=$(aws secretsmanager describe-secret --secret-id canopy/jwt-secret --query ARN --output text)
+JWT_ARN=$(aws secretsmanager describe-secret \
+  --secret-id canopy/jwt-secret \
+  --query ARN --output text \
+  --region "$AWS_REGION")
 JWT_VER=$(aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secret \
-  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' --output text)
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
+  --output text \
+  --region "$AWS_REGION")
 
 # 編輯 terraform.tfvars：
 #   jwt_secret_arn        = "<上面的 ARN>"

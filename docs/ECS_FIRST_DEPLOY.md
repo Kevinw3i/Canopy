@@ -140,24 +140,30 @@ encrypt        = true
 JWT 密鑰故意不放在 Terraform state 裡（安全考量），在 Terraform 外先建好：
 
 ```bash
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
 aws secretsmanager create-secret \
   --name canopy/jwt-secret \
   --secret-string "$(openssl rand -base64 44)" \
-  --region ap-northeast-1
+  --region "$AWS_REGION"
 ```
 
 記下 ARN 和 Version ID（後續填入 `terraform.tfvars`）：
 
 ```bash
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
 JWT_ARN=$(aws secretsmanager describe-secret \
   --secret-id canopy/jwt-secret \
-  --query ARN --output text)
+  --query ARN --output text \
+  --region "$AWS_REGION")
 echo "JWT_ARN = $JWT_ARN"
 
 JWT_VER=$(aws secretsmanager list-secret-version-ids \
   --secret-id canopy/jwt-secret \
   --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
-  --output text)
+  --output text \
+  --region "$AWS_REGION")
 echo "JWT_VER = $JWT_VER"
 ```
 
