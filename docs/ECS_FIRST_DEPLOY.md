@@ -236,10 +236,12 @@ cp entitlements.sample.toml entitlements.toml
 編輯 `entitlements.toml`，設定你的使用者、帳號、區域對應關係。
 格式說明見 [`entitlements.sample.toml`](../entitlements.sample.toml)。
 
-部署前先確認 Terraform 變數本身有效，並確認 entitlements 與 Terraform 變數一致：
+Phase 1 還沒有 image，部署前先用 `create_service=false` 確認 Terraform
+變數本身有效，並確認 entitlements 與 Terraform 變數一致：
 
 ```bash
-./scripts/validate-terraform-tfvars.sh infra
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=false"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
 
@@ -266,6 +268,10 @@ ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
+
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
 
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   -t "$ECR_URL:$VERSION" \

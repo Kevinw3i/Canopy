@@ -61,6 +61,7 @@ JWT_VER=$(aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secr
 cd infra
 cp backend.hcl.example backend.hcl
 terraform init -backend-config=backend.hcl
+../scripts/validate-terraform-tfvars.sh . -var="create_service=false"
 terraform apply -var="create_service=false"
 ```
 
@@ -77,11 +78,17 @@ aws ecr get-login-password --region ap-northeast-1 | \
 
 # Build & push（platform 須與 Terraform 的 cpu_architecture 一致）
 cd ..
+# entitlements.toml 應已由 entitlements.sample.toml 複製並填入實際權限規則
+test -s entitlements.toml
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
@@ -102,9 +109,13 @@ terraform apply \
 > **重要：** 因為 entitlements 是 bake 進 Docker image 的，rolling update 期間會有新舊授權規則同時生效的短暫窗口。
 > 如果此次變更包含 entitlements 修改，建議用 `desired_count=1` 先縮容，部署完再擴回原數量，以確保授權規則一致性。
 >
-> 部署前請先驗證 Terraform 變數本身有效，並驗證 entitlements 與 Terraform 變數一致：
+> 部署前請先用即將部署的 image tag 驗證 Terraform Phase 2 變數本身有效，
+> 並驗證 entitlements 與 Terraform 變數一致：
 > ```bash
-> ./scripts/validate-terraform-tfvars.sh infra
+> VERSION=<new-image-tag>
+> ./scripts/validate-terraform-tfvars.sh infra \
+>   -var="create_service=true" \
+>   -var="image_tag=$VERSION"
 > ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 > ```
 >
