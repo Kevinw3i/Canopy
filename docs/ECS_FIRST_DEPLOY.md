@@ -226,6 +226,12 @@ cp entitlements.sample.toml entitlements.toml
 編輯 `entitlements.toml`，設定你的使用者、帳號、區域對應關係。
 格式說明見 [`entitlements.sample.toml`](../entitlements.sample.toml)。
 
+部署前先確認 entitlements 與 Terraform 變數一致：
+
+```bash
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+```
+
 ---
 
 ## Step 6：Build & Push Docker Image
@@ -242,7 +248,7 @@ aws ecr get-login-password --region ap-northeast-1 | \
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 
-docker build --platform linux/amd64 \
+DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
   -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
@@ -301,7 +307,7 @@ ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 
-docker build --platform linux/amd64 \
+DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
   -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
@@ -314,8 +320,9 @@ terraform apply -var="image_tag=$VERSION"
 ```
 
 > **Entitlements 變更注意：** entitlements 是 bake 進 image 的，rolling update 期間
-> 會短暫存在新舊規則並存。如果變更了 entitlements，建議設
-> `force_new_deployment = true` 強制全部替換。
+> 可能短暫存在新舊規則並存。`force_new_deployment = true` 只會觸發新部署，
+> 不會在 `desired_count > 1` 時保證無重疊替換。若這次變更要求授權規則
+> 不可重疊，先暫時把 `desired_count` 降到 `1`，新 image 穩定後再擴回原數量。
 
 ---
 
