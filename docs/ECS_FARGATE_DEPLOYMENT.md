@@ -181,7 +181,9 @@ VERSION=${VERSION:-$(git describe --tags --always)}
 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
 ALB/DNS/subnet/service preconditions。第二個檢查會確認 AssumeRole ARN 已列在
 `assumable_role_arns`、使用 `direct` 時已啟用 `enable_direct_access`、
-`profile:*` 未被部署到 ECS，且 ECS Exec rule 不使用 direct/profile credentials。
+`profile:*` 未被部署到 ECS、ECS Exec rule 不使用 direct/profile credentials、
+授予 ECS 存取的 rule 有明確 `allowed_clusters` 且寬鬆 wildcard 已設定
+`allow_broad_cluster_discovery=true`，以及 SSM rule 有明確 `allowed_os_users`。
 
 ---
 
@@ -618,6 +620,10 @@ curl -s https://canopy.your-domain.com/health
 - [ ] `bind_address` 設為 `0.0.0.0:8443`
 - [ ] `dev_mode = false`
 - [ ] `entitlements_file` 指向容器內的路徑
+- [ ] `entitlements.toml` 已通過 `scripts/validate-entitlements.sh`
+- [ ] 授予 ECS 存取的 rule 有明確 `allowed_clusters`
+- [ ] 寬鬆 ECS cluster wildcard 已明確設定 `allow_broad_cluster_discovery=true`
+- [ ] SSM rule 有明確 `allowed_os_users`
 - [ ] JWT secret 從 Secrets Manager 注入（不寫死在 config）
 - [ ] OIDC `issuer_url` 和 `client_id` 設定正確
 - [ ] `cors_allowed_origins` 列出 TUI client 的 callback URL
