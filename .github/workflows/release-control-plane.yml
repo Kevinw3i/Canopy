@@ -51,19 +51,14 @@ jobs:
 
       - name: Validate Terraform
         shell: bash
-        run: |
-          set -euo pipefail
-
-          terraform -chdir=infra fmt -check
-          terraform -chdir=infra init -backend=false
-          terraform -chdir=infra validate
-          terraform -chdir=infra test
+        run: scripts/test-terraform-module.sh
 
       - name: Validate deployment scripts
         shell: bash
         run: |
           set -euo pipefail
 
+          bash -n scripts/test-terraform-module.sh
           bash -n scripts/validate-entitlements.sh
           bash -n scripts/test-validate-entitlements.sh
           scripts/test-validate-entitlements.sh

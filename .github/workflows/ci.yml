@@ -42,14 +42,11 @@ jobs:
         run: cargo test --workspace
 
       - name: Validate Terraform
-        run: |
-          terraform -chdir=infra fmt -check
-          terraform -chdir=infra init -backend=false
-          terraform -chdir=infra validate
-          terraform -chdir=infra test
+        run: scripts/test-terraform-module.sh
 
       - name: Validate deployment scripts
         run: |
+          bash -n scripts/test-terraform-module.sh
           bash -n scripts/validate-entitlements.sh
           bash -n scripts/test-validate-entitlements.sh
           scripts/test-validate-entitlements.sh

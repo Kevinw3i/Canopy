@@ -7,6 +7,8 @@ Describe the change and why it is needed.
 - [ ] `cargo fmt --all`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace`
+- [ ] `bash -n scripts/test-terraform-module.sh`
+- [ ] `scripts/test-terraform-module.sh`
 - [ ] `bash -n scripts/validate-entitlements.sh`
 - [ ] `bash -n scripts/test-validate-entitlements.sh`
 - [ ] `scripts/test-validate-entitlements.sh`
