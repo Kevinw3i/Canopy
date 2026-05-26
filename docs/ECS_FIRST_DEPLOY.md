@@ -113,7 +113,14 @@ aws dynamodb create-table \
   --region ap-northeast-1
 ```
 
-建立 `infra/backend.hcl`（已包含在本 repo）：
+從範本建立本機 `infra/backend.hcl`。`backend.hcl.example` 會進 repo，
+實際的 `backend.hcl` 會被 `.gitignore` 排除，避免把環境專用的
+state bucket 寫進版本庫：
+
+```bash
+cd infra
+cp backend.hcl.example backend.hcl
+```
 
 ```hcl
 bucket         = "canopy-terraform-state"
@@ -211,6 +218,9 @@ terraform apply -var="create_service=false"
 ```
 
 這會建立：ECR Repository、ECS Cluster、ALB、Security Groups、IAM Roles、CloudWatch Log Group。
+
+> Phase 1 可以讓 `image_tag = ""`，因為此時還不會建立 ECS Task
+> Definition / Service。Phase 2 開始建立 service 時必須提供明確 image tag。
 
 ---
 
