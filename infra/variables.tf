@@ -24,6 +24,14 @@ variable "vpc_cidr" {
   description = "CIDR block for the Terraform-managed VPC when create_vpc = true."
   type        = string
   default     = "10.200.0.0/16"
+
+  validation {
+    condition = (
+      can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$", var.vpc_cidr)) &&
+      try(cidrsubnet(var.vpc_cidr, 0, 0) == var.vpc_cidr, false)
+    )
+    error_message = "vpc_cidr must be a valid canonical IPv4 CIDR block."
+  }
 }
 
 variable "public_subnet_cidrs" {
@@ -35,6 +43,17 @@ variable "public_subnet_cidrs" {
     condition     = length(var.public_subnet_cidrs) >= 2
     error_message = "public_subnet_cidrs must contain at least two CIDR blocks."
   }
+
+  validation {
+    condition = alltrue([
+      for cidr in var.public_subnet_cidrs :
+      (
+        can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$", cidr)) &&
+        try(cidrsubnet(cidr, 0, 0) == cidr, false)
+      )
+    ])
+    error_message = "public_subnet_cidrs must contain only valid canonical IPv4 CIDR blocks."
+  }
 }
 
 variable "private_subnet_cidrs" {
@@ -45,6 +64,17 @@ variable "private_subnet_cidrs" {
   validation {
     condition     = length(var.private_subnet_cidrs) >= 2
     error_message = "private_subnet_cidrs must contain at least two CIDR blocks."
+  }
+
+  validation {
+    condition = alltrue([
+      for cidr in var.private_subnet_cidrs :
+      (
+        can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$", cidr)) &&
+        try(cidrsubnet(cidr, 0, 0) == cidr, false)
+      )
+    ])
+    error_message = "private_subnet_cidrs must contain only valid canonical IPv4 CIDR blocks."
   }
 }
 
@@ -135,6 +165,17 @@ variable "alb_allowed_cidrs" {
   validation {
     condition     = length(var.alb_allowed_cidrs) > 0
     error_message = "alb_allowed_cidrs must contain at least one CIDR block (e.g. your VPC CIDR for internal, or office IPs for public)."
+  }
+
+  validation {
+    condition = alltrue([
+      for cidr in var.alb_allowed_cidrs :
+      (
+        can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$", cidr)) &&
+        try(cidrsubnet(cidr, 0, 0) == cidr, false)
+      )
+    ])
+    error_message = "alb_allowed_cidrs must contain only valid canonical IPv4 CIDR blocks."
   }
 }
 
@@ -249,6 +290,14 @@ variable "log_retention_days" {
   description = "CloudWatch Logs retention in days"
   type        = number
   default     = 90
+
+  validation {
+    condition = contains([
+      1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096,
+      1827, 2192, 2557, 2922, 3288, 3653
+    ], var.log_retention_days)
+    error_message = "log_retention_days must be a CloudWatch Logs supported retention value."
+  }
 }
 
 # ── Cross-account access ────────────────────────────────

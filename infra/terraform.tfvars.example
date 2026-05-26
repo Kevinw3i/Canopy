@@ -39,6 +39,7 @@ oidc_client_id  = "your-client-id"
 # Runtime defaults generated into config.toml by the ECS entrypoint.
 # jwt_expiry_seconds            = 3600
 # aws_session_duration_seconds  = 3600
+# log_retention_days            = 90
 
 # STS ExternalId for cross-account AssumeRole (must match target trust policy)
 # sts_external_id = "my-custom-external-id"
