@@ -179,7 +179,7 @@ encrypt        = true
 | `oidc_issuer_url` | Yes | OIDC provider HTTPS issuer URL（不可含 query、fragment 或 whitespace） |
 | `oidc_client_id` | Yes | OIDC client ID（不可為空或含 whitespace） |
 | `project` | No | 預設 `canopy`；1-28 字元，僅 lowercase letters、numbers、hyphens，且不可頭尾 hyphen |
-| `image_tag` | Phase 2 | 版本 tag 或 git SHA（不可使用 `latest`）；`create_service = false` 的 Phase 1 可留空 |
+| `image_tag` | Phase 2 | 有效 Docker tag 或 git SHA（不可使用 `latest`）；`create_service = false` 的 Phase 1 可留空 |
 | `alb_allowed_cidrs` | Yes | ALB 入站允許的 IPv4 CIDR 清單 |
 | `aws_region` | No | 預設 `ap-northeast-1` |
 | `cpu` / `memory` | No | 預設 512 / 1024；必須符合 AWS Fargate Linux task size 組合 |

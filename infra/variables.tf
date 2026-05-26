@@ -169,7 +169,12 @@ variable "image_tag" {
   default     = ""
 
   validation {
-    condition     = var.image_tag != "latest"
+    condition     = var.image_tag == "" || can(regex("^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$", var.image_tag))
+    error_message = "image_tag must be empty or a valid Docker image tag."
+  }
+
+  validation {
+    condition     = lower(var.image_tag) != "latest"
     error_message = "Using 'latest' is not allowed. Specify an explicit version tag or git SHA for deterministic deployments."
   }
 }
