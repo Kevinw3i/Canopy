@@ -1024,7 +1024,10 @@ fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
         .collect()
 }
 
-fn ecs_container_readiness_label(container: &EcsContainer) -> String {
+fn ecs_container_readiness_label(task_exec_enabled: bool, container: &EcsContainer) -> String {
+    if !task_exec_enabled {
+        return format!("{}:disabled", container.name);
+    }
     let last_status = container.last_status.trim();
     if !last_status.eq_ignore_ascii_case("RUNNING") {
         let status_label = if last_status.is_empty() {
@@ -1930,7 +1933,9 @@ impl Ec2Screen {
                 let containers = task
                     .containers
                     .iter()
-                    .map(ecs_container_readiness_label)
+                    .map(|container| {
+                        ecs_container_readiness_label(task.enable_execute_command, container)
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
 
@@ -2317,12 +2322,16 @@ mod tests {
         let labels = task
             .containers
             .iter()
-            .map(ecs_container_readiness_label)
+            .map(|container| ecs_container_readiness_label(true, container))
             .collect::<Vec<_>>();
 
         assert_eq!(
             labels,
             vec!["app:ready", "api:no-agent", "job:stopped", "init:unknown"]
+        );
+        assert_eq!(
+            ecs_container_readiness_label(false, &task.containers[0]),
+            "app:disabled"
         );
     }
 
@@ -2340,6 +2349,21 @@ mod tests {
 
         assert!(text.contains("app:ready,api:no-agent"));
         assert!(!text.contains("api*"));
+    }
+
+    #[test]
+    fn ecs_table_marks_containers_disabled_when_task_exec_is_disabled() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task = ecs_task_with_containers(vec![("app", "RUNNING", true)]);
+        task.enable_execute_command = false;
+        screen.set_tasks(vec![task]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("app:disabled"));
+        assert!(!text.contains("app:ready"));
     }
 
     #[test]
