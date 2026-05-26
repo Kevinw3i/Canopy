@@ -39,6 +39,16 @@ jobs:
 
           echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
 
+      - name: Validate deployment scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bash -n scripts/validate-entitlements.sh
+          sh -n scripts/docker-entrypoint.sh
+          bash -n scripts/test-docker-entrypoint.sh
+          scripts/test-docker-entrypoint.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
