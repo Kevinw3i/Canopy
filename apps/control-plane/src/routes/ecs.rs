@@ -396,6 +396,13 @@ fn effective_task_fetch_regions(
 ) -> Vec<String> {
     if let Some(region) = req.region.as_ref() {
         vec![region.clone()]
+    } else if let Some((cluster_region, _)) = req
+        .cluster
+        .as_deref()
+        .filter(|cluster| cluster.starts_with("arn:"))
+        .and_then(ecs_arn_region_account)
+    {
+        vec![cluster_region.to_string()]
     } else if !rule_regions.is_empty() {
         rule_regions.to_vec()
     } else if !cluster_pattern_regions.is_empty() {
@@ -1479,6 +1486,21 @@ mod tests {
 
         assert_eq!(
             effective_task_fetch_regions(&req, &[], &[], "us-east-1".into()),
+            vec!["ap-northeast-1"]
+        );
+    }
+
+    #[test]
+    fn effective_regions_use_cluster_arn_region_when_request_region_absent() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: None,
+            cluster: Some(cluster_arn("ap-northeast-1", "111111111111", "app")),
+            page_size: 50,
+        };
+
+        assert_eq!(
+            effective_task_fetch_regions(&req, &["us-east-1".into()], &[], "us-west-2".into()),
             vec!["ap-northeast-1"]
         );
     }
