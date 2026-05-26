@@ -75,11 +75,14 @@ ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
 aws ecr get-login-password --region ap-northeast-1 | \
   docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-# Build & push（指定 linux/amd64 確保與 ECS 架構匹配）
+# Build & push（platform 須與 Terraform 的 cpu_architecture 一致）
 cd ..
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
-DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$ECR_URL:$VERSION" \
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
+DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
@@ -106,8 +109,9 @@ terraform apply -var="image_tag=$VERSION"
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
-# CPU_ARCH 須與 Terraform 的 cpu_architecture 一致（X86_64 → linux/amd64, ARM64 → linux/arm64）
-PLATFORM="linux/amd64"
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
 
 # Build + push（帶 platform 和 entitlements）
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \

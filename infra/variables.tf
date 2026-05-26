@@ -250,7 +250,7 @@ variable "enable_direct_access" {
 }
 
 variable "force_new_deployment" {
-  description = "Force a full task replacement instead of rolling update. Set to true when changing entitlements to avoid mixed auth versions behind the ALB."
+  description = "Trigger a new ECS deployment using the current task definition. This does not guarantee zero overlap between old and new tasks; reduce desired_count to 1 for entitlement rollouts that must avoid mixed rules."
   type        = bool
   default     = false
 }

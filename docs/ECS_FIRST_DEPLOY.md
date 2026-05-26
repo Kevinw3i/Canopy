@@ -247,8 +247,11 @@ aws ecr get-login-password --region ap-northeast-1 | \
 
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
 
-DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
+DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
@@ -306,8 +309,11 @@ aws logs tail $(cd infra && terraform output -raw log_group_name) --follow
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
 
-DOCKER_BUILDKIT=1 docker build --platform linux/amd64 \
+DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
