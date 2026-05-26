@@ -200,6 +200,13 @@ expect_failure \
   "$TMP_DIR/invalid.tfvars" \
   "concrete IAM role ARN"
 
+write_entitlements "$TMP_DIR/unsupported-role-entitlements.toml" "canopy-role"
+expect_failure \
+  "unsupported-role" \
+  "$TMP_DIR/unsupported-role-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "role_arn in entitlements must be \"direct\", \"profile:*\", or a concrete IAM role ARN"
+
 write_entitlements "$TMP_DIR/direct-entitlements.toml" "direct"
 write_tfvars "$TMP_DIR/direct-disabled.tfvars" "$GOV_ROLE"
 expect_failure \

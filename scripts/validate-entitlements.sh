@@ -6,11 +6,12 @@
 #   0. Active sample placeholders are rejected before production image builds
 #   1. If any account uses role_arn = "direct", enable_direct_access must be true in tfvars
 #   2. profile:* role_arn entries are rejected for ECS deployments
-#   3. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
-#   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
-#   5. ECS Exec must imply ECS view, ECS access rules need allowed_clusters,
+#   3. role_arn entries must be direct, profile:*, or concrete ARN values
+#   4. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
+#   5. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
+#   6. ECS Exec must imply ECS view, ECS access rules need allowed_clusters,
 #      and broad ECS cluster wildcards require explicit opt-in
-#   6. SSM access rules need explicit allowed_os_users
+#   7. SSM access rules need explicit allowed_os_users
 set -euo pipefail
 
 usage() {
@@ -61,6 +62,21 @@ extract_assumable_role_arns() {
   ' | grep -oE '"arn:[^"]+"' | tr -d '"' | sort -u || true
 }
 
+extract_role_arn_values() {
+  printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+    {
+      line = $0
+      while (match(line, /role_arn[[:space:]]*=[[:space:]]*["\047][^"\047]+["\047]/)) {
+        value = substr(line, RSTART, RLENGTH)
+        sub(/^[^"\047]*["\047]/, "", value)
+        sub(/["\047]$/, "", value)
+        print value
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }
+  ' | sort -u || true
+}
+
 ACTIVE_ENTITLEMENTS="$(strip_comments "$ENTITLEMENTS")"
 
 # Check 0: sample placeholders should never reach an ECS image.
@@ -83,20 +99,22 @@ if grep -qE "role_arn[[:space:]]*=[[:space:]]*['\"]profile:[^'\"]*['\"]" <<< "$A
   ERRORS=$((ERRORS + 1))
 fi
 
-# Check 3: all role ARNs present in assumable_role_arns (uncommented lines only)
-ROLE_ARNS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | \
-  awk '
-    {
-      line = $0
-      while (match(line, /role_arn[[:space:]]*=[[:space:]]*["\047]arn:[^"\047]+["\047]/)) {
-        value = substr(line, RSTART, RLENGTH)
-        sub(/^[^"\047]*["\047]/, "", value)
-        sub(/["\047]$/, "", value)
-        print value
-        line = substr(line, RSTART + RLENGTH)
-      }
-    }
-  ' | sort -u || true)
+ROLE_VALUES="$(extract_role_arn_values)"
+
+# Check 3: role_arn entries must use a supported credential mode.
+while IFS= read -r role_value; do
+  [ -n "$role_value" ] || continue
+  case "$role_value" in
+    direct|profile:*|arn:*) ;;
+    *)
+      echo "ERROR: role_arn in entitlements must be \"direct\", \"profile:*\", or a concrete IAM role ARN (value redacted)"
+      ERRORS=$((ERRORS + 1))
+      ;;
+  esac
+done <<< "$ROLE_VALUES"
+
+# Check 4: all role ARNs present in assumable_role_arns (uncommented lines only)
+ROLE_ARNS=$(printf '%s\n' "$ROLE_VALUES" | grep -E '^arn:' || true)
 ASSUMABLE_ROLE_ARNS="$(extract_assumable_role_arns)"
 
 for arn in $ROLE_ARNS; do
@@ -112,7 +130,7 @@ for arn in $ROLE_ARNS; do
   fi
 done
 
-# Check 4: ECS Exec needs scoped AssumeRole credentials. Direct access may be
+# Check 5: ECS Exec needs scoped AssumeRole credentials. Direct access may be
 # valid for inventory/logs, but the ECS exec route intentionally rejects
 # direct/profile credentials in non-mock deployments.
 ECS_EXEC_LOCAL_RULES=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
@@ -152,7 +170,7 @@ if [ -n "$ECS_EXEC_LOCAL_RULES" ]; then
   ERRORS=$((ERRORS + 1))
 fi
 
-# Check 5: mirror control-plane ECS rule shape invariants before image build.
+# Check 6: mirror control-plane ECS rule shape invariants before image build.
 ECS_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
 function cluster_name(pattern, rest, pos) {
   rest = pattern
@@ -282,7 +300,7 @@ if [ -n "$ECS_RULE_SHAPE_ERRORS" ]; then
   ERRORS=$((ERRORS + 1))
 fi
 
-# Check 6: mirror SSM shell-scope invariant before image build.
+# Check 7: mirror SSM shell-scope invariant before image build.
 SSM_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
 function flush_rule() {
   if (in_rule && can_ssm && !has_os_users) {
