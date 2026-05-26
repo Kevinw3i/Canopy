@@ -164,7 +164,9 @@ terraform -chdir=infra apply tfplan.phase2
 > 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
 > ALB/DNS/subnet/service preconditions。第二個檢查會同時驗證
 > `assumable_role_arns`、`enable_direct_access`、部署時禁止的 `profile:*`，
-> 以及 ECS Exec rule 必須使用 AssumeRole ARN。
+> ECS Exec rule 必須使用 AssumeRole ARN、授予 ECS 存取的 rule 必須有明確
+> `allowed_clusters` 且寬鬆 wildcard 需要 `allow_broad_cluster_discovery=true`，
+> 以及 SSM rule 必須設定明確的 `allowed_os_users`。
 
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)

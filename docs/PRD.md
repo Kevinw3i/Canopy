@@ -521,7 +521,7 @@ group = "platform-engineering"
 2. 填寫 `infra/terraform.tfvars`（VPC/subnet/ACM、OIDC、secret ARN/version、AWS region、CPU architecture、Phase 2 image tag）
 3. 建立 `entitlements.toml`（權限規則）
 4. 執行 `scripts/validate-terraform-tfvars.sh infra` 驗證 ALB/DNS/subnet/service preconditions（Phase 1 帶 `-var="create_service=false"`；Phase 2 帶 `-var="create_service=true"` 與 `-var="image_tag=<tag>"`）
-5. 執行 `scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars` 驗證權限規則與 Terraform 變數一致
+5. 執行 `scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars` 驗證權限規則與 Terraform 變數一致，並在部署前攔截本機 profile、ECS access / SSM shell scope 缺漏、未 opt-in 的寬鬆 cluster wildcard
 6. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
 7. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
 8. 分發 `dist/` 資料夾給維運人員
