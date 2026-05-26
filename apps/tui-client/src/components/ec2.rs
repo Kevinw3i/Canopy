@@ -867,11 +867,14 @@ impl Ec2Screen {
                 }
 
                 let regions = ecs_region_scope_options(entitlements, None);
-                if self
-                    .selected_region
-                    .as_ref()
-                    .is_some_and(|region| !regions.contains(region))
-                {
+                if self.selected_region.as_ref().is_some_and(|region| {
+                    !regions.contains(region)
+                        && !ecs_region_selection_matches(
+                            entitlements,
+                            self.selected_account_id.as_deref(),
+                            region,
+                        )
+                }) {
                     self.selected_region = None;
                 }
 
@@ -1023,10 +1026,10 @@ fn ecs_account_scope_options(
         let Some((region, account)) = ecs_cluster_pattern_scope(pattern) else {
             continue;
         };
-        if account != "*"
-            && !account.is_empty()
-            && ecs_scope_part_matches_selection(region, selected_region)
-        {
+        if !ecs_region_part_matches_selection(region, selected_region) {
+            continue;
+        }
+        if account != "*" && !account.is_empty() {
             accounts.insert(account.to_string());
         }
     }
@@ -1042,10 +1045,10 @@ fn ecs_region_scope_options(
         let Some((region, account)) = ecs_cluster_pattern_scope(pattern) else {
             continue;
         };
-        if region != "*"
-            && !region.is_empty()
-            && ecs_scope_part_matches_selection(account, selected_account)
-        {
+        if !ecs_account_part_matches_selection(account, selected_account) {
+            continue;
+        }
+        if region != "*" && !region.is_empty() {
             regions.insert(region.to_string());
         }
     }
@@ -1055,7 +1058,21 @@ fn ecs_region_scope_options(
 fn ecs_scope_pair_matches(entitlements: &UserEntitlements, account: &str, region: &str) -> bool {
     entitlements.allowed_clusters.iter().any(|pattern| {
         ecs_cluster_pattern_scope(pattern).is_some_and(|(cluster_region, cluster_account)| {
-            cluster_account == account && cluster_region == region
+            ecs_account_part_matches_selection(cluster_account, Some(account))
+                && ecs_region_part_matches_selection(cluster_region, Some(region))
+        })
+    })
+}
+
+fn ecs_region_selection_matches(
+    entitlements: &UserEntitlements,
+    selected_account: Option<&str>,
+    region: &str,
+) -> bool {
+    entitlements.allowed_clusters.iter().any(|pattern| {
+        ecs_cluster_pattern_scope(pattern).is_some_and(|(cluster_region, cluster_account)| {
+            ecs_region_part_matches_selection(cluster_region, Some(region))
+                && ecs_account_part_matches_selection(cluster_account, selected_account)
         })
     })
 }
@@ -1076,7 +1093,11 @@ fn ecs_cluster_pattern_scope(pattern: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn ecs_scope_part_matches_selection(part: &str, selected: Option<&str>) -> bool {
+fn ecs_region_part_matches_selection(part: &str, selected: Option<&str>) -> bool {
+    selected.is_none_or(|selected| part == "*" || part == selected)
+}
+
+fn ecs_account_part_matches_selection(part: &str, selected: Option<&str>) -> bool {
     selected.is_none_or(|selected| part != "*" && part == selected)
 }
 
@@ -1999,6 +2020,19 @@ mod tests {
         ent
     }
 
+    fn wildcard_region_ecs_entitlements() -> UserEntitlements {
+        let mut ent = ecs_entitlements(true);
+        ent.allowed_regions.clear();
+        ent.allowed_clusters = vec!["arn:aws:ecs:*:111:cluster/app".into()];
+        ent
+    }
+
+    fn wildcard_account_ecs_entitlements() -> UserEntitlements {
+        let mut ent = ecs_entitlements(true);
+        ent.allowed_clusters = vec!["arn:aws:ecs:us-east-1:*:cluster/app".into()];
+        ent
+    }
+
     fn power_entitlements() -> UserEntitlements {
         let mut ent = test_entitlements();
         ent.features.can_start_ec2 = true;
@@ -2255,6 +2289,28 @@ mod tests {
     }
 
     #[test]
+    fn ecs_view_account_cycle_accepts_wildcard_region_pattern() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(wildcard_region_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_region = Some("ap-northeast-1".into());
+
+        assert!(screen.cycle_account(true));
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_does_not_expand_wildcard_account_pattern() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(wildcard_account_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_region = Some("us-east-1".into());
+
+        assert!(!screen.cycle_account(true));
+        assert!(screen.selected_account_id.is_none());
+    }
+
+    #[test]
     fn ecs_view_region_cycle_respects_selected_account_pair() {
         let mut screen = Ec2Screen::new();
         screen.set_entitlements(multi_scope_ecs_entitlements());
@@ -2295,6 +2351,32 @@ mod tests {
         assert_eq!(screen.view, InventoryView::Ecs);
         assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
         assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn toggling_to_ecs_keeps_region_selected_when_wildcard_region_authorizes_it() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(wildcard_region_ecs_entitlements());
+        screen.selected_account_id = Some("111".into());
+        screen.selected_region = Some("ap-northeast-1".into());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+        assert_eq!(screen.selected_region.as_deref(), Some("ap-northeast-1"));
+    }
+
+    #[test]
+    fn ecs_scope_pair_matches_wildcard_region_pattern() {
+        let entitlements = wildcard_region_ecs_entitlements();
+
+        assert!(ecs_scope_pair_matches(
+            &entitlements,
+            "111",
+            "ap-northeast-1"
+        ));
     }
 
     // ── State filter ──
