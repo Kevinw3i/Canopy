@@ -420,6 +420,8 @@ No shared state -- survives restarts and multi-replica routing.
 | `oidc.jwks_uri` | auto | JWKS endpoint |
 | `jwt.secret` | -- | HMAC secret (JWTs + query tokens) |
 | `aws.session_duration_seconds` | `3600` | STS AssumeRole duration |
+| `audit_export.cloudwatch_logs.*` | disabled | Optional direct audit export to CloudWatch Logs |
+| `audit_export.s3.*` | disabled | Optional direct audit export to S3 |
 | `control_plane_url` | -- | (TUI) Control plane URL |
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |

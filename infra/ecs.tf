@@ -82,6 +82,11 @@ resource "aws_ecs_task_definition" "control_plane" {
       { name = "ENTITLEMENTS_FILE", value = var.entitlements_file },
       { name = "CORS_ALLOWED_ORIGINS", value = join(",", var.cors_allowed_origins) },
       { name = "STS_EXTERNAL_ID", value = var.sts_external_id },
+      { name = "AUDIT_CLOUDWATCH_LOG_GROUP", value = var.audit_export_cloudwatch_log_group_name },
+      { name = "AUDIT_CLOUDWATCH_LOG_STREAM", value = var.audit_export_cloudwatch_log_stream_name },
+      { name = "AUDIT_S3_BUCKET", value = var.audit_export_s3_bucket },
+      { name = "AUDIT_S3_PREFIX", value = var.audit_export_s3_prefix },
+      { name = "AUDIT_EXPORT_QUEUE_SIZE", value = tostring(var.audit_export_queue_size) },
     ]
 
     # Inject secrets via ECS-native secrets injection (uses execution role).

@@ -36,6 +36,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub audit_log: Option<String>,
 
+    /// Optional remote audit exports. These are additive sinks; the local
+    /// structured tracing and `audit_log` behavior remain unchanged.
+    #[serde(default)]
+    pub audit_export: AuditExportConfig,
+
     /// Allowed CORS origins. If empty and dev_mode is true, all origins are
     /// allowed. In production, list the exact origins that need access
     /// (e.g. ["http://localhost:9876"]).
@@ -112,6 +117,83 @@ fn default_sts_external_id() -> Option<String> {
     Some("canopy".into())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditExportConfig {
+    #[serde(default = "default_audit_export_queue_size")]
+    pub queue_size: usize,
+    #[serde(default)]
+    pub cloudwatch_logs: Option<AuditCloudWatchLogsExportConfig>,
+    #[serde(default)]
+    pub s3: Option<AuditS3ExportConfig>,
+}
+
+impl Default for AuditExportConfig {
+    fn default() -> Self {
+        Self {
+            queue_size: default_audit_export_queue_size(),
+            cloudwatch_logs: None,
+            s3: None,
+        }
+    }
+}
+
+impl AuditExportConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.cloudwatch_logs.is_some() || self.s3.is_some()
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.queue_size == 0 {
+            anyhow::bail!("audit_export.queue_size must be greater than zero");
+        }
+
+        if let Some(config) = &self.cloudwatch_logs {
+            if config.log_group_name.trim().is_empty() {
+                anyhow::bail!("audit_export.cloudwatch_logs.log_group_name must not be empty");
+            }
+            if config.log_stream_name.trim().is_empty() {
+                anyhow::bail!("audit_export.cloudwatch_logs.log_stream_name must not be empty");
+            }
+        }
+
+        if let Some(config) = &self.s3 {
+            if config.bucket.trim().is_empty() {
+                anyhow::bail!("audit_export.s3.bucket must not be empty");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn default_audit_export_queue_size() -> usize {
+    1024
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditCloudWatchLogsExportConfig {
+    pub log_group_name: String,
+    #[serde(default = "default_audit_cloudwatch_log_stream_name")]
+    pub log_stream_name: String,
+    #[serde(default = "default_true")]
+    pub create_log_stream: bool,
+}
+
+fn default_audit_cloudwatch_log_stream_name() -> String {
+    "canopy-audit".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditS3ExportConfig {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: String,
+}
+
 impl AppConfig {
     pub fn load() -> anyhow::Result<Self> {
         // Try config file first, fall back to env-based defaults
@@ -122,12 +204,15 @@ impl AppConfig {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             let config: AppConfig = toml::from_str(&content)?;
+            config.validate()?;
             Ok(config)
         } else if std::env::var("DEV_MODE")
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
         {
-            Ok(Self::dev_defaults())
+            let config = Self::dev_defaults();
+            config.validate()?;
+            Ok(config)
         } else {
             anyhow::bail!(
                 "No config.toml found and DEV_MODE not set. \
@@ -169,6 +254,7 @@ impl AppConfig {
             entitlements_file: None,
             entitlements_database_url: None,
             audit_log: None,
+            audit_export: AuditExportConfig::default(),
             cors_allowed_origins: vec![],
         }
     }
@@ -176,6 +262,11 @@ impl AppConfig {
     /// Whether to use mock AWS data. Defaults to `dev_mode` value if not set.
     pub fn use_mock_aws(&self) -> bool {
         self.mock_aws_data.unwrap_or(self.dev_mode)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        self.audit_export.validate()?;
+        Ok(())
     }
 }
 
@@ -204,6 +295,9 @@ mod tests {
             config.aws.sts_external_id.as_deref(),
             Some("canopy") // default
         );
+        assert_eq!(config.audit_export.queue_size, 1024);
+        assert!(!config.audit_export.is_enabled());
+        config.validate().unwrap();
     }
 
     #[test]
@@ -215,6 +309,18 @@ mod tests {
             entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
             audit_log = "/tmp/audit.jsonl"
             cors_allowed_origins = ["http://localhost:3000"]
+
+            [audit_export]
+            queue_size = 2048
+
+            [audit_export.cloudwatch_logs]
+            log_group_name = "/aws/canopy/audit"
+            log_stream_name = "control-plane"
+            create_log_stream = true
+
+            [audit_export.s3]
+            bucket = "canopy-audit"
+            prefix = "prod/"
 
             [oidc]
             issuer_url = "https://auth.example.com"
@@ -245,6 +351,15 @@ mod tests {
             config.entitlements_database_url.as_deref(),
             Some("sqlite:///var/lib/canopy/entitlements.db")
         );
+        assert_eq!(config.audit_log.as_deref(), Some("/tmp/audit.jsonl"));
+        assert_eq!(config.audit_export.queue_size, 2048);
+        let cw = config.audit_export.cloudwatch_logs.as_ref().unwrap();
+        assert_eq!(cw.log_group_name, "/aws/canopy/audit");
+        assert_eq!(cw.log_stream_name, "control-plane");
+        assert!(cw.create_log_stream);
+        let s3 = config.audit_export.s3.as_ref().unwrap();
+        assert_eq!(s3.bucket, "canopy-audit");
+        assert_eq!(s3.prefix, "prod/");
         assert_eq!(config.jwt.expiry_seconds, 7200);
         assert_eq!(config.oidc.client_secret.as_deref(), Some("csecret"));
         assert_eq!(config.oidc.acr_values, vec!["urn:mfa"]);
@@ -255,6 +370,31 @@ mod tests {
         assert_eq!(config.aws.default_region.as_deref(), Some("eu-west-1"));
         assert_eq!(config.aws.sts_external_id.as_deref(), Some("custom-id"));
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_audit_export_validation_rejects_invalid_sink_config() {
+        let zero_queue: AuditExportConfig = toml::from_str("queue_size = 0").unwrap();
+        assert!(zero_queue.validate().is_err());
+
+        let empty_log_group: AuditExportConfig = toml::from_str(
+            r#"
+            [cloudwatch_logs]
+            log_group_name = " "
+        "#,
+        )
+        .unwrap();
+        assert!(empty_log_group.validate().is_err());
+
+        let empty_bucket: AuditExportConfig = toml::from_str(
+            r#"
+            [s3]
+            bucket = ""
+        "#,
+        )
+        .unwrap();
+        assert!(empty_bucket.validate().is_err());
     }
 
     #[test]

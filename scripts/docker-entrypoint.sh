@@ -9,6 +9,10 @@ OIDC_ISSUER_URL="${OIDC_ISSUER_URL:-}"
 OIDC_CLIENT_ID="${OIDC_CLIENT_ID:-}"
 OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:-}"
 CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-}"
+AUDIT_CLOUDWATCH_LOG_GROUP="${AUDIT_CLOUDWATCH_LOG_GROUP:-}"
+AUDIT_CLOUDWATCH_LOG_STREAM="${AUDIT_CLOUDWATCH_LOG_STREAM:-canopy-audit}"
+AUDIT_S3_BUCKET="${AUDIT_S3_BUCKET:-}"
+AUDIT_S3_PREFIX="${AUDIT_S3_PREFIX:-}"
 
 fatal() {
   echo "FATAL: $*" >&2
@@ -226,10 +230,42 @@ if [ ! -f "$CONFIG_PATH" ] || [ "${GENERATE_CONFIG:-0}" = "1" ]; then
     CORS_LINE="cors_allowed_origins = $(toml_array_from_csv "$CORS_ALLOWED_ORIGINS")"
   fi
 
+  AUDIT_EXPORT_CONFIG=""
+  if [ -n "$AUDIT_CLOUDWATCH_LOG_GROUP" ] || [ -n "$AUDIT_S3_BUCKET" ]; then
+    SAFE_AUDIT_EXPORT_QUEUE_SIZE=$(positive_int "AUDIT_EXPORT_QUEUE_SIZE" "${AUDIT_EXPORT_QUEUE_SIZE:-1024}")
+    AUDIT_EXPORT_CONFIG=$(cat <<TOML
+[audit_export]
+queue_size = ${SAFE_AUDIT_EXPORT_QUEUE_SIZE}
+TOML
+)
+  fi
+
+  if [ -n "$AUDIT_CLOUDWATCH_LOG_GROUP" ]; then
+    SAFE_AUDIT_CLOUDWATCH_LOG_GROUP=$(escape_toml "$AUDIT_CLOUDWATCH_LOG_GROUP")
+    SAFE_AUDIT_CLOUDWATCH_LOG_STREAM=$(escape_toml "$AUDIT_CLOUDWATCH_LOG_STREAM")
+    AUDIT_EXPORT_CONFIG="${AUDIT_EXPORT_CONFIG}
+
+[audit_export.cloudwatch_logs]
+log_group_name = \"${SAFE_AUDIT_CLOUDWATCH_LOG_GROUP}\"
+log_stream_name = \"${SAFE_AUDIT_CLOUDWATCH_LOG_STREAM}\"
+create_log_stream = true"
+  fi
+
+  if [ -n "$AUDIT_S3_BUCKET" ]; then
+    SAFE_AUDIT_S3_BUCKET=$(escape_toml "$AUDIT_S3_BUCKET")
+    SAFE_AUDIT_S3_PREFIX=$(escape_toml "$AUDIT_S3_PREFIX")
+    AUDIT_EXPORT_CONFIG="${AUDIT_EXPORT_CONFIG}
+
+[audit_export.s3]
+bucket = \"${SAFE_AUDIT_S3_BUCKET}\"
+prefix = \"${SAFE_AUDIT_S3_PREFIX}\""
+  fi
+
   cat > "$WRITABLE_CONFIG" <<TOML
 bind_address = "${SAFE_BIND_ADDRESS}"
 ${CORS_LINE}
 ${ENTITLEMENTS_LINE}
+${AUDIT_EXPORT_CONFIG}
 
 [oidc]
 issuer_url = "${SAFE_OIDC_ISSUER_URL}"

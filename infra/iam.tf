@@ -128,6 +128,33 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = "*"
       }] : [],
 
+      # Optional direct audit event export to CloudWatch Logs.
+      var.audit_export_cloudwatch_log_group_name != "" ? [{
+        Sid    = "AuditCloudWatchLogsExport"
+        Effect = "Allow"
+        Action = [
+          "logs:DescribeLogStreams",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = [
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${var.audit_export_cloudwatch_log_group_name}",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${var.audit_export_cloudwatch_log_group_name}:*",
+        ]
+      }] : [],
+
+      # Optional direct audit event export to S3.
+      var.audit_export_s3_bucket != "" ? [{
+        Sid    = "AuditS3Export"
+        Effect = "Allow"
+        Action = ["s3:PutObject"]
+        Resource = format(
+          "arn:aws:s3:::%s/%s",
+          var.audit_export_s3_bucket,
+          trim(var.audit_export_s3_prefix, "/") != "" ? format("%s/*", trim(var.audit_export_s3_prefix, "/")) : "*"
+        )
+      }] : [],
+
       # STS GetCallerIdentity is always needed for preflight health check
       [{
         Sid      = "StsIdentity"

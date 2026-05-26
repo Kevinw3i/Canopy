@@ -435,6 +435,56 @@ variable "log_retention_days" {
   }
 }
 
+variable "audit_export_cloudwatch_log_group_name" {
+  description = "Optional CloudWatch Logs log group name for direct audit event export. Leave empty to disable."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.audit_export_cloudwatch_log_group_name == "" || (length(var.audit_export_cloudwatch_log_group_name) <= 512 && can(regex("^[A-Za-z0-9_./#-]+$", var.audit_export_cloudwatch_log_group_name)))
+    error_message = "audit_export_cloudwatch_log_group_name must be empty or a valid CloudWatch Logs log group name."
+  }
+}
+
+variable "audit_export_cloudwatch_log_stream_name" {
+  description = "CloudWatch Logs stream name used when audit_export_cloudwatch_log_group_name is set."
+  type        = string
+  default     = "canopy-audit"
+
+  validation {
+    condition     = length(var.audit_export_cloudwatch_log_stream_name) >= 1 && length(var.audit_export_cloudwatch_log_stream_name) <= 512 && can(regex("^[^:*]*$", var.audit_export_cloudwatch_log_stream_name))
+    error_message = "audit_export_cloudwatch_log_stream_name must be 1-512 characters and cannot contain ':' or '*'."
+  }
+}
+
+variable "audit_export_s3_bucket" {
+  description = "Optional S3 bucket name for direct audit event export. Leave empty to disable."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.audit_export_s3_bucket == "" || can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.audit_export_s3_bucket))
+    error_message = "audit_export_s3_bucket must be empty or a valid DNS-style S3 bucket name."
+  }
+}
+
+variable "audit_export_s3_prefix" {
+  description = "S3 key prefix for direct audit event export."
+  type        = string
+  default     = "canopy/audit/"
+}
+
+variable "audit_export_queue_size" {
+  description = "In-memory queue size for remote audit export sinks."
+  type        = number
+  default     = 1024
+
+  validation {
+    condition     = var.audit_export_queue_size >= 1 && var.audit_export_queue_size <= 100000 && var.audit_export_queue_size == floor(var.audit_export_queue_size)
+    error_message = "audit_export_queue_size must be a whole number between 1 and 100000."
+  }
+}
+
 # ── Cross-account access ────────────────────────────────
 
 variable "enable_direct_access" {

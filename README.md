@@ -146,6 +146,20 @@ entitlements_file = "entitlements.toml"
 # If not set, audit events are only emitted via structured tracing (stdout).
 # audit_log = "/var/log/canopy/audit.jsonl"
 
+# Optional remote audit exports. These enqueue JSON audit events after the
+# local tracing/file audit write has accepted the event.
+# [audit_export]
+# queue_size = 1024
+#
+# [audit_export.cloudwatch_logs]
+# log_group_name = "/aws/canopy/audit"
+# log_stream_name = "control-plane"
+# create_log_stream = true
+#
+# [audit_export.s3]
+# bucket = "canopy-audit"
+# prefix = "prod/"
+
 # ── CORS ────────────────────────────────────────────
 # List of allowed origins. Empty + dev_mode = allow all.
 # cors_allowed_origins = ["http://localhost:9876"]

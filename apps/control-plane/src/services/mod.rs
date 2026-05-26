@@ -140,11 +140,11 @@ impl AppState {
         }
         entitlement_store.validate()?;
 
-        let audit_service = if let Some(ref log_path) = config.audit_log {
-            audit::AuditService::with_file(log_path)?
-        } else {
-            audit::AuditService::new()
-        };
+        let audit_service = audit::AuditService::from_config(
+            config.audit_log.as_deref(),
+            &config.audit_export,
+            &base_aws_config,
+        )?;
 
         Ok(Self {
             config,

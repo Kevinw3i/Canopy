@@ -1501,6 +1501,7 @@ mod tests {
             entitlements_file: None,
             entitlements_database_url: None,
             audit_log: None,
+            audit_export: Default::default(),
             cors_allowed_origins: vec![],
         };
         let oidc_client = crate::services::oidc::OidcClient::new(config.oidc.clone());

@@ -367,8 +367,9 @@ TUI                     Control Plane              OIDC Provider
 
 1. 結構化 tracing 日誌（stdout/stderr，JSON 格式）
 2. 可選的持久化 JSON-lines 檔案（`audit_log` 設定）
+3. 可選的遠端匯出 sink：CloudWatch Logs `PutLogEvents`、S3 `PutObject`
 
-**稽核失敗策略**：fail-closed — 當持久化稽核日誌寫入失敗時，受保護的 API 端點回傳 503 Service Unavailable。
+**稽核失敗策略**：fail-closed — 當持久化稽核日誌寫入失敗，或遠端匯出 queue 無法接受 event 時，受保護的 API 端點回傳 503 Service Unavailable。遠端 AWS 寫入錯誤會記錄在 control-plane log，後續 event 仍會繼續嘗試遠端送出。
 
 ---
 
@@ -423,6 +424,18 @@ entitlements_file = "entitlements.toml"
 # entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
 audit_log = "/var/log/canopy/audit.jsonl"
 cors_allowed_origins = ["http://localhost:9876"]
+
+[audit_export]
+queue_size = 1024
+
+[audit_export.cloudwatch_logs]
+log_group_name = "/aws/canopy/audit"
+log_stream_name = "control-plane"
+create_log_stream = true
+
+[audit_export.s3]
+bucket = "canopy-audit"
+prefix = "prod/"
 
 [oidc]
 issuer_url = "https://accounts.google.com"
@@ -636,4 +649,4 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - [x] 自訂快捷鍵設定（dashboard / settings）
 - [x] 主題與配色自訂（dashboard / settings shell）
 - [ ] 全工作流配色 token 化
-- [ ] 匯出稽核日誌至 CloudWatch Logs / S3
+- [x] 匯出稽核日誌至 CloudWatch Logs / S3

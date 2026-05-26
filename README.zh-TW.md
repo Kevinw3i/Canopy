@@ -145,6 +145,20 @@ entitlements_file = "entitlements.toml"
 # 沒設定的話只會透過 structured tracing 輸出到 stdout。
 # audit_log = "/var/log/canopy/audit.jsonl"
 
+# 可選的遠端稽核匯出。local tracing / file audit 接受 event 後，
+# 會把同一筆 JSON audit event enqueue 到遠端 sink。
+# [audit_export]
+# queue_size = 1024
+#
+# [audit_export.cloudwatch_logs]
+# log_group_name = "/aws/canopy/audit"
+# log_stream_name = "control-plane"
+# create_log_stream = true
+#
+# [audit_export.s3]
+# bucket = "canopy-audit"
+# prefix = "prod/"
+
 # ── CORS ────────────────────────────────────────────
 # 允許的來源清單。空值 + dev_mode = 允許全部。
 # cors_allowed_origins = ["http://localhost:9876"]

@@ -1,7 +1,8 @@
 # Audit Log Schema
 
 Canopy audit events are JSON-lines records emitted through tracing and, when
-configured, the durable `audit_log` file.
+configured, the durable `audit_log` file plus optional CloudWatch Logs / S3
+export sinks.
 
 All values in this document are illustrative placeholders.
 

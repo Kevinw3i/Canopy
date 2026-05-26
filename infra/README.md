@@ -293,6 +293,11 @@ encrypt        = true
 | `assumable_role_arns` | No | 跨帳號 AssumeRole 的目標 IAM role ARN 清單；不允許 wildcard |
 | `assumable_role_arn_patterns` | No | AWS Organizations 帳號 discovery 用的 AssumeRole ARN pattern；只允許 account-id segment 為 `*`，例如 `arn:aws:iam::*:role/CanopyRole` |
 | `enable_direct_access` | No | 預設 `false`；設為 `true` 時允許 `role_arn = "direct"` 查看部署帳號的 EC2、SSM managed-instance inventory、ECS task inventory、CloudWatch Logs |
+| `audit_export_cloudwatch_log_group_name` | No | 遠端稽核事件直接匯出到 CloudWatch Logs 的 log group；空值停用 |
+| `audit_export_cloudwatch_log_stream_name` | No | CloudWatch audit export log stream，預設 `canopy-audit` |
+| `audit_export_s3_bucket` | No | 遠端稽核事件直接匯出到 S3 的 bucket；空值停用 |
+| `audit_export_s3_prefix` | No | S3 audit export key prefix，預設 `canopy/audit/` |
+| `audit_export_queue_size` | No | 遠端 audit export 的記憶體 queue 大小，預設 1024 |
 | `log_retention_days` | No | 預設 90 天；必須是 CloudWatch Logs 支援的 retention 天數 |
 | `cors_allowed_origins` | No | CORS 允許的 origins；只接受 scheme + host + optional port |
 
