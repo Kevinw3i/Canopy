@@ -21,6 +21,14 @@ fi
 
 cat > "$TMP_DIR/control-plane" <<'SH'
 #!/bin/sh
+if [ -n "${CANOPY_TEST_CONFIG_MODE_FILE:-}" ]; then
+  if mode=$(stat -f '%Lp' "$CONFIG_PATH" 2>/dev/null); then
+    :
+  else
+    mode=$(stat -c '%a' "$CONFIG_PATH")
+  fi
+  printf '%s\n' "$mode" > "$CANOPY_TEST_CONFIG_MODE_FILE"
+fi
 cat "$CONFIG_PATH"
 SH
 chmod +x "$TMP_DIR/control-plane"
@@ -60,9 +68,11 @@ expect_entrypoint_failure() {
 }
 
 CONFIG_OUT="$TMP_DIR/generated.toml"
+CONFIG_MODE_OUT="$TMP_DIR/generated.mode"
 
 env \
   PATH="$TMP_DIR:$PATH" \
+  CANOPY_TEST_CONFIG_MODE_FILE="$CONFIG_MODE_OUT" \
   GENERATE_CONFIG=1 \
   JWT_SECRET='jwt"sec\ret' \
   OIDC_ISSUER_URL='https://issuer.example/a"b' \
@@ -74,6 +84,8 @@ env \
   AWS_DEFAULT_REGION='ap-northeast-1' \
   STS_EXTERNAL_ID='canopy"external' \
   sh "$ENTRYPOINT" > "$CONFIG_OUT"
+
+grep -qxF '600' "$CONFIG_MODE_OUT"
 
 python3 - <<'PY' "$CONFIG_OUT"
 import sys
@@ -166,12 +178,16 @@ sts_external_id = "canopy"
 TOML
 
 PATCH_OUT="$TMP_DIR/patched.toml"
+PATCH_MODE_OUT="$TMP_DIR/patched.mode"
 env \
   PATH="$TMP_DIR:$PATH" \
+  CANOPY_TEST_CONFIG_MODE_FILE="$PATCH_MODE_OUT" \
   CONFIG_PATH="$PATCH_CONFIG" \
   JWT_SECRET='patched"jwt\secret' \
   OIDC_CLIENT_SECRET='patched"oidc\secret' \
   sh "$ENTRYPOINT" > "$PATCH_OUT"
+
+grep -qxF '600' "$PATCH_MODE_OUT"
 
 python3 - <<'PY' "$PATCH_OUT"
 import sys

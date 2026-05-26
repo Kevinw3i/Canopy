@@ -1,5 +1,6 @@
 #!/bin/sh
 set -e
+umask 077
 
 CONFIG_PATH="${CONFIG_PATH:-/etc/canopy/config.toml}"
 JWT_SECRET="${JWT_SECRET:-}"
@@ -234,6 +235,7 @@ default_region           = "${SAFE_AWS_DEFAULT_REGION}"
 session_duration_seconds = ${SAFE_AWS_SESSION_DURATION_SECONDS}
 sts_external_id          = "${SAFE_STS_EXTERNAL_ID}"
 TOML
+  chmod 0600 "$WRITABLE_CONFIG"
 
   CONFIG_PATH="$WRITABLE_CONFIG"
   export CONFIG_PATH
@@ -264,6 +266,8 @@ elif [ -n "$JWT_SECRET" ] || [ -n "$OIDC_CLIENT_SECRET" ]; then
       "client_secret = \"${SAFE_CS}\"" \
       "$WRITABLE_CONFIG"
   fi
+
+  chmod 0600 "$WRITABLE_CONFIG"
 
   CONFIG_PATH="$WRITABLE_CONFIG"
   export CONFIG_PATH
