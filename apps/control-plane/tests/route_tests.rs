@@ -11,11 +11,14 @@ use axum::{
     response::IntoResponse,
     Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use shared::dto::cloudwatch::LiveTailMessage;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
 // ── Re-use crate internals via the library-style paths ──────────────────
@@ -138,8 +141,33 @@ fn build_app(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(routes::auth::router())
+        .merge(routes::live_tail::router())
         .merge(protected)
         .with_state(state)
+}
+
+async fn start_route_server(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("ws://{addr}/api/cloudwatch/live-tail")
+}
+
+async fn recv_live_tail_message<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> LiveTailMessage
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("timed out waiting for live-tail message")
+        .expect("websocket stream ended")
+        .expect("websocket message failed");
+    let text = msg.into_text().expect("expected text websocket message");
+    serde_json::from_str(&text).expect("live-tail message should parse")
 }
 
 /// Issue a valid JWT for the dev-admin user (matches dev_defaults memberships).
@@ -1292,6 +1320,72 @@ async fn cloudwatch_insights_bad_request_is_audited_with_query_string() {
         event["metadata"]["query_string"],
         "fields @timestamp, @message | limit 10"
     );
+}
+
+#[tokio::test]
+async fn live_tail_ws_streams_mock_session_start_and_event() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let app = build_app(build_state(config));
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": token,
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"
+            ],
+            "filter_pattern": "ERROR"
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let first = recv_live_tail_message(&mut ws).await;
+    let session_id = match first {
+        LiveTailMessage::SessionStart { session_id } => session_id,
+        _ => panic!("expected session_start, got {first:?}"),
+    };
+    assert!(!session_id.is_empty());
+
+    let second = recv_live_tail_message(&mut ws).await;
+    match second {
+        LiveTailMessage::Event(event) => {
+            assert_eq!(event.log_group_name, "/app/web-service");
+            assert_eq!(event.log_stream_name, "web-prod-01/application");
+            assert!(event.message.contains("Simulated log event #1"));
+        }
+        _ => panic!("expected event, got {second:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn live_tail_ws_rejects_invalid_token_with_error_message() {
+    let app = build_app(build_state(dev_config()));
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": "not-a-valid-token",
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"
+            ]
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let msg = recv_live_tail_message(&mut ws).await;
+    match msg {
+        LiveTailMessage::Error { message } => assert_eq!(message, "Authentication failed"),
+        _ => panic!("expected error, got {msg:?}"),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
