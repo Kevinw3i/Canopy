@@ -132,19 +132,39 @@ fn requested_cluster_for_account_region(
     })
 }
 
-fn concrete_ecs_arn_region_account<'a>(
+fn concrete_ecs_resource_region_account<'a>(
     arn: &'a str,
     resource_prefix: &str,
+    allowed_resource_segments: &[usize],
 ) -> Option<(&'a str, &'a str)> {
-    let (region, account) = ecs_arn_region_account(arn)?;
-    let resource = arn.splitn(6, ':').nth(5)?;
+    let mut parts = arn.splitn(6, ':');
+    let (prefix, partition, service, region, account, resource) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+    if prefix != "arn" || service != "ecs" {
+        return None;
+    }
     let resource_id = resource.strip_prefix(resource_prefix)?;
-    if region.is_empty()
+    let resource_segments = resource_id.split('/').collect::<Vec<_>>();
+    if partition.is_empty()
+        || region.is_empty()
         || account.is_empty()
         || resource_id.is_empty()
+        || partition.contains('*')
+        || partition.contains('?')
         || region.contains('*')
+        || region.contains('?')
         || account.contains('*')
-        || resource_id.contains('*')
+        || account.contains('?')
+        || resource_segments
+            .iter()
+            .any(|segment| segment.is_empty() || segment.contains('*') || segment.contains('?'))
+        || !allowed_resource_segments.contains(&resource_segments.len())
     {
         return None;
     }
@@ -152,11 +172,11 @@ fn concrete_ecs_arn_region_account<'a>(
 }
 
 fn concrete_cluster_arn_region_account(arn: &str) -> Option<(&str, &str)> {
-    concrete_ecs_arn_region_account(arn, "cluster/")
+    concrete_ecs_resource_region_account(arn, "cluster/", &[1])
 }
 
 fn concrete_task_arn_region_account(arn: &str) -> Option<(&str, &str)> {
-    concrete_ecs_arn_region_account(arn, "task/")
+    concrete_ecs_resource_region_account(arn, "task/", &[1, 2])
 }
 
 fn requested_tasks_page_size(page_size: u32) -> usize {
@@ -1583,6 +1603,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_task_request_arn_rejects_pattern_task_arn() {
+        let mut req = exec_req();
+        req.task_arn = format!(
+            "arn:aws:ecs:{}:{}:task/{}/abc?",
+            req.region, req.account_id, DEV_MOCK_CLUSTER_NAME
+        );
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS task ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_pattern_task_partition() {
+        let mut req = exec_req();
+        req.task_arn = req.task_arn.replacen("arn:aws:", "arn:aws*:", 1);
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS task ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_malformed_task_segments() {
+        let mut req = exec_req();
+        req.task_arn = format!(
+            "arn:aws:ecs:{}:{}:task/{}/abc/extra",
+            req.region, req.account_id, DEV_MOCK_CLUSTER_NAME
+        );
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS task ARN");
+    }
+
+    #[test]
     fn validate_task_request_arn_rejects_non_task_arn() {
         let mut req = exec_req();
         req.task_arn = req.cluster_arn.clone();
@@ -1590,6 +1646,42 @@ mod tests {
         let err = validate_task_request_arn(&req).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(err.1 .0.message, "Invalid ECS task ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_pattern_cluster_arn() {
+        let mut req = exec_req();
+        req.cluster_arn = format!(
+            "arn:aws:ecs:{}:{}:cluster/prod?",
+            req.region, req.account_id
+        );
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS cluster ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_pattern_cluster_partition() {
+        let mut req = exec_req();
+        req.cluster_arn = req.cluster_arn.replacen("arn:aws:", "arn:aws?:", 1);
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS cluster ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_malformed_cluster_segments() {
+        let mut req = exec_req();
+        req.cluster_arn = format!(
+            "arn:aws:ecs:{}:{}:cluster/prod/extra",
+            req.region, req.account_id
+        );
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS cluster ARN");
     }
 
     #[test]
