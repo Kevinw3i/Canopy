@@ -51,7 +51,7 @@ Options:
   --target-group <name>   ALB target group name. Used only when no target group ARN is set.
   --target-group-arn <arn> ALB target group ARN. Default: Terraform target_group_arn output, then <project>-tg.
   --log-group <name>      CloudWatch Logs log group. Default: Terraform log_group_name output, then /ecs/<project>/control-plane.
-  --plan-only             Stop after writing the Terraform plan. Does not build or push the image.
+  --plan-only             Stop after writing the Terraform plan. Skips ECR checks, build, push, and apply.
   --tail-logs             Tail CloudWatch logs after deploy.
   --yes                   Do not prompt before AWS-changing steps.
   -h, --help              Show this help.
@@ -200,10 +200,10 @@ esac
 
 cd "$REPO_ROOT"
 
-need_cmd aws
 need_cmd terraform
 need_cmd shasum
 if [ "$PLAN_ONLY" -eq 0 ]; then
+  need_cmd aws
   need_cmd docker
 fi
 
@@ -302,6 +302,34 @@ echo "== Validate Terraform inputs and entitlements =="
 "$SCRIPT_DIR/validate-entitlements.sh" "$ENTITLEMENTS_FILE" "$TERRAFORM_DIR/terraform.tfvars"
 
 echo ""
+echo "== Terraform Phase 2 plan =="
+AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" plan \
+  -var="create_service=true" \
+  -var="image_tag=$IMAGE_TAG" \
+  -out="$PLAN_FILE"
+
+PLAN_TEXT="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" show -no-color "$PLAN_FILE")"
+
+if grep -Eq 'will be destroyed' <<< "$PLAN_TEXT"; then
+  echo ""
+  echo "ERROR: Terraform plan includes destroy actions. Refusing to continue."
+  echo "Review $TERRAFORM_DIR/$PLAN_FILE and fix the inputs before applying."
+  exit 1
+fi
+
+if grep -Eq 'must be replaced' <<< "$PLAN_TEXT"; then
+  echo ""
+  echo "WARNING: Terraform plan includes replacement actions."
+  echo "Review the plan above carefully before applying."
+fi
+
+if [ "$PLAN_ONLY" -eq 1 ]; then
+  echo ""
+  echo "Plan written to $TERRAFORM_DIR/$PLAN_FILE. Stop because --plan-only was set."
+  exit 0
+fi
+
+echo ""
 echo "== Resolve ECR repository =="
 ECR_URL="$(tf_output_raw ecr_repository_url)"
 [ -n "$ECR_URL" ] || fail "Terraform output ecr_repository_url is empty."
@@ -333,34 +361,6 @@ if ! grep -q "ImageNotFoundException" <<< "$describe_output"; then
 fi
 
 echo "Tag is available: $IMAGE_TAG"
-
-echo ""
-echo "== Terraform Phase 2 plan =="
-AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" plan \
-  -var="create_service=true" \
-  -var="image_tag=$IMAGE_TAG" \
-  -out="$PLAN_FILE"
-
-PLAN_TEXT="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" show -no-color "$PLAN_FILE")"
-
-if grep -Eq 'will be destroyed' <<< "$PLAN_TEXT"; then
-  echo ""
-  echo "ERROR: Terraform plan includes destroy actions. Refusing to continue."
-  echo "Review $TERRAFORM_DIR/$PLAN_FILE and fix the inputs before applying."
-  exit 1
-fi
-
-if grep -Eq 'must be replaced' <<< "$PLAN_TEXT"; then
-  echo ""
-  echo "WARNING: Terraform plan includes replacement actions."
-  echo "Review the plan above carefully before applying."
-fi
-
-if [ "$PLAN_ONLY" -eq 1 ]; then
-  echo ""
-  echo "Plan written to $TERRAFORM_DIR/$PLAN_FILE. Stop because --plan-only was set."
-  exit 0
-fi
 
 echo ""
 echo "== Login to ECR =="
