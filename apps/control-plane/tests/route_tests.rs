@@ -142,6 +142,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .merge(routes::ecs::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
+        .merge(routes::mfa::router())
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
@@ -209,6 +210,21 @@ async fn authed_post_json(
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {}", token))
                 .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json = body_json(resp.into_body()).await;
+    (status, json)
+}
+
+async fn authed_get_json(app: Router, path: &str, token: &str) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::get(path)
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
                 .unwrap(),
         )
         .await
@@ -628,6 +644,24 @@ async fn protected_route_rejects_invalid_token() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mfa_status_returns_provider_and_local_factor_readiness() {
+    let mut config = dev_config();
+    config.oidc.required_amr_values = vec!["mfa".into()];
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_get_json(app, "/api/auth/mfa/status", &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["user_id"], "dev-admin");
+    assert_eq!(json["provider_step_up_configured"], true);
+    assert_eq!(json["local_step_up_available"], false);
+    assert_eq!(json["factors"][0]["kind"], "totp");
+    assert_eq!(json["factors"][1]["kind"], "web_authn");
 }
 
 #[tokio::test]

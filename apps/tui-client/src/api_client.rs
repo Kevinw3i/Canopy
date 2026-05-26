@@ -405,6 +405,14 @@ impl ApiClient {
         .await
     }
 
+    pub async fn mfa_status(&self) -> ApiResult<MfaStatusResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .get(format!("{}/api/auth/mfa/status", self.base_url))
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

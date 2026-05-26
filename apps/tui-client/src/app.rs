@@ -945,6 +945,18 @@ impl App {
                 }
             }
 
+            // MFA
+            Action::RefreshMfaStatus => {
+                self.settings.set_mfa_loading();
+                self.spawn_mfa_status_fetch();
+            }
+            Action::MfaStatusLoaded(status) => {
+                self.settings.set_mfa_status(status);
+            }
+            Action::MfaStatusFailed(error) => {
+                self.settings.set_mfa_error(error);
+            }
+
             // Auto-update
             Action::CheckForUpdate => {
                 let tx = self.action_tx.clone();
@@ -1283,6 +1295,21 @@ impl App {
                 false
             }
         }
+    }
+
+    fn spawn_mfa_status_fetch(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match api.mfa_status().await {
+                Ok(status) => {
+                    let _ = tx.send(Action::MfaStatusLoaded(status));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(err, Action::MfaStatusFailed));
+                }
+            }
+        });
     }
 
     fn spawn_ec2_fetch(&mut self, name_filter: Option<String>) {

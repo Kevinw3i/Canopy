@@ -78,6 +78,32 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MfaFactorKind {
+    Totp,
+    WebAuthn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MfaFactorStatus {
+    pub kind: MfaFactorKind,
+    pub available: bool,
+    pub enrolled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MfaStatusResponse {
+    pub user_id: String,
+    pub provider_step_up_configured: bool,
+    pub local_step_up_available: bool,
+    pub step_up_required: bool,
+    pub factors: Vec<MfaFactorStatus>,
+    pub message: String,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -154,6 +180,38 @@ mod tests {
 
         assert_eq!(resp.access_token, "tok");
         assert_eq!(resp.refresh_token, None);
+    }
+
+    #[test]
+    fn mfa_status_roundtrip() {
+        let resp = MfaStatusResponse {
+            user_id: "u1".into(),
+            provider_step_up_configured: true,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            message: "OIDC provider MFA/re-auth controls are configured.".into(),
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["factors"][0]["kind"], "totp");
+        assert_eq!(json["factors"][1]["kind"], "web_authn");
+
+        let back: MfaStatusResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]

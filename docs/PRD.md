@@ -306,6 +306,7 @@ TUI                     Control Plane              OIDC Provider
 
 - 顯示目前設定：Control Plane URL、開發模式、刷新間隔、Live Tail scrollback
 - 顯示目前 theme preset 與 resolved semantic colors
+- 顯示 MFA / step-up readiness：OIDC Provider MFA / re-auth controls、本機 TOTP / WebAuthn 因子狀態、step-up 是否可用
 - 顯示目前 keybindings：dashboard 導航、quick nav、logout、settings back / change password
 - 提示設定檔路徑；自訂主題與快捷鍵透過 TUI config 的 `[theme]` / `[keybindings]` table 設定
 - 主題 token 套用到登入、Dashboard、Settings、Access、EC2/ECS inventory、CloudWatch search、Live Tail、modal 與 connect-session chrome；connect-session 內的遠端 terminal 輸出保留 VT100 色彩
@@ -639,7 +640,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - EC2 Instance Connect 支援判斷為近似值
 - AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
 - 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
-- MFA 目前為 OIDC Provider-driven；本機 TOTP/WebAuthn 註冊、復原碼與 step-up UI 尚未實作
+- MFA 目前為 OIDC Provider-driven；TUI 已顯示本機 MFA / step-up readiness，但本機 TOTP/WebAuthn 註冊、復原碼、持久化與 step-up enforcement 尚未實作
 
 ### 未來規劃
 

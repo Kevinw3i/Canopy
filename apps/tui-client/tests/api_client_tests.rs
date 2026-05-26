@@ -178,6 +178,35 @@ async fn entitlements_handler(headers: HeaderMap) -> impl IntoResponse {
     .into_response()
 }
 
+async fn mfa_status_handler(headers: HeaderMap) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+
+    Json(json!({
+        "user_id": "alice",
+        "provider_step_up_configured": true,
+        "local_step_up_available": false,
+        "step_up_required": false,
+        "factors": [
+            {
+                "kind": "totp",
+                "available": false,
+                "enrolled": false,
+                "label": "Authenticator app"
+            },
+            {
+                "kind": "web_authn",
+                "available": false,
+                "enrolled": false,
+                "label": "Security key"
+            }
+        ],
+        "message": "OIDC provider MFA/re-auth controls are configured."
+    }))
+    .into_response()
+}
+
 async fn log_groups_handler(headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
@@ -333,6 +362,7 @@ fn mock_app() -> Router {
         .route("/auth/dev-login", post(dev_login_handler))
         .route("/api/ec2/list", post(list_ec2_handler))
         .route("/api/entitlements", get(entitlements_handler))
+        .route("/api/auth/mfa/status", get(mfa_status_handler))
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
 }
 
@@ -499,6 +529,26 @@ async fn get_entitlements_requires_auth() {
     let ent = client.get_entitlements().await.unwrap();
     assert_eq!(ent.user_id, "alice");
     assert_eq!(ent.groups, vec!["eng"]);
+}
+
+#[tokio::test]
+async fn mfa_status_success() {
+    let base_url = start_mock(mock_app()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_token("access-token".into());
+
+    let status = client.mfa_status().await.unwrap();
+    assert_eq!(status.user_id, "alice");
+    assert!(status.provider_step_up_configured);
+    assert!(!status.local_step_up_available);
+    assert_eq!(
+        status.factors[0].kind,
+        shared::dto::auth::MfaFactorKind::Totp
+    );
+    assert_eq!(
+        status.factors[1].kind,
+        shared::dto::auth::MfaFactorKind::WebAuthn
+    );
 }
 
 #[tokio::test]

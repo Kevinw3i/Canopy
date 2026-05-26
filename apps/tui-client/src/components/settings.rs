@@ -9,15 +9,41 @@ use crate::config::ClientConfig;
 use crate::event::Action;
 use crate::keybindings::KeyBindings;
 use crate::theme::{color_label, Theme};
+use shared::dto::auth::{MfaFactorKind, MfaStatusResponse};
 
 pub struct SettingsScreen {
     pub config: ClientConfig,
     theme: Theme,
+    mfa_status: Option<MfaStatusResponse>,
+    mfa_loading: bool,
+    mfa_error: Option<String>,
 }
 
 impl SettingsScreen {
     pub fn new(config: ClientConfig, theme: Theme) -> Self {
-        Self { config, theme }
+        Self {
+            config,
+            theme,
+            mfa_status: None,
+            mfa_loading: false,
+            mfa_error: None,
+        }
+    }
+
+    pub fn set_mfa_loading(&mut self) {
+        self.mfa_loading = true;
+        self.mfa_error = None;
+    }
+
+    pub fn set_mfa_status(&mut self, status: MfaStatusResponse) {
+        self.mfa_status = Some(status);
+        self.mfa_loading = false;
+        self.mfa_error = None;
+    }
+
+    pub fn set_mfa_error(&mut self, error: String) {
+        self.mfa_loading = false;
+        self.mfa_error = Some(error);
     }
 }
 
@@ -44,6 +70,9 @@ impl Component for SettingsScreen {
         {
             return Action::ChangePassword;
         }
+        if key.modifiers.is_empty() && matches!(key.code, crossterm::event::KeyCode::Char('r')) {
+            return Action::RefreshMfaStatus;
+        }
         Action::Noop
     }
 
@@ -66,45 +95,50 @@ impl Component for SettingsScreen {
                 Span::raw(&self.config.control_plane_url),
             ]),
             Line::from(vec![
-                Span::styled("Dev Mode:           ", label_style),
-                Span::raw(if self.config.dev_mode { "Yes" } else { "No" }),
+                Span::styled("Dev/Refresh/Tail:   ", label_style),
+                Span::raw(format!(
+                    "{} / {}s / {}",
+                    if self.config.dev_mode { "Yes" } else { "No" },
+                    self.config.refresh_interval_secs,
+                    self.config.live_tail_scrollback
+                )),
             ]),
-            Line::from(vec![
-                Span::styled("Refresh Interval:   ", label_style),
-                Span::raw(format!("{}s", self.config.refresh_interval_secs)),
-            ]),
-            Line::from(vec![
-                Span::styled("Live Tail Scrollback:", label_style),
-                Span::raw(format!(" {}", self.config.live_tail_scrollback)),
-            ]),
+            Line::from(Span::styled("MFA & Step-up", heading_style)),
+            self.mfa_line(
+                "Provider step-up:   ",
+                self.mfa_status
+                    .as_ref()
+                    .map(|status| status.provider_step_up_configured),
+                "configured",
+                "not configured",
+            ),
+            self.factor_line("Local TOTP:         ", MfaFactorKind::Totp),
+            self.factor_line("Local WebAuthn:     ", MfaFactorKind::WebAuthn),
+            self.mfa_line(
+                "Step-up:            ",
+                self.mfa_status
+                    .as_ref()
+                    .map(|status| status.local_step_up_available),
+                "available",
+                "not configured",
+            ),
             Line::from(Span::styled("Theme", heading_style)),
             Line::from(vec![
                 Span::styled("Preset:             ", label_style),
-                Span::raw(&self.config.theme.preset),
-            ]),
-            Line::from(vec![
-                Span::styled("Accent/Text/Muted:  ", label_style),
                 Span::raw(format!(
-                    "{} / {} / {}",
-                    color_label(self.theme.accent),
-                    color_label(self.theme.text),
-                    color_label(self.theme.muted)
-                )),
-            ]),
-            Line::from(vec![
-                Span::styled("Selected:           ", label_style),
-                Span::raw(format!(
-                    "{} on {}",
+                    "{} / selected {} on {}",
+                    self.config.theme.preset,
                     color_label(self.theme.selected_fg),
                     color_label(self.theme.selected_bg)
                 )),
             ]),
             Line::from(vec![
-                Span::styled("Status:             ", label_style),
+                Span::styled("Colors: ", label_style),
                 Span::raw(format!(
-                    "ok {} warn {} err {}",
-                    color_label(self.theme.success),
-                    color_label(self.theme.warning),
+                    "{} / {} / {}; err {}",
+                    color_label(self.theme.accent),
+                    color_label(self.theme.text),
+                    color_label(self.theme.muted),
                     color_label(self.theme.danger)
                 )),
             ]),
@@ -133,7 +167,7 @@ impl Component for SettingsScreen {
             )),
             Line::from(Span::styled(
                 format!(
-                    "{}: change password | {}: back",
+                    "r: refresh MFA | {}: change password | {}: back",
                     KeyBindings::first_label(&self.config.keybindings.settings_change_password),
                     KeyBindings::first_label(&self.config.keybindings.settings_back)
                 ),
@@ -143,10 +177,85 @@ impl Component for SettingsScreen {
 
         Paragraph::new(lines).style(body_style).render(inner, buf);
     }
+
+    fn on_enter(&mut self) -> Vec<Action> {
+        vec![Action::RefreshMfaStatus]
+    }
 }
 
 fn shortcut_cell(name: &str, keys: &str) -> String {
     format!("{name}: {keys}")
+}
+
+impl SettingsScreen {
+    fn mfa_line(
+        &self,
+        label: &'static str,
+        value: Option<bool>,
+        enabled: &'static str,
+        disabled: &'static str,
+    ) -> Line<'static> {
+        let label_style = Style::default().fg(self.theme.text).bold();
+        let value_style = if self.mfa_loading {
+            self.theme.warning_style()
+        } else if self.mfa_error.is_some() {
+            self.theme.danger_style()
+        } else if value == Some(true) {
+            self.theme.success_style()
+        } else {
+            self.theme.muted_style()
+        };
+        let text = if self.mfa_loading {
+            "loading".into()
+        } else if let Some(error) = self.mfa_error.as_deref() {
+            format!("error: {}", truncate(error, 42))
+        } else if let Some(value) = value {
+            if value {
+                enabled.into()
+            } else {
+                disabled.into()
+            }
+        } else {
+            "unknown".into()
+        };
+
+        Line::from(vec![
+            Span::styled(label, label_style),
+            Span::styled(text, value_style),
+        ])
+    }
+
+    fn factor_line(&self, label: &'static str, kind: MfaFactorKind) -> Line<'static> {
+        let factor = self
+            .mfa_status
+            .as_ref()
+            .and_then(|status| status.factors.iter().find(|factor| factor.kind == kind));
+        match factor {
+            Some(factor) if factor.available && factor.enrolled => {
+                self.mfa_line(label, Some(true), "enrolled", "not enrolled")
+            }
+            Some(factor) if factor.available => {
+                self.mfa_line(label, Some(false), "enrolled", "not enrolled")
+            }
+            Some(_) => self.mfa_line(label, Some(false), "enrolled", "not configured"),
+            None => self.mfa_line(label, None, "enrolled", "not configured"),
+        }
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return out;
+        };
+        out.push(ch);
+    }
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -273,10 +382,41 @@ mod tests {
     }
 
     #[test]
+    fn r_refreshes_mfa_status() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        let action = screen.handle_key(key(KeyCode::Char('r')));
+        assert!(matches!(action, Action::RefreshMfaStatus));
+    }
+
+    #[test]
     fn render_shows_keyboard_shortcuts_and_theme_at_80x24() {
         let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: true,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            message: "OIDC provider MFA/re-auth controls are configured.".into(),
+        });
         let text = rendered_text(&mut screen);
 
+        assert!(text.contains("MFA & Step-up"));
+        assert!(text.contains("Provider step-up:"));
+        assert!(text.contains("Local TOTP:"));
         assert!(text.contains("Theme"));
         assert!(text.contains("Preset:"));
         assert!(text.contains("Keyboard Shortcuts"));

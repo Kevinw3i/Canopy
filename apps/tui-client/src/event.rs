@@ -155,6 +155,11 @@ pub enum Action {
     FetchPublicIp,
     SetPublicIp(String, u64), // ip, generation
 
+    // MFA
+    RefreshMfaStatus,
+    MfaStatusLoaded(shared::dto::auth::MfaStatusResponse),
+    MfaStatusFailed(String),
+
     // Auto-update
     CheckForUpdate,
     UpdateCheckComplete(Option<crate::updater::UpdateResult>),
