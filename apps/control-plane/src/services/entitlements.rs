@@ -1,5 +1,5 @@
 use shared::dto::ec2::Ec2Instance;
-use shared::dto::entitlements::{AllowedAccount, UserEntitlements};
+use shared::dto::entitlements::{AllowedAccount, FeatureFlags, UserEntitlements};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -84,6 +84,59 @@ impl EntitlementService {
             }
         }
         arns
+    }
+
+    /// Return accounts from rules that individually grant the requested feature
+    /// and cover this account, region, and every requested log group.
+    pub async fn scoped_accounts_for_log_groups(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+        log_group_arns: &[String],
+        feature_check: impl Fn(&FeatureFlags) -> bool,
+    ) -> Vec<AllowedAccount> {
+        let store = self.store.read().await;
+        let rules = store.matching_rules_for_scope(
+            &claims.sub,
+            &claims.email,
+            claims.email_verified,
+            account_id,
+            feature_check,
+        );
+        let mut accounts = Vec::new();
+
+        for rule in rules {
+            if !rule.allowed_regions.is_empty()
+                && !rule.allowed_regions.contains(&region.to_string())
+            {
+                continue;
+            }
+            if !rule.allowed_log_group_arns.is_empty()
+                && !log_group_arns.iter().all(|arn| {
+                    rule.allowed_log_group_arns
+                        .iter()
+                        .any(|pattern| arn_matches_pattern(pattern, arn))
+                })
+            {
+                continue;
+            }
+
+            for account in rule
+                .allowed_accounts
+                .iter()
+                .filter(|account| account.account_id == account_id)
+            {
+                if !accounts.iter().any(|existing: &AllowedAccount| {
+                    existing.account_id == account.account_id
+                        && existing.role_arn == account.role_arn
+                }) {
+                    accounts.push(account.clone());
+                }
+            }
+        }
+
+        accounts
     }
 
     /// Return the set of allowed accounts from rules that individually

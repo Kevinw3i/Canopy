@@ -23,10 +23,6 @@ use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRun
 use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
-const LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE: &str =
-    "Live tail production streaming is not yet available. \
-This beta feature currently supports dev/mock control-plane streaming only.";
-
 pub struct App {
     config: ClientConfig,
     api: ApiClient,
@@ -841,39 +837,31 @@ impl App {
 
             // Live Tail
             Action::StartLiveTail => {
-                if self.config.dev_mode {
-                    let Some(request) = self.live_tail.start_request() else {
-                        self.error_modal.show(
-                            "No Live Tail log group is available with your current entitlements"
-                                .into(),
-                        );
-                        return;
-                    };
-                    // Dev mode: connect to the control-plane's WebSocket
-                    // and stream simulated events into the live tail screen.
-                    self.live_tail.set_connected();
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    self.live_tail_cancel = Some(cancel.clone());
-                    let tx = self.action_tx.clone();
-                    let base_url = self.config.control_plane_url.clone();
-                    let token = self.api.get_token();
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::live_tail_ws::stream_live_tail(
-                            &base_url,
-                            token.as_deref(),
-                            request,
-                            tx,
-                            cancel,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Live tail stream ended: {}", e);
-                        }
-                    });
-                } else {
-                    self.error_modal
-                        .show(LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.into());
-                }
+                let Some(request) = self.live_tail.start_request() else {
+                    self.error_modal.show(
+                        "No Live Tail log group is available with your current entitlements".into(),
+                    );
+                    return;
+                };
+                self.live_tail.set_connected();
+                let cancel = tokio_util::sync::CancellationToken::new();
+                self.live_tail_cancel = Some(cancel.clone());
+                let tx = self.action_tx.clone();
+                let base_url = self.config.control_plane_url.clone();
+                let token = self.api.get_token();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::live_tail_ws::stream_live_tail(
+                        &base_url,
+                        token.as_deref(),
+                        request,
+                        tx,
+                        cancel,
+                    )
+                    .await
+                    {
+                        tracing::warn!("Live tail stream ended: {}", e);
+                    }
+                });
             }
             Action::StopLiveTail => {
                 if let Some(cancel) = self.live_tail_cancel.take() {
@@ -2359,13 +2347,6 @@ mod tests {
             security_groups: vec![],
             iam_role: None,
         }
-    }
-
-    #[test]
-    fn live_tail_prod_unavailable_message_names_server_limit() {
-        assert!(LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.contains("production streaming"));
-        assert!(LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.contains("dev/mock"));
-        assert!(!LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.contains("client is not yet available"));
     }
 
     // ── Navigation ──────────────────────────────────────────

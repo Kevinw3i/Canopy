@@ -558,7 +558,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 
 ### 目前限制
 
-- Live Tail 為 beta 功能，TUI WebSocket 客戶端目前支援 dev/mock 串流、log group picker 與自動重連；production real-AWS streaming 尚未完整
+- Live Tail 為 beta 功能，支援 dev/mock 串流、production CloudWatch Logs StartLiveTail 串流、log group picker 與自動重連；production session 仍受 AWS 服務端 timeout、sampling 與配額限制
 - ECS 目前支援 task inventory 與 ECS Exec，不支援 ECS service/deployment 管理
 - ECS broad cluster discovery 需要明確 opt-in，且 response 仍受服務端上限保護
 - OIDC refresh token 流程已支援 PKCE/device-code 取得、TUI 401 refresh/retry 與 rotated token 持久化；仍要求 provider 發放 refresh token 並在 refresh grant 回傳 id_token
@@ -569,7 +569,6 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 
 ### 未來規劃
 
-- [ ] Production CloudWatch Live Tail streaming
 - [ ] 資料庫後端的權限管理
 - [ ] AWS Organizations 帳號自動發現
 - [ ] SSM DescribeInstanceInformation 精確判斷受管理狀態

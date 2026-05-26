@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use shared::dto::cloudwatch::LiveTailMessage;
+use shared::dto::entitlements::{AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -1455,6 +1456,101 @@ async fn live_tail_ws_streams_mock_session_start_and_event() {
             assert!(event.message.contains("Simulated log event #1"));
         }
         _ => panic!("expected event, got {second:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn live_tail_ws_streams_mock_session_when_dev_mode_disabled() {
+    let mut config = dev_config();
+    config.dev_mode = false;
+    config.mock_aws_data = Some(true);
+    let token = issue_test_token(&config);
+    let app = build_app(build_state(config));
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": token,
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"
+            ]
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let first = recv_live_tail_message(&mut ws).await;
+    match first {
+        LiveTailMessage::SessionStart { session_id } => assert!(!session_id.is_empty()),
+        _ => panic!("expected session_start, got {first:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn live_tail_ws_rejects_log_group_from_non_tail_rule() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        store.rules.push(EntitlementRule {
+            id: "rule-log-pattern-no-tail".into(),
+            group: "log-pattern-no-tail".into(),
+            features: FeatureFlags {
+                can_use_cloudwatch_search: true,
+                can_use_cloudwatch_tail: false,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111111111111".into(),
+                account_name: "production".into(),
+                role_arn: "arn:aws:iam::111111111111:role/CanopyReadOnly".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec!["arn:aws:logs:*:111111111111:log-group:/secret/*".into()],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "log-pattern-no-tail".into(),
+        });
+    }
+    let app = build_app(state);
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": token,
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/secret/api"
+            ]
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let first = recv_live_tail_message(&mut ws).await;
+    match first {
+        LiveTailMessage::Error { message } => {
+            assert_eq!(message, "Live tail not authorized for requested scope");
+        }
+        _ => panic!("expected error, got {first:?}"),
     }
 
     let _ = ws.close(None).await;
