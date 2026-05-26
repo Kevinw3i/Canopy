@@ -105,6 +105,13 @@ impl Component for McpScreen {
                     Action::ShowError("MCP is not enabled for this user".into())
                 }
             }
+            KeyCode::Char('l') => {
+                if self.can_use_mcp() {
+                    Action::LaunchMcpAiClient
+                } else {
+                    Action::ShowError("MCP is not enabled for this user".into())
+                }
+            }
             KeyCode::Char('s') => Action::StopMcp,
             KeyCode::Char('r') => Action::RestartMcp,
             KeyCode::Char('t') => Action::TestMcp,
@@ -171,7 +178,7 @@ impl Component for McpScreen {
             .wrap(Wrap { trim: true })
             .render(chunks[1], buf);
 
-        let help = "Use e to enable the local MCP server, verify healthz, then choose Codex CLI or Claude Code. Use s to stop, r to restart, t to test health. Phase 3 exposes CloudWatch discovery plus preflight-gated search and Insights tools.";
+        let help = "Use e to enable the local MCP server, verify healthz, then choose Codex CLI or Claude Code. Use l to launch a CLI against the already-running MCP server; it will not start MCP automatically. Use s to stop, r to restart, t to test health. Phase 3 exposes CloudWatch discovery plus preflight-gated search and Insights tools.";
         let body = if let Some(error) = self.last_error.as_ref() {
             format!("{help}\n\nLast error:\n{error}")
         } else {
@@ -182,9 +189,11 @@ impl Component for McpScreen {
             .wrap(Wrap { trim: true })
             .render(chunks[2], buf);
 
-        Paragraph::new("e: enable + launch | s: stop | r: restart | t: test | Esc/q: back")
-            .style(Style::default().fg(Color::Gray))
-            .render(chunks[3], buf);
+        Paragraph::new(
+            "e: enable + launch | l: launch CLI | s: stop | r: restart | t: test | Esc/q: back",
+        )
+        .style(Style::default().fg(Color::Gray))
+        .render(chunks[3], buf);
     }
 }
 
@@ -299,6 +308,41 @@ mod tests {
         // Null/missing: entitlements have not arrived yet.
         let mut screen = McpScreen::new();
         let action = screen.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(action, Action::ShowError(_)));
+    }
+
+    #[test]
+    fn l_returns_launch_mcp_ai_client_when_entitlement_allows() {
+        let mut screen = McpScreen::new();
+        screen.set_entitlements(entitlements_with_mcp(true));
+
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('l'))),
+            Action::LaunchMcpAiClient
+        ));
+    }
+
+    #[test]
+    fn l_returns_show_error_when_entitlement_denies() {
+        let mut screen = McpScreen::new();
+        screen.set_entitlements(entitlements_with_mcp(false));
+
+        let action = screen.handle_key(key(KeyCode::Char('l')));
+        match action {
+            Action::ShowError(msg) => {
+                assert!(
+                    msg.contains("MCP is not enabled"),
+                    "expected denial message, got {msg:?}"
+                );
+            }
+            other => panic!("expected ShowError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn l_returns_show_error_before_entitlements_are_loaded() {
+        let mut screen = McpScreen::new();
+        let action = screen.handle_key(key(KeyCode::Char('l')));
         assert!(matches!(action, Action::ShowError(_)));
     }
 
@@ -440,6 +484,8 @@ mod tests {
         assert!(text.contains("Stopped"));
         // Help line
         assert!(text.contains("e: enable + launch"));
+        assert!(text.contains("l: launch CLI"));
+        assert!(text.contains("will not start MCP automatically"));
         assert!(text.contains("Esc/q: back"));
     }
 

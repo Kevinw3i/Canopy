@@ -2,7 +2,11 @@ use anyhow::Result;
 use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
 use shared::dto::entitlements::UserEntitlements;
-use std::process::Command;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tokio::sync::mpsc;
 
 use crate::api_client::{ApiClient, ApiClientError};
@@ -237,6 +241,35 @@ enum McpAiClient {
     Claude,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalLaunchAdapter {
+    AppleTerminal,
+    ITerm2,
+    WarpStable,
+    WarpPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedTerminalApp {
+    display_name: String,
+    bundle_id: String,
+    app_path: PathBuf,
+    adapter: TerminalLaunchAdapter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppBundleInfo {
+    display_name: String,
+    bundle_id: String,
+    app_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpAiLaunchResult {
+    client_label: &'static str,
+    terminal_label: String,
+}
+
 fn prompt_yes_no(prompt: &str) -> bool {
     use std::io::Write;
 
@@ -249,6 +282,15 @@ fn prompt_yes_no(prompt: &str) -> bool {
     }
 
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn parse_mcp_ai_client_choice(input: &str) -> Result<Option<McpAiClient>, String> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "codex" | "c" => Ok(Some(McpAiClient::Codex)),
+        "2" | "claude" => Ok(Some(McpAiClient::Claude)),
+        "q" | "quit" | "cancel" | "" => Ok(None),
+        other => Err(format!("Invalid AI client choice: {other}")),
+    }
 }
 
 fn prompt_mcp_ai_client() -> Result<Option<McpAiClient>, String> {
@@ -270,12 +312,72 @@ fn prompt_mcp_ai_client() -> Result<Option<McpAiClient>, String> {
         .read_line(&mut input)
         .map_err(|err| format!("Failed to read choice: {err}"))?;
 
-    match input.trim().to_ascii_lowercase().as_str() {
-        "1" | "codex" | "c" => Ok(Some(McpAiClient::Codex)),
-        "2" | "claude" => Ok(Some(McpAiClient::Claude)),
-        "q" | "quit" | "cancel" | "" => Ok(None),
-        other => Err(format!("Invalid AI client choice: {other}")),
+    parse_mcp_ai_client_choice(&input)
+}
+
+fn parse_terminal_app_choice(
+    input: &str,
+    terminals: &[DetectedTerminalApp],
+) -> Result<Option<DetectedTerminalApp>, String> {
+    let choice = input.trim();
+    let normalized = choice.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "" | "q" | "quit" | "cancel") {
+        return Ok(None);
     }
+
+    if let Ok(index) = normalized.parse::<usize>() {
+        if (1..=terminals.len()).contains(&index) {
+            return Ok(Some(terminals[index - 1].clone()));
+        }
+        return Err(format!("Invalid terminal choice: {choice}"));
+    }
+
+    terminals
+        .iter()
+        .find(|terminal| {
+            terminal.display_name.eq_ignore_ascii_case(choice)
+                || terminal.bundle_id.eq_ignore_ascii_case(choice)
+                || terminal
+                    .app_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(choice))
+        })
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| format!("Invalid terminal choice: {choice}"))
+}
+
+fn prompt_mcp_terminal_app(
+    terminals: &[DetectedTerminalApp],
+) -> Result<Option<DetectedTerminalApp>, String> {
+    use std::io::Write;
+
+    if terminals.is_empty() {
+        return Err("No supported terminal app was detected on this computer.".into());
+    }
+
+    println!("\nChoose terminal app:");
+    for (index, terminal) in terminals.iter().enumerate() {
+        println!(
+            "  {}) {} ({})",
+            index + 1,
+            terminal.display_name,
+            terminal.app_path.display()
+        );
+    }
+    println!("  q) Cancel");
+    print!("Open in which terminal? [1-{}/q]: ", terminals.len());
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("Failed to write terminal prompt: {err}"))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("Failed to read terminal choice: {err}"))?;
+
+    parse_terminal_app_choice(&input, terminals)
 }
 
 fn resolve_command(program: &str) -> Result<String, String> {
@@ -304,6 +406,187 @@ fn shell_single_quote(value: &str) -> String {
 
 fn applescript_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+fn plist_string_value(plist: &str, key: &str) -> Option<String> {
+    let marker = format!("<key>{key}</key>");
+    let after_key = plist.split_once(&marker)?.1;
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let after_start = &after_key[string_start..];
+    let string_end = after_start.find("</string>")?;
+    Some(xml_unescape_minimal(after_start[..string_end].trim()))
+}
+
+fn xml_unescape_minimal(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn read_plist_xml(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => Ok(value),
+        Err(read_error) if cfg!(target_os = "macos") => {
+            let output = Command::new("plutil")
+                .args(["-convert", "xml1", "-o", "-", "--"])
+                .arg(path)
+                .output()
+                .map_err(|err| {
+                    format!(
+                        "Failed to read {} as text ({read_error}) and plutil failed: {err}",
+                        path.display()
+                    )
+                })?;
+            if !output.status.success() {
+                return Err(format!("plutil failed to convert {}", path.display()));
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|err| format!("plutil output for {} is not UTF-8: {err}", path.display()))
+        }
+        Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
+    }
+}
+
+fn read_app_bundle_info(app_path: &Path) -> Option<AppBundleInfo> {
+    let plist_path = app_path.join("Contents/Info.plist");
+    let plist = read_plist_xml(&plist_path).ok()?;
+    let bundle_id = plist_string_value(&plist, "CFBundleIdentifier")?;
+    let display_name = plist_string_value(&plist, "CFBundleDisplayName")
+        .or_else(|| plist_string_value(&plist, "CFBundleName"))
+        .or_else(|| plist_string_value(&plist, "CFBundleExecutable"))
+        .or_else(|| {
+            app_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(ToOwned::to_owned)
+        })?;
+
+    Some(AppBundleInfo {
+        display_name,
+        bundle_id,
+        app_path: app_path.to_path_buf(),
+    })
+}
+
+fn terminal_adapter_for_app(info: &AppBundleInfo) -> Option<TerminalLaunchAdapter> {
+    let bundle_id = info.bundle_id.to_ascii_lowercase();
+    let display_name = info.display_name.to_ascii_lowercase();
+    let file_stem = info
+        .app_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if bundle_id == "com.apple.terminal" {
+        return Some(TerminalLaunchAdapter::AppleTerminal);
+    }
+    if bundle_id == "com.googlecode.iterm2"
+        || display_name == "iterm2"
+        || file_stem == "iterm"
+        || file_stem == "iterm2"
+    {
+        return Some(TerminalLaunchAdapter::ITerm2);
+    }
+    if bundle_id.starts_with("dev.warp.warp") || display_name == "warp" || file_stem == "warp" {
+        if bundle_id.contains("preview") || display_name.contains("preview") {
+            return Some(TerminalLaunchAdapter::WarpPreview);
+        }
+        return Some(TerminalLaunchAdapter::WarpStable);
+    }
+
+    None
+}
+
+fn default_terminal_app_scan_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(PathBuf::from("/Applications"));
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    dirs.push(PathBuf::from("/System/Applications/Utilities"));
+    dirs
+}
+
+fn detect_supported_terminal_apps() -> Result<Vec<DetectedTerminalApp>, String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Launching a new terminal window is currently implemented for macOS only.".into(),
+        );
+    }
+
+    detect_supported_terminal_apps_in(&default_terminal_app_scan_dirs())
+}
+
+fn detect_supported_terminal_apps_in(dirs: &[PathBuf]) -> Result<Vec<DetectedTerminalApp>, String> {
+    let mut seen = HashSet::new();
+    let mut terminals = Vec::new();
+
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let app_path = entry.path();
+            if app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+                continue;
+            }
+            let Some(info) = read_app_bundle_info(&app_path) else {
+                continue;
+            };
+            let Some(adapter) = terminal_adapter_for_app(&info) else {
+                continue;
+            };
+            let canonical_path = std::fs::canonicalize(&info.app_path).unwrap_or(info.app_path);
+            let dedupe_key = (
+                info.bundle_id.to_ascii_lowercase(),
+                canonical_path.display().to_string(),
+            );
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            terminals.push(DetectedTerminalApp {
+                display_name: info.display_name,
+                bundle_id: info.bundle_id,
+                app_path: canonical_path,
+                adapter,
+            });
+        }
+    }
+
+    terminals.sort_by(|left, right| {
+        let left_priority = terminal_sort_priority(left);
+        let right_priority = terminal_sort_priority(right);
+        left_priority
+            .cmp(&right_priority)
+            .then_with(|| {
+                left.display_name
+                    .to_ascii_lowercase()
+                    .cmp(&right.display_name.to_ascii_lowercase())
+            })
+            .then_with(|| left.app_path.cmp(&right.app_path))
+    });
+
+    if terminals.is_empty() {
+        Err("No supported terminal app was detected on this computer.".into())
+    } else {
+        Ok(terminals)
+    }
+}
+
+fn terminal_sort_priority(terminal: &DetectedTerminalApp) -> u8 {
+    match terminal.adapter {
+        TerminalLaunchAdapter::AppleTerminal => 0,
+        _ => 1,
+    }
 }
 
 fn write_temp_claude_mcp_config(
@@ -368,36 +651,163 @@ fn write_temp_file_private(path: &std::path::Path, data: &[u8], _mode: u32) -> s
     file.write_all(data)
 }
 
-fn open_new_terminal_window(script_path: &std::path::Path) -> Result<(), String> {
+fn launch_script_path_str(script_path: &Path) -> Result<&str, String> {
+    script_path
+        .to_str()
+        .ok_or_else(|| "Temporary launch script path is not UTF-8.".to_string())
+}
+
+fn terminal_applescript_do_script(script_path: &Path) -> Result<String, String> {
     let script = script_path
         .to_str()
         .ok_or_else(|| "Temporary launch script path is not UTF-8.".to_string())?;
+    let command = shell_single_quote(script);
+    Ok(format!(
+        "tell application \"Terminal\" to do script {}",
+        applescript_string(&command)
+    ))
+}
 
-    if cfg!(target_os = "macos") {
-        let command = shell_single_quote(script);
-        let script = format!(
-            "tell application \"Terminal\" to do script {}",
-            applescript_string(&command)
-        );
-        let status = Command::new("osascript")
-            .args([
-                "-e",
-                "tell application \"Terminal\" to activate",
-                "-e",
-                &script,
-            ])
-            .status()
-            .map_err(|err| format!("Failed to open Terminal.app: {err}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err("Failed to open a new Terminal.app window.".into())
-        }
+fn iterm2_applescript_create_window(script_path: &Path) -> Result<String, String> {
+    let script = launch_script_path_str(script_path)?;
+    let command = format!("/bin/bash -lc {}", shell_single_quote(script));
+    Ok(format!(
+        "tell application \"iTerm2\" to create window with default profile command {}",
+        applescript_string(&command)
+    ))
+}
+
+fn open_script_in_apple_terminal(script_path: &Path) -> Result<(), String> {
+    let script = terminal_applescript_do_script(script_path)?;
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"Terminal\" to activate",
+            "-e",
+            &script,
+        ])
+        .status()
+        .map_err(|err| format!("Failed to open Terminal.app: {err}"))?;
+    if status.success() {
+        Ok(())
     } else {
-        Err(
-            "Launching a new terminal window is currently implemented for macOS Terminal.app only."
-                .into(),
-        )
+        Err("Failed to open a new Terminal.app window.".into())
+    }
+}
+
+fn open_script_in_iterm2(script_path: &Path) -> Result<(), String> {
+    let script = iterm2_applescript_create_window(script_path)?;
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"iTerm2\" to activate",
+            "-e",
+            &script,
+        ])
+        .status()
+        .map_err(|err| format!("Failed to open iTerm2: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Failed to open a new iTerm2 window.".into())
+    }
+}
+
+fn warp_tab_config_dir(adapter: TerminalLaunchAdapter) -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "Unable to resolve home directory.".to_string())?;
+    match adapter {
+        TerminalLaunchAdapter::WarpPreview => Ok(home.join(".warp-preview/tab_configs")),
+        TerminalLaunchAdapter::WarpStable => Ok(home.join(".warp/tab_configs")),
+        _ => Err("Unsupported Warp adapter.".into()),
+    }
+}
+
+fn warp_url_scheme(adapter: TerminalLaunchAdapter) -> Result<&'static str, String> {
+    match adapter {
+        TerminalLaunchAdapter::WarpPreview => Ok("warppreview"),
+        TerminalLaunchAdapter::WarpStable => Ok("warp"),
+        _ => Err("Unsupported Warp adapter.".into()),
+    }
+}
+
+fn build_warp_tab_config(
+    name: &str,
+    script_path: &Path,
+    tab_config_path: &Path,
+    directory: &Path,
+) -> Result<String, String> {
+    let script = launch_script_path_str(script_path)?;
+    let tab_config = tab_config_path
+        .to_str()
+        .ok_or_else(|| "Temporary Warp tab config path is not UTF-8.".to_string())?;
+    let directory = directory
+        .to_str()
+        .ok_or_else(|| "Warp launch directory path is not UTF-8.".to_string())?;
+    let cleanup_command = format!("rm -f {}", shell_single_quote(tab_config));
+    let launch_command = format!("/bin/bash -lc {}", shell_single_quote(script));
+
+    Ok(format!(
+        "name = {}\ntitle = {}\ncolor = \"cyan\"\n\n[[panes]]\nid = \"main\"\ntype = \"terminal\"\ndirectory = {}\ncommands = [\n  {},\n  {},\n]\nis_focused = true\n",
+        toml_string(name),
+        toml_string("Canopy MCP"),
+        toml_string(directory),
+        toml_string(&cleanup_command),
+        toml_string(&launch_command),
+    ))
+}
+
+fn build_warp_tab_config_url(name: &str, adapter: TerminalLaunchAdapter) -> Result<String, String> {
+    Ok(format!(
+        "{}://tab_config/{name}?new_window=true",
+        warp_url_scheme(adapter)?
+    ))
+}
+
+fn write_temp_warp_tab_config(
+    script_path: &Path,
+    adapter: TerminalLaunchAdapter,
+) -> Result<(PathBuf, String), String> {
+    let dir = warp_tab_config_dir(adapter)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("Failed to create Warp tab config directory: {err}"))?;
+    let name = format!("canopy_mcp_{}", uuid::Uuid::new_v4().as_simple());
+    let path = dir.join(format!("{name}.toml"));
+    let directory = std::env::current_dir()
+        .ok()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let body = build_warp_tab_config(&name, script_path, &path, &directory)?;
+    write_temp_file_private(&path, body.as_bytes(), 0o600)
+        .map_err(|err| format!("Failed to write temporary Warp tab config: {err}"))?;
+    Ok((path, build_warp_tab_config_url(&name, adapter)?))
+}
+
+fn open_script_in_warp(script_path: &Path, adapter: TerminalLaunchAdapter) -> Result<(), String> {
+    let (_path, url) = write_temp_warp_tab_config(script_path, adapter)?;
+    let status = Command::new("open")
+        .arg(&url)
+        .status()
+        .map_err(|err| format!("Failed to open Warp tab config URL: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Failed to open Warp tab config URL.".into())
+    }
+}
+
+fn open_launch_script(script_path: &Path, terminal: &DetectedTerminalApp) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Launching a new terminal window is currently implemented for macOS only.".into(),
+        );
+    }
+
+    match terminal.adapter {
+        TerminalLaunchAdapter::AppleTerminal => open_script_in_apple_terminal(script_path),
+        TerminalLaunchAdapter::ITerm2 => open_script_in_iterm2(script_path),
+        TerminalLaunchAdapter::WarpStable | TerminalLaunchAdapter::WarpPreview => {
+            open_script_in_warp(script_path, terminal.adapter)
+        }
     }
 }
 
@@ -997,6 +1407,11 @@ impl App {
             Action::EnableMcp => {
                 self.start_mcp_runtime(terminal, true).await;
             }
+            Action::LaunchMcpAiClient => {
+                if !self.reject_direct_mcp_launch_when_stopped() {
+                    self.launch_mcp_ai_client(terminal).await;
+                }
+            }
             Action::StopMcp => {
                 self.stop_mcp_runtime();
             }
@@ -1487,6 +1902,16 @@ impl App {
         }
     }
 
+    fn reject_direct_mcp_launch_when_stopped(&mut self) -> bool {
+        if self.mcp_runtime.is_none() {
+            self.mcp
+                .set_error("MCP server is not running; press e to enable + launch first.".into());
+            true
+        } else {
+            false
+        }
+    }
+
     async fn mcp_health_check(
         &self,
         runtime: &McpRuntime,
@@ -1532,9 +1957,10 @@ impl App {
         self.resume_after_external_command(terminal);
 
         match result {
-            Ok(Some(client)) => self
-                .mcp
-                .set_status_line(format!("{client} launched in a new Terminal window.")),
+            Ok(Some(result)) => self.mcp.set_status_line(format!(
+                "{} launched in {}.",
+                result.client_label, result.terminal_label
+            )),
             Ok(None) => self
                 .mcp
                 .set_status_line("AI client launch cancelled; MCP server is running.".into()),
@@ -1547,26 +1973,40 @@ impl App {
         endpoint: &str,
         health_url: &str,
         session: &crate::mcp::McpSessionFile,
-    ) -> Result<Option<&'static str>, String> {
+    ) -> Result<Option<McpAiLaunchResult>, String> {
         println!("\nCanopy MCP server is healthy: {health_url}");
 
         let Some(client) = prompt_mcp_ai_client()? else {
             return Ok(None);
         };
+        let terminals = detect_supported_terminal_apps()?;
+        let Some(terminal) = prompt_mcp_terminal_app(&terminals)? else {
+            return Ok(None);
+        };
 
-        match client {
+        let client_label = match client {
             McpAiClient::Codex => {
-                self.run_codex_with_mcp(endpoint, &session.bearer_token)?;
-                Ok(Some("Codex CLI"))
+                self.run_codex_with_mcp(endpoint, &session.bearer_token, &terminal)?;
+                "Codex CLI"
             }
             McpAiClient::Claude => {
-                self.run_claude_with_mcp(endpoint, &session.authorization_header)?;
-                Ok(Some("Claude Code"))
+                self.run_claude_with_mcp(endpoint, &session.authorization_header, &terminal)?;
+                "Claude Code"
             }
-        }
+        };
+
+        Ok(Some(McpAiLaunchResult {
+            client_label,
+            terminal_label: terminal.display_name,
+        }))
     }
 
-    fn run_codex_with_mcp(&self, endpoint: &str, bearer_token: &str) -> Result<(), String> {
+    fn run_codex_with_mcp(
+        &self,
+        endpoint: &str,
+        bearer_token: &str,
+        terminal: &DetectedTerminalApp,
+    ) -> Result<(), String> {
         let codex_bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
         let codex_bin = resolve_command(&codex_bin)?;
 
@@ -1605,13 +2045,14 @@ exit "$rc"
             codex_bin = shell_single_quote(&codex_bin),
         );
         let script_path = write_temp_launch_script("codex-mcp", &script_body)?;
-        open_new_terminal_window(&script_path)
+        open_launch_script(&script_path, terminal)
     }
 
     fn run_claude_with_mcp(
         &self,
         endpoint: &str,
         authorization_header: &str,
+        terminal: &DetectedTerminalApp,
     ) -> Result<(), String> {
         let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
         let claude_bin = resolve_command(&claude_bin)?;
@@ -1641,7 +2082,7 @@ exit "$rc"
             config_path = shell_single_quote(config_path_str),
         );
         let script_path = write_temp_launch_script("claude-mcp", &script_body)?;
-        open_new_terminal_window(&script_path)
+        open_launch_script(&script_path, terminal)
     }
 
     // ── Async operations ────────────────────────────────
@@ -2724,7 +3165,9 @@ exit "$rc"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Component;
     use crate::event::Screen;
+    use ratatui::{buffer::Buffer, layout::Rect};
     use shared::dto::ec2::Ec2Instance;
     use shared::dto::entitlements::*;
     use std::collections::HashMap;
@@ -2798,6 +3241,261 @@ mod tests {
             security_groups: vec![],
             iam_role: None,
         }
+    }
+
+    fn detected_terminal(
+        display_name: &str,
+        bundle_id: &str,
+        adapter: TerminalLaunchAdapter,
+    ) -> DetectedTerminalApp {
+        DetectedTerminalApp {
+            display_name: display_name.into(),
+            bundle_id: bundle_id.into(),
+            app_path: PathBuf::from(format!("/Applications/{display_name}.app")),
+            adapter,
+        }
+    }
+
+    fn write_fake_app(
+        root: &Path,
+        app_name: &str,
+        bundle_id: &str,
+        display_name: &str,
+        executable_name: &str,
+    ) -> PathBuf {
+        let app_path = root.join(app_name);
+        let contents = app_path.join("Contents");
+        std::fs::create_dir_all(&contents).expect("create fake app contents");
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>{bundle_id}</string>
+  <key>CFBundleDisplayName</key>
+  <string>{display_name}</string>
+  <key>CFBundleName</key>
+  <string>{display_name}</string>
+  <key>CFBundleExecutable</key>
+  <string>{executable_name}</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .expect("write fake Info.plist");
+        app_path
+    }
+
+    fn rendered_mcp_screen(app: &mut App) -> String {
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        app.mcp.render(area, &mut buf);
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    // ── MCP launcher helpers ────────────────────────────────
+
+    #[test]
+    fn mcp_ai_client_choice_parser_accepts_aliases_and_cancel() {
+        assert_eq!(
+            parse_mcp_ai_client_choice("1").unwrap(),
+            Some(McpAiClient::Codex)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("codex").unwrap(),
+            Some(McpAiClient::Codex)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("c").unwrap(),
+            Some(McpAiClient::Codex)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("2").unwrap(),
+            Some(McpAiClient::Claude)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("claude").unwrap(),
+            Some(McpAiClient::Claude)
+        );
+        assert_eq!(parse_mcp_ai_client_choice("q").unwrap(), None);
+        assert_eq!(parse_mcp_ai_client_choice("").unwrap(), None);
+        assert!(parse_mcp_ai_client_choice("vim").is_err());
+    }
+
+    #[test]
+    fn terminal_choice_parser_accepts_index_name_bundle_id_and_cancel() {
+        let terminals = vec![
+            detected_terminal(
+                "iTerm2",
+                "com.googlecode.iterm2",
+                TerminalLaunchAdapter::ITerm2,
+            ),
+            detected_terminal(
+                "Warp",
+                "dev.warp.Warp-Stable",
+                TerminalLaunchAdapter::WarpStable,
+            ),
+        ];
+
+        assert_eq!(
+            parse_terminal_app_choice("1", &terminals)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "iTerm2"
+        );
+        assert_eq!(
+            parse_terminal_app_choice("warp", &terminals)
+                .unwrap()
+                .unwrap()
+                .bundle_id,
+            "dev.warp.Warp-Stable"
+        );
+        assert_eq!(
+            parse_terminal_app_choice("com.googlecode.iterm2", &terminals)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "iTerm2"
+        );
+        assert!(parse_terminal_app_choice("q", &terminals)
+            .unwrap()
+            .is_none());
+        assert!(parse_terminal_app_choice("", &terminals).unwrap().is_none());
+        assert!(parse_terminal_app_choice("3", &terminals).is_err());
+        assert!(parse_terminal_app_choice("Ghostty", &terminals).is_err());
+    }
+
+    #[test]
+    fn terminal_discovery_lists_detected_supported_apps_and_skips_unsupported() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        write_fake_app(
+            root.path(),
+            "Warp.app",
+            "dev.warp.Warp-Stable",
+            "Warp",
+            "warp",
+        );
+        write_fake_app(
+            root.path(),
+            "Notes.app",
+            "com.apple.Notes",
+            "Notes",
+            "Notes",
+        );
+        write_fake_app(
+            root.path(),
+            "iTerm.app",
+            "com.googlecode.iterm2",
+            "iTerm2",
+            "iTerm2",
+        );
+        write_fake_app(
+            root.path(),
+            "Terminal.app",
+            "com.apple.Terminal",
+            "Terminal",
+            "Terminal",
+        );
+
+        let dirs = vec![root.path().to_path_buf(), root.path().to_path_buf()];
+        let terminals = detect_supported_terminal_apps_in(&dirs).unwrap();
+        let names = terminals
+            .iter()
+            .map(|terminal| terminal.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Terminal", "iTerm2", "Warp"]);
+        assert_eq!(terminals.len(), 3, "duplicate scan dirs should be deduped");
+        assert!(terminals
+            .iter()
+            .all(|terminal| terminal.display_name != "Notes"));
+    }
+
+    #[test]
+    fn terminal_discovery_errors_when_no_supported_apps_exist() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        write_fake_app(
+            root.path(),
+            "Notes.app",
+            "com.apple.Notes",
+            "Notes",
+            "Notes",
+        );
+
+        let err = detect_supported_terminal_apps_in(&[root.path().to_path_buf()]).unwrap_err();
+        assert_eq!(
+            err,
+            "No supported terminal app was detected on this computer."
+        );
+    }
+
+    #[test]
+    fn terminal_launch_command_builders_escape_script_paths() {
+        let script_path = PathBuf::from("/tmp/canopy launch/it's quoted.command");
+
+        let terminal_script = terminal_applescript_do_script(&script_path).unwrap();
+        assert!(terminal_script.contains("tell application \"Terminal\" to do script"));
+        assert!(terminal_script.contains("/tmp/canopy launch/it'\\\\''s quoted.command"));
+
+        let iterm_script = iterm2_applescript_create_window(&script_path).unwrap();
+        assert!(iterm_script
+            .contains("tell application \"iTerm2\" to create window with default profile command"));
+        assert!(iterm_script.contains("/bin/bash -lc"));
+        assert!(iterm_script.contains("/tmp/canopy launch/it'\\\\''s quoted.command"));
+    }
+
+    #[test]
+    fn warp_tab_config_builder_writes_terminal_pane_commands_and_url() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let script_path = root.path().join("canopy launch.command");
+        let tab_config_path = root.path().join("canopy_mcp_test.toml");
+        let body = build_warp_tab_config(
+            "canopy_mcp_test",
+            &script_path,
+            &tab_config_path,
+            root.path(),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&body).expect("valid TOML");
+        let pane = parsed["panes"].as_array().unwrap()[0].as_table().unwrap();
+        let commands = pane["commands"].as_array().unwrap();
+
+        assert_eq!(pane["type"].as_str(), Some("terminal"));
+        assert_eq!(
+            pane["directory"].as_str(),
+            Some(root.path().to_str().unwrap())
+        );
+        assert!(commands[0].as_str().unwrap().starts_with("rm -f "));
+        assert!(commands[1].as_str().unwrap().starts_with("/bin/bash -lc "));
+        assert!(commands[1]
+            .as_str()
+            .unwrap()
+            .contains("canopy launch.command"));
+        assert_eq!(
+            build_warp_tab_config_url("canopy_mcp_test", TerminalLaunchAdapter::WarpStable)
+                .unwrap(),
+            "warp://tab_config/canopy_mcp_test?new_window=true"
+        );
+        assert_eq!(
+            build_warp_tab_config_url("canopy_mcp_test", TerminalLaunchAdapter::WarpPreview)
+                .unwrap(),
+            "warppreview://tab_config/canopy_mcp_test?new_window=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_launch_without_runtime_sets_enable_first_error() {
+        let mut app = test_app().await;
+
+        assert!(app.reject_direct_mcp_launch_when_stopped());
+        assert!(app.mcp_runtime.is_none());
+        let text = rendered_mcp_screen(&mut app);
+        assert!(text.contains("MCP server is not running"));
+        assert!(text.contains("press e to enable + launch first"));
     }
 
     // ── Navigation ──────────────────────────────────────────
