@@ -501,7 +501,7 @@ group = "platform-engineering"
 
 - OIDC 流程測試（mock HTTP server）
 - WebSocket Live Tail 連線測試
-- TUI 元件渲染快照測試
+- 更多 TUI 元件渲染快照測試（目前已涵蓋 ECS inventory table 與 ECS Exec container picker）
 - 端到端測試（mock AWS 回應）
 
 ---

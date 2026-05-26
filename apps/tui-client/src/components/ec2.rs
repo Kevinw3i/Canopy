@@ -1767,8 +1767,8 @@ impl Ec2Screen {
     fn render_container_picker(&self, area: Rect, buf: &mut Buffer, pending: &PendingEcsExec) {
         use ratatui::widgets::Clear;
 
-        let popup_height = (pending.containers.len() as u16 + 5).min(area.height.saturating_sub(4));
-        let popup_width = 56u16.min(area.width.saturating_sub(4));
+        let popup_height = (pending.containers.len() as u16 + 6).min(area.height.saturating_sub(4));
+        let popup_width = 96u16.min(area.width);
         let popup_area = Rect {
             x: area.x + (area.width.saturating_sub(popup_width)) / 2,
             y: area.y + (area.height.saturating_sub(popup_height)) / 2,
@@ -1785,7 +1785,7 @@ impl Ec2Screen {
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
-        let mut lines = Vec::with_capacity(pending.containers.len() + 3);
+        let mut lines = Vec::with_capacity(pending.containers.len() + 4);
         let task_label = pending
             .task_arn
             .rsplit('/')
@@ -2052,6 +2052,31 @@ mod tests {
             out.push_str(cell.symbol());
         }
         out
+    }
+
+    fn rendered_snapshot(screen: &mut Ec2Screen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut lines = buf
+            .content
+            .chunks(width as usize)
+            .take(height as usize)
+            .map(|row| {
+                let mut line = String::new();
+                for cell in row {
+                    line.push_str(cell.symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect::<Vec<_>>();
+
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+
+        lines.join("\n")
     }
 
     fn test_entitlements() -> UserEntitlements {
@@ -2501,6 +2526,78 @@ mod tests {
 
         assert!(text.contains("app:disabled"));
         assert!(!text.contains("app:ready"));
+    }
+
+    #[test]
+    fn ecs_inventory_render_snapshot_keeps_scan_layout() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task =
+            ecs_task_with_containers(vec![("app", "RUNNING", true), ("api", "RUNNING", false)]);
+        task.cluster_name = "prod-api".into();
+        task.family = Some("payments".into());
+        task.task_id = Some("task-abcdef123456".into());
+        task.launch_type = "FARGATE".into();
+        screen.set_tasks(vec![task]);
+
+        let snapshot = rendered_snapshot(&mut screen, 140, 18);
+
+        let expected = r#"┌ ECS Inventory ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ Search (cluster, family, task, container) ─────────────────────────────────────────────────────────────────────────────────────────────┐│
+││                                                                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ Account: All │ Region: All                                                                                                               │
+│┌ ECS Tasks ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+││  Cluster              Family              Task ID            Launch   Status     Containers               Account        Region        ││
+││> prod-api             payments            task-abcdef123456  FARGATE  RUNNING    app:ready,api:no-agent   111            us-east-1     ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│1 tasks | Ctrl+E: EC2 | /: search | r: refresh | Enter: containers | Esc: back                                                            │
+│                                                                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"#;
+        assert_eq!(snapshot, expected);
+    }
+
+    #[test]
+    fn ecs_container_picker_render_snapshot_keeps_exec_context() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task =
+            ecs_task_with_containers(vec![("app", "RUNNING", true), ("worker", "RUNNING", true)]);
+        task.task_arn = "arn:aws:ecs:us-east-1:111:task/app/task-abcdef123456".into();
+        screen.set_tasks(vec![task]);
+
+        assert!(matches!(screen.start_ecs_exec(), Action::Noop));
+        let snapshot = rendered_snapshot(&mut screen, 92, 20);
+
+        let expected = r#"┌ ECS Inventory ───────────────────────────────────────────────────────────────────────────┐
+│┌ Search (cluster, family, task, container) ─────────────────────────────────────────────┐│
+││                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────┘│
+│ Account: All │ Region: All                                                               │
+│┌ ECS Tasks ─────────────────────────────────────────────────────────────────────────────┐│
+│┌ ECS Exec — Select Container ───────────────────────────────────────────────────────────┐│
+││Task: task-abcdef123456                                                                 ││
+││                                                                                        ││
+││>> app                                                                                  ││
+││   worker                                                                               ││
+││                                                                                        ││
+││j/k: select | Enter: exec | Esc: cancel                                                 ││
+│└────────────────────────────────────────────────────────────────────────────────────────┘│
+││                                                                                        ││
+││                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────┘│
+│1 tasks | Ctrl+E: EC2 | /: search | r: refresh | Enter: containers | Esc: back            │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘"#;
+        assert_eq!(snapshot, expected);
     }
 
     #[test]
