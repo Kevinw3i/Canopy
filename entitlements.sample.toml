@@ -52,6 +52,10 @@ can_use_ec2_instance_connect = true
 # 有 TUI CloudWatch 權限就自動開 MCP CloudWatch。
 can_use_mcp = true
 can_use_mcp_cloudwatch = false
+# Raw MCP CloudWatch filter/query audit values are encrypted by default.
+# Set this true only on a rule whose allowed_accounts / allowed_regions /
+# allowed_log_group_arns also authorize the exact same CloudWatch scope.
+can_view_mcp_raw_audit_plaintext = false
 can_use_mcp_ec2 = false
 # MCP Database v1 是獨立權限。開啟後仍需要下方
 # [[rules.database_scopes]] 授權具體 connection / schema / table。
@@ -206,6 +210,7 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # can_use_ec2_instance_connect = false
 # can_use_mcp = false
 # can_use_mcp_cloudwatch = false
+# can_view_mcp_raw_audit_plaintext = false
 # can_use_mcp_ec2 = false
 # can_use_mcp_database = false
 #

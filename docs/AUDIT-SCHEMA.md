@@ -172,9 +172,19 @@ MCP CloudWatch data metadata can include:
 - `tool_name`: `canopy_preflight_request`, `canopy_search_logs`, or
   `canopy_run_insights_query`.
 - `log_group_name` / `log_group_names`
-- `filter_pattern_raw` / `query_string_raw`: present only after the relevant
-  guidance and preflight gates pass; denial paths redact raw input as
-  `[redacted: denial path]`.
+- `filter_pattern_raw` / `query_string_raw`: denial paths redact raw input as
+  `[redacted: denial path]`. After the relevant guidance, preflight, and
+  scope-entitlement gates pass, raw values are encrypted by default and these
+  plaintext fields contain `[encrypted: see *_raw_encrypted]`.
+- `filter_pattern_raw_encrypted` / `query_string_raw_encrypted`: sealed raw
+  filter/query values for successful MCP CloudWatch data lifecycle events.
+- `raw_audit_storage`: `encrypted_default` unless the same entitlement rule that
+  authorizes the CloudWatch account/region/log groups also sets
+  `can_view_mcp_raw_audit_plaintext = true`; then it is
+  `plaintext_restricted`.
+- `raw_plaintext_allowed`: boolean reviewer signal for whether the raw
+  plaintext value was intentionally written under the same scoped entitlement
+  rule.
 - `has_preflight_token`, `has_search_cursor`, `has_query_token`
 - `aws_execution_planned` / `aws_execution_attempted`
 - `returned_count`, `row_count`, `status`, `truncated`, `cursor_issued`

@@ -2357,7 +2357,7 @@ async fn mcp_cloudwatch_search_uses_preflight_then_cursor_and_audits() {
         "account_id": "111111111111",
         "region": "us-east-1",
         "log_group_name": "/app/web-service",
-        "filter_pattern": "INFO",
+        "filter_pattern": "SEARCH_RAW_SECRET_SHOULD_NOT_APPEAR",
         "start_time": 1000,
         "end_time": 2000,
         "limit": 2
@@ -2429,6 +2429,14 @@ async fn mcp_cloudwatch_search_uses_preflight_then_cursor_and_audits() {
         })
         .count();
     assert_eq!(search_successes, 2);
+    let audit_json = serde_json::to_string(&lines).unwrap();
+    assert!(
+        !audit_json.contains("SEARCH_RAW_SECRET_SHOULD_NOT_APPEAR"),
+        "successful search audit must encrypt raw filter input by default: {audit_json}"
+    );
+    assert!(audit_json.contains("filter_pattern_raw_encrypted"));
+    assert!(audit_json.contains("encrypted_default"));
+    assert!(audit_json.contains("[encrypted: see *_raw_encrypted]"));
     assert!(!serde_json::to_string(&search_json)
         .unwrap()
         .contains("aws_next_token"));
@@ -2505,7 +2513,7 @@ async fn mcp_cloudwatch_insights_starts_then_polls_with_query_token() {
         "account_id": "111111111111",
         "region": "us-east-1",
         "log_group_names": ["/app/web-service"],
-        "query_string": "fields @timestamp, @message | limit 2",
+        "query_string": "fields @timestamp, @message | filter @message like /INSIGHTS_RAW_SECRET_SHOULD_NOT_APPEAR/ | limit 2",
         "start_time": 1000,
         "end_time": 2000
     });
@@ -2567,6 +2575,16 @@ async fn mcp_cloudwatch_insights_starts_then_polls_with_query_token() {
     assert_eq!(polled_json["terminal"], true);
     assert!(polled_json["query_token"].is_null());
     assert_eq!(polled_json["results"].as_array().unwrap().len(), 2);
+
+    let events = read_audit_events(&audit.path);
+    let audit_json = serde_json::to_string(&events).unwrap();
+    assert!(
+        !audit_json.contains("INSIGHTS_RAW_SECRET_SHOULD_NOT_APPEAR"),
+        "successful Insights audit must encrypt raw query input by default: {audit_json}"
+    );
+    assert!(audit_json.contains("query_string_raw_encrypted"));
+    assert!(audit_json.contains("encrypted_default"));
+    assert!(audit_json.contains("[encrypted: see *_raw_encrypted]"));
 }
 
 #[tokio::test]
@@ -2617,6 +2635,100 @@ async fn mcp_cloudwatch_preflight_denial_redacts_raw_inputs() {
         "denial audit must redact raw filter/query input: {audit_json}"
     );
     assert!(audit_json.contains("[redacted: denial path]"));
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_success_raw_audit_plaintext_requires_entitlement_flag() {
+    let audit = AuditFile::new("mcp-cloudwatch-raw-plaintext-allowed");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    {
+        let mut store = state.entitlement_store.write().await;
+        for rule in &mut store.rules {
+            if rule.id == "rule-platform-eng" {
+                rule.features.can_view_mcp_raw_audit_plaintext = true;
+            }
+        }
+    }
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let preflight_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "VISIBLE_FILTER_FOR_RAW_AUDIT",
+        "start_time": 1000,
+        "end_time": 2000,
+        "limit": 2
+    });
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(preflight_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    let preflight_json = body_json(preflight.into_body()).await;
+    let preflight_token = preflight_json["preflight_token"].as_str().unwrap();
+
+    let search_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "preflight_token": preflight_token
+    });
+    let search = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/search")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(search_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search.status(), StatusCode::OK);
+
+    let events = read_audit_events(&audit.path);
+    let audit_json = serde_json::to_string(&events).unwrap();
+    assert!(audit_json.contains("VISIBLE_FILTER_FOR_RAW_AUDIT"));
+    let raw_event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "mcp_cloudwatch_preflight"
+                && event["metadata"]["mcp_outcome_kind"] == "success"
+        })
+        .expect("preflight success raw audit event");
+    assert_eq!(
+        raw_event["metadata"]["raw_audit_storage"],
+        "plaintext_restricted"
+    );
+    assert_eq!(raw_event["metadata"]["raw_plaintext_allowed"], true);
+    assert_eq!(
+        raw_event["metadata"]["filter_pattern_raw"],
+        "VISIBLE_FILTER_FOR_RAW_AUDIT"
+    );
+    assert!(raw_event["metadata"]["filter_pattern_raw_encrypted"]
+        .as_str()
+        .is_some_and(|value| value.len() > 32));
 }
 
 #[tokio::test]

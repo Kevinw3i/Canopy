@@ -72,6 +72,7 @@ const CLOUDWATCH_INSIGHTS_REQUIRED_GUIDANCE: &[&str] = &[
 const CLOUDWATCH_PREFLIGHT_TOKEN_AAD: &[u8] = b"canopy:mcp:cloudwatch:preflight:v1";
 const CLOUDWATCH_SEARCH_CURSOR_AAD: &[u8] = b"canopy:mcp:cloudwatch:search-cursor:v1";
 const CLOUDWATCH_INSIGHTS_QUERY_TOKEN_AAD: &[u8] = b"canopy:mcp:cloudwatch:insights-query-token:v1";
+const CLOUDWATCH_RAW_AUDIT_AAD: &[u8] = b"canopy:mcp:cloudwatch:raw-audit:v1";
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -833,6 +834,38 @@ async fn preflight_cloudwatch_data(
             ));
         }
     };
+    let raw_plaintext_allowed = ent_service
+        .mcp_cloudwatch_raw_audit_plaintext_allowed(
+            &claims,
+            &req.account_id,
+            &req.region,
+            &log_group_names,
+        )
+        .await;
+    let filter_pattern_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        &state,
+        &claims.sub,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        req.tool_name.as_str(),
+        &req.account_id,
+        &req.region,
+        &log_group_names,
+        "filter_pattern",
+        req.filter_pattern.as_deref(),
+    )?;
+    let query_string_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        &state,
+        &claims.sub,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        req.tool_name.as_str(),
+        &req.account_id,
+        &req.region,
+        &log_group_names,
+        "query_string",
+        req.query_string.as_deref(),
+    )?;
 
     let expires_at = Utc::now() + Duration::seconds(guardrails.preflight_token_ttl_seconds as i64);
     let payload = CloudwatchPreflightTokenPayload {
@@ -886,8 +919,12 @@ async fn preflight_cloudwatch_data(
             "start_time": req.start_time,
             "end_time": req.end_time,
             "limit": req.limit,
-            "filter_pattern_raw": req.filter_pattern.as_deref(),
-            "query_string_raw": req.query_string.as_deref(),
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "filter_pattern_raw": cloudwatch_raw_plaintext_value(req.filter_pattern.as_deref(), raw_plaintext_allowed),
+            "filter_pattern_raw_encrypted": filter_pattern_raw_encrypted,
+            "query_string_raw": cloudwatch_raw_plaintext_value(req.query_string.as_deref(), raw_plaintext_allowed),
+            "query_string_raw_encrypted": query_string_raw_encrypted,
             "aws_execution_attempted": false,
             "preflight_token_issued": true,
         })))
@@ -1015,7 +1052,24 @@ async fn search_logs(
         ));
     }
 
-    audit_cloudwatch_search_attempt(&state, &claims.sub, &audit_ctx, &req, &context)?;
+    let search_log_group_names = vec![context.log_group_name.clone()];
+    let raw_plaintext_allowed = ent_service
+        .mcp_cloudwatch_raw_audit_plaintext_allowed(
+            &claims,
+            &context.account_id,
+            &context.region,
+            &search_log_group_names,
+        )
+        .await;
+
+    audit_cloudwatch_search_attempt(
+        &state,
+        &claims.sub,
+        &audit_ctx,
+        &req,
+        &context,
+        raw_plaintext_allowed,
+    )?;
 
     let search_result = if state.config.use_mock_aws() {
         execute_mock_search(&context, &guardrails)
@@ -1029,6 +1083,7 @@ async fn search_logs(
                     &audit_ctx,
                     &req,
                     &context,
+                    raw_plaintext_allowed,
                     "aws_filter_log_events_failed",
                     "AWS FilterLogEvents failed",
                 );
@@ -1054,6 +1109,18 @@ async fn search_logs(
     } else {
         None
     };
+    let filter_pattern_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        &state,
+        &claims.sub,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_SEARCH_TOOL,
+        &context.account_id,
+        &context.region,
+        &search_log_group_names,
+        "filter_pattern",
+        context.filter_pattern.as_deref(),
+    )?;
 
     state
         .audit_service
@@ -1077,7 +1144,10 @@ async fn search_logs(
             "start_time": context.start_time,
             "end_time": context.end_time,
             "limit": context.limit,
-            "filter_pattern_raw": context.filter_pattern.as_deref(),
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "filter_pattern_raw": cloudwatch_raw_plaintext_value(context.filter_pattern.as_deref(), raw_plaintext_allowed),
+            "filter_pattern_raw_encrypted": filter_pattern_raw_encrypted,
             "aws_execution_attempted": !state.config.use_mock_aws(),
             "returned_count": search_result.events.len(),
             "truncated": search_result.truncated,
@@ -2012,6 +2082,64 @@ struct InsightsQueryTokenPayload {
     expires_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize)]
+struct CloudwatchRawAuditPayload<'a> {
+    version: u8,
+    actor: &'a str,
+    canopy_mcp_session_id: Option<&'a str>,
+    local_secret_generation: Option<&'a str>,
+    tool_name: &'a str,
+    account_id: &'a str,
+    region: &'a str,
+    log_group_names: &'a [String],
+    field: &'a str,
+    value: &'a str,
+    created_at: chrono::DateTime<Utc>,
+}
+
+trait CloudwatchInsightsAuditPayload {
+    fn audit_account_id(&self) -> &str;
+    fn audit_region(&self) -> &str;
+    fn audit_log_group_names(&self) -> &[String];
+    fn audit_query_string(&self) -> Option<&str>;
+}
+
+impl CloudwatchInsightsAuditPayload for CloudwatchPreflightTokenPayload {
+    fn audit_account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    fn audit_region(&self) -> &str {
+        &self.region
+    }
+
+    fn audit_log_group_names(&self) -> &[String] {
+        &self.log_group_names
+    }
+
+    fn audit_query_string(&self) -> Option<&str> {
+        self.query_string.as_deref()
+    }
+}
+
+impl CloudwatchInsightsAuditPayload for InsightsQueryTokenPayload {
+    fn audit_account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    fn audit_region(&self) -> &str {
+        &self.region
+    }
+
+    fn audit_log_group_names(&self) -> &[String] {
+        &self.log_group_names
+    }
+
+    fn audit_query_string(&self) -> Option<&str> {
+        Some(self.query_string.as_str())
+    }
+}
+
 fn cloudwatch_required_guidance_for_tool(tool_name: &str) -> Option<&'static [&'static str]> {
     match tool_name {
         CLOUDWATCH_SEARCH_TOOL => Some(CLOUDWATCH_SEARCH_REQUIRED_GUIDANCE),
@@ -2221,6 +2349,55 @@ fn decode_cloudwatch_token<T: DeserializeOwned>(
         )
         .map_err(|_| "cloudwatch_token_auth_failed")?;
     serde_json::from_slice(&plaintext).map_err(|_| "cloudwatch_token_decode_failed")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encrypted_cloudwatch_raw_audit_value(
+    state: &AppState,
+    actor: &str,
+    session_id: Option<&str>,
+    local_secret_generation: Option<&str>,
+    tool_name: &str,
+    account_id: &str,
+    region: &str,
+    log_group_names: &[String],
+    field: &str,
+    raw: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, Json<ApiError>)> {
+    let Some(value) = raw else {
+        return Ok(serde_json::Value::Null);
+    };
+    let payload = CloudwatchRawAuditPayload {
+        version: 1,
+        actor,
+        canopy_mcp_session_id: session_id,
+        local_secret_generation,
+        tool_name,
+        account_id,
+        region,
+        log_group_names,
+        field,
+        value,
+        created_at: Utc::now(),
+    };
+    encode_cloudwatch_token(state, &payload, CLOUDWATCH_RAW_AUDIT_AAD)
+        .map(serde_json::Value::String)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::internal(
+                    "Failed to encrypt MCP CloudWatch raw audit value",
+                )),
+            )
+        })
+}
+
+fn cloudwatch_raw_plaintext_value(raw: Option<&str>, plaintext_allowed: bool) -> serde_json::Value {
+    match (raw, plaintext_allowed) {
+        (Some(value), true) => serde_json::Value::String(value.to_string()),
+        (Some(_), false) => serde_json::Value::String("[encrypted: see *_raw_encrypted]".into()),
+        (None, _) => serde_json::Value::Null,
+    }
 }
 
 fn validate_preflight_payload(
@@ -2711,7 +2888,24 @@ async fn start_mcp_insights_query(
         ));
     }
 
-    audit_cloudwatch_insights_attempt(state, &claims.sub, audit_ctx, req, &payload, "start")?;
+    let raw_plaintext_allowed = ent_service
+        .mcp_cloudwatch_raw_audit_plaintext_allowed(
+            claims,
+            &payload.account_id,
+            &payload.region,
+            &payload.log_group_names,
+        )
+        .await;
+
+    audit_cloudwatch_insights_attempt(
+        state,
+        &claims.sub,
+        audit_ctx,
+        req,
+        &payload,
+        raw_plaintext_allowed,
+        "start",
+    )?;
 
     let query_string = payload.query_string.clone().unwrap_or_default();
     let aws_query_id = if state.config.use_mock_aws() {
@@ -2743,6 +2937,7 @@ async fn start_mcp_insights_query(
                     audit_ctx,
                     req,
                     Some(&payload),
+                    raw_plaintext_allowed,
                     "aws_start_query_failed",
                     "AWS StartQuery failed",
                 );
@@ -2759,6 +2954,7 @@ async fn start_mcp_insights_query(
                     audit_ctx,
                     req,
                     Some(&payload),
+                    raw_plaintext_allowed,
                     "aws_start_query_missing_query_id",
                     "AWS StartQuery returned no query_id",
                 );
@@ -2809,6 +3005,7 @@ async fn start_mcp_insights_query(
         0,
         false,
         !state.config.use_mock_aws(),
+        raw_plaintext_allowed,
     )?;
 
     Ok(Json(McpRunInsightsQueryResponse {
@@ -2924,7 +3121,24 @@ async fn poll_mcp_insights_query(
         ));
     }
 
-    audit_cloudwatch_insights_attempt(state, &claims.sub, audit_ctx, req, &payload, "poll")?;
+    let raw_plaintext_allowed = ent_service
+        .mcp_cloudwatch_raw_audit_plaintext_allowed(
+            claims,
+            &payload.account_id,
+            &payload.region,
+            &payload.log_group_names,
+        )
+        .await;
+
+    audit_cloudwatch_insights_attempt(
+        state,
+        &claims.sub,
+        audit_ctx,
+        req,
+        &payload,
+        raw_plaintext_allowed,
+        "poll",
+    )?;
 
     let (status, raw_results, statistics) = if state.config.use_mock_aws() {
         (
@@ -2957,6 +3171,7 @@ async fn poll_mcp_insights_query(
                     audit_ctx,
                     req,
                     None,
+                    false,
                     "aws_get_query_results_failed",
                     "AWS GetQueryResults failed",
                 );
@@ -3004,6 +3219,7 @@ async fn poll_mcp_insights_query(
         results.len(),
         results_truncated,
         !state.config.use_mock_aws(),
+        raw_plaintext_allowed,
     )?;
 
     let next_action_hint = if !terminal {
@@ -3159,7 +3375,21 @@ fn audit_cloudwatch_search_attempt(
     audit_ctx: &AuditRequestContext,
     req: &McpSearchLogsRequest,
     context: &CloudwatchSearchContext,
+    raw_plaintext_allowed: bool,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let log_group_names = vec![context.log_group_name.clone()];
+    let filter_pattern_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        state,
+        actor,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_SEARCH_TOOL,
+        &context.account_id,
+        &context.region,
+        &log_group_names,
+        "filter_pattern",
+        context.filter_pattern.as_deref(),
+    )?;
     state
         .audit_service
         .event(
@@ -3182,7 +3412,10 @@ fn audit_cloudwatch_search_attempt(
             "start_time": context.start_time,
             "end_time": context.end_time,
             "limit": context.limit,
-            "filter_pattern_raw": context.filter_pattern.as_deref(),
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "filter_pattern_raw": cloudwatch_raw_plaintext_value(context.filter_pattern.as_deref(), raw_plaintext_allowed),
+            "filter_pattern_raw_encrypted": filter_pattern_raw_encrypted,
             "aws_execution_attempted": false,
             "aws_execution_planned": true,
         })))
@@ -3190,15 +3423,30 @@ fn audit_cloudwatch_search_attempt(
         .map_err(|_| cloudwatch_data_audit_failure_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_cloudwatch_search_failure(
     state: &AppState,
     actor: &str,
     audit_ctx: &AuditRequestContext,
     req: &McpSearchLogsRequest,
     context: &CloudwatchSearchContext,
+    raw_plaintext_allowed: bool,
     reason: &str,
     message: &str,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let log_group_names = vec![context.log_group_name.clone()];
+    let filter_pattern_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        state,
+        actor,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_SEARCH_TOOL,
+        &context.account_id,
+        &context.region,
+        &log_group_names,
+        "filter_pattern",
+        context.filter_pattern.as_deref(),
+    )?;
     state
         .audit_service
         .event(
@@ -3219,7 +3467,10 @@ fn audit_cloudwatch_search_failure(
             "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
             "local_secret_generation": req.local_secret_generation.as_deref(),
             "log_group_name": context.log_group_name.as_str(),
-            "filter_pattern_raw": context.filter_pattern.as_deref(),
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "filter_pattern_raw": cloudwatch_raw_plaintext_value(context.filter_pattern.as_deref(), raw_plaintext_allowed),
+            "filter_pattern_raw_encrypted": filter_pattern_raw_encrypted,
             "aws_execution_attempted": true,
             "rejection_reason": reason,
         })))
@@ -3269,15 +3520,28 @@ fn audit_cloudwatch_insights_denied(
         .map_err(|_| cloudwatch_data_audit_failure_response())
 }
 
-fn audit_cloudwatch_insights_attempt<T: Serialize>(
+fn audit_cloudwatch_insights_attempt<T: CloudwatchInsightsAuditPayload>(
     state: &AppState,
     actor: &str,
     audit_ctx: &AuditRequestContext,
     req: &McpRunInsightsQueryRequest,
     payload: &T,
+    raw_plaintext_allowed: bool,
     phase: &str,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
-    let metadata_payload = serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({}));
+    let target = payload.audit_log_group_names().join(",");
+    let query_string_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        state,
+        actor,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_INSIGHTS_TOOL,
+        payload.audit_account_id(),
+        payload.audit_region(),
+        payload.audit_log_group_names(),
+        "query_string",
+        payload.audit_query_string(),
+    )?;
     state
         .audit_service
         .event(
@@ -3285,6 +3549,9 @@ fn audit_cloudwatch_insights_attempt<T: Serialize>(
             AuditAction::McpCloudwatchInsights,
             AuditOutcome::Success,
         )
+        .account(Some(payload.audit_account_id()))
+        .region(Some(payload.audit_region()))
+        .target(Some(&target))
         .metadata(audit_ctx.metadata(serde_json::json!({
             "client_type": "mcp",
             "surface": "mcp",
@@ -3294,10 +3561,13 @@ fn audit_cloudwatch_insights_attempt<T: Serialize>(
             "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
             "local_secret_generation": req.local_secret_generation.as_deref(),
             "phase": phase,
-            "account_id": metadata_payload.get("account_id"),
-            "region": metadata_payload.get("region"),
-            "log_group_names": metadata_payload.get("log_group_names"),
-            "query_string_raw": metadata_payload.get("query_string"),
+            "account_id": payload.audit_account_id(),
+            "region": payload.audit_region(),
+            "log_group_names": payload.audit_log_group_names(),
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "query_string_raw": cloudwatch_raw_plaintext_value(payload.audit_query_string(), raw_plaintext_allowed),
+            "query_string_raw_encrypted": query_string_raw_encrypted,
             "aws_execution_attempted": false,
             "aws_execution_planned": true,
         })))
@@ -3305,15 +3575,37 @@ fn audit_cloudwatch_insights_attempt<T: Serialize>(
         .map_err(|_| cloudwatch_data_audit_failure_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_cloudwatch_insights_failure(
     state: &AppState,
     actor: &str,
     audit_ctx: &AuditRequestContext,
     req: &McpRunInsightsQueryRequest,
     preflight: Option<&CloudwatchPreflightTokenPayload>,
+    raw_plaintext_allowed: bool,
     reason: &str,
     message: &str,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let log_group_names = preflight
+        .map(|p| p.log_group_names.as_slice())
+        .unwrap_or(&[]);
+    let query_string = preflight.and_then(|p| p.query_string.as_deref());
+    let query_string_raw_encrypted = if let Some(preflight) = preflight {
+        encrypted_cloudwatch_raw_audit_value(
+            state,
+            actor,
+            req.canopy_mcp_session_id.as_deref(),
+            req.local_secret_generation.as_deref(),
+            CLOUDWATCH_INSIGHTS_TOOL,
+            &preflight.account_id,
+            &preflight.region,
+            &preflight.log_group_names,
+            "query_string",
+            query_string,
+        )?
+    } else {
+        serde_json::Value::Null
+    };
     state
         .audit_service
         .event(
@@ -3334,8 +3626,11 @@ fn audit_cloudwatch_insights_failure(
             "local_secret_generation": req.local_secret_generation.as_deref(),
             "account_id": preflight.map(|p| p.account_id.as_str()),
             "region": preflight.map(|p| p.region.as_str()),
-            "log_group_names": preflight.map(|p| p.log_group_names.as_slice()),
-            "query_string_raw": preflight.and_then(|p| p.query_string.as_deref()),
+            "log_group_names": log_group_names,
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "query_string_raw": cloudwatch_raw_plaintext_value(query_string, raw_plaintext_allowed),
+            "query_string_raw_encrypted": query_string_raw_encrypted,
             "aws_execution_attempted": true,
             "rejection_reason": reason,
         })))
@@ -3355,7 +3650,20 @@ fn audit_cloudwatch_insights_success(
     row_count: usize,
     results_truncated: bool,
     aws_execution_attempted: bool,
+    raw_plaintext_allowed: bool,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let query_string_raw_encrypted = encrypted_cloudwatch_raw_audit_value(
+        state,
+        actor,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_INSIGHTS_TOOL,
+        &payload.account_id,
+        &payload.region,
+        &payload.log_group_names,
+        "query_string",
+        Some(payload.query_string.as_str()),
+    )?;
     state
         .audit_service
         .event(
@@ -3375,7 +3683,10 @@ fn audit_cloudwatch_insights_success(
             "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
             "local_secret_generation": req.local_secret_generation.as_deref(),
             "log_group_names": payload.log_group_names,
-            "query_string_raw": payload.query_string,
+            "raw_audit_storage": if raw_plaintext_allowed { "plaintext_restricted" } else { "encrypted_default" },
+            "raw_plaintext_allowed": raw_plaintext_allowed,
+            "query_string_raw": cloudwatch_raw_plaintext_value(Some(payload.query_string.as_str()), raw_plaintext_allowed),
+            "query_string_raw_encrypted": query_string_raw_encrypted,
             "status": status,
             "row_count": row_count,
             "results_truncated": results_truncated,
