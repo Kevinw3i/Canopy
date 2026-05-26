@@ -174,7 +174,9 @@ AWS account `<AWS_ACCOUNT_ID>` 需要有一個給 GitHub Actions 使用的 IAM r
 }
 ```
 
-該 role 需要最小 ECR push 權限：
+該 role 需要最小 ECR push 權限。`<aws_region>` 和 `<project>` 必須和
+`infra/terraform.tfvars` 內的 `aws_region` / `project` 一致，因為 workflow
+會用同一份 tfvars 決定推送目標：
 
 ```json
 {
@@ -198,7 +200,7 @@ AWS account `<AWS_ACCOUNT_ID>` 需要有一個給 GitHub Actions 使用的 IAM r
         "ecr:PutImage",
         "ecr:UploadLayerPart"
       ],
-      "Resource": "arn:aws:ecr:ap-northeast-1:<AWS_ACCOUNT_ID>:repository/canopy/control-plane"
+      "Resource": "arn:aws:ecr:<aws_region>:<AWS_ACCOUNT_ID>:repository/<project>/control-plane"
     }
   ]
 }
@@ -246,9 +248,8 @@ ECR repository 是 immutable，同一個 tag 不能重複推送，且不可使�
 Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先以
 `scripts/validate-terraform-tfvars.sh infra -var="create_service=true" -var="image_tag=<release-tag>"`
 驗證 Phase 2 部署 preconditions，再驗證 entitlements，最後推送到
-`aws_region` 的 `<project>/control-plane`。如果 `project` 不是 `canopy` 或
-`aws_region` 不是預設區域，請同步調整 GitHub Actions ECR push role 的
-repository ARN 與允許區域。
+`aws_region` 的 `<project>/control-plane`。請確認 GitHub Actions ECR push role
+的 repository ARN 與允許區域也使用同一組 `aws_region` / `project`。
 
 ### 部署到 ECS
 
