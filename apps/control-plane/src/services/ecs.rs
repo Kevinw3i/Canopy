@@ -266,7 +266,8 @@ pub fn build_ecs_exec_command(
     {
         return Err("Account not authorized".into());
     }
-    if !entitlements.allowed_regions.is_empty()
+    if rule_scopes.is_empty()
+        && !entitlements.allowed_regions.is_empty()
         && !entitlements.allowed_regions.contains(&req.region)
     {
         return Err(format!("Region '{}' not authorized", req.region));
@@ -629,6 +630,45 @@ mod tests {
 
         let resp = build_ecs_exec_command(&req, &ent, &task, None, &[scope]).unwrap();
         assert_eq!(resp.env_vars["AWS_DEFAULT_REGION"], task.region);
+    }
+
+    #[test]
+    fn build_ecs_exec_command_prefers_rule_scope_over_merged_regions() {
+        let task = mock_tasks().remove(0);
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "app".into(),
+        };
+        let mut ent = entitlements();
+        ent.allowed_regions = vec!["ap-northeast-1".into()];
+        let mut scope = rule_scope();
+        scope.regions.clear();
+        scope.cluster_patterns = vec![cluster_arn("*", "111111111111", DEV_MOCK_CLUSTER_NAME)];
+
+        let resp = build_ecs_exec_command(&req, &ent, &task, None, &[scope]).unwrap();
+
+        assert_eq!(resp.env_vars["AWS_DEFAULT_REGION"], task.region);
+    }
+
+    #[test]
+    fn build_ecs_exec_command_legacy_path_still_checks_merged_regions() {
+        let task = mock_tasks().remove(0);
+        let req = EcsExecRequest {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            container_name: "app".into(),
+        };
+        let mut ent = entitlements();
+        ent.allowed_regions = vec!["ap-northeast-1".into()];
+
+        let err = build_ecs_exec_command(&req, &ent, &task, None, &[]).unwrap_err();
+
+        assert!(err.contains("Region 'us-east-1' not authorized"));
     }
 
     #[test]
