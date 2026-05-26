@@ -519,11 +519,13 @@ group = "platform-engineering"
 
 1. 建立 OIDC client 與 Secrets Manager secret（JWT secret，必要時也包含 OIDC client secret）
 2. 填寫 `infra/terraform.tfvars`（VPC/subnet/ACM、OIDC、secret ARN/version、AWS region、CPU architecture）
-3. 建立 `entitlements.toml`（權限規則），並執行 `scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars`
-4. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
-5. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
-6. 分發 `dist/` 資料夾給維運人員
-7. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔、AWS CLI、SSM Plugin）
+3. 建立 `entitlements.toml`（權限規則）
+4. 執行 `scripts/validate-terraform-tfvars.sh infra` 驗證 ALB/DNS/subnet/service preconditions
+5. 執行 `scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars` 驗證權限規則與 Terraform 變數一致
+6. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
+7. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
+8. 分發 `dist/` 資料夾給維運人員
+9. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔、AWS CLI、SSM Plugin）
 
 ECS 部署不需要 commit 或掛載生產 `config.toml`。Terraform task definition
 會設定 `GENERATE_CONFIG=1`，container entrypoint 會從環境變數與
