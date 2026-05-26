@@ -11,7 +11,6 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  ECR_REPOSITORY: canopy/control-plane
 
 jobs:
   build-and-push:
@@ -88,13 +87,14 @@ jobs:
           printf '%s' "${TERRAFORM_TFVARS_B64}" | base64 -d > infra/terraform.tfvars
           ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
-      - name: Resolve Docker platform
+      - name: Resolve Terraform deployment settings
         id: platform
         shell: bash
         run: |
           set -euo pipefail
 
           cpu_architecture=""
+          project=""
           if [ -f infra/terraform.tfvars ]; then
             cpu_architecture="$(
               awk -F= '
@@ -108,10 +108,23 @@ jobs:
                 }
               ' infra/terraform.tfvars
             )"
+            project="$(
+              awk -F= '
+                /^[[:space:]]*#/ { next }
+                /^[[:space:]]*project[[:space:]]*=/ {
+                  value = $2
+                  sub(/#.*/, "", value)
+                  gsub(/[[:space:]"]/, "", value)
+                  print value
+                  exit
+                }
+              ' infra/terraform.tfvars
+            )"
           else
-            echo "::warning::infra/terraform.tfvars was not provided; defaulting Docker platform to X86_64 / linux/amd64"
+            echo "::warning::infra/terraform.tfvars was not provided; defaulting Docker platform to X86_64 / linux/amd64 and ECR repository to canopy/control-plane"
           fi
           cpu_architecture="${cpu_architecture:-X86_64}"
+          project="${project:-canopy}"
 
           case "$cpu_architecture" in
             X86_64) platform="linux/amd64" ;;
@@ -124,6 +137,8 @@ jobs:
 
           echo "cpu_architecture=$cpu_architecture" >> "$GITHUB_OUTPUT"
           echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "ecr_repository=$project/control-plane" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -142,7 +157,7 @@ jobs:
 
           set +e
           output=$(aws ecr describe-images \
-            --repository-name "${ECR_REPOSITORY}" \
+            --repository-name "${{ steps.platform.outputs.ecr_repository }}" \
             --image-ids "imageTag=${{ steps.meta.outputs.image_tag }}" \
             --region "${AWS_REGION}" 2>&1)
           status=$?
@@ -173,14 +188,14 @@ jobs:
           secret-files: |
             entitlements_toml=entitlements.toml
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ steps.platform.outputs.ecr_repository }}:${{ steps.meta.outputs.image_tag }}
 
       - name: Write deployment summary
         shell: bash
         run: |
           set -euo pipefail
 
-          image_uri="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${{ steps.meta.outputs.image_tag }}"
+          image_uri="${{ steps.ecr.outputs.registry }}/${{ steps.platform.outputs.ecr_repository }}:${{ steps.meta.outputs.image_tag }}"
 
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## Control-plane image pushed
@@ -192,6 +207,8 @@ jobs:
           \`\`\`
 
           Platform: \`${{ steps.platform.outputs.platform }}\` (${{ steps.platform.outputs.cpu_architecture }})
+
+          Terraform project: \`${{ steps.platform.outputs.project }}\`
 
           Next manual Terraform step:
 

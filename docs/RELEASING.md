@@ -210,7 +210,7 @@ GitHub repo secrets：
 |--------|------|
 | `AWS_GHA_ECR_PUSH_ROLE_ARN` | GitHub Actions 要 assume 的 AWS role ARN |
 | `CONTROL_PLANE_ENTITLEMENTS_TOML_B64` | `entitlements.toml` 的 base64 內容，build image 時寫回檔案 |
-| `CONTROL_PLANE_TFVARS_B64` | 可選，`infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 entitlements，並依 `cpu_architecture` 決定 Docker platform。未設定時預設 `X86_64` / `linux/amd64` |
+| `CONTROL_PLANE_TFVARS_B64` | 可選，`infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 entitlements，並依 `cpu_architecture` 決定 Docker platform、依 `project` 決定 ECR repository。未設定時預設 `X86_64` / `linux/amd64` 與 `canopy/control-plane` |
 
 設定 secrets：
 
@@ -242,6 +242,9 @@ Workflow 完成後會推送 image：
 ```
 
 ECR repository 是 immutable，同一個 tag 不能重複推送。需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
+如果 `infra/terraform.tfvars` 的 `project` 不是 `canopy`，請設定
+`CONTROL_PLANE_TFVARS_B64`，讓 workflow 推送到 `<project>/control-plane`，
+並同步調整 GitHub Actions ECR push role 的 repository ARN。
 
 ### 部署到 ECS
 
