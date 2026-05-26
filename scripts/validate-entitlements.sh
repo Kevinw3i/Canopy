@@ -7,6 +7,7 @@
 #   2. profile:* role_arn entries are rejected for ECS deployments
 #   3. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
 #   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
+#   5. Active sample placeholders are rejected before production image builds
 set -euo pipefail
 
 usage() {
@@ -57,8 +58,16 @@ extract_assumable_role_arns() {
   ' | grep -oE '"arn:[^"]+"' | tr -d '"' | sort -u || true
 }
 
+ACTIVE_ENTITLEMENTS="$(strip_comments "$ENTITLEMENTS")"
+
+# Check 0: sample placeholders should never reach an ECS image.
+if grep -Eq '<[^>]+>|REPLACE(_ME)?|example\.com' <<< "$ACTIVE_ENTITLEMENTS"; then
+  echo "ERROR: entitlements contains sample placeholder values in active configuration"
+  ERRORS=$((ERRORS + 1))
+fi
+
 # Check 1: direct access (only in uncommented lines)
-if strip_comments "$ENTITLEMENTS" | grep -qE 'role_arn\s*=\s*"direct"'; then
+if grep -qE 'role_arn\s*=\s*"direct"' <<< "$ACTIVE_ENTITLEMENTS"; then
   if ! strip_comments "$TFVARS" | grep -qE 'enable_direct_access\s*=\s*true'; then
     echo "ERROR: entitlements uses role_arn = \"direct\" but enable_direct_access is not true in $TFVARS"
     ERRORS=$((ERRORS + 1))
@@ -66,13 +75,13 @@ if strip_comments "$ENTITLEMENTS" | grep -qE 'role_arn\s*=\s*"direct"'; then
 fi
 
 # Check 2: local AWS profiles cannot work inside the ECS task.
-if strip_comments "$ENTITLEMENTS" | grep -qE 'role_arn\s*=\s*"profile:[^"]*"'; then
+if grep -qE 'role_arn\s*=\s*"profile:[^"]*"' <<< "$ACTIVE_ENTITLEMENTS"; then
   echo "ERROR: entitlements uses role_arn = \"profile:*\", which is local-development only and cannot be deployed to ECS"
   ERRORS=$((ERRORS + 1))
 fi
 
 # Check 3: all role ARNs present in assumable_role_arns (uncommented lines only)
-ROLE_ARNS=$(strip_comments "$ENTITLEMENTS" | \
+ROLE_ARNS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | \
   grep -oE 'role_arn\s*=\s*"arn:[^"]+"' | \
   sed 's/role_arn[[:space:]]*=[[:space:]]*//' | tr -d '"' | sort -u || true)
 ASSUMABLE_ROLE_ARNS="$(extract_assumable_role_arns)"
@@ -93,7 +102,7 @@ done
 # Check 4: ECS Exec needs scoped AssumeRole credentials. Direct access may be
 # valid for inventory/logs, but the ECS exec route intentionally rejects
 # direct/profile credentials in non-mock deployments.
-ECS_EXEC_LOCAL_RULES=$(strip_comments "$ENTITLEMENTS" | awk '
+ECS_EXEC_LOCAL_RULES=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
 function flush_rule() {
   if (in_rule && can_exec && has_local_role) {
     print rule_id

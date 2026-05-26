@@ -91,6 +91,45 @@ expect_command_failure \
   "$TMP_DIR/gov-entitlements.toml" \
   "$TMP_DIR/no.tfvars"
 
+cat > "$TMP_DIR/active-placeholder-entitlements.toml" <<'EOF'
+[[rules]]
+id = "placeholder-rule"
+group = "platform-engineering"
+allowed_regions = ["ap-northeast-1"]
+
+[rules.features]
+can_view_ec2 = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "production"
+role_arn = "direct"
+
+[[memberships]]
+user_id = "admin@example.com"
+group = "platform-engineering"
+EOF
+cat > "$TMP_DIR/direct-enabled.tfvars" <<'EOF'
+enable_direct_access = true
+assumable_role_arns = []
+EOF
+expect_failure \
+  "active-sample-placeholder" \
+  "$TMP_DIR/active-placeholder-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "sample placeholder values"
+
+cat > "$TMP_DIR/commented-placeholder-entitlements.toml" <<EOF
+# account_id = "<ACCOUNT_ID>"
+[[rules]]
+id = "gov"
+can_view_ec2 = true
+allowed_accounts = [
+  { account_id = "123456789012", account_name = "prod", role_arn = "$GOV_ROLE" },
+]
+EOF
+expect_success "commented-placeholder-ignored" "$TMP_DIR/commented-placeholder-entitlements.toml" "$TMP_DIR/gov.tfvars"
+
 cat > "$TMP_DIR/missing.tfvars" <<'EOF'
 enable_direct_access = false
 assumable_role_arns = []
@@ -128,10 +167,6 @@ expect_failure \
   "$TMP_DIR/direct-disabled.tfvars" \
   "enable_direct_access is not true"
 
-cat > "$TMP_DIR/direct-enabled.tfvars" <<'EOF'
-enable_direct_access = true
-assumable_role_arns = []
-EOF
 expect_success "direct-enabled" "$TMP_DIR/direct-entitlements.toml" "$TMP_DIR/direct-enabled.tfvars"
 
 write_entitlements "$TMP_DIR/profile-entitlements.toml" "profile:dev"

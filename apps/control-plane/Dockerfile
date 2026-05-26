@@ -81,8 +81,8 @@ RUN --mount=type=secret,id=entitlements_toml,target=/tmp/entitlements.toml,requi
     fi \
  && printf '%s\n' "entitlements_sha=${ENTITLEMENTS_SHA}" > /etc/canopy/entitlements.sha \
  && test -s /tmp/entitlements.toml \
- && if sed 's/#.*$//' /tmp/entitlements.toml | grep -q '<ACCOUNT_ID>'; then \
-      echo "ERROR: entitlements_toml contains sample <ACCOUNT_ID> placeholders."; \
+ && if sed 's/#.*$//' /tmp/entitlements.toml | grep -Eq '<[^>]+>|REPLACE(_ME)?|example\.com'; then \
+      echo "ERROR: entitlements_toml contains sample placeholder values in active configuration."; \
       exit 1; \
     fi \
  && cp /tmp/entitlements.toml /etc/canopy/entitlements.toml \
