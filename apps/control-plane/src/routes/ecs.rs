@@ -226,7 +226,7 @@ fn cluster_pattern_applies_to_account_region(
     account_id: &str,
     region: &str,
 ) -> bool {
-    ecs_arn_region_account(pattern).map_or(true, |(pattern_region, pattern_account)| {
+    ecs_arn_region_account(pattern).is_none_or(|(pattern_region, pattern_account)| {
         (pattern_region == "*" || pattern_region == region)
             && (pattern_account == "*" || pattern_account == account_id)
     })
