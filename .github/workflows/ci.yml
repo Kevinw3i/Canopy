@@ -32,5 +32,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Validate entitlements script syntax
-        run: bash -n scripts/validate-entitlements.sh
+      - name: Validate deployment scripts
+        run: |
+          bash -n scripts/validate-entitlements.sh
+          sh -n scripts/docker-entrypoint.sh
+          bash -n scripts/test-docker-entrypoint.sh
+          scripts/test-docker-entrypoint.sh

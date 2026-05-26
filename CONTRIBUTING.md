@@ -62,6 +62,9 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace
 bash -n scripts/validate-entitlements.sh
+sh -n scripts/docker-entrypoint.sh
+bash -n scripts/test-docker-entrypoint.sh
+scripts/test-docker-entrypoint.sh
 ```
 
 ## Testing guidance
