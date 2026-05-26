@@ -87,6 +87,18 @@ run "accepts_service_launch_inputs" {
   }
 }
 
+run "rejects_disabled_generate_config" {
+  command = plan
+
+  variables {
+    generate_config = false
+  }
+
+  expect_failures = [
+    var.generate_config,
+  ]
+}
+
 run "rejects_service_without_jwt_secret_version_id" {
   command = plan
 
