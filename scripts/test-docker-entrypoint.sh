@@ -25,6 +25,17 @@ cat "$CONFIG_PATH"
 SH
 chmod +x "$TMP_DIR/control-plane"
 
+cat > "$TMP_DIR/aws" <<'SH'
+#!/bin/sh
+if [ "$1" = "secretsmanager" ] && [ "$2" = "get-secret-value" ]; then
+  printf '%s\n' 'jwt-from-arn'
+  exit 0
+fi
+echo "unexpected aws call: $*" >&2
+exit 1
+SH
+chmod +x "$TMP_DIR/aws"
+
 expect_entrypoint_failure() {
   local name="$1"
   local expected="$2"
@@ -85,6 +96,27 @@ assert data["cors_allowed_origins"] == [
     "https://one.example",
     'https://two.example/path?x="y"',
 ]
+PY
+
+ARN_CONFIG_OUT="$TMP_DIR/generated-from-arn.toml"
+env \
+  PATH="$TMP_DIR:$PATH" \
+  GENERATE_CONFIG=1 \
+  JWT_SECRET_ARN='arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client-id' \
+  sh "$ENTRYPOINT" > "$ARN_CONFIG_OUT"
+
+python3 - <<'PY' "$ARN_CONFIG_OUT"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+
+assert data["jwt"]["secret"] == "jwt-from-arn"
+assert data["oidc"]["issuer_url"] == "https://issuer.example"
+assert data["oidc"]["client_id"] == "client-id"
 PY
 
 PATCH_CONFIG="$TMP_DIR/existing-config.toml"
