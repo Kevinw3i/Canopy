@@ -15,6 +15,7 @@ Describe the change and why it is needed.
 - [ ] `bash -n scripts/validate-terraform-tfvars.sh`
 - [ ] `bash -n scripts/test-validate-terraform-tfvars.sh`
 - [ ] `scripts/test-validate-terraform-tfvars.sh`
+- [ ] `bash -n scripts/deploy-control-plane-local.sh`
 - [ ] `bash -n scripts/test-deploy-control-plane-local.sh`
 - [ ] `scripts/test-deploy-control-plane-local.sh`
 - [ ] `sh -n scripts/docker-entrypoint.sh`
