@@ -132,20 +132,31 @@ fn requested_cluster_for_account_region(
     })
 }
 
-fn concrete_cluster_arn_region_account(arn: &str) -> Option<(&str, &str)> {
+fn concrete_ecs_arn_region_account<'a>(
+    arn: &'a str,
+    resource_prefix: &str,
+) -> Option<(&'a str, &'a str)> {
     let (region, account) = ecs_arn_region_account(arn)?;
     let resource = arn.splitn(6, ':').nth(5)?;
-    let cluster_name = resource.strip_prefix("cluster/")?;
+    let resource_id = resource.strip_prefix(resource_prefix)?;
     if region.is_empty()
         || account.is_empty()
-        || cluster_name.is_empty()
+        || resource_id.is_empty()
         || region.contains('*')
         || account.contains('*')
-        || cluster_name.contains('*')
+        || resource_id.contains('*')
     {
         return None;
     }
     Some((region, account))
+}
+
+fn concrete_cluster_arn_region_account(arn: &str) -> Option<(&str, &str)> {
+    concrete_ecs_arn_region_account(arn, "cluster/")
+}
+
+fn concrete_task_arn_region_account(arn: &str) -> Option<(&str, &str)> {
+    concrete_ecs_arn_region_account(arn, "task/")
 }
 
 fn requested_tasks_page_size(page_size: u32) -> usize {
@@ -861,7 +872,7 @@ async fn list_tasks(
 fn validate_task_request_arn(
     req: &EcsExecRequest,
 ) -> Result<(), (axum::http::StatusCode, Json<ApiError>)> {
-    match ecs_arn_region_account(&req.task_arn) {
+    match concrete_task_arn_region_account(&req.task_arn) {
         Some((region, account)) if region == req.region && account == req.account_id => {}
         Some((_region, _account)) => {
             return Err((
@@ -879,7 +890,7 @@ fn validate_task_request_arn(
         }
     }
 
-    match ecs_arn_region_account(&req.cluster_arn) {
+    match concrete_cluster_arn_region_account(&req.cluster_arn) {
         Some((region, account)) if region == req.region && account == req.account_id => Ok(()),
         Some((_region, _account)) => Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -1551,6 +1562,44 @@ mod tests {
         req.account_id = "222222222222".into();
         let err = validate_task_request_arn(&req).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn validate_task_request_arn_accepts_concrete_arns() {
+        assert!(validate_task_request_arn(&exec_req()).is_ok());
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_wildcard_task_arn() {
+        let mut req = exec_req();
+        req.task_arn = format!(
+            "arn:aws:ecs:{}:{}:task/{}/{}",
+            req.region, req.account_id, DEV_MOCK_CLUSTER_NAME, "*"
+        );
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS task ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_non_task_arn() {
+        let mut req = exec_req();
+        req.task_arn = req.cluster_arn.clone();
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS task ARN");
+    }
+
+    #[test]
+    fn validate_task_request_arn_rejects_non_cluster_arn() {
+        let mut req = exec_req();
+        req.cluster_arn = req.task_arn.clone();
+
+        let err = validate_task_request_arn(&req).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS cluster ARN");
     }
 
     #[test]
