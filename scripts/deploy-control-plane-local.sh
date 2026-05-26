@@ -295,7 +295,8 @@ else
 fi
 echo ""
 
-echo "== Validate entitlements =="
+echo "== Validate Terraform inputs and entitlements =="
+"$SCRIPT_DIR/validate-terraform-tfvars.sh" "$TERRAFORM_DIR"
 "$SCRIPT_DIR/validate-entitlements.sh" "$ENTITLEMENTS_FILE" "$TERRAFORM_DIR/terraform.tfvars"
 
 echo ""

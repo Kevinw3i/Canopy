@@ -62,6 +62,9 @@ jobs:
           bash -n scripts/validate-entitlements.sh
           bash -n scripts/test-validate-entitlements.sh
           scripts/test-validate-entitlements.sh
+          bash -n scripts/validate-terraform-tfvars.sh
+          bash -n scripts/test-validate-terraform-tfvars.sh
+          scripts/test-validate-terraform-tfvars.sh
           bash -n scripts/test-deploy-control-plane-local.sh
           scripts/test-deploy-control-plane-local.sh
           sh -n scripts/docker-entrypoint.sh
@@ -101,7 +104,7 @@ jobs:
           set -euo pipefail
           echo "sha=$(sha256sum entitlements.toml | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Validate entitlements against Terraform variables
+      - name: Validate Terraform variables and entitlements
         shell: bash
         env:
           TERRAFORM_TFVARS_B64: ${{ secrets.CONTROL_PLANE_TFVARS_B64 }}
@@ -114,6 +117,7 @@ jobs:
           fi
 
           printf '%s' "${TERRAFORM_TFVARS_B64}" | base64 -d > infra/terraform.tfvars
+          ./scripts/validate-terraform-tfvars.sh infra
           ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
       - name: Resolve Terraform deployment settings
