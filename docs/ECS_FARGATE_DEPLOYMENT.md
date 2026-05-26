@@ -204,11 +204,13 @@ VERSION=${VERSION:-$(git describe --tags --always)}
 ```
 
 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
-ALB/DNS/subnet/service preconditions。第二個檢查會確認 AssumeRole ARN 已列在
-`assumable_role_arns`、使用 `direct` 時已啟用 `enable_direct_access`、
-`profile:*` 未被部署到 ECS、ECS Exec rule 不使用 direct/profile credentials、
-授予 ECS 存取的 rule 有明確 `allowed_clusters` 且寬鬆 wildcard 已設定
-`allow_broad_cluster_discovery=true`，以及 SSM rule 有明確 `allowed_os_users`。
+ALB/DNS/subnet/service preconditions。第二個檢查會確認 active entitlements
+沒有 sample placeholder、AssumeRole ARN 已列在 `assumable_role_arns`、
+`role_arn` 格式有效且 IAM Role ARN 不含 wildcard、使用 `direct` 時已啟用
+`enable_direct_access`、`profile:*` 未被部署到 ECS、ECS Exec rule 不使用
+direct/profile credentials 且同時授權 ECS view、授予 ECS 存取的 rule 有明確
+`allowed_clusters` 且寬鬆 wildcard 已設定 `allow_broad_cluster_discovery=true`，
+以及 SSM rule 有明確 `allowed_os_users`。
 
 ---
 
