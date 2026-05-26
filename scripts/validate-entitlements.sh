@@ -4,7 +4,9 @@
 #
 # Checks:
 #   1. If any account uses role_arn = "direct", enable_direct_access must be true in tfvars
-#   2. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
+#   2. profile:* role_arn entries are rejected for ECS deployments
+#   3. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
+#   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
 set -euo pipefail
 
 ENTITLEMENTS="${1:?Usage: $0 <entitlements.toml> <terraform.tfvars>}"
@@ -25,7 +27,13 @@ if strip_comments "$ENTITLEMENTS" | grep -qE 'role_arn\s*=\s*"direct"'; then
   fi
 fi
 
-# Check 2: all role ARNs present in assumable_role_arns (uncommented lines only)
+# Check 2: local AWS profiles cannot work inside the ECS task.
+if strip_comments "$ENTITLEMENTS" | grep -qE 'role_arn\s*=\s*"profile:[^"]*"'; then
+  echo "ERROR: entitlements uses role_arn = \"profile:*\", which is local-development only and cannot be deployed to ECS"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# Check 3: all role ARNs present in assumable_role_arns (uncommented lines only)
 ROLE_ARNS=$(strip_comments "$ENTITLEMENTS" | \
   grep -oE 'role_arn\s*=\s*"arn:aws:iam::[^"]+"' | \
   sed 's/role_arn[[:space:]]*=[[:space:]]*//' | tr -d '"' | sort -u || true)
@@ -36,6 +44,46 @@ for arn in $ROLE_ARNS; do
     ERRORS=$((ERRORS + 1))
   fi
 done
+
+# Check 4: ECS Exec needs scoped AssumeRole credentials. Direct access may be
+# valid for inventory/logs, but the ECS exec route intentionally rejects
+# direct/profile credentials in non-mock deployments.
+ECS_EXEC_LOCAL_RULES=$(strip_comments "$ENTITLEMENTS" | awk '
+function flush_rule() {
+  if (in_rule && can_exec && has_local_role) {
+    print rule_id
+  }
+}
+/^[[:space:]]*\[\[rules\]\][[:space:]]*$/ {
+  flush_rule()
+  in_rule = 1
+  can_exec = 0
+  has_local_role = 0
+  rule_id = "<unknown>"
+  next
+}
+in_rule && /^[[:space:]]*id[[:space:]]*=/ {
+  rule_id = $0
+  sub(/^[^"]*"/, "", rule_id)
+  sub(/".*$/, "", rule_id)
+}
+in_rule && /can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
+  can_exec = 1
+}
+in_rule && /role_arn[[:space:]]*=[[:space:]]*"(direct|profile:[^"]*)"/ {
+  has_local_role = 1
+}
+END {
+  flush_rule()
+}
+')
+
+if [ -n "$ECS_EXEC_LOCAL_RULES" ]; then
+  while IFS= read -r rule_id; do
+    echo "ERROR: rule '$rule_id' enables can_use_ecs_exec but uses direct/profile credentials; ECS Exec deployments require an AssumeRole ARN"
+  done <<< "$ECS_EXEC_LOCAL_RULES"
+  ERRORS=$((ERRORS + 1))
+fi
 
 if [ "$ERRORS" -gt 0 ]; then
   echo "Validation failed with $ERRORS error(s)."
