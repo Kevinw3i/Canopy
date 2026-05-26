@@ -22,6 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -35,6 +40,13 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Validate Terraform
+        run: |
+          terraform -chdir=infra fmt -check
+          terraform -chdir=infra init -backend=false
+          terraform -chdir=infra validate
+          terraform -chdir=infra test
 
       - name: Validate deployment scripts
         run: |

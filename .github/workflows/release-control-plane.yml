@@ -24,6 +24,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+
       - name: Resolve image tag
         id: meta
         shell: bash
@@ -38,6 +43,16 @@ jobs:
           fi
 
           echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Terraform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          terraform -chdir=infra fmt -check
+          terraform -chdir=infra init -backend=false
+          terraform -chdir=infra validate
+          terraform -chdir=infra test
 
       - name: Validate deployment scripts
         shell: bash
