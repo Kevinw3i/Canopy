@@ -109,6 +109,13 @@ expect_success \
   -var="create_service=true" \
   -var="image_tag=cp-v0.1.0"
 
+write_valid_tfvars
+expect_failure \
+  "phase-two-missing-jwt-version" \
+  "jwt_secret_version_id is required" \
+  -var="create_service=true" \
+  -var="image_tag=cp-v0.1.0"
+
 write_tfvars '["0.0.0.0/0"]' "false"
 expect_failure "public-world-cidr" "Public ALB cannot allow 0.0.0.0/0"
 
