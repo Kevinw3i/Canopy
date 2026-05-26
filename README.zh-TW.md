@@ -5,11 +5,11 @@
 內部營運終端機操作介面，用於管理 AWS 基礎設施。
 
 ```
-┌──────────────┐         ┌──────────────────┐         ┌─────────┐
-│  TUI 客戶端  │──HTTP──▶│   Control Plane  │──STS───▶│   AWS   │
-│  (ratatui)   │         │   (axum)         │         │ EC2/CWL │
-│              │◀─JSON───│                  │◀────────│ SSM/STS │
-└──────────────┘         │  - 認證 (OIDC)   │         └─────────┘
+┌──────────────┐         ┌──────────────────┐         ┌──────────────┐
+│  TUI 客戶端  │──HTTP──▶│   Control Plane  │──STS───▶│   AWS APIs   │
+│  (ratatui)   │         │   (axum)         │         │ EC2/ECS/CWL  │
+│              │◀─JSON───│                  │◀────────│ SSM/STS/Exec │
+└──────────────┘         │  - 認證 (OIDC)   │         └──────────────┘
                          │  - 授權 (權限)    │
                          │  - 稽核日誌       │
                          │  - 伺服器端過濾   │
@@ -31,14 +31,14 @@
 - Rust 1.75+
 - 兩個終端機視窗
 
-> AWS CLI 和 Session Manager plugin 只有「連線」功能（SSM/EIC）需要，其他功能不需要。
+> AWS CLI 和 Session Manager plugin 只有連線功能（SSM/EIC/ECS Exec）需要；清查與搜尋流程不需要。
 
 ### 第一步：建置
 
 ```bash
 cd ~/Desktop/Canopy
 cargo build
-cargo test        # 39 個測試，應全部通過
+cargo test        # workspace 測試應全部通過
 ```
 
 ### 第二步：啟動 Control Plane（終端機 1）
@@ -65,7 +65,7 @@ DEV_MODE=1 cargo run -p tui-client
 | 畫面 | 怎麼進去 | 顯示什麼 |
 |------|----------|----------|
 | 儀表板 | 登入後自動進入 | 歡迎訊息、導航選單 |
-| EC2 清查 | 按 `1` | 5 台 mock 執行個體，`/` 搜尋，`Enter` 看詳細 |
+| EC2 / ECS 清查 | 按 `1` | EC2 mock 執行個體；有權限時按 `Ctrl+E` 切到 ECS tasks。若 task 可 exec 且有 ECS Exec 權限，`Enter` 開啟 container 選擇 |
 | CloudWatch 搜尋 | 按 `2` | 查詢輸入框，mock 日誌事件 |
 | 存取/身分 | 按 `4` | 使用者、群組、功能旗標、允許的帳號 |
 | 設定 | 按 `5` | 目前的設定值；按 `p` 開啟 Change Password |
@@ -78,7 +78,7 @@ DEV_MODE=1 cargo run -p tui-client
 
 | 使用者名稱 | 群組 | 可以做什麼 |
 |-----------|------|-----------|
-| `dev-admin` | platform-engineering | 全部功能：EC2、CloudWatch、SSM、EIC，跨 2 個帳號 |
+| `dev-admin` | platform-engineering | 全部功能：EC2、ECS、CloudWatch、SSM、EIC，跨 2 個帳號 |
 | `dev-readonly` | readonly-ops | 唯讀：只能看 staging 帳號的 EC2 和 CloudWatch，不能連線 |
 
 試試用 `dev-readonly` 登入，觀察介面如何隱藏該使用者沒有權限的功能。
@@ -198,10 +198,15 @@ allowed_regions = ["us-east-1", "us-west-2"]
 allowed_log_group_arns = [
     "arn:aws:logs:*:123456789012:log-group:/app/*",   # 支援萬用字元
 ]
+allowed_clusters = [
+    "arn:aws:ecs:us-east-1:123456789012:cluster/prod-*",
+]
 allowed_os_users = ["ec2-user", "ubuntu"]              # 用於 SSM/EIC 連線
 
 [rules.features]
 can_view_ec2 = true               # 可以看 EC2 執行個體
+can_view_ecs = true               # 可以看授權 cluster 裡的 ECS tasks
+can_use_ecs_exec = true           # 可以開啟 ECS Exec session
 can_use_cloudwatch_search = true  # 可以搜尋 CloudWatch 日誌
 can_use_cloudwatch_tail = true    # 可以使用 Live Tail
 can_use_ssm = true                # 可以透過 SSM Session Manager 連線
@@ -212,11 +217,11 @@ account_id = "123456789012"
 account_name = "production"
 # role_arn 支援三種模式：
 #   "direct"              → 直接用本機預設 AWS 憑證（不走 AssumeRole）
-#                           不支援 SSM/EIC 連線（僅 SSH）
+#                           不支援 SSM/EIC/ECS Exec 連線（僅 SSH）
 #   "profile:NAME"        → 用 ~/.aws/credentials 裡指定的 profile
-#                           不支援 SSM/EIC 連線（僅 SSH）
+#                           不支援 SSM/EIC/ECS Exec 連線（僅 SSH）
 #   "arn:aws:iam::...:role/..." → AssumeRole 到該 IAM Role（生產環境）
-#                           支援 SSM、EIC、SSH，使用範圍限定憑證
+#                           支援 SSM、EIC、SSH、ECS Exec，使用範圍限定憑證
 role_arn = "arn:aws:iam::123456789012:role/CanopyRole"
 
 [[rules.allowed_accounts]]
@@ -227,6 +232,10 @@ role_arn = "arn:aws:iam::234567890123:role/CanopyRole"
 [[rules.instance_tag_selectors]]        # 執行個體必須匹配至少一個 selector
 [rules.instance_tag_selectors.tags]
 Environment = ["production", "staging"]  # 標籤鍵 = 允許的值
+
+[[rules.task_tag_selectors]]             # ECS task 必須匹配至少一個 selector
+[rules.task_tag_selectors.tags]
+Environment = ["production"]
 
 # max_session_seconds = 3600             # 可選：連線 60 分鐘後自動斷開
                                          # 非 SSH 連線最低 900 秒（AWS STS 限制）
@@ -244,6 +253,7 @@ group = "platform-engineering"
 - 功能旗標、帳號、區域、OS users — 加法式合併（任一群組授予即擁有）
 - `max_session_seconds` — 取最嚴格（最小非零值）
 - `excluded_tag_selectors` — 聯集（任一群組排除即排除）
+- ECS 的 account、region、cluster、task tag、sidecar denylist 由 control-plane 以 rule-local scope 評估，避免跨群組 scope 被拼接成未授權組合
 
 ### TUI 客戶端設定
 
@@ -524,6 +534,7 @@ TUI                     Control Plane              OIDC 提供者
 記錄的操作包括：
 - 登入/登出
 - EC2 列表請求
+- ECS task list / exec 請求
 - CloudWatch 搜尋
 - Live Tail 啟動/停止
 - 連線動作
@@ -540,13 +551,14 @@ TUI                     Control Plane              OIDC 提供者
 |------|------|------|
 | `j/k` | 表格 | 上下移動 |
 | `Enter` | 表格 | 展開詳細/執行 |
-| `/` | EC2、CW | 啟動搜尋/過濾 |
+| `/` | EC2、ECS、CW | 啟動搜尋/過濾 |
+| `Ctrl+E` | 清查 | 有權限時切換 EC2/ECS 視圖 |
 | `s` | EC2 | SSM Session Manager 連線 |
 | `e` | EC2 | EC2 Instance Connect SSH |
 | `c` | EC2 | 直接 SSH（使用你自己的金鑰） |
-| `r` | EC2 | 重新整理 |
-| `[`/`]` | CW 搜尋 | 切換帳號（上一個/下一個） |
-| `{`/`}` | CW 搜尋 | 切換區域（上一個/下一個） |
+| `r` | EC2、ECS | 重新整理 |
+| `[`/`]` | 清查、CW 搜尋 | 切換帳號（上一個/下一個） |
+| `{`/`}` | 清查、CW 搜尋 | 切換區域（上一個/下一個） |
 | `x` | CW 搜尋 | 匯出結果 |
 | `Tab` | CW 搜尋 | 切換 Quick/Insights 模式 |
 | `Esc` | 任何 | 返回/取消焦點 |
@@ -557,9 +569,9 @@ TUI                     Control Plane              OIDC 提供者
 
 ## 安全模型
 
-- **伺服器端過濾**：EC2 和 CloudWatch 資料在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
+- **伺服器端過濾**：EC2、ECS tasks 和 CloudWatch 資料在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **範圍隔離**：功能授權與資源範圍依規則逐一驗證，防止跨群組權限拼接。一個群組的功能不能套用到另一個群組的資源上
-- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 限縮到特定執行個體，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）
+- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 將主要動作限縮到特定執行個體或 ECS task，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）或 ECS cluster（`ecs:ExecuteCommand`）；ECS Exec 憑證另只包含必要的 `ecs:DescribeTasks` 與 `ssmmessages` 輔助動作
 - **帳號身份驗證**：`direct`/`profile:` 和 AssumeRole 憑證透過 `GetCallerIdentity` 驗證，確保與設定的 `account_id` 一致
 - **TUI 無 AWS 長期金鑰**：所有 AWS 存取都經由 Control Plane
 - **稽核失敗則拒絕**：持久化稽核日誌寫入失敗時，所有受保護的 API（包含登入、刷新、權限查詢）回傳 503。暫時性 I/O 錯誤可自行恢復，無需重啟

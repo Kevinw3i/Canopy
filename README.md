@@ -5,11 +5,11 @@
 Internal terminal operations console for AWS infrastructure management.
 
 ```
-┌──────────────┐         ┌──────────────────┐         ┌─────────┐
-│  TUI Client  │──HTTP──▶│  Control Plane   │──STS───▶│   AWS   │
-│  (ratatui)   │         │  (axum)          │         │ EC2/CWL │
-│              │◀─JSON───│                  │◀────────│ SSM/STS │
-└──────────────┘         │  - Auth (OIDC)   │         └─────────┘
+┌──────────────┐         ┌──────────────────┐         ┌──────────────┐
+│  TUI Client  │──HTTP──▶│  Control Plane   │──STS───▶│   AWS APIs   │
+│  (ratatui)   │         │  (axum)          │         │ EC2/ECS/CWL  │
+│              │◀─JSON───│                  │◀────────│ SSM/STS/Exec │
+└──────────────┘         │  - Auth (OIDC)   │         └──────────────┘
                          │  - Entitlements  │
                          │  - Audit logging │
                          │  - Server-side   │
@@ -32,14 +32,14 @@ Internal terminal operations console for AWS infrastructure management.
 - Rust 1.75+
 - Two terminal windows
 
-> AWS CLI and Session Manager plugin are only needed for the `connect` feature (SSM/EIC). All other features work without them.
+> AWS CLI and Session Manager plugin are only needed for connection features (SSM/EIC/ECS Exec). Inventory and search flows work without them.
 
 ### Step 1: Build
 
 ```bash
 cd ~/Desktop/Canopy
 cargo build
-cargo test        # 39 tests, should all pass
+cargo test        # workspace tests should all pass
 ```
 
 ### Step 2: Start the control-plane (Terminal 1)
@@ -66,7 +66,7 @@ The TUI opens on the login screen. Type `dev-admin` and press Enter.
 | Screen | How to get there | What it shows |
 |--------|-----------------|---------------|
 | Dashboard | Automatic after login | Welcome message, navigation menu |
-| EC2 Inventory | Press `1` | 5 mock instances, search with `/`, detail with `Enter` |
+| EC2 / ECS Inventory | Press `1` | EC2 mock instances; press `Ctrl+E` when entitled to switch to ECS tasks. `Enter` opens container selection for exec-ready tasks when ECS Exec is granted |
 | CloudWatch Search | Press `2` | Query input, mock log events |
 | Access / Identity | Press `4` | Your user, groups, feature flags, allowed accounts |
 | Settings | Press `5` | Current config values; press `p` to open Change Password |
@@ -79,7 +79,7 @@ Two users are pre-configured in the built-in dev defaults:
 
 | Username | Group | What they can do |
 |----------|-------|-----------------|
-| `dev-admin` | platform-engineering | Everything: EC2, CloudWatch, SSM, EIC across 2 accounts |
+| `dev-admin` | platform-engineering | Everything: EC2, ECS, CloudWatch, SSM, EIC across 2 accounts |
 | `dev-readonly` | readonly-ops | Read-only: EC2 view + CloudWatch search on staging only, no connect |
 
 Try logging in as `dev-readonly` to see how the UI hides features the user doesn't have.
@@ -199,10 +199,15 @@ allowed_regions = ["us-east-1", "us-west-2"]
 allowed_log_group_arns = [
     "arn:aws:logs:*:123456789012:log-group:/app/*",   # Wildcards supported
 ]
+allowed_clusters = [
+    "arn:aws:ecs:us-east-1:123456789012:cluster/prod-*",
+]
 allowed_os_users = ["ec2-user", "ubuntu"]              # For SSM/EIC connect
 
 [rules.features]
 can_view_ec2 = true               # Can see EC2 instances
+can_view_ecs = true               # Can see ECS tasks in allowed clusters
+can_use_ecs_exec = true           # Can open ECS Exec sessions
 can_use_cloudwatch_search = true  # Can search CloudWatch logs
 can_use_cloudwatch_tail = true    # Can use Live Tail
 can_use_ssm = true                # Can connect via SSM Session Manager
@@ -213,11 +218,11 @@ account_id = "123456789012"
 account_name = "production"
 # role_arn supports three modes:
 #   "direct"              → use ambient AWS credentials (no AssumeRole)
-#                           SSM/EIC connect not supported (SSH only)
+#                           SSM/EIC/ECS Exec not supported (SSH only)
 #   "profile:NAME"        → use a specific AWS profile from ~/.aws/credentials
-#                           SSM/EIC connect not supported (SSH only)
+#                           SSM/EIC/ECS Exec not supported (SSH only)
 #   "arn:aws:iam::...:role/..." → AssumeRole into that IAM role (production)
-#                           Supports SSM, EIC, and SSH with scoped credentials
+#                           Supports SSM, EIC, SSH, and ECS Exec with scoped credentials
 role_arn = "arn:aws:iam::123456789012:role/CanopyRole"
 
 [[rules.allowed_accounts]]
@@ -228,6 +233,10 @@ role_arn = "arn:aws:iam::234567890123:role/CanopyRole"
 [[rules.instance_tag_selectors]]        # Instance must match at least one selector
 [rules.instance_tag_selectors.tags]
 Environment = ["production", "staging"]  # Tag key = allowed values
+
+[[rules.task_tag_selectors]]             # ECS task must match at least one selector
+[rules.task_tag_selectors.tags]
+Environment = ["production"]
 
 # max_session_seconds = 3600             # Optional: auto-disconnect after 60 min
                                          # Minimum 900 seconds for non-SSH connects (AWS STS limit)
@@ -245,7 +254,7 @@ user_id = "bob@example.com"
 group = "readonly-ops"
 ```
 
-**Merge rule**: If a user belongs to multiple groups, permissions are merged additively — if *any* group grants a feature, the user has it.
+**Merge rule**: If a user belongs to multiple groups, feature flags are merged additively — if *any* group grants a feature, the user has it. ECS account, region, cluster, task tag, and sidecar denylist checks are evaluated rule-locally by the control-plane to avoid cross-group scope splicing.
 
 ### TUI client config
 
@@ -526,6 +535,7 @@ Every action is logged with structured tracing **and** to a durable JSON-lines f
 
 - Login / logout
 - EC2 list requests
+- ECS task list / exec requests
 - CloudWatch searches
 - Live tail start/stop
 - Connect actions
@@ -543,13 +553,14 @@ When the durable audit file is configured and a write fails, the API returns 503
 |-----|---------|--------|
 | `j/k` | Tables | Navigate rows |
 | `Enter` | Tables | Toggle detail / execute |
-| `/` | EC2, CW | Focus search/filter |
+| `/` | EC2, ECS, CW | Focus search/filter |
+| `Ctrl+E` | Inventory | Toggle EC2/ECS view when entitled |
 | `s` | EC2 | SSM Session Manager connect |
 | `e` | EC2 | EC2 Instance Connect SSH |
 | `c` | EC2 | Direct SSH (your own key) |
-| `r` | EC2 | Refresh |
-| `[`/`]` | CW Search | Cycle accounts (prev/next) |
-| `{`/`}` | CW Search | Cycle regions (prev/next) |
+| `r` | EC2, ECS | Refresh |
+| `[`/`]` | Inventory, CW Search | Cycle accounts (prev/next) |
+| `{`/`}` | Inventory, CW Search | Cycle regions (prev/next) |
 | `x` | CW Search | Export results |
 | `Tab` | CW Search | Toggle quick/insights mode |
 | `Esc` | Any | Go back / unfocus |
@@ -560,9 +571,9 @@ When the durable audit file is configured and a write fails, the API returns 503
 
 ## Security model
 
-- **Server-side filtering**: EC2 instances and CloudWatch data are filtered by entitlements on the backend before returning to the TUI. The client never sees unauthorized resources.
+- **Server-side filtering**: EC2 instances, ECS tasks, and CloudWatch data are filtered by entitlements on the backend before returning to the TUI. The client never sees unauthorized resources.
 - **Scope isolation**: Feature grants and resource scopes are evaluated per-rule to prevent cross-group privilege escalation. A feature from one group cannot be applied to resources from another group.
-- **Short-lived credentials**: STS AssumeRole with session tags. Connect operations use inline session policies scoped to the specific instance, including OS-user binding via IAM conditions (`ssm:SessionDocumentAccessCheck`, `ec2:osuser`).
+- **Short-lived credentials**: STS AssumeRole with session tags. Connect operations use inline session policies that scope the primary action to the specific instance or ECS task, including OS-user binding via IAM conditions (`ssm:SessionDocumentAccessCheck`, `ec2:osuser`) and ECS cluster binding for `ecs:ExecuteCommand`; ECS Exec credentials also include only the required `ecs:DescribeTasks` and `ssmmessages` helper actions.
 - **Account identity verification**: `direct`/`profile:` and AssumeRole credentials are verified via `GetCallerIdentity` to ensure they match the configured `account_id`.
 - **No long-lived AWS keys in the TUI**: All AWS access goes through the control-plane.
 - **Audit fail-closed**: If the durable audit log cannot be written, all protected APIs (including login, refresh, entitlements) return 503. Transient I/O failures self-recover without restart.

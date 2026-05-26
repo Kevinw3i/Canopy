@@ -11,8 +11,9 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 1. 瀏覽與搜尋跨帳號的 EC2 執行個體
 2. 執行 CloudWatch Logs 快速搜尋與 Logs Insights 查詢
 3. 即時串流 CloudWatch Logs（Live Tail）
-4. 透過 SSM Session Manager 或 EC2 Instance Connect 連線至執行個體
-5. 檢視自身的身分、群組與存取權限
+4. 檢視授權 ECS cluster/task，並在符合條件時開啟 ECS Exec
+5. 透過 SSM Session Manager 或 EC2 Instance Connect 連線至執行個體
+6. 檢視自身的身分、群組與存取權限
 
 本系統**不是**單機直連 AWS 的工具——它採用 Client/Server 架構，由後端控制面 (Control Plane) 統一處理認證、授權、權限評估與 AWS 存取，確保：
 
@@ -26,9 +27,9 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 
 | 角色 | 說明 |
 |------|------|
-| Platform Engineer | 擁有完整存取權限：EC2 瀏覽、CloudWatch 搜尋/Live Tail、SSM/EIC 連線 |
-| On-Call Engineer | 有限的 CloudWatch 搜尋與 EC2 唯讀瀏覽，無連線權限 |
-| Read-Only Observer | 僅 staging 環境的 EC2 瀏覽與 CloudWatch 搜尋 |
+| Platform Engineer | 擁有完整存取權限：EC2/ECS 瀏覽、CloudWatch 搜尋/Live Tail、SSM/EIC/ECS Exec 連線 |
+| On-Call Engineer | 有限的 CloudWatch 搜尋與 EC2/ECS 唯讀瀏覽，無連線權限 |
+| Read-Only Observer | 僅 staging 環境的 EC2 瀏覽與 CloudWatch 搜尋；ECS 視覺化需另授權 |
 
 權限透過**群組 → 權限規則**映射，支援多群組加法式合併。
 
@@ -40,7 +41,7 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 ┌──────────────────┐      HTTPS/JSON       ┌──────────────────────┐      STS AssumeRole
 │   TUI Client     │◀────────────────────▶│   Control Plane       │◀──────────────────▶ AWS
 │   (ratatui)      │                       │   (axum)              │
-│                  │      WebSocket        │                       │    EC2 / CloudWatch
+│                  │      WebSocket        │                       │    EC2 / ECS / CloudWatch
 │  - 7 個畫面      │◀────────────────────▶│  - 認證 (OIDC)        │    Logs / STS / SSM
 │  - 鍵盤操作      │                       │  - 授權 (Entitlements)│
 │  - async 事件迴圈│                       │  - 稽核日誌           │
@@ -66,7 +67,7 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 | HTTP 客戶端 | reqwest 0.12 |
 | 序列化 | serde + serde_json |
 | 認證 | jsonwebtoken (JWT)、OIDC Discovery、PKCE |
-| AWS SDK | aws-sdk-ec2、aws-sdk-cloudwatchlogs、aws-sdk-sts |
+| AWS SDK | aws-sdk-ec2、aws-sdk-ecs、aws-sdk-cloudwatchlogs、aws-sdk-sts、aws-sdk-iam |
 | 日誌 | tracing + tracing-subscriber (JSON 格式) |
 | 設定 | toml |
 
@@ -112,12 +113,19 @@ TUI                     Control Plane              OIDC Provider
 | `can_use_cloudwatch_tail` | 是否可使用 Live Tail |
 | `can_use_ssm` | 是否可透過 SSM 連線 |
 | `can_use_ec2_instance_connect` | 是否可透過 EC2 Instance Connect 連線 |
+| `can_view_ecs` | 是否可檢視授權 ECS tasks |
+| `can_use_ecs_exec` | 是否可對授權 task/container 開啟 ECS Exec |
 | `allowed_accounts` | 允許存取的 AWS 帳號 + 對應的 IAM Role ARN |
 | `allowed_regions` | 允許的 AWS 區域 |
 | `allowed_log_group_arns` | 允許的 CloudWatch Log Group ARN 樣式（支援萬用字元） |
 | `instance_tag_selectors` | EC2 標籤過濾條件（執行個體必須匹配至少一個 selector） |
 | `allowed_os_users` | 允許的作業系統使用者（用於 SSM/EIC/SSH 連線）。設定 2+ 個時連線時會彈出選擇介面 |
 | `excluded_tag_selectors` | 排除規則：匹配的機器即使通過 allow 也會被隱藏 |
+| `allowed_clusters` | ECS cluster ARN / pattern allow-list |
+| `task_tag_selectors` | ECS task 標籤 allow-list |
+| `excluded_task_tag_selectors` | ECS task 標籤 deny-list |
+| `excluded_container_names` | ECS Exec container deny-list（例如 sidecar） |
+| `allow_broad_cluster_discovery` | 明確允許 `cluster/*` 這類廣泛 cluster discovery |
 | `max_session_seconds` | 連線時間上限（秒）。省略或 0 = 不限時 |
 
 **合併策略**：
@@ -128,13 +136,15 @@ TUI                     Control Plane              OIDC Provider
 | 帳號/區域/OS users | 加法（聯集去重） |
 | `instance_tag_selectors` | 聯集（匹配任一即可見） |
 | `excluded_tag_selectors` | 聯集（匹配任一即排除） |
+| ECS cluster / task / container scope | 後端以 rule-local scope 評估，不允許把不同群組的 account、region、cluster、task selector 或 container denylist 拼接使用 |
 | `max_session_seconds` | **取最嚴格（最小非零值）** |
 
 ### 4.4 安全規則
 
-- **伺服器端過濾**：EC2 列表在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
+- **伺服器端過濾**：EC2、ECS tasks、CloudWatch data 在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **短期憑證**：透過 STS AssumeRole 取得暫時性憑證，附帶 Session Tags 供稽核
-- **連線範圍限縮**：連線操作使用 inline session policy 限制憑證僅能對目標執行個體執行 SSM/EIC
+- **連線範圍限縮**：連線操作使用 inline session policy 將主要動作限縮到目標執行個體或 ECS task；ECS Exec 只額外授予必要的 task 描述與 `ssmmessages` channel 動作
+- **ECS scope 不跨規則拼接**：ECS task list / exec 的 account、role、region、cluster、task tag、container denylist 必須來自同一授權規則
 - **稽核失敗則拒絕 (fail-closed)**：當稽核日誌寫入失敗時，後端拒絕處理請求
 - **開發模式防護**：禁止在非 loopback 位址啟用 dev_mode（除非明確覆寫）
 
@@ -158,7 +168,7 @@ TUI                     Control Plane              OIDC Provider
 - Live Tail 受 feature flag 控制（beta 功能）
 - 快捷鍵：`1`-`5` 直接跳轉、`j`/`k` 上下選擇、`Enter` 進入、`q` 離開
 
-### 5.3 EC2 清查畫面 (EC2 Inventory)
+### 5.3 EC2 / ECS 清查畫面 (Inventory)
 
 **列表區**：
 
@@ -183,6 +193,7 @@ TUI                     Control Plane              OIDC Provider
 - 重新整理（`r`）
 - 分頁支援
 - 載入中/錯誤狀態顯示
+- 若使用者有 `can_view_ecs`，`Ctrl+E` 可在 EC2 與 ECS 清查視圖切換
 
 **三種連線方式**：
 
@@ -209,6 +220,28 @@ TUI                     Control Plane              OIDC Provider
 5. SSM/EIC：產生範圍限縮的 STS 憑證 + 回傳指令
 6. SSH：回傳 `ssh user@IP` 指令（不需要 AWS 憑證）
 7. TUI 暫停 alternate screen → 執行指令 → 結束後恢復 TUI
+
+**ECS Task 視圖**：
+
+| 欄位 | 說明 |
+|------|------|
+| Cluster | Cluster 名稱 |
+| Family | Task definition family |
+| Task ID | Task ARN 尾段 |
+| Launch | Launch type |
+| Status | Task 狀態 |
+| Containers | 可見 container 與 exec-ready 狀態 |
+| Account | AWS 帳號 |
+| Region | AWS 區域 |
+
+**ECS 功能**：
+
+- 帳號/區域 scope selector 只列出目前 ECS grant 可證明的選項，避免 EC2-only grant 出現在 ECS 視圖
+- `r` 重新整理 task list；`/` 搜尋 cluster、family、task id、container name
+- `Enter` 只在 task running、`enable_execute_command = true`，且至少一個 container running 並啟動 execute-command agent 時開啟 container picker
+- ECS Exec 固定執行 `/bin/sh`，不接受使用者自訂 command
+- 後端會重新驗證 task/container scope、task tag selectors、container denylist，並為 AWS CLI 回傳短期範圍限縮憑證
+- `role_arn = "direct"` / `profile:NAME` 可用於 ECS task inventory，但 ECS Exec 需要可 AssumeRole 的 IAM role ARN
 
 **錯誤處理**：
 
@@ -266,6 +299,7 @@ TUI                     Control Plane              OIDC Provider
 - 顯示允許的帳號（含 Role ARN）
 - 顯示允許的區域
 - 顯示允許的 Log Group ARN 樣式
+- 顯示 ECS scope：allowed clusters、task tag selectors、excluded task selectors、excluded container names、broad discovery opt-in
 
 ### 5.7 設定畫面 (Settings)
 
@@ -295,6 +329,8 @@ TUI                     Control Plane              OIDC Provider
 | POST | `/api/ec2/list` | 列出 EC2 執行個體（伺服器端過濾） |
 | POST | `/api/ec2/connect` | 取得連線指令與憑證 |
 | POST | `/api/ec2/power` | 對單一 EC2 執行 start / stop / reboot（需 typed confirmation） |
+| POST | `/api/ecs/tasks` | 列出授權 ECS tasks（伺服器端過濾、支援 account/region/cluster scope） |
+| POST | `/api/ecs/exec` | 取得 ECS Exec 指令與範圍限縮憑證 |
 | POST | `/api/cloudwatch/log-groups` | 列出允許的 Log Groups |
 | POST | `/api/cloudwatch/filter-events` | 執行 FilterLogEvents 搜尋 |
 | POST | `/api/cloudwatch/insights/start` | 啟動 Logs Insights 查詢 |
@@ -317,7 +353,7 @@ TUI                     Control Plane              OIDC Provider
 | `event_id` | UUID |
 | `timestamp` | RFC 3339 時間戳記 |
 | `actor` | 使用者 ID |
-| `action` | 操作類型（login、ec2_list、cloudwatch_search 等） |
+| `action` | 操作類型（login、ec2_list、ecs_task_list、ecs_exec、cloudwatch_search 等） |
 | `account_id` | 目標 AWS 帳號 |
 | `region` | 目標 AWS 區域 |
 | `target_resource` | 目標資源（instance_id、log_group 等） |
@@ -341,6 +377,9 @@ TUI                     Control Plane              OIDC Provider
 |------|-----|------|
 | EC2 | `DescribeInstances` | 列出執行個體 |
 | EC2 | `StartInstances` / `StopInstances` / `RebootInstances` | 高風險 power actions |
+| ECS | `ListClusters` / `DescribeClusters` / `ListTasks` / `DescribeTasks` | 列出與驗證授權 tasks |
+| ECS | `ExecuteCommand` | 由 TUI 透過 control-plane 回傳的短期憑證啟動 ECS Exec |
+| IAM | `SimulatePrincipalPolicy` | ECS Exec 前檢查候選 role 是否具備必要動作 |
 | CloudWatch Logs | `DescribeLogGroups` | 列出 Log Groups |
 | CloudWatch Logs | `FilterLogEvents` | 快速搜尋 |
 | CloudWatch Logs | `StartQuery` | 啟動 Insights 查詢 |
@@ -362,6 +401,7 @@ TUI                     Control Plane              OIDC Provider
 
 - SSM：僅允許 `ssm:StartSession` 對目標執行個體
 - EIC：僅允許 `ec2-instance-connect:SendSSHPublicKey` 和 `ec2-instance-connect:OpenTunnel`
+- ECS Exec：僅允許 `ecs:ExecuteCommand` 對目標 task，並以 `ecs:cluster` 條件限制目標 cluster；另允許同區域 `ecs:DescribeTasks` 與必要的 `ssmmessages:*Channel`
 - 憑證有效期：900 秒（15 分鐘）
 - 不授予 `ec2:Describe*` 以防止客戶端繞過伺服器端過濾
 
@@ -422,14 +462,21 @@ allowed_accounts = [
 ]
 allowed_regions = ["us-east-1", "us-west-2"]
 allowed_log_group_arns = ["arn:aws:logs:*:123456789012:log-group:/app/*"]
+allowed_clusters = ["arn:aws:ecs:us-east-1:123456789012:cluster/prod-*"]
 allowed_os_users = ["ec2-user", "ubuntu"]
 
 [rules.features]
 can_view_ec2 = true
+can_view_ecs = true
+can_use_ecs_exec = true
 can_use_cloudwatch_search = true
 can_use_cloudwatch_tail = true
 can_use_ssm = true
 can_use_ec2_instance_connect = true
+
+[[rules.task_tag_selectors]]
+[rules.task_tag_selectors.tags]
+Environment = ["production"]
 
 [[memberships]]
 user_id = "alice@example.com"
@@ -440,20 +487,18 @@ group = "platform-engineering"
 
 ## 10. 測試策略
 
-### 10.1 單元測試（目前 39 個）
+### 10.1 單元測試與整合測試
 
-| 模組 | 測試數量 | 覆蓋範圍 |
-|------|----------|----------|
-| `shared::dto::entitlements` | 4 | TagSelector 匹配邏輯 |
-| `control-plane::models::entitlements` | 13 | 權限評估、多群組合併、邊界案例 |
-| `control-plane::services::ec2` | 14 | 伺服器端過濾、使用者過濾、連線授權、排除標籤 |
-| `control-plane::services::entitlements` | 4 | ARN 萬用字元匹配 |
-| `control-plane::services::cloudwatch` | 2 | 查詢狀態機、mock 資料 |
-| `tui-client::auth::device_code` | 2 | 指數退避 |
+| 模組 | 覆蓋範圍 |
+|------|----------|
+| `shared::dto::*` | EC2 / ECS / CloudWatch / entitlement DTO 序列化與預設值 |
+| `control-plane::models::entitlements` | 權限評估、多群組合併、ECS cluster allow-list 驗證、broad wildcard opt-in |
+| `control-plane::services::{ec2,ecs,entitlements,cloudwatch}` | 伺服器端過濾、rule-local ECS scope、exec command 建構、ARN 萬用字元匹配、mock 資料 |
+| `control-plane::routes::*` | 受保護 API route、audit fail-closed、pagination、scope denied / partial failure 行為 |
+| `tui-client` components | EC2/ECS inventory rendering、scope cycling、container picker、connect session、CloudWatch search、device-code backoff |
 
 ### 10.2 待補強的測試
 
-- API 路由整合測試（使用 axum test utilities）
 - OIDC 流程測試（mock HTTP server）
 - WebSocket Live Tail 連線測試
 - TUI 元件渲染快照測試
@@ -466,8 +511,8 @@ group = "platform-engineering"
 ### 11.1 先決條件
 
 - Rust 1.75+
-- AWS CLI v2（用於 SSM/EIC 連線）
-- Session Manager plugin（用於 SSM）
+- AWS CLI v2（用於 SSM/EIC/ECS Exec 連線）
+- Session Manager plugin（用於 SSM/ECS Exec）
 - OIDC Provider（Google、Okta、Azure AD 等）
 
 ### 11.2 生產部署步驟
@@ -510,6 +555,8 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 ### 目前限制
 
 - Live Tail 為 beta 功能，WebSocket 客戶端尚未完整實作
+- ECS 目前支援 task inventory 與 ECS Exec，不支援 ECS service/deployment 管理
+- ECS broad cluster discovery 需要明確 opt-in，且 response 仍受服務端上限保護
 - OIDC 刷新 Token 流程未完整
 - SSM 受管理狀態為啟發式判斷（有 IAM Role 且 Running）
 - EC2 Instance Connect 支援判斷為近似值
