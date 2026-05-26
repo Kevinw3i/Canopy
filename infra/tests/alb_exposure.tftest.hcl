@@ -103,6 +103,42 @@ run "rejects_invalid_alb_allowed_cidr" {
   ]
 }
 
+run "rejects_invalid_acm_certificate_arn" {
+  command = plan
+
+  variables {
+    acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/not-a-uuid"
+  }
+
+  expect_failures = [
+    var.acm_certificate_arn,
+  ]
+}
+
+run "rejects_invalid_route53_zone_id" {
+  command = plan
+
+  variables {
+    route53_zone_id = "zone-123"
+  }
+
+  expect_failures = [
+    var.route53_zone_id,
+  ]
+}
+
+run "rejects_invalid_domain_name" {
+  command = plan
+
+  variables {
+    domain_name = "-canopy.example.com"
+  }
+
+  expect_failures = [
+    var.domain_name,
+  ]
+}
+
 run "rejects_reused_network_without_vpc_id" {
   command = plan
 
