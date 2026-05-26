@@ -204,7 +204,9 @@ async fn list_log_groups(
     let entitlements = ent_service.evaluate(&claims).await;
 
     // Scope-aware check: verify that at least one rule grants CloudWatch
-    // search AND access to the requested account+region (prevents cross-group escalation)
+    // search or Live Tail AND access to the requested account+region. Live Tail
+    // uses this route for its log-group picker, while event search and
+    // Insights routes remain search-only below.
     if !ent_service
         .has_feature_for_scope(
             &claims,
@@ -212,7 +214,7 @@ async fn list_log_groups(
             Some(&req.region),
             None,
             None,
-            |f| f.can_use_cloudwatch_search,
+            |f| f.can_use_cloudwatch_search || f.can_use_cloudwatch_tail,
         )
         .await
     {
@@ -221,12 +223,12 @@ async fn list_log_groups(
             .event(&claims.sub, AuditAction::LogGroupList, AuditOutcome::Denied)
             .account(Some(&req.account_id))
             .region(Some(&req.region))
-            .error(Some("CloudWatch search not authorized"))
+            .error(Some("CloudWatch log groups not authorized"))
             .optional_metadata(Some(log_groups_metadata(&audit_ctx, &req)))
             .commit_best_effort();
         return Err((
             axum::http::StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden("CloudWatch search not authorized")),
+            Json(ApiError::forbidden("CloudWatch log groups not authorized")),
         ));
     }
 
@@ -267,10 +269,11 @@ async fn list_log_groups(
     }
 
     // Use scope-aware log-group ARN patterns: only patterns from rules that
-    // also grant CloudWatch search + this account (prevents cross-group leak).
+    // also grant CloudWatch search or Live Tail + this account (prevents
+    // cross-group leak).
     let scoped_log_arns = ent_service
         .allowed_log_group_arns_for_scope(&claims, &req.account_id, &req.region, |f| {
-            f.can_use_cloudwatch_search
+            f.can_use_cloudwatch_search || f.can_use_cloudwatch_tail
         })
         .await;
 

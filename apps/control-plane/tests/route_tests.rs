@@ -1135,6 +1135,86 @@ async fn cloudwatch_log_groups_returns_mock_data() {
 }
 
 #[tokio::test]
+async fn cloudwatch_log_groups_allows_tail_only_scope_for_picker() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform rule");
+        rule.features.can_use_cloudwatch_search = false;
+        assert!(rule.features.can_use_cloudwatch_tail);
+    }
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "prefix": "/app/"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let groups = json["log_groups"].as_array().unwrap();
+    assert!(!groups.is_empty());
+    for group in groups {
+        assert!(group["name"].as_str().unwrap().starts_with("/app/"));
+    }
+}
+
+#[tokio::test]
+async fn cloudwatch_filter_events_still_requires_search_scope_when_tail_only() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform rule");
+        rule.features.can_use_cloudwatch_search = false;
+        assert!(rule.features.can_use_cloudwatch_tail);
+    }
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "start_time": 0,
+        "end_time": 9999999999999_i64
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/filter-events")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn cloudwatch_filter_events_returns_mock_data() {
     let config = dev_config();
     let token = issue_test_token(&config);
@@ -1499,7 +1579,10 @@ async fn cloudwatch_log_group_denied_is_audited_with_client_metadata() {
     let event = events.last().unwrap();
     assert_eq!(event["action"], "log_group_list");
     assert_eq!(event["outcome"], "denied");
-    assert_eq!(event["error_message"], "CloudWatch search not authorized");
+    assert_eq!(
+        event["error_message"],
+        "CloudWatch log groups not authorized"
+    );
     assert_eq!(event["metadata"]["actor_email"], "dev-admin@dev.local");
     assert_eq!(event["metadata"]["client_ip"], "203.0.113.20");
     assert_eq!(event["metadata"]["prefix"], "/ecs/");

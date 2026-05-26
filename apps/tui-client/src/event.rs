@@ -135,6 +135,15 @@ pub enum Action {
     StopLiveTail,
     PauseLiveTail,
     ResumeLiveTail,
+    RefreshLiveTailLogGroups,
+    LiveTailLogGroupsLoaded {
+        groups: Vec<shared::dto::cloudwatch::LogGroup>,
+        generation: u64,
+    },
+    LiveTailLogGroupsFailed {
+        error: String,
+        generation: u64,
+    },
     LiveTailEvent(shared::dto::cloudwatch::LiveTailEvent),
     LiveTailSessionUpdate {
         events_per_second: Option<f64>,
