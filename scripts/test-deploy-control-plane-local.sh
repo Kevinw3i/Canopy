@@ -104,6 +104,10 @@ case "$service:$operation" in
   ecs:wait|ecs:describe-services|elbv2:describe-target-health)
     printf 'stub %s %s\n' "$service" "$operation"
     ;;
+  elbv2:describe-target-groups)
+    default_tg_arn="arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/canopy/abcdef1234567890"
+    printf '%s\n' "${CANOPY_TARGET_GROUP_ARN_OUTPUT:-$default_tg_arn}"
+    ;;
   *)
     echo "unexpected aws command: $*" >&2
     exit 1
@@ -292,6 +296,54 @@ if [ "$(cat "$TMP_DIR/aws-describe-images-count")" != "2" ]; then
   echo "ERROR: expected ECR describe-images to run before and after push." >&2
   exit 1
 fi
+
+FULL_DEPLOY_TG_NAME_OUT="$TMP_DIR/full-deploy-target-group-name.out"
+rm -f "$TMP_DIR/aws-describe-images-count"
+if ! env \
+  PATH="$REPO_TMP_DIR/bin:$PATH" \
+  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+  AWS_PROFILE= \
+  CANOPY_EXPECT_AWS_PROFILE_UNSET=1 \
+  CANOPY_ALLOW_AWS=1 \
+  CANOPY_ALLOW_DOCKER=1 \
+  CANOPY_ALLOW_TERRAFORM_OUTPUTS=1 \
+  CANOPY_AWS_STATE_DIR="$TMP_DIR" \
+  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+  --yes \
+  --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
+  --cluster canopy \
+  --service control-plane \
+  > "$FULL_DEPLOY_TG_NAME_OUT" 2>&1; then
+  cat "$FULL_DEPLOY_TG_NAME_OUT" >&2
+  echo "ERROR: expected stubbed full deploy to resolve target group by name." >&2
+  exit 1
+fi
+grep -qF -- "Target group name: canopy-tg" "$FULL_DEPLOY_TG_NAME_OUT"
+grep -qF -- "Image deployed: 123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.1.0" "$FULL_DEPLOY_TG_NAME_OUT"
+
+MISSING_TG_OUT="$TMP_DIR/missing-target-group.out"
+rm -f "$TMP_DIR/aws-describe-images-count"
+if env \
+  PATH="$REPO_TMP_DIR/bin:$PATH" \
+  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+  AWS_PROFILE= \
+  CANOPY_EXPECT_AWS_PROFILE_UNSET=1 \
+  CANOPY_ALLOW_AWS=1 \
+  CANOPY_ALLOW_DOCKER=1 \
+  CANOPY_ALLOW_TERRAFORM_OUTPUTS=1 \
+  CANOPY_AWS_STATE_DIR="$TMP_DIR" \
+  CANOPY_TARGET_GROUP_ARN_OUTPUT=None \
+  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+  --yes \
+  --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
+  --cluster canopy \
+  --service control-plane \
+  > "$MISSING_TG_OUT" 2>&1; then
+  cat "$MISSING_TG_OUT" >&2
+  echo "ERROR: expected missing target group name resolution to fail." >&2
+  exit 1
+fi
+grep -qF -- "Unable to resolve target group ARN for target group name: canopy-tg" "$MISSING_TG_OUT"
 
 TF_VAR_REGION_OUT="$TMP_DIR/tf-var-region.out"
 if ! run_plan_only "$TF_VAR_REGION_OUT" TF_VAR_aws_region=ap-southeast-1; then

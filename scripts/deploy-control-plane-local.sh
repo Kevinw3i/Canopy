@@ -450,6 +450,9 @@ else
     --region "$AWS_REGION" \
     --query 'TargetGroups[0].TargetGroupArn' \
     --output text)"
+  if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+    fail "Unable to resolve target group ARN for target group name: $TARGET_GROUP_NAME"
+  fi
 fi
 
 run_aws elbv2 describe-target-health \
