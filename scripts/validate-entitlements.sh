@@ -8,7 +8,8 @@
 #   2. profile:* role_arn entries are rejected for ECS deployments
 #   3. All role ARNs in entitlements must appear in assumable_role_arns in tfvars
 #   4. ECS Exec rules must use AssumeRole ARNs, not direct/profile credentials
-#   5. ECS Exec must imply ECS view, and ECS access rules need allowed_clusters
+#   5. ECS Exec must imply ECS view, ECS access rules need allowed_clusters,
+#      and broad ECS cluster wildcards require explicit opt-in
 #   6. SSM access rules need explicit allowed_os_users
 set -euo pipefail
 
@@ -143,6 +144,42 @@ fi
 
 # Check 5: mirror control-plane ECS rule shape invariants before image build.
 ECS_RULE_SHAPE_ERRORS=$(printf '%s\n' "$ACTIVE_ENTITLEMENTS" | awk '
+function cluster_name(pattern, rest, pos) {
+  rest = pattern
+  while ((pos = index(rest, "cluster/")) > 0) {
+    rest = substr(rest, pos + 8)
+  }
+  return rest
+}
+function validate_cluster(pattern, name, first_star, literal_prefix_len) {
+  if (pattern == "*") {
+    has_bare_star = 1
+    return
+  }
+
+  name = cluster_name(pattern)
+  if (name ~ /[?\[\]{}\\]/) {
+    has_invalid_glob_chars = 1
+  }
+
+  first_star = index(name, "*")
+  if (first_star > 0) {
+    literal_prefix_len = length(substr(name, 1, first_star - 1))
+    if (literal_prefix_len < 3) {
+      has_broad_cluster_wildcard = 1
+    }
+  }
+}
+function scan_cluster_entries(line, entry) {
+  while (line ~ /"[^"]+"/) {
+    entry = line
+    sub(/^[^"]*"/, "", entry)
+    sub(/".*$/, "", entry)
+    has_clusters = 1
+    validate_cluster(entry)
+    sub(/"[^"]+"/, "", line)
+  }
+}
 function flush_rule() {
   if (in_rule && can_exec && !can_view) {
     print rule_id "|exec_without_view"
@@ -150,16 +187,34 @@ function flush_rule() {
   if (in_rule && (can_view || can_exec) && !has_clusters) {
     print rule_id "|missing_clusters"
   }
+  if (in_rule && has_bare_star) {
+    print rule_id "|bare_star_cluster"
+  }
+  if (in_rule && has_invalid_glob_chars) {
+    print rule_id "|invalid_cluster_glob"
+  }
+  if (in_rule && has_broad_cluster_wildcard && !allow_broad_cluster_discovery) {
+    print rule_id "|broad_cluster_without_opt_in"
+  }
 }
 /^[[:space:]]*\[\[rules\]\][[:space:]]*$/ {
   flush_rule()
   in_rule = 1
+  in_rule_table = 1
   in_clusters = 0
   can_view = 0
   can_exec = 0
   has_clusters = 0
+  has_bare_star = 0
+  has_invalid_glob_chars = 0
+  has_broad_cluster_wildcard = 0
+  allow_broad_cluster_discovery = 0
   rule_id = "<unknown>"
   next
+}
+in_rule && /^[[:space:]]*\[/ {
+  in_rule_table = 0
+  in_clusters = 0
 }
 in_rule && /^[[:space:]]*id[[:space:]]*=/ {
   rule_id = $0
@@ -172,11 +227,19 @@ in_rule && /^[[:space:]]*can_view_ecs[[:space:]]*=[[:space:]]*true/ {
 in_rule && /^[[:space:]]*can_use_ecs_exec[[:space:]]*=[[:space:]]*true/ {
   can_exec = 1
 }
-in_rule && /^[[:space:]]*allowed_clusters[[:space:]]*=/ {
-  in_clusters = 1
+in_rule && in_rule_table && /^[[:space:]]*allow_broad_cluster_discovery[[:space:]]*=[[:space:]]*true/ {
+  allow_broad_cluster_discovery = 1
 }
-in_rule && in_clusters && /"[^"]+"/ {
-  has_clusters = 1
+in_rule && in_rule_table && /^[[:space:]]*allowed_clusters[[:space:]]*=/ {
+  in_clusters = 1
+  scan_cluster_entries($0)
+  if ($0 ~ /\]/) {
+    in_clusters = 0
+  }
+  next
+}
+in_rule && in_clusters {
+  scan_cluster_entries($0)
 }
 in_rule && in_clusters && /\]/ {
   in_clusters = 0
@@ -194,6 +257,15 @@ if [ -n "$ECS_RULE_SHAPE_ERRORS" ]; then
         ;;
       missing_clusters)
         echo "ERROR: rule '$rule_id' grants ECS access but allowed_clusters is empty"
+        ;;
+      bare_star_cluster)
+        echo "ERROR: rule '$rule_id' has invalid allowed_clusters entry; bare '*' is not allowed"
+        ;;
+      invalid_cluster_glob)
+        echo "ERROR: rule '$rule_id' has invalid allowed_clusters entry; only literal characters and '*' are allowed in cluster name patterns"
+        ;;
+      broad_cluster_without_opt_in)
+        echo "ERROR: rule '$rule_id' has broad allowed_clusters wildcard; wildcard cluster patterns require at least 3 literal characters before '*' unless allow_broad_cluster_discovery=true"
         ;;
     esac
   done <<< "$ECS_RULE_SHAPE_ERRORS"

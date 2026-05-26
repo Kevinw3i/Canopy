@@ -239,6 +239,84 @@ expect_failure \
   "$TMP_DIR/gov.tfvars" \
   "allowed_clusters is empty"
 
+cat > "$TMP_DIR/broad-cluster-without-opt-in-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-broad-cluster"
+allowed_clusters = ["cluster/*"]
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "broad-cluster-without-opt-in" \
+  "$TMP_DIR/broad-cluster-without-opt-in-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "allow_broad_cluster_discovery=true"
+
+cat > "$TMP_DIR/broad-cluster-misplaced-opt-in-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-broad-cluster-misplaced-opt-in"
+allowed_clusters = ["cluster/*"]
+
+[rules.features]
+can_view_ecs = true
+allow_broad_cluster_discovery = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "broad-cluster-misplaced-opt-in" \
+  "$TMP_DIR/broad-cluster-misplaced-opt-in-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "allow_broad_cluster_discovery=true"
+
+cat > "$TMP_DIR/broad-cluster-with-opt-in-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-broad-cluster-opt-in"
+allowed_clusters = ["arn:aws:ecs:us-east-1:123456789012:cluster/*"]
+allow_broad_cluster_discovery = true
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_success \
+  "broad-cluster-with-opt-in" \
+  "$TMP_DIR/broad-cluster-with-opt-in-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars"
+
+cat > "$TMP_DIR/invalid-cluster-pattern-entitlements.toml" <<EOF
+[[rules]]
+id = "ecs-invalid-cluster-pattern"
+allowed_clusters = ["cluster/p?od-*"]
+allow_broad_cluster_discovery = true
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "invalid-cluster-pattern" \
+  "$TMP_DIR/invalid-cluster-pattern-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "only literal characters and '*' are allowed"
+
 cat > "$TMP_DIR/ssm-without-os-users-entitlements.toml" <<EOF
 [[rules]]
 id = "ssm-without-os-users"
