@@ -990,7 +990,7 @@ impl Ec2Screen {
         let Some(task) = self.selected_task() else {
             return Action::Noop;
         };
-        if task.last_status != "RUNNING" {
+        if !ecs_status_is_running(&task.last_status) {
             return Action::ShowError("Task is not running".into());
         }
         if !task.enable_execute_command {
@@ -1018,10 +1018,14 @@ fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
     task.containers
         .iter()
         .filter(|container| {
-            container.last_status == "RUNNING" && container.execute_command_agent_running
+            ecs_status_is_running(&container.last_status) && container.execute_command_agent_running
         })
         .map(|container| container.name.clone())
         .collect()
+}
+
+fn ecs_status_is_running(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("RUNNING")
 }
 
 fn ecs_container_readiness_label(task_exec_enabled: bool, container: &EcsContainer) -> String {
@@ -1029,7 +1033,7 @@ fn ecs_container_readiness_label(task_exec_enabled: bool, container: &EcsContain
         return format!("{}:disabled", container.name);
     }
     let last_status = container.last_status.trim();
-    if !last_status.eq_ignore_ascii_case("RUNNING") {
+    if !ecs_status_is_running(last_status) {
         let status_label = if last_status.is_empty() {
             "unknown".to_string()
         } else {
@@ -1925,7 +1929,7 @@ impl Ec2Screen {
         let rows: Vec<_> = tasks
             .into_iter()
             .map(|task| {
-                let status_style = if task.last_status == "RUNNING" {
+                let status_style = if ecs_status_is_running(&task.last_status) {
                     Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(Color::Yellow)
@@ -2349,6 +2353,15 @@ mod tests {
     }
 
     #[test]
+    fn ecs_running_status_normalizes_case_and_whitespace() {
+        assert!(ecs_status_is_running("RUNNING"));
+        assert!(ecs_status_is_running(" running "));
+        assert!(ecs_status_is_running("Running"));
+        assert!(!ecs_status_is_running(""));
+        assert!(!ecs_status_is_running("STOPPED"));
+    }
+
+    #[test]
     fn ecs_table_renders_container_readiness_labels() {
         let mut screen = Ec2Screen::new();
         screen.set_entitlements(ecs_entitlements(true));
@@ -2626,6 +2639,27 @@ mod tests {
         assert!(matches!(action, Action::Noop));
         let pending = screen.pending_ecs_exec.as_ref().unwrap();
         assert_eq!(pending.containers, vec!["app"]);
+    }
+
+    #[test]
+    fn container_picker_uses_normalized_running_statuses() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task = ecs_task_with_containers(vec![
+            ("app", " running ", true),
+            ("sidecar", "Running", true),
+            ("worker", "STOPPED", true),
+        ]);
+        task.last_status = "running".into();
+        screen.set_tasks(vec![task]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::Noop));
+        let pending = screen.pending_ecs_exec.as_ref().unwrap();
+        assert_eq!(pending.containers, vec!["app", "sidecar"]);
+        assert_eq!(screen.test_focus(), "ContainerPicker");
     }
 
     #[test]
