@@ -4,7 +4,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Wrap},
 };
 use shared::dto::ec2::{Ec2Instance, Ec2PowerAction, InstanceState};
-use shared::dto::ecs::EcsTask;
+use shared::dto::ecs::{EcsContainer, EcsTask};
 use shared::dto::entitlements::UserEntitlements;
 
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
@@ -1024,6 +1024,23 @@ fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
         .collect()
 }
 
+fn ecs_container_readiness_label(container: &EcsContainer) -> String {
+    let last_status = container.last_status.trim();
+    if !last_status.eq_ignore_ascii_case("RUNNING") {
+        let status_label = if last_status.is_empty() {
+            "unknown".to_string()
+        } else {
+            last_status.to_ascii_lowercase()
+        };
+        return format!("{}:{}", container.name, status_label);
+    }
+    if container.execute_command_agent_running {
+        format!("{}:ready", container.name)
+    } else {
+        format!("{}:no-agent", container.name)
+    }
+}
+
 fn ecs_account_scope_options(
     entitlements: &UserEntitlements,
     selected_region: Option<&str>,
@@ -1913,13 +1930,7 @@ impl Ec2Screen {
                 let containers = task
                     .containers
                     .iter()
-                    .map(|container| {
-                        if container.execute_command_agent_running {
-                            container.name.clone()
-                        } else {
-                            format!("{}*", container.name)
-                        }
-                    })
+                    .map(ecs_container_readiness_label)
                     .collect::<Vec<_>>()
                     .join(",");
 
@@ -2292,6 +2303,43 @@ mod tests {
         let text = rendered_text(&mut screen);
 
         assert!(text.contains("1/2 tasks"));
+    }
+
+    #[test]
+    fn ecs_container_readiness_label_includes_exec_state() {
+        let task = ecs_task_with_containers(vec![
+            ("app", "RUNNING", true),
+            ("api", "running", false),
+            ("job", "STOPPED", true),
+            ("init", "", false),
+        ]);
+
+        let labels = task
+            .containers
+            .iter()
+            .map(ecs_container_readiness_label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["app:ready", "api:no-agent", "job:stopped", "init:unknown"]
+        );
+    }
+
+    #[test]
+    fn ecs_table_renders_container_readiness_labels() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("app", "RUNNING", true),
+            ("api", "RUNNING", false),
+        ])]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("app:ready,api:no-agent"));
+        assert!(!text.contains("api*"));
     }
 
     #[test]
