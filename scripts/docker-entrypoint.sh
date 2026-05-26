@@ -77,6 +77,74 @@ positive_int() {
   printf '%s' "$value"
 }
 
+patch_config_line() {
+  section_re="$1"
+  match_re="$2"
+  after_re="$3"
+  line="$4"
+  file="$5"
+  tmp="${file}.tmp.$$"
+
+  if PATCH_SECTION="$section_re" PATCH_MATCH="$match_re" PATCH_AFTER="$after_re" PATCH_LINE="$line" awk '
+    BEGIN {
+      section_re = ENVIRON["PATCH_SECTION"]
+      match_re = ENVIRON["PATCH_MATCH"]
+      after_re = ENVIRON["PATCH_AFTER"]
+      line = ENVIRON["PATCH_LINE"]
+    }
+    {
+      lines[NR] = $0
+      if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*$/) {
+        if (!section_start && $0 ~ section_re) {
+          in_section = 1
+          section_start = NR
+        } else {
+          in_section = 0
+        }
+      }
+      if (!in_section) {
+        next
+      }
+      if (!match_line && $0 ~ match_re) {
+        match_line = NR
+      }
+      if (!after_line && $0 ~ after_re) {
+        after_line = NR
+      }
+    }
+    END {
+      if (!section_start || (!match_line && !after_line)) {
+        exit 1
+      }
+      if (match_line) {
+        for (i = 1; i <= NR; i++) {
+          if (i == match_line) {
+            print line
+          } else {
+            print lines[i]
+          }
+        }
+        exit 0
+      }
+      if (after_line) {
+        for (i = 1; i <= NR; i++) {
+          print lines[i]
+          if (i == after_line) {
+            print line
+          }
+        }
+        exit 0
+      }
+      exit 1
+    }
+  ' "$file" > "$tmp"; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    fatal "Unable to patch generated runtime config."
+  fi
+}
+
 # ── Resolve JWT secret ─────────────────────────────────────
 # Prefer JWT_SECRET (set directly, e.g. via ECS native secrets injection).
 # Fall back to JWT_SECRET_ARN (fetched via AWS CLI; needs task-role access).
@@ -160,25 +228,25 @@ elif [ -n "$JWT_SECRET" ] || [ -n "$OIDC_CLIENT_SECRET" ]; then
   cp "$CONFIG_PATH" "$WRITABLE_CONFIG"
 
   if [ -n "$JWT_SECRET" ]; then
-    ESCAPED_SECRET=$(escape_toml "$JWT_SECRET" | sed -e 's/&/\\&/g' -e 's/|/\\|/g')
+    ESCAPED_SECRET=$(escape_toml "$JWT_SECRET")
     # Replace existing secret line, or insert after [jwt] header if missing
-    if grep -q '^[[:space:]]*secret[[:space:]]*=' "$WRITABLE_CONFIG"; then
-      sed -i "s|^[[:space:]]*secret[[:space:]]*=.*|secret = \"${ESCAPED_SECRET}\"|" "$WRITABLE_CONFIG"
-    else
-      sed -i "/^\[jwt\]/a\\
-secret = \"${ESCAPED_SECRET}\"" "$WRITABLE_CONFIG"
-    fi
+    patch_config_line \
+      '^[[:space:]]*\[jwt\][[:space:]]*$' \
+      '^[[:space:]]*secret[[:space:]]*=' \
+      '^[[:space:]]*\[jwt\][[:space:]]*$' \
+      "secret = \"${ESCAPED_SECRET}\"" \
+      "$WRITABLE_CONFIG"
   fi
 
   if [ -n "$OIDC_CLIENT_SECRET" ]; then
-    SAFE_CS=$(escape_toml "$OIDC_CLIENT_SECRET" | sed -e 's/&/\\&/g' -e 's/|/\\|/g')
+    SAFE_CS=$(escape_toml "$OIDC_CLIENT_SECRET")
     # Insert client_secret after client_id line if not already present
-    if grep -q '^[[:space:]]*client_secret[[:space:]]*=' "$WRITABLE_CONFIG"; then
-      sed -i "s|^[[:space:]]*client_secret[[:space:]]*=.*|client_secret = \"${SAFE_CS}\"|" "$WRITABLE_CONFIG"
-    else
-      sed -i "/^[[:space:]]*client_id[[:space:]]*=/a\\
-client_secret = \"${SAFE_CS}\"" "$WRITABLE_CONFIG"
-    fi
+    patch_config_line \
+      '^[[:space:]]*\[oidc\][[:space:]]*$' \
+      '^[[:space:]]*client_secret[[:space:]]*=' \
+      '^[[:space:]]*client_id[[:space:]]*=' \
+      "client_secret = \"${SAFE_CS}\"" \
+      "$WRITABLE_CONFIG"
   fi
 
   CONFIG_PATH="$WRITABLE_CONFIG"

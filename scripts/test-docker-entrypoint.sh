@@ -87,6 +87,46 @@ assert data["cors_allowed_origins"] == [
 ]
 PY
 
+PATCH_CONFIG="$TMP_DIR/existing-config.toml"
+cat > "$PATCH_CONFIG" <<'TOML'
+bind_address = "127.0.0.1:8443"
+entitlements_file = "/etc/canopy/entitlements.toml"
+
+[oidc]
+issuer_url = "https://issuer.example"
+client_id = "client-id"
+
+[jwt]
+secret = "old-secret"
+expiry_seconds = 3600
+
+[aws]
+default_region = "ap-northeast-1"
+session_duration_seconds = 3600
+sts_external_id = "canopy"
+TOML
+
+PATCH_OUT="$TMP_DIR/patched.toml"
+env \
+  PATH="$TMP_DIR:$PATH" \
+  CONFIG_PATH="$PATCH_CONFIG" \
+  JWT_SECRET='patched"jwt\secret' \
+  OIDC_CLIENT_SECRET='patched"oidc\secret' \
+  sh "$ENTRYPOINT" > "$PATCH_OUT"
+
+python3 - <<'PY' "$PATCH_OUT"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+
+assert data["oidc"]["client_secret"] == 'patched"oidc\\secret'
+assert data["jwt"]["secret"] == 'patched"jwt\\secret'
+assert data["jwt"]["expiry_seconds"] == 3600
+assert data["aws"]["session_duration_seconds"] == 3600
+PY
+
 expect_entrypoint_failure \
   "missing-jwt-secret" \
   "JWT_SECRET is not set and no JWT_SECRET_ARN configured" \
