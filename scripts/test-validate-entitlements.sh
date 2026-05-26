@@ -101,6 +101,17 @@ expect_failure \
   "$TMP_DIR/missing.tfvars" \
   "not listed"
 
+cat > "$TMP_DIR/misleading.tfvars" <<EOF
+enable_direct_access = false
+assumable_role_arns = []
+other_role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "role-only-outside-assumable-list" \
+  "$TMP_DIR/gov-entitlements.toml" \
+  "$TMP_DIR/misleading.tfvars" \
+  "not listed"
+
 write_entitlements "$TMP_DIR/invalid-entitlements.toml" "arn:aws:s3:::not-a-role"
 write_tfvars "$TMP_DIR/invalid.tfvars" "arn:aws-us-gov:iam::123456789012:role/path/CanopyRole"
 expect_failure \

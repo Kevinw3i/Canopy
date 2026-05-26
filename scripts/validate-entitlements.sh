@@ -36,6 +36,27 @@ strip_comments() {
   sed 's/#.*$//' "$1"
 }
 
+extract_assumable_role_arns() {
+  strip_comments "$TFVARS" | awk '
+    /^[[:space:]]*assumable_role_arns[[:space:]]*=/ {
+      in_list = 1
+      line = $0
+      sub(/^[^=]*=/, "", line)
+      print line
+      if (line ~ /\]/) {
+        in_list = 0
+      }
+      next
+    }
+    in_list {
+      print
+      if ($0 ~ /\]/) {
+        in_list = 0
+      }
+    }
+  ' | grep -oE '"arn:[^"]+"' | tr -d '"' | sort -u || true
+}
+
 # Check 1: direct access (only in uncommented lines)
 if strip_comments "$ENTITLEMENTS" | grep -qE 'role_arn\s*=\s*"direct"'; then
   if ! strip_comments "$TFVARS" | grep -qE 'enable_direct_access\s*=\s*true'; then
@@ -54,6 +75,7 @@ fi
 ROLE_ARNS=$(strip_comments "$ENTITLEMENTS" | \
   grep -oE 'role_arn\s*=\s*"arn:[^"]+"' | \
   sed 's/role_arn[[:space:]]*=[[:space:]]*//' | tr -d '"' | sort -u || true)
+ASSUMABLE_ROLE_ARNS="$(extract_assumable_role_arns)"
 
 for arn in $ROLE_ARNS; do
   if ! grep -qE '^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$' <<< "$arn"; then
@@ -62,7 +84,7 @@ for arn in $ROLE_ARNS; do
     continue
   fi
 
-  if ! strip_comments "$TFVARS" | grep -qF "$arn"; then
+  if ! grep -qxF "$arn" <<< "$ASSUMABLE_ROLE_ARNS"; then
     echo "ERROR: a role_arn in entitlements is not listed in $TFVARS assumable_role_arns (value redacted)"
     ERRORS=$((ERRORS + 1))
   fi
