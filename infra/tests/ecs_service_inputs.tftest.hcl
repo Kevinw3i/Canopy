@@ -51,6 +51,42 @@ run "rejects_fractional_desired_count" {
   ]
 }
 
+run "rejects_unsupported_fargate_cpu" {
+  command = plan
+
+  variables {
+    cpu = 128
+  }
+
+  expect_failures = [
+    var.cpu,
+  ]
+}
+
+run "rejects_unsupported_fargate_memory" {
+  command = plan
+
+  variables {
+    memory = 1536
+  }
+
+  expect_failures = [
+    var.memory,
+  ]
+}
+
+run "rejects_invalid_cpu_architecture" {
+  command = plan
+
+  variables {
+    cpu_architecture = "x86_64"
+  }
+
+  expect_failures = [
+    var.cpu_architecture,
+  ]
+}
+
 run "rejects_latest_image_tag" {
   command = plan
 
