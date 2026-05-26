@@ -148,6 +148,29 @@ if grep -qF -- "Resolve ECR repository" "$PLAN_ONLY_OUT"; then
   exit 1
 fi
 
+PLATFORM_MISMATCH_OUT="$TMP_DIR/platform-mismatch.out"
+if env \
+  PATH="$REPO_TMP_DIR/bin:$PATH" \
+  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+  --plan-only \
+  --profile test-profile \
+  --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
+  --cluster canopy \
+  --service control-plane \
+  --platform linux/arm64 \
+  > "$PLATFORM_MISMATCH_OUT" 2>&1; then
+  cat "$PLATFORM_MISMATCH_OUT" >&2
+  echo "ERROR: expected mismatched Docker platform to fail." >&2
+  exit 1
+fi
+grep -qF -- "--platform linux/arm64 does not match Terraform cpu_architecture=X86_64" "$PLATFORM_MISMATCH_OUT"
+if grep -qF -- "Terraform Phase 2 plan" "$PLATFORM_MISMATCH_OUT"; then
+  cat "$PLATFORM_MISMATCH_OUT" >&2
+  echo "ERROR: platform mismatch should stop before Terraform plan." >&2
+  exit 1
+fi
+
 DESTROY_PLAN_OUT="$TMP_DIR/plan-destroy.out"
 if run_plan_only "$DESTROY_PLAN_OUT" CANOPY_TERRAFORM_SHOW_TEXT='aws_ecs_service.control_plane will be destroyed'; then
   cat "$DESTROY_PLAN_OUT" >&2
