@@ -609,12 +609,18 @@ impl App {
                     return;
                 }
                 let task_count = tasks.len();
+                let failed_scope_count = failed_scopes.len();
                 let warnings =
                     ecs_tasks_warning_messages(&failed_scopes, task_count, total_count, truncated);
                 if !warnings.is_empty() {
                     self.error_modal.show(warnings.join("\n\n"));
                 }
-                self.ec2.set_tasks(tasks);
+                self.ec2.set_ecs_task_results(
+                    tasks,
+                    Some(total_count),
+                    truncated,
+                    failed_scope_count,
+                );
             }
             Action::EcsTasksFetchFailed(err, generation) => {
                 if generation != self.ec2.fetch_generation {

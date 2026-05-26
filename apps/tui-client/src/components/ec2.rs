@@ -117,6 +117,9 @@ impl StateFilter {
 pub struct Ec2Screen {
     pub instances: Vec<Ec2Instance>,
     pub tasks: Vec<EcsTask>,
+    ecs_total_count: usize,
+    ecs_results_truncated: bool,
+    ecs_failed_scope_count: usize,
     pub loading: bool,
     pub error: Option<String>,
     entitlements: Option<UserEntitlements>,
@@ -153,6 +156,9 @@ impl Ec2Screen {
         Self {
             instances: Vec::new(),
             tasks: Vec::new(),
+            ecs_total_count: 0,
+            ecs_results_truncated: false,
+            ecs_failed_scope_count: 0,
             loading: false,
             error: None,
             entitlements: None,
@@ -228,7 +234,21 @@ impl Ec2Screen {
     }
 
     pub fn set_tasks(&mut self, tasks: Vec<EcsTask>) {
+        self.set_ecs_task_results(tasks, None, false, 0);
+    }
+
+    pub fn set_ecs_task_results(
+        &mut self,
+        tasks: Vec<EcsTask>,
+        total_count: Option<usize>,
+        truncated: bool,
+        failed_scope_count: usize,
+    ) {
+        let task_count = tasks.len();
         self.tasks = tasks;
+        self.ecs_total_count = total_count.unwrap_or(task_count).max(task_count);
+        self.ecs_results_truncated = truncated;
+        self.ecs_failed_scope_count = failed_scope_count;
         self.apply_ecs_filter();
         self.loading = false;
         self.error = None;
@@ -325,6 +345,46 @@ impl Ec2Screen {
                         .any(|container| container.name.to_ascii_lowercase().contains(&query))
             })
             .collect()
+    }
+
+    fn ecs_task_count_display(&self) -> String {
+        let loaded_count = self.tasks.len();
+        let known_total = self.ecs_total_count.max(loaded_count);
+        let filtered_count = self.filtered_tasks().len();
+        let suffix = if self.ecs_results_truncated { "+" } else { "" };
+        let base = if self.search_input.value.trim().is_empty() {
+            if known_total > loaded_count {
+                format!("{loaded_count}/{known_total}{suffix} tasks")
+            } else {
+                format!("{loaded_count}{suffix} tasks")
+            }
+        } else if known_total > loaded_count {
+            format!("{filtered_count}/{loaded_count}/{known_total}{suffix} tasks")
+        } else {
+            format!("{filtered_count}/{loaded_count}{suffix} tasks")
+        };
+
+        let mut parts = vec![base];
+        if self.ecs_results_truncated {
+            parts.push("truncated".into());
+        }
+        if self.ecs_failed_scope_count > 0 {
+            let noun = if self.ecs_failed_scope_count == 1 {
+                "scope"
+            } else {
+                "scopes"
+            };
+            parts.push(format!(
+                "partial: {} {} failed",
+                self.ecs_failed_scope_count, noun
+            ));
+        }
+        parts.join(" | ")
+    }
+
+    fn has_ecs_result_warning(&self) -> bool {
+        self.view == InventoryView::Ecs
+            && (self.ecs_results_truncated || self.ecs_failed_scope_count > 0)
     }
 
     fn apply_ecs_filter(&mut self) {
@@ -809,6 +869,9 @@ impl Ec2Screen {
         self.fetch_generation += 1;
         self.instances.clear();
         self.tasks.clear();
+        self.ecs_total_count = 0;
+        self.ecs_results_truncated = false;
+        self.ecs_failed_scope_count = 0;
         self.table.set_row_count(0);
         self.ecs_table.set_row_count(0);
         self.loading = false;
@@ -1541,12 +1604,7 @@ impl Component for Ec2Screen {
         let filter_label = self.state_filter.label();
 
         let count_display = if self.view == InventoryView::Ecs {
-            if self.search_input.value.trim().is_empty() {
-                format!("{} tasks", total_count)
-            } else {
-                let filtered_task_count = self.filtered_tasks().len();
-                format!("{}/{} tasks", filtered_task_count, total_count)
-            }
+            self.ecs_task_count_display()
         } else if self.state_filter == StateFilter::All {
             format!("{} instances", total_count)
         } else {
@@ -1596,7 +1654,7 @@ impl Component for Ec2Screen {
 
         let status_style = if self.error.is_some() {
             Style::default().fg(Color::Red)
-        } else if self.loading {
+        } else if self.loading || self.has_ecs_result_warning() {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::Gray)
@@ -2325,6 +2383,47 @@ mod tests {
         let text = rendered_text(&mut screen);
 
         assert!(text.contains("1/2 tasks"));
+    }
+
+    #[test]
+    fn ecs_view_status_persists_truncated_result_state() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_ecs_task_results(vec![ecs_task(vec!["app"])], Some(5), true, 0);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1/5+ tasks"));
+        assert!(text.contains("truncated"));
+    }
+
+    #[test]
+    fn ecs_view_status_persists_partial_scope_state() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_ecs_task_results(vec![ecs_task(vec!["app"])], Some(1), false, 1);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1 tasks"));
+        assert!(text.contains("partial: 1 scope failed"));
+    }
+
+    #[test]
+    fn ecs_view_set_tasks_clears_result_warning_state() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_ecs_task_results(vec![ecs_task(vec!["app"])], Some(5), true, 1);
+        screen.set_tasks(vec![ecs_task(vec!["app"])]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1 tasks"));
+        assert!(!text.contains("truncated"));
+        assert!(!text.contains("partial:"));
     }
 
     #[test]
