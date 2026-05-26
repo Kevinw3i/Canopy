@@ -170,6 +170,11 @@ variable "desired_count" {
   description = "Number of ECS tasks"
   type        = number
   default     = 2
+
+  validation {
+    condition     = var.desired_count >= 0 && var.desired_count == floor(var.desired_count)
+    error_message = "desired_count must be a non-negative whole number."
+  }
 }
 
 variable "create_service" {
