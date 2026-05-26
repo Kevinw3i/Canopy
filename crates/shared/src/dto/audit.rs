@@ -61,6 +61,9 @@ pub enum AuditAction {
     /// id and version so data-access tools can prove the required guidance was
     /// issued before use.
     McpGuidanceSync,
+    /// MCP CloudWatch discovery. The operation lists authorized log groups
+    /// only; CloudWatch data access stays behind later MCP phases.
+    McpCloudwatchDiscovery,
     /// MCP database scope discovery. Scope details stay in metadata; secrets
     /// and connection internals must not be exposed in the response or audit.
     McpDatabaseScopeList,
@@ -88,6 +91,7 @@ impl AuditAction {
             Self::EntitlementsView => "entitlements_view",
             Self::McpSessionRegister => "mcp_session_register",
             Self::McpGuidanceSync => "mcp_guidance_sync",
+            Self::McpCloudwatchDiscovery => "mcp_cloudwatch_discovery",
             Self::McpDatabaseScopeList => "mcp_database_scope_list",
             Self::McpDatabaseQuery => "mcp_database_query",
         }
@@ -123,6 +127,7 @@ mod tests {
             AuditAction::EntitlementsView,
             AuditAction::McpSessionRegister,
             AuditAction::McpGuidanceSync,
+            AuditAction::McpCloudwatchDiscovery,
             AuditAction::McpDatabaseScopeList,
             AuditAction::McpDatabaseQuery,
         ] {

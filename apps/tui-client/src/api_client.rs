@@ -10,8 +10,8 @@ use shared::dto::database::*;
 use shared::dto::ec2::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
-    McpGuidanceSyncRequest, McpGuidanceSyncResponse, McpRegisterSessionRequest,
-    McpRegisterSessionResponse,
+    McpGuidanceSyncRequest, McpGuidanceSyncResponse, McpListAllowedLogGroupsRequest,
+    McpListAllowedLogGroupsResponse, McpRegisterSessionRequest, McpRegisterSessionResponse,
 };
 use shared::errors::ApiError;
 use shared::headers;
@@ -341,6 +341,23 @@ impl ApiClient {
         let mut req = self
             .client
             .post(format!("{}/api/mcp/guidance/delivered", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn list_mcp_allowed_log_groups(
+        &self,
+        request: &McpListAllowedLogGroupsRequest,
+    ) -> ApiResult<McpListAllowedLogGroupsResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/cloudwatch/log-groups", self.base_url))
             .json(request);
 
         if let Some(ref auth) = self.auth_header() {

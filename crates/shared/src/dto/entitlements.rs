@@ -49,7 +49,7 @@ pub struct FeatureFlags {
     /// Allows MCP CloudWatch tools when combined with `can_use_mcp`.
     #[serde(default)]
     pub can_use_mcp_cloudwatch: bool,
-    /// Reserved for future MCP EC2 tools. Product Phase 1 does not expose EC2 MCP tools.
+    /// Reserved for future MCP EC2 tools. Product Phase 2 does not expose EC2 MCP tools.
     #[serde(default)]
     pub can_use_mcp_ec2: bool,
     /// Allows MCP database tools. The control-plane still enforces

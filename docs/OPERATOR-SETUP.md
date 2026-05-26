@@ -131,12 +131,13 @@ can_use_mcp = true
 4. health check 成功後選擇 `Codex CLI` 或 `Claude Code`
 5. TUI 會開一個新的 macOS Terminal 視窗啟動對應 AI client
 
-目前 Product Phase 1 提供 MCP 基礎工具：
+目前 Product Phase 2 提供 MCP 基礎工具與 CloudWatch discovery：
 
 - `canopy_describe_capabilities`
 - `canopy_get_guidance`
+- `canopy_list_allowed_log_groups`
 
-並可在明確啟用時提供 MCP Database v1。CloudWatch / EC2 data tools 尚未開放。即使使用者有
+並可在明確啟用時提供 MCP Database v1。CloudWatch search / Insights / EC2 data tools 尚未開放。即使使用者有
 `can_use_cloudwatch_search = true`，也不會自動取得 MCP CloudWatch
 查詢權限；後續會由獨立的 `can_use_mcp_cloudwatch` 與 control-plane MCP
 專用 route 控制。

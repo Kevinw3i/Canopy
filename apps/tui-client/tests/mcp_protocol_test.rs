@@ -43,7 +43,7 @@ fn dev_admin_entitlements() -> UserEntitlements {
             can_stop_ec2: false,
             can_reboot_ec2: false,
             can_use_mcp: true,
-            can_use_mcp_cloudwatch: false,
+            can_use_mcp_cloudwatch: true,
             can_use_mcp_ec2: false,
             can_use_mcp_database: true,
         },
@@ -103,7 +103,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .and(body_partial_json(json!({
             "protocol_version": "2025-06-18",
             "client_name": "canopy-local-mcp",
-            "product_phase": "phase_1_local_foundation"
+            "product_phase": "phase_2_discovery"
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "canopy_mcp_session_id": expected_sid,
@@ -195,6 +195,34 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
                 "max_examined_rows": 10000,
                 "allow_full_table_scan": false
             }]
+        })))
+        .mount(&mock)
+        .await;
+
+    // List allowed log groups — assert (sid, lsg, account, region) make it through.
+    Mock::given(method("POST"))
+        .and(path("/api/mcp/cloudwatch/log-groups"))
+        .and(header("Authorization", "Bearer fake-jwt-for-tui-test"))
+        .and(body_partial_json(json!({
+            "canopy_mcp_session_id": expected_sid,
+            "local_secret_generation": expected_lsg,
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "prefix": "/app"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "prefix": "/app",
+            "log_groups": [{
+                "name": "/app/web-service",
+                "arn": "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service",
+                "stored_bytes": 1024,
+                "retention_days": 30
+            }],
+            "returned_count": 1,
+            "scanned_count": 1,
+            "truncated": false
         })))
         .mount(&mock)
         .await;
@@ -336,7 +364,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         "tools/list without protocol session id must fail"
     );
 
-    // 3.7 tools/list with session id → 4 expected tools
+    // 3.7 tools/list with session id → expected tools
     let resp = client
         .post(&endpoint)
         .bearer_auth(&bearer)
@@ -355,6 +383,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     for expected in [
         "canopy_describe_capabilities",
         "canopy_get_guidance",
+        "canopy_list_allowed_log_groups",
         "canopy_list_database_scopes",
         "canopy_query_database",
     ] {
@@ -383,7 +412,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .as_str()
         .expect("content[0].text");
     let payload: Value = serde_json::from_str(payload_text).unwrap();
-    assert_eq!(payload["mcp_product_phase"], "phase_1_local_foundation");
+    assert_eq!(payload["mcp_product_phase"], "phase_2_discovery");
 
     // 3.9 tools/call canopy_get_guidance → forwards to control-plane
     //     `/api/mcp/guidance/delivered` with the workflow guidance id.
@@ -418,7 +447,38 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     assert_eq!(payload["id"], "database_query_workflow");
     assert_eq!(payload["version"], "2026-05-13");
 
-    // 3.10 tools/call canopy_list_database_scopes → forwards to mock
+    // 3.10 tools/call canopy_list_allowed_log_groups → forwards to mock
+    //      control-plane; it is Phase 2 discovery and does not require
+    //      a preflight token.
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(&bearer)
+        .header("Content-Type", "application/json")
+        .header("Mcp-Session-Id", &proto_session_id)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": {
+                "name": "canopy_list_allowed_log_groups",
+                "arguments": {
+                    "account_id": "111111111111",
+                    "region": "us-east-1",
+                    "prefix": "/app"
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let payload_text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("content[0].text on list_allowed_log_groups");
+    let payload: Value = serde_json::from_str(payload_text).unwrap();
+    assert_eq!(payload["log_groups"][0]["name"], "/app/web-service");
+    assert_eq!(payload["truncated"], false);
+
+    // 3.11 tools/call canopy_list_database_scopes → forwards to mock
     //     control-plane; we verify the response shape AND that the mock
     //     actually saw the request below.
     let resp = client
@@ -427,7 +487,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .header("Content-Type", "application/json")
         .header("Mcp-Session-Id", &proto_session_id)
         .json(&json!({
-            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": {"name": "canopy_list_database_scopes", "arguments": {}}
         }))
         .send()
@@ -441,7 +501,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     let payload: Value = serde_json::from_str(payload_text).unwrap();
     assert_eq!(payload["scopes"][0]["name"], "orders_prod_readonly");
 
-    // 3.11 tools/call canopy_query_database → control-plane returns 400
+    // 3.12 tools/call canopy_query_database → control-plane returns 400
     //      which the TUI MCP server should surface as a structured
     //      JSON-RPC error, not a 5xx.
     let resp = client
@@ -450,7 +510,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .header("Content-Type", "application/json")
         .header("Mcp-Session-Id", &proto_session_id)
         .json(&json!({
-            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "jsonrpc": "2.0", "id": 8, "method": "tools/call",
             "params": {
                 "name": "canopy_query_database",
                 "arguments": {
@@ -477,6 +537,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     let path_counts: std::collections::HashMap<&str, usize> = [
         "/api/mcp/session/register",
         "/api/mcp/guidance/delivered",
+        "/api/mcp/cloudwatch/log-groups",
         "/api/mcp/database/scopes",
         "/api/mcp/database/query",
     ]
@@ -497,6 +558,10 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
     assert_eq!(
         path_counts["/api/mcp/guidance/delivered"], 1,
         "canopy_get_guidance must forward to control-plane exactly once"
+    );
+    assert!(
+        path_counts["/api/mcp/cloudwatch/log-groups"] >= 1,
+        "list_allowed_log_groups tool must forward to control-plane"
     );
     assert!(
         path_counts["/api/mcp/database/scopes"] >= 1,
@@ -522,7 +587,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         serde_json::from_slice(&register_req.body).expect("register body should be JSON");
     assert_eq!(register_body["protocol_version"], "2025-06-18");
     assert_eq!(register_body["client_name"], "canopy-local-mcp");
-    assert_eq!(register_body["product_phase"], "phase_1_local_foundation");
+    assert_eq!(register_body["product_phase"], "phase_2_discovery");
     assert_eq!(
         register_body["local_secret_generation"], expected_lsg,
         "register must carry the runtime-generated local_secret_generation"

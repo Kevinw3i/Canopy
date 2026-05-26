@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::cloudwatch::LogGroup;
+
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-pub const MCP_PRODUCT_PHASE: &str = "phase_1_local_foundation";
+pub const MCP_PRODUCT_PHASE: &str = "phase_2_discovery";
 pub const MCP_SECURITY_BOUNDARIES_KEY: &str = "security_boundaries@2026-05-13";
 pub const MCP_DATABASE_GUIDANCE_ID: &str = "database_query_workflow";
 pub const MCP_DATABASE_GUIDANCE_VERSION: &str = "2026-05-13";
@@ -25,13 +27,13 @@ pub const MCP_GUIDANCE_CATALOG: &[McpGuidanceCatalogEntry] = &[
         id: "cloudwatch_search_workflow",
         version: "2026-05-13",
         title: "CloudWatch Search Workflow",
-        content: "Before searching logs, call canopy_describe_capabilities. In Phase 1, CloudWatch search tools are intentionally disabled; do not fabricate log results.",
+        content: "Before using CloudWatch MCP tools, call canopy_describe_capabilities. In Phase 2, only canopy_list_allowed_log_groups is enabled for discovery; search and Insights data tools remain disabled until Phase 3.",
     },
     McpGuidanceCatalogEntry {
         id: "cloudwatch_insights_workflow",
         version: "2026-05-13",
         title: "CloudWatch Insights Workflow",
-        content: "Insights queries require explicit Phase 3 support, preflight validation, bounded time windows, and central guardrails. In Phase 1, do not run Insights.",
+        content: "Insights queries require explicit Phase 3 support, preflight validation, bounded time windows, and central guardrails. In Phase 2, do not run Insights.",
     },
     McpGuidanceCatalogEntry {
         id: "privacy_and_audit_notice",
@@ -135,6 +137,9 @@ pub struct McpToolAvailability {
 pub struct McpGuardrails {
     pub max_request_body_bytes: u64,
     pub max_log_group_list_results: u64,
+    pub max_describe_log_groups_pages: u64,
+    pub max_discovery_results_scanned: u64,
+    pub discovery_cursor_ttl_seconds: u64,
     pub max_search_window_seconds: u64,
     pub max_search_events: u64,
     pub max_response_bytes: u64,
@@ -152,6 +157,9 @@ impl Default for McpGuardrails {
         Self {
             max_request_body_bytes: 256 * 1024,
             max_log_group_list_results: 200,
+            max_describe_log_groups_pages: 5,
+            max_discovery_results_scanned: 1_000,
+            discovery_cursor_ttl_seconds: 10 * 60,
             max_search_window_seconds: 6 * 60 * 60,
             max_search_events: 1000,
             max_response_bytes: 1024 * 1024,
@@ -175,6 +183,38 @@ pub struct McpDescribeCapabilitiesResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpListAllowedLogGroupsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canopy_mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_secret_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpListAllowedLogGroupsResponse {
+    pub account_id: String,
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    pub log_groups: Vec<LogGroup>,
+    pub returned_count: usize,
+    pub scanned_count: u64,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action_hint: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,9 +228,9 @@ mod tests {
     }
 
     #[test]
-    fn constants_match_phase_one() {
+    fn constants_match_current_phase() {
         assert_eq!(MCP_PROTOCOL_VERSION, "2025-06-18");
-        assert_eq!(MCP_PRODUCT_PHASE, "phase_1_local_foundation");
+        assert_eq!(MCP_PRODUCT_PHASE, "phase_2_discovery");
     }
 
     #[test]
