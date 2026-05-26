@@ -289,6 +289,21 @@ enable_live_tail = true        # 選單中顯示 Live Tail（beta 功能）
 auto_update = false            # true = 啟動時檢查並套用更新
 # update_repo_owner = "Kevinw3i"  # GitHub owner（預設值）
 # update_repo_name = "Canopy"     # GitHub repo（預設值）
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
 ```
 
 當 `auto_update = true` 時，TUI 啟動時會檢查 GitHub 上是否有更新的 `tui-v*` release（每 10 分鐘最多檢查一次）。如果找到新版本：

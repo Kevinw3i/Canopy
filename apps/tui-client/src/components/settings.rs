@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph},
@@ -7,6 +7,7 @@ use ratatui::{
 use super::Component;
 use crate::config::ClientConfig;
 use crate::event::Action;
+use crate::keybindings::KeyBindings;
 
 pub struct SettingsScreen {
     pub config: ClientConfig,
@@ -20,14 +21,28 @@ impl SettingsScreen {
 
 impl Component for SettingsScreen {
     fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if self
+            .config
+            .keybindings
+            .matches_any(&self.config.keybindings.quit, &key)
+        {
             return Action::Quit;
         }
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => Action::GoBack,
-            KeyCode::Char('p') if key.modifiers.is_empty() => Action::ChangePassword,
-            _ => Action::Noop,
+        if self
+            .config
+            .keybindings
+            .matches_any(&self.config.keybindings.settings_back, &key)
+        {
+            return Action::GoBack;
         }
+        if self
+            .config
+            .keybindings
+            .matches_any(&self.config.keybindings.settings_change_password, &key)
+        {
+            return Action::ChangePassword;
+        }
+        Action::Noop
     }
 
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -38,7 +53,11 @@ impl Component for SettingsScreen {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
-        let lines = vec![
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "Runtime",
+                Style::default().fg(Color::Cyan).bold(),
+            )),
             Line::from(vec![
                 Span::styled("Control Plane URL:  ", Style::default().bold()),
                 Span::raw(&self.config.control_plane_url),
@@ -58,19 +77,53 @@ impl Component for SettingsScreen {
             Line::from(""),
             Line::from(vec![
                 Span::styled("Change Password:    ", Style::default().bold()),
-                Span::raw("Press p to open the password page"),
+                Span::raw(format!(
+                    "Press {} to open the password page",
+                    KeyBindings::first_label(&self.config.keybindings.settings_change_password)
+                )),
             ]),
             Line::from(""),
             Line::from(Span::styled(
-                "Edit config in the OS config directory",
+                "Keyboard Shortcuts",
+                Style::default().fg(Color::Cyan).bold(),
+            )),
+        ];
+
+        let rows = self.config.keybindings.settings_rows();
+        for row in rows.chunks(2) {
+            let left = shortcut_cell(row[0].0, &row[0].1);
+            let line = if let Some(right) = row.get(1) {
+                format!("{left:<38}{}", shortcut_cell(right.0, &right.1))
+            } else {
+                left
+            };
+            lines.push(Line::from(line));
+        }
+
+        lines.extend([
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Config File:        ", Style::default().bold()),
+                Span::raw(ClientConfig::config_path().display().to_string()),
+            ]),
+            Line::from(Span::styled(
+                "Edit [keybindings] in the OS config file to customize shortcuts",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
-            Line::from("p: change password | Esc/q: back"),
-        ];
+            Line::from(format!(
+                "{}: change password | {}: back",
+                KeyBindings::first_label(&self.config.keybindings.settings_change_password),
+                KeyBindings::first_label(&self.config.keybindings.settings_back)
+            )),
+        ]);
 
         Paragraph::new(lines).render(inner, buf);
     }
+}
+
+fn shortcut_cell(name: &str, keys: &str) -> String {
+    format!("{name}: {keys}")
 }
 
 #[cfg(test)]
@@ -109,6 +162,7 @@ mod tests {
             update_repo_owner: "Kevinw3i".into(),
             update_repo_name: "Canopy".into(),
             change_password_url: None,
+            keybindings: crate::keybindings::KeyBindings::default(),
         }
     }
 
@@ -143,5 +197,48 @@ mod tests {
             screen.handle_key(key(KeyCode::Char('q'))),
             Action::GoBack
         ));
+    }
+
+    #[test]
+    fn custom_settings_shortcuts_replace_defaults() {
+        let mut config = test_config();
+        config.keybindings.settings_back = vec!["b".into()];
+        config.keybindings.settings_change_password = vec!["P".into()];
+        let mut screen = SettingsScreen::new(config);
+
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('q'))),
+            Action::Noop
+        ));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('b'))),
+            Action::GoBack
+        ));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('p'))),
+            Action::Noop
+        ));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('P'))),
+            Action::ChangePassword
+        ));
+    }
+
+    #[test]
+    fn render_shows_keyboard_shortcuts() {
+        let mut screen = SettingsScreen::new(test_config());
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let text = buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Keyboard Shortcuts"));
+        assert!(text.contains("Dashboard select"));
+        assert!(text.contains("enter"));
+        assert!(text.contains("Config File:"));
     }
 }

@@ -305,7 +305,8 @@ TUI                     Control Plane              OIDC Provider
 ### 5.7 設定畫面 (Settings)
 
 - 顯示目前設定：Control Plane URL、開發模式、刷新間隔、Live Tail scrollback
-- 提示設定檔路徑
+- 顯示目前 keybindings：dashboard 導航、quick nav、logout、settings back / change password
+- 提示設定檔路徑；自訂快捷鍵透過 TUI config 的 `[keybindings]` table 設定
 
 ---
 
@@ -455,6 +456,21 @@ enable_live_tail = false
 auto_update = false              # 啟動時自動檢查 GitHub Releases 更新
 # update_repo_owner = "Kevinw3i" # GitHub owner（預設值）
 # update_repo_name = "Canopy"    # GitHub repo（預設值）
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
 ```
 
 ### 9.3 權限規則 (`entitlements.toml`)
@@ -610,6 +626,6 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - [x] SSM DescribeInstanceInformation 精確判斷受管理狀態
 - [x] OIDC Provider-driven Multi-factor Authentication 支援
 - [ ] 本機 TOTP/WebAuthn 註冊與 step-up UI
-- [ ] 自訂快捷鍵設定
+- [x] 自訂快捷鍵設定（dashboard / settings）
 - [ ] 主題與配色自訂
 - [ ] 匯出稽核日誌至 CloudWatch Logs / S3

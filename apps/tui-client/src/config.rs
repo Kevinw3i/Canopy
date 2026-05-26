@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::keybindings::KeyBindings;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub control_plane_url: String,
@@ -31,6 +33,9 @@ pub struct ClientConfig {
     /// Optional self-service password change URL, typically the Cognito hosted UI.
     #[serde(default)]
     pub change_password_url: Option<String>,
+    /// Configurable keyboard shortcuts for high-level TUI actions.
+    #[serde(default)]
+    pub keybindings: KeyBindings,
 }
 
 fn default_auto_update() -> bool {
@@ -80,6 +85,7 @@ impl ClientConfig {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             let config: ClientConfig = toml::from_str(&content)?;
+            config.validate()?;
             Ok(config)
         } else {
             anyhow::bail!(
@@ -91,7 +97,7 @@ impl ClientConfig {
         }
     }
 
-    fn config_path() -> PathBuf {
+    pub fn config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("canopy")
@@ -121,7 +127,12 @@ impl ClientConfig {
             update_repo_owner: default_update_repo_owner(),
             update_repo_name: default_update_repo_name(),
             change_password_url: None,
+            keybindings: KeyBindings::default(),
         }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        self.keybindings.validate()
     }
 }
 
@@ -152,6 +163,7 @@ mod tests {
         assert!(!config.enable_live_tail);
         assert!(!config.auto_update);
         assert!(config.change_password_url.is_none());
+        assert_eq!(config.keybindings.dashboard_up, vec!["up", "k"]);
     }
 
     #[test]
@@ -168,6 +180,12 @@ mod tests {
             update_repo_owner = "MyOrg"
             update_repo_name = "MyRepo"
             change_password_url = "https://auth.example.com/forgotPassword"
+
+            [keybindings]
+            dashboard_up = ["w"]
+            dashboard_down = ["s"]
+            dashboard_inventory = ["i"]
+            settings_change_password = ["P"]
         "#;
         let config: ClientConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.control_plane_url, "http://localhost:9999");
@@ -184,6 +202,10 @@ mod tests {
             config.change_password_url.as_deref(),
             Some("https://auth.example.com/forgotPassword")
         );
+        assert_eq!(config.keybindings.dashboard_up, vec!["w"]);
+        assert_eq!(config.keybindings.dashboard_down, vec!["s"]);
+        assert_eq!(config.keybindings.dashboard_inventory, vec!["i"]);
+        assert_eq!(config.keybindings.settings_change_password, vec!["P"]);
     }
 
     #[test]
@@ -221,5 +243,35 @@ mod tests {
         let config = ClientConfig::load_from_path(true, path.clone()).unwrap();
         assert_eq!(config.control_plane_url, "http://localhost:8443");
         assert!(config.dev_mode);
+        assert_eq!(config.keybindings.dashboard_select, vec!["enter"]);
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_keybinding() {
+        let dir = std::env::temp_dir().join(format!(
+            "canopy-tui-config-keybinding-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = RemoveDirOnDrop(dir.clone());
+        let path = dir.join("config.toml");
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"
+            control_plane_url = "https://canopy.internal"
+
+            [keybindings]
+            dashboard_up = ["cmd+k"]
+        "#,
+        )
+        .unwrap();
+
+        let err = ClientConfig::load_from_path(false, path).unwrap_err();
+        assert!(err.to_string().contains("invalid keybindings.dashboard_up"));
     }
 }

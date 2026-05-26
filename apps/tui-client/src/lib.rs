@@ -7,6 +7,7 @@ pub mod auth;
 pub mod components;
 pub mod config;
 pub mod event;
+pub mod keybindings;
 pub mod live_tail_ws;
 pub mod local_deps;
 pub mod tui;

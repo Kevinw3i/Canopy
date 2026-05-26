@@ -291,6 +291,21 @@ enable_live_tail = true        # Show live-tail in menu (beta feature)
 auto_update = false            # true = check & apply updates on startup
 # update_repo_owner = "Kevinw3i"  # GitHub owner (default)
 # update_repo_name = "Canopy"     # GitHub repo  (default)
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
 ```
 
 When `auto_update = true`, the TUI checks for new `tui-v*` releases on GitHub at startup (throttled to once per 10 minutes). If a newer version is found:

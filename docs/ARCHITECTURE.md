@@ -422,6 +422,7 @@ No shared state -- survives restarts and multi-replica routing.
 | `control_plane_url` | -- | (TUI) Control plane URL |
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |
+| `keybindings.*` | built-in defaults | (TUI) Dashboard/settings shortcut overrides |
 
 ## Tests
 

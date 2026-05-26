@@ -240,7 +240,11 @@ impl App {
 
         Ok(Self {
             login: LoginScreen::new(config.dev_mode),
-            dashboard: DashboardScreen::new(config.enable_live_tail, config.show_public_ip),
+            dashboard: DashboardScreen::new(
+                config.enable_live_tail,
+                config.show_public_ip,
+                config.keybindings.clone(),
+            ),
             ec2: Ec2Screen::new(),
             cloudwatch_search: CloudWatchSearchScreen::new(),
             live_tail: LiveTailScreen::new(scrollback),
@@ -2210,6 +2214,7 @@ impl App {
             update_repo_owner: "test".into(),
             update_repo_name: "test".into(),
             change_password_url: None,
+            keybindings: crate::keybindings::KeyBindings::default(),
         }
     }
 
