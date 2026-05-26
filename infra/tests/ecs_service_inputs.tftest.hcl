@@ -183,6 +183,90 @@ run "rejects_sts_external_id_with_space" {
   ]
 }
 
+run "rejects_invalid_jwt_secret_arn" {
+  command = plan
+
+  variables {
+    jwt_secret_arn = "arn:aws:ssm:ap-northeast-1:123456789012:parameter/canopy/jwt-secret"
+  }
+
+  expect_failures = [
+    var.jwt_secret_arn,
+  ]
+}
+
+run "rejects_invalid_jwt_secret_version_id" {
+  command = plan
+
+  variables {
+    jwt_secret_version_id = "short"
+  }
+
+  expect_failures = [
+    var.jwt_secret_version_id,
+  ]
+}
+
+run "rejects_invalid_secrets_kms_key_arn" {
+  command = plan
+
+  variables {
+    secrets_kms_key_arns = ["arn:aws:kms:ap-northeast-1:123456789012:alias/canopy"]
+  }
+
+  expect_failures = [
+    var.secrets_kms_key_arns,
+  ]
+}
+
+run "rejects_non_https_oidc_issuer_url" {
+  command = plan
+
+  variables {
+    oidc_issuer_url = "http://accounts.google.com"
+  }
+
+  expect_failures = [
+    var.oidc_issuer_url,
+  ]
+}
+
+run "rejects_oidc_client_id_with_whitespace" {
+  command = plan
+
+  variables {
+    oidc_client_id = "test client id"
+  }
+
+  expect_failures = [
+    var.oidc_client_id,
+  ]
+}
+
+run "rejects_invalid_oidc_client_secret_arn" {
+  command = plan
+
+  variables {
+    oidc_client_secret_arn = "arn:aws:ssm:ap-northeast-1:123456789012:parameter/canopy/oidc-client-secret"
+  }
+
+  expect_failures = [
+    var.oidc_client_secret_arn,
+  ]
+}
+
+run "rejects_invalid_oidc_client_secret_version_id" {
+  command = plan
+
+  variables {
+    oidc_client_secret_version_id = "short"
+  }
+
+  expect_failures = [
+    var.oidc_client_secret_version_id,
+  ]
+}
+
 run "rejects_service_without_jwt_secret_version_id" {
   command = plan
 
