@@ -172,7 +172,7 @@ impl Ec2Screen {
                     "State".into(),
                     "Type".into(),
                     "SSM".into(),
-                    "SSH".into(),
+                    "EIC".into(),
                     "Env".into(),
                 ],
                 vec![
@@ -2353,6 +2353,18 @@ mod tests {
         assert!(text.contains("Region { / }: All"));
         assert!(!text.contains("Account [/]"));
         assert!(!text.contains("Region {/}"));
+    }
+
+    #[test]
+    fn ec2_table_labels_instance_connect_column_as_eic() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(test_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("EIC"));
+        assert!(!text.contains("SSH"));
     }
 
     #[test]
