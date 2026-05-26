@@ -70,8 +70,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#tui-v}" >> "$GITHUB_OUTPUT"
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p tui-client
+        run: CANOPY_BUILD_VERSION="${{ steps.version.outputs.version }}" cargo build --release --target ${{ matrix.target }} -p tui-client
 
       - name: Package
         run: |

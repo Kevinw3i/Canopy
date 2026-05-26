@@ -68,6 +68,15 @@ session_duration_seconds = ${AWS_SESSION_DURATION_SECONDS:-3600}
 sts_external_id          = "${STS_EXTERNAL_ID:-canopy}"
 TOML
 
+  if [ -n "$DATABASE_CONNECTIONS_TOML" ]; then
+    cat >> "$WRITABLE_CONFIG" <<TOML
+
+# Database connection registry.
+# This must contain only non-secret connection metadata and Secrets Manager ARNs.
+${DATABASE_CONNECTIONS_TOML}
+TOML
+  fi
+
   # Append CORS origins at top level (before first [section])
   if [ -n "$CORS_ALLOWED_ORIGINS" ]; then
     # Trim whitespace around each comma-separated origin

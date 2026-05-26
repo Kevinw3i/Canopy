@@ -2,6 +2,11 @@ use anyhow::Result;
 use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
 use shared::dto::entitlements::UserEntitlements;
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use tokio::sync::mpsc;
 
 use crate::api_client::{ApiClient, ApiClientError};
@@ -13,14 +18,34 @@ use crate::components::ec2::Ec2Screen;
 use crate::components::error_modal::ErrorModal;
 use crate::components::live_tail::LiveTailScreen;
 use crate::components::login::LoginScreen;
+use crate::components::mcp::McpScreen;
 use crate::components::settings::SettingsScreen;
 use crate::components::Component;
 use crate::config::ClientConfig;
 use crate::event::{Action, Event, EventReader, Screen};
 use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRunner};
+use crate::mcp::McpRuntime;
 use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
+
+/// Outcome of `App::set_session_token`. Callers use this to decide
+/// whether to proceed to the dashboard after a successful login.
+/// Codex round 8: when save AND stale-token-clear both fail we MUST
+/// refuse to proceed, because the next restart would auto-load the
+/// prior user's credential.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionTokenOutcome {
+    /// New token persisted; safe to proceed to the dashboard.
+    PersistedFresh,
+    /// New token did NOT persist, BUT we successfully removed any
+    /// stale on-disk token. The in-memory session is safe to use
+    /// for THIS run; restart will require re-login.
+    InMemoryOnly,
+    /// New token did not persist AND we could not remove the stale
+    /// on-disk token. Caller MUST refuse to enter the dashboard.
+    StaleTokenSurvivesOnDisk,
+}
 
 pub struct App {
     config: ClientConfig,
@@ -38,6 +63,7 @@ pub struct App {
     live_tail: LiveTailScreen,
     access: AccessScreen,
     settings: SettingsScreen,
+    mcp: McpScreen,
     connect_session: Option<ConnectSessionScreen>,
     error_modal: ErrorModal,
 
@@ -52,8 +78,23 @@ pub struct App {
     ec2_fetch_cancel: Option<tokio_util::sync::CancellationToken>,
     cw_fetch_cancel: Option<tokio_util::sync::CancellationToken>,
 
+    // Override for the on-disk token persistence path. `None` in
+    // production code (falls back to `auth::token_path()`). Tests
+    // inject a tempdir-based path so `cargo test` cannot clobber
+    // the developer's real persisted credential (Codex round 10).
+    token_store_path: Option<std::path::PathBuf>,
+
     // Cancellation token for the live tail background task
     live_tail_cancel: Option<tokio_util::sync::CancellationToken>,
+    // Monotonic counter identifying the active live-tail stream.
+    // Each call to `try_arm_live_tail_stream` increments this; the
+    // stream's emitted `LiveTailEvent` / `LiveTailStreamEnded`
+    // actions carry the generation they were spawned with, so the
+    // handler can drop signals from a previously-active stream
+    // (Codex round 5: prevents stale `LiveTailStreamEnded` from
+    // cancelling a freshly-armed replacement stream).
+    pub(crate) live_tail_generation: u64,
+    mcp_runtime: Option<McpRuntime>,
 
     // Auto-update banner message, shown until dismissed
     update_banner: Option<String>,
@@ -117,6 +158,19 @@ fn should_retry_api_error(err: &ApiClientError) -> bool {
 const TOKEN_EXPIRED_MODAL_MESSAGE: &str =
     "Your session has expired. Please sign in again.\n\nPress Enter to return to the login screen.";
 
+/// Prefix for the Codex / Claude MCP server name we register on the user's
+/// behalf. The actual registered name embeds the TUI PID so two concurrent
+/// Canopy sessions cannot stomp on each other AND a user's own pre-existing
+/// MCP entry called `canopy` is never deleted by Canopy's launcher cleanup.
+const MCP_AI_CLIENT_SERVER_NAME_PREFIX: &str = "canopy-session";
+
+fn mcp_ai_client_server_name() -> String {
+    format!(
+        "{}-{}",
+        MCP_AI_CLIENT_SERVER_NAME_PREFIX,
+        std::process::id()
+    )
+}
 const SESSION_COUNTDOWN_WIDTH: u64 = 20;
 
 fn format_session_duration(secs: u64) -> String {
@@ -182,6 +236,41 @@ struct ConnectTarget<'a> {
     os_user: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpAiClient {
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalLaunchAdapter {
+    AppleTerminal,
+    ITerm2,
+    WarpStable,
+    WarpPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedTerminalApp {
+    display_name: String,
+    bundle_id: String,
+    app_path: PathBuf,
+    adapter: TerminalLaunchAdapter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppBundleInfo {
+    display_name: String,
+    bundle_id: String,
+    app_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpAiLaunchResult {
+    client_label: &'static str,
+    terminal_label: String,
+}
+
 fn prompt_yes_no(prompt: &str) -> bool {
     use std::io::Write;
 
@@ -194,6 +283,533 @@ fn prompt_yes_no(prompt: &str) -> bool {
     }
 
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn parse_mcp_ai_client_choice(input: &str) -> Result<Option<McpAiClient>, String> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "codex" | "c" => Ok(Some(McpAiClient::Codex)),
+        "2" | "claude" => Ok(Some(McpAiClient::Claude)),
+        "q" | "quit" | "cancel" | "" => Ok(None),
+        other => Err(format!("Invalid AI client choice: {other}")),
+    }
+}
+
+fn prompt_mcp_ai_client() -> Result<Option<McpAiClient>, String> {
+    use std::io::Write;
+
+    println!("\n== Canopy MCP AI launcher ==");
+    println!("MCP health check passed.");
+    println!("\nChoose AI client:");
+    println!("  1) Codex CLI");
+    println!("  2) Claude Code");
+    println!("  q) Cancel");
+    print!("Start which client? [1/2/q]: ");
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("Failed to write prompt: {err}"))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("Failed to read choice: {err}"))?;
+
+    parse_mcp_ai_client_choice(&input)
+}
+
+fn parse_terminal_app_choice(
+    input: &str,
+    terminals: &[DetectedTerminalApp],
+) -> Result<Option<DetectedTerminalApp>, String> {
+    let choice = input.trim();
+    let normalized = choice.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "" | "q" | "quit" | "cancel") {
+        return Ok(None);
+    }
+
+    if let Ok(index) = normalized.parse::<usize>() {
+        if (1..=terminals.len()).contains(&index) {
+            return Ok(Some(terminals[index - 1].clone()));
+        }
+        return Err(format!("Invalid terminal choice: {choice}"));
+    }
+
+    terminals
+        .iter()
+        .find(|terminal| {
+            terminal.display_name.eq_ignore_ascii_case(choice)
+                || terminal.bundle_id.eq_ignore_ascii_case(choice)
+                || terminal
+                    .app_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.eq_ignore_ascii_case(choice))
+        })
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| format!("Invalid terminal choice: {choice}"))
+}
+
+fn prompt_mcp_terminal_app(
+    terminals: &[DetectedTerminalApp],
+) -> Result<Option<DetectedTerminalApp>, String> {
+    use std::io::Write;
+
+    if terminals.is_empty() {
+        return Err("No supported terminal app was detected on this computer.".into());
+    }
+
+    println!("\nChoose terminal app:");
+    for (index, terminal) in terminals.iter().enumerate() {
+        println!(
+            "  {}) {} ({})",
+            index + 1,
+            terminal.display_name,
+            terminal.app_path.display()
+        );
+    }
+    println!("  q) Cancel");
+    print!("Open in which terminal? [1-{}/q]: ", terminals.len());
+    std::io::stdout()
+        .flush()
+        .map_err(|err| format!("Failed to write terminal prompt: {err}"))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|err| format!("Failed to read terminal choice: {err}"))?;
+
+    parse_terminal_app_choice(&input, terminals)
+}
+
+fn resolve_command(program: &str) -> Result<String, String> {
+    let output = Command::new("sh")
+        .args(["-lc", "command -v \"$1\"", "sh", program])
+        .output()
+        .map_err(|err| format!("Failed to resolve command '{program}': {err}"))?;
+    if !output.status.success() {
+        return Err(format!("Required command '{program}' not found in PATH."));
+    }
+
+    let resolved = String::from_utf8(output.stdout)
+        .map_err(|err| format!("Resolved command path is not UTF-8: {err}"))?
+        .trim()
+        .to_string();
+    if resolved.is_empty() {
+        Err(format!("Required command '{program}' not found in PATH."))
+    } else {
+        Ok(resolved)
+    }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn applescript_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+fn plist_string_value(plist: &str, key: &str) -> Option<String> {
+    let marker = format!("<key>{key}</key>");
+    let after_key = plist.split_once(&marker)?.1;
+    let string_start = after_key.find("<string>")? + "<string>".len();
+    let after_start = &after_key[string_start..];
+    let string_end = after_start.find("</string>")?;
+    Some(xml_unescape_minimal(after_start[..string_end].trim()))
+}
+
+fn xml_unescape_minimal(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn read_plist_xml(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => Ok(value),
+        Err(read_error) if cfg!(target_os = "macos") => {
+            let output = Command::new("plutil")
+                .args(["-convert", "xml1", "-o", "-", "--"])
+                .arg(path)
+                .output()
+                .map_err(|err| {
+                    format!(
+                        "Failed to read {} as text ({read_error}) and plutil failed: {err}",
+                        path.display()
+                    )
+                })?;
+            if !output.status.success() {
+                return Err(format!("plutil failed to convert {}", path.display()));
+            }
+            String::from_utf8(output.stdout)
+                .map_err(|err| format!("plutil output for {} is not UTF-8: {err}", path.display()))
+        }
+        Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
+    }
+}
+
+fn read_app_bundle_info(app_path: &Path) -> Option<AppBundleInfo> {
+    let plist_path = app_path.join("Contents/Info.plist");
+    let plist = read_plist_xml(&plist_path).ok()?;
+    let bundle_id = plist_string_value(&plist, "CFBundleIdentifier")?;
+    let display_name = plist_string_value(&plist, "CFBundleDisplayName")
+        .or_else(|| plist_string_value(&plist, "CFBundleName"))
+        .or_else(|| plist_string_value(&plist, "CFBundleExecutable"))
+        .or_else(|| {
+            app_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(ToOwned::to_owned)
+        })?;
+
+    Some(AppBundleInfo {
+        display_name,
+        bundle_id,
+        app_path: app_path.to_path_buf(),
+    })
+}
+
+fn terminal_adapter_for_app(info: &AppBundleInfo) -> Option<TerminalLaunchAdapter> {
+    let bundle_id = info.bundle_id.to_ascii_lowercase();
+    let display_name = info.display_name.to_ascii_lowercase();
+    let file_stem = info
+        .app_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if bundle_id == "com.apple.terminal" {
+        return Some(TerminalLaunchAdapter::AppleTerminal);
+    }
+    if bundle_id == "com.googlecode.iterm2"
+        || display_name == "iterm2"
+        || file_stem == "iterm"
+        || file_stem == "iterm2"
+    {
+        return Some(TerminalLaunchAdapter::ITerm2);
+    }
+    if bundle_id.starts_with("dev.warp.warp") || display_name == "warp" || file_stem == "warp" {
+        if bundle_id.contains("preview") || display_name.contains("preview") {
+            return Some(TerminalLaunchAdapter::WarpPreview);
+        }
+        return Some(TerminalLaunchAdapter::WarpStable);
+    }
+
+    None
+}
+
+fn default_terminal_app_scan_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(PathBuf::from("/Applications"));
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    dirs.push(PathBuf::from("/System/Applications/Utilities"));
+    dirs
+}
+
+fn detect_supported_terminal_apps() -> Result<Vec<DetectedTerminalApp>, String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Launching a new terminal window is currently implemented for macOS only.".into(),
+        );
+    }
+
+    detect_supported_terminal_apps_in(&default_terminal_app_scan_dirs())
+}
+
+fn detect_supported_terminal_apps_in(dirs: &[PathBuf]) -> Result<Vec<DetectedTerminalApp>, String> {
+    let mut seen = HashSet::new();
+    let mut terminals = Vec::new();
+
+    for dir in dirs {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let app_path = entry.path();
+            if app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+                continue;
+            }
+            let Some(info) = read_app_bundle_info(&app_path) else {
+                continue;
+            };
+            let Some(adapter) = terminal_adapter_for_app(&info) else {
+                continue;
+            };
+            let canonical_path = std::fs::canonicalize(&info.app_path).unwrap_or(info.app_path);
+            let dedupe_key = (
+                info.bundle_id.to_ascii_lowercase(),
+                canonical_path.display().to_string(),
+            );
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            terminals.push(DetectedTerminalApp {
+                display_name: info.display_name,
+                bundle_id: info.bundle_id,
+                app_path: canonical_path,
+                adapter,
+            });
+        }
+    }
+
+    terminals.sort_by(|left, right| {
+        let left_priority = terminal_sort_priority(left);
+        let right_priority = terminal_sort_priority(right);
+        left_priority
+            .cmp(&right_priority)
+            .then_with(|| {
+                left.display_name
+                    .to_ascii_lowercase()
+                    .cmp(&right.display_name.to_ascii_lowercase())
+            })
+            .then_with(|| left.app_path.cmp(&right.app_path))
+    });
+
+    if terminals.is_empty() {
+        Err("No supported terminal app was detected on this computer.".into())
+    } else {
+        Ok(terminals)
+    }
+}
+
+fn terminal_sort_priority(terminal: &DetectedTerminalApp) -> u8 {
+    match terminal.adapter {
+        TerminalLaunchAdapter::AppleTerminal => 0,
+        _ => 1,
+    }
+}
+
+fn write_temp_claude_mcp_config(
+    endpoint: &str,
+    authorization_header: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!(
+        "canopy-claude-mcp-{}.json",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    let body = serde_json::json!({
+        "mcpServers": {
+            (mcp_ai_client_server_name()): {
+                "type": "http",
+                "url": endpoint,
+                "headers": {
+                    "Authorization": authorization_header,
+                }
+            }
+        }
+    });
+    let data = serde_json::to_vec_pretty(&body)
+        .map_err(|err| format!("Failed to encode temporary Claude MCP config: {err}"))?;
+    write_temp_file_private(&path, &data, 0o600)
+        .map_err(|err| format!("Failed to write temporary Claude MCP config: {err}"))?;
+
+    Ok(path)
+}
+
+fn write_temp_launch_script(name: &str, body: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::env::temp_dir().join(format!(
+        "canopy-{name}-{}.command",
+        uuid::Uuid::new_v4().as_simple()
+    ));
+    write_temp_file_private(&path, body.as_bytes(), 0o700)
+        .map_err(|err| format!("Failed to write temporary {name} launch script: {err}"))?;
+
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn write_temp_file_private(path: &std::path::Path, data: &[u8], mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?;
+    file.write_all(data)
+}
+
+#[cfg(not(unix))]
+fn write_temp_file_private(path: &std::path::Path, data: &[u8], _mode: u32) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(data)
+}
+
+fn launch_script_path_str(script_path: &Path) -> Result<&str, String> {
+    script_path
+        .to_str()
+        .ok_or_else(|| "Temporary launch script path is not UTF-8.".to_string())
+}
+
+fn terminal_applescript_do_script(script_path: &Path) -> Result<String, String> {
+    let script = script_path
+        .to_str()
+        .ok_or_else(|| "Temporary launch script path is not UTF-8.".to_string())?;
+    let command = shell_single_quote(script);
+    Ok(format!(
+        "tell application \"Terminal\" to do script {}",
+        applescript_string(&command)
+    ))
+}
+
+fn iterm2_applescript_create_window(script_path: &Path) -> Result<String, String> {
+    let script = launch_script_path_str(script_path)?;
+    let command = format!("/bin/bash -lc {}", shell_single_quote(script));
+    Ok(format!(
+        "tell application \"iTerm2\" to create window with default profile command {}",
+        applescript_string(&command)
+    ))
+}
+
+fn open_script_in_apple_terminal(script_path: &Path) -> Result<(), String> {
+    let script = terminal_applescript_do_script(script_path)?;
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"Terminal\" to activate",
+            "-e",
+            &script,
+        ])
+        .status()
+        .map_err(|err| format!("Failed to open Terminal.app: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Failed to open a new Terminal.app window.".into())
+    }
+}
+
+fn open_script_in_iterm2(script_path: &Path) -> Result<(), String> {
+    let script = iterm2_applescript_create_window(script_path)?;
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"iTerm2\" to activate",
+            "-e",
+            &script,
+        ])
+        .status()
+        .map_err(|err| format!("Failed to open iTerm2: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Failed to open a new iTerm2 window.".into())
+    }
+}
+
+fn warp_tab_config_dir(adapter: TerminalLaunchAdapter) -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "Unable to resolve home directory.".to_string())?;
+    match adapter {
+        TerminalLaunchAdapter::WarpPreview => Ok(home.join(".warp-preview/tab_configs")),
+        TerminalLaunchAdapter::WarpStable => Ok(home.join(".warp/tab_configs")),
+        _ => Err("Unsupported Warp adapter.".into()),
+    }
+}
+
+fn warp_url_scheme(adapter: TerminalLaunchAdapter) -> Result<&'static str, String> {
+    match adapter {
+        TerminalLaunchAdapter::WarpPreview => Ok("warppreview"),
+        TerminalLaunchAdapter::WarpStable => Ok("warp"),
+        _ => Err("Unsupported Warp adapter.".into()),
+    }
+}
+
+fn build_warp_tab_config(
+    name: &str,
+    script_path: &Path,
+    tab_config_path: &Path,
+    directory: &Path,
+) -> Result<String, String> {
+    let script = launch_script_path_str(script_path)?;
+    let tab_config = tab_config_path
+        .to_str()
+        .ok_or_else(|| "Temporary Warp tab config path is not UTF-8.".to_string())?;
+    let directory = directory
+        .to_str()
+        .ok_or_else(|| "Warp launch directory path is not UTF-8.".to_string())?;
+    let cleanup_command = format!("rm -f {}", shell_single_quote(tab_config));
+    let launch_command = format!("/bin/bash -lc {}", shell_single_quote(script));
+
+    Ok(format!(
+        "name = {}\ntitle = {}\ncolor = \"cyan\"\n\n[[panes]]\nid = \"main\"\ntype = \"terminal\"\ndirectory = {}\ncommands = [\n  {},\n  {},\n]\nis_focused = true\n",
+        toml_string(name),
+        toml_string("Canopy MCP"),
+        toml_string(directory),
+        toml_string(&cleanup_command),
+        toml_string(&launch_command),
+    ))
+}
+
+fn build_warp_tab_config_url(name: &str, adapter: TerminalLaunchAdapter) -> Result<String, String> {
+    Ok(format!(
+        "{}://tab_config/{name}?new_window=true",
+        warp_url_scheme(adapter)?
+    ))
+}
+
+fn write_temp_warp_tab_config(
+    script_path: &Path,
+    adapter: TerminalLaunchAdapter,
+) -> Result<(PathBuf, String), String> {
+    let dir = warp_tab_config_dir(adapter)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("Failed to create Warp tab config directory: {err}"))?;
+    let name = format!("canopy_mcp_{}", uuid::Uuid::new_v4().as_simple());
+    let path = dir.join(format!("{name}.toml"));
+    let directory = std::env::current_dir()
+        .ok()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let body = build_warp_tab_config(&name, script_path, &path, &directory)?;
+    write_temp_file_private(&path, body.as_bytes(), 0o600)
+        .map_err(|err| format!("Failed to write temporary Warp tab config: {err}"))?;
+    Ok((path, build_warp_tab_config_url(&name, adapter)?))
+}
+
+fn open_script_in_warp(script_path: &Path, adapter: TerminalLaunchAdapter) -> Result<(), String> {
+    let (_path, url) = write_temp_warp_tab_config(script_path, adapter)?;
+    let status = Command::new("open")
+        .arg(&url)
+        .status()
+        .map_err(|err| format!("Failed to open Warp tab config URL: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Failed to open Warp tab config URL.".into())
+    }
+}
+
+fn open_launch_script(script_path: &Path, terminal: &DetectedTerminalApp) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "Launching a new terminal window is currently implemented for macOS only.".into(),
+        );
+    }
+
+    match terminal.adapter {
+        TerminalLaunchAdapter::AppleTerminal => open_script_in_apple_terminal(script_path),
+        TerminalLaunchAdapter::ITerm2 => open_script_in_iterm2(script_path),
+        TerminalLaunchAdapter::WarpStable | TerminalLaunchAdapter::WarpPreview => {
+            open_script_in_warp(script_path, terminal.adapter)
+        }
+    }
 }
 
 impl App {
@@ -211,6 +827,7 @@ impl App {
             live_tail: LiveTailScreen::new(scrollback),
             access: AccessScreen::new(),
             settings: SettingsScreen::new(config.clone()),
+            mcp: McpScreen::new(),
             connect_session: None,
             error_modal: ErrorModal::new(),
             config,
@@ -224,7 +841,10 @@ impl App {
             event_reader_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ec2_fetch_cancel: None,
             cw_fetch_cancel: None,
+            token_store_path: None, // Production default uses auth::token_path()
             live_tail_cancel: None,
+            live_tail_generation: 0,
+            mcp_runtime: None,
             update_banner: None,
             session_expired_pending_login: false,
         })
@@ -243,8 +863,14 @@ impl App {
                 Err(e) => {
                     match e {
                         ApiClientError::TokenExpired => {
+                            // Codex round 7+8: surface clear failures so
+                            // a stale on-disk token doesn't quietly
+                            // resurrect the next session. Modal shown
+                            // by the helper when delete fails; we still
+                            // proceed with in-memory clear because the
+                            // user must be logged out NOW.
+                            let _ = self.clear_persisted_token_or_warn();
                             self.api.clear_token();
-                            crate::auth::clear_token().ok();
                         }
                         other => {
                             // Transient or non-authz error: keep the token but stay on login
@@ -301,6 +927,7 @@ impl App {
                 Screen::LiveTail => self.live_tail.render(area, buf),
                 Screen::Access => self.access.render(area, buf),
                 Screen::Settings => self.settings.render(area, buf),
+                Screen::Mcp => self.mcp.render(area, buf),
                 Screen::ConnectSession => {
                     if let Some(session) = self.connect_session.as_ref() {
                         session.render(area, buf);
@@ -379,6 +1006,7 @@ impl App {
                     Screen::LiveTail => self.live_tail.handle_key(key),
                     Screen::Access => self.access.handle_key(key),
                     Screen::Settings => self.settings.handle_key(key),
+                    Screen::Mcp => self.mcp.handle_key(key),
                     Screen::ConnectSession => self
                         .connect_session
                         .as_mut()
@@ -399,6 +1027,7 @@ impl App {
                     Screen::LiveTail => self.live_tail.handle_paste(&text),
                     Screen::Access => self.access.handle_paste(&text),
                     Screen::Settings => self.settings.handle_paste(&text),
+                    Screen::Mcp => self.mcp.handle_paste(&text),
                     Screen::ConnectSession => self
                         .connect_session
                         .as_mut()
@@ -430,6 +1059,7 @@ impl App {
     async fn handle_action(&mut self, action: Action, terminal: &mut Tui) {
         match action {
             Action::Quit => {
+                self.stop_mcp_runtime();
                 self.running = false;
             }
             Action::NavigateTo(screen) => {
@@ -489,12 +1119,26 @@ impl App {
                 }
             },
             Action::TokenReceived(resp) => {
-                self.install_token_response(resp);
-                if self.fetch_entitlements().await {
-                    self.enter_dashboard();
+                // Codex round 8: set_session_tokens positively
+                // removes any stale on-disk token if persist fails.
+                // If both save AND clear fail, refuse to enter the
+                // dashboard — the prior user's credential could
+                // resurrect on restart.
+                match self.install_token_response(resp) {
+                    SessionTokenOutcome::PersistedFresh | SessionTokenOutcome::InMemoryOnly => {
+                        if self.fetch_entitlements().await {
+                            self.enter_dashboard();
+                        }
+                        // If fetch_entitlements failed, error modal
+                        // is shown and we stay on the current screen
+                        // so the user can retry.
+                    }
+                    SessionTokenOutcome::StaleTokenSurvivesOnDisk => {
+                        // Modal already shown by set_session_token.
+                        // Stay on Login so the user must remediate.
+                        self.api.clear_token();
+                    }
                 }
-                // If fetch_entitlements failed, error modal is shown and we
-                // stay on the current screen so the user can retry.
             }
 
             // EC2
@@ -600,23 +1244,16 @@ impl App {
                 .await;
             }
             Action::ConnectSessionStdoutReady => {
-                if let Some(session) = self.connect_session.as_mut() {
-                    session.process_pending_output();
-                }
+                self.apply_connect_session_stdout_ready();
             }
             Action::ConnectSessionFailure(message) => {
-                if let Some(session) = self.connect_session.as_mut() {
-                    session.fail(message);
-                }
+                self.apply_connect_session_failure(message);
             }
             Action::ConnectSessionUserDisconnect => {
-                if let Some(session) = self.connect_session.as_mut() {
-                    session.disconnect();
-                }
+                self.apply_connect_session_user_disconnect();
             }
             Action::ConnectSessionExit => {
-                self.connect_session = None;
-                self.current_screen = Screen::Ec2Inventory;
+                self.apply_connect_session_exit();
             }
 
             // CloudWatch
@@ -644,20 +1281,10 @@ impl App {
                 append,
                 generation,
             } => {
-                if generation != self.cloudwatch_search.fetch_generation {
-                    return;
-                }
-                if append {
-                    self.cloudwatch_search.append_events(events, next_token);
-                } else {
-                    self.cloudwatch_search.set_events(events, next_token);
-                }
+                self.apply_filter_events_loaded(events, next_token, append, generation);
             }
             Action::FilterEventsFetchFailed(err, generation) => {
-                if generation != self.cloudwatch_search.fetch_generation {
-                    return;
-                }
-                self.cloudwatch_search.set_error(err);
+                self.apply_filter_events_fetch_failed(err, generation);
             }
             Action::LoadMoreFilterResults => {
                 self.spawn_filter_search(true);
@@ -733,24 +1360,29 @@ impl App {
                 if self.config.dev_mode {
                     // Dev mode: connect to the control-plane's WebSocket
                     // and stream simulated events into the live tail screen.
-                    self.live_tail.set_connected();
-                    let cancel = tokio_util::sync::CancellationToken::new();
-                    self.live_tail_cancel = Some(cancel.clone());
-                    let tx = self.action_tx.clone();
-                    let base_url = self.config.control_plane_url.clone();
-                    let token = self.api.get_token();
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::live_tail_ws::stream_live_tail(
-                            &base_url,
-                            token.as_deref(),
-                            tx,
-                            cancel,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Live tail stream ended: {}", e);
-                        }
-                    });
+                    if let Some((cancel, generation)) = self.try_arm_live_tail_stream() {
+                        let tx = self.action_tx.clone();
+                        let base_url = self.config.control_plane_url.clone();
+                        let token = self.api.get_token();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::live_tail_ws::stream_simulated_live_tail(
+                                &base_url,
+                                token.as_deref(),
+                                tx,
+                                cancel,
+                                generation,
+                            )
+                            .await
+                            {
+                                tracing::warn!("Live tail stream ended: {}", e);
+                            }
+                        });
+                    }
+                    // else: a stream is already in flight; ignore the
+                    // duplicate StartLiveTail (Codex round 3: a queued
+                    // double-Start would otherwise overwrite the
+                    // cancel token, leaking the old stream and making
+                    // the old stream's StopLiveTail cancel the new one).
                 } else {
                     self.error_modal.show(
                         "Live tail WebSocket client is not yet available. \
@@ -759,21 +1391,53 @@ impl App {
                     );
                 }
             }
-            Action::StopLiveTail => {
-                if let Some(cancel) = self.live_tail_cancel.take() {
-                    cancel.cancel();
+            // Live-tail actions are dispatched through a single
+            // entry point so tests can call the same code path as
+            // production (Codex round 2: testing apply_* alone
+            // doesn't catch deletion of this match arm — but
+            // funneling through dispatch_live_tail_action does).
+            other @ (Action::StopLiveTail
+            | Action::PauseLiveTail
+            | Action::ResumeLiveTail
+            | Action::LiveTailEvent { .. }
+            | Action::LiveTailStreamEnded(_)) => {
+                self.dispatch_live_tail_action(other);
+            }
+
+            // MCP local server
+            Action::EnableMcp => {
+                self.start_mcp_runtime(terminal, true).await;
+            }
+            Action::LaunchMcpAiClient => {
+                if !self.reject_direct_mcp_launch_when_stopped() {
+                    self.launch_mcp_ai_client(terminal).await;
                 }
-                self.live_tail.set_disconnected();
             }
-            Action::PauseLiveTail => {
-                self.live_tail.set_paused();
+            Action::StopMcp => {
+                self.stop_mcp_runtime();
             }
-            Action::ResumeLiveTail => {
-                self.live_tail.set_connected();
+            Action::RestartMcp => {
+                self.stop_mcp_runtime();
+                self.start_mcp_runtime(terminal, true).await;
             }
-            Action::LiveTailEvent(event) => {
-                self.live_tail.push_event(event);
+            Action::TestMcp => {
+                self.test_mcp_runtime().await;
             }
+            Action::McpStarted(status) => {
+                self.mcp.set_running(&status);
+            }
+            Action::McpStartFailed(error) => {
+                self.mcp.set_error(error);
+            }
+            Action::McpStopped => {
+                self.mcp.set_stopped();
+            }
+            Action::McpHealthChecked(result) => match result {
+                Ok(()) => self
+                    .mcp
+                    .set_status_line("Health check OK; server responded successfully.".into()),
+                Err(error) => self.mcp.set_error(error),
+            },
 
             // Dashboard
             Action::FetchPublicIp => {
@@ -856,6 +1520,7 @@ impl App {
             session.disconnect();
         }
         self.connect_session = None;
+        self.stop_mcp_runtime();
     }
 
     fn cancel_cloudwatch_request(&mut self) {
@@ -864,6 +1529,133 @@ impl App {
         }
         self.cloudwatch_search.advance_fetch_generation();
         self.cloudwatch_search.cancel_loading();
+    }
+
+    /// Resolved path to the on-disk token store, honoring any test
+    /// override. Production code: `None` → falls back to the real
+    /// `auth::token_path()`. Tests: install a tempdir-based path so
+    /// `cargo test` never touches the real credential (Codex round 10).
+    fn resolved_token_path(&self) -> std::path::PathBuf {
+        self.token_store_path
+            .clone()
+            .unwrap_or_else(crate::auth::token_path)
+    }
+
+    /// Clear the persisted-on-disk token. Returns Ok on success.
+    /// On failure both logs a tracing::warn AND shows a user-visible
+    /// modal (Codex round 8: warning-only is insufficient because
+    /// startup `load_token` would resurrect the stale token without
+    /// the user knowing).
+    fn clear_persisted_token_or_warn(&mut self) -> Result<(), String> {
+        let path = self.resolved_token_path();
+        match crate::auth::clear_token_at_path(&path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::warn!(
+                    error = %e,
+                    "Failed to remove persisted token file during teardown; \
+                     a stale credential may survive to the next session.",
+                );
+                self.error_modal.show(format!(
+                    "Could not delete the persisted auth token: {e}\n\n\
+                     A stale credential may auto-resurrect on next restart. \
+                     Manually remove the canopy token file before re-logging in."
+                ));
+                Err(msg)
+            }
+        }
+    }
+
+    /// Persist a freshly received auth session to disk. Returns true
+    /// on success, false on failure. Callers that handle a fresh login
+    /// should use `set_session_tokens` / `install_token_response`,
+    /// which add the stale-on-disk-token cleanup guard.
+    fn persist_session_or_warn(
+        &mut self,
+        path: &Path,
+        session: &crate::auth::SessionTokens,
+    ) -> bool {
+        match crate::auth::save_session_to_path(path, session) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to persist auth session to disk. The session \
+                     remains valid in memory but will not survive restart.",
+                );
+                self.error_modal.show(format!(
+                    "Auth session could not be saved to disk: {e}\n\n\
+                     You can keep using the app this session, but you will \
+                     have to log in again after restart."
+                ));
+                false
+            }
+        }
+    }
+
+    fn persist_session_with_stale_guard(
+        &mut self,
+        path: &Path,
+        session: &crate::auth::SessionTokens,
+    ) -> SessionTokenOutcome {
+        if self.persist_session_or_warn(path, session) {
+            return SessionTokenOutcome::PersistedFresh;
+        }
+
+        // Save failed — actively try to delete any leftover stale
+        // token so the next restart can't pick it up.
+        if crate::auth::clear_token_at_path(path).is_ok() {
+            tracing::warn!(
+                "Could not save the new auth session, but successfully removed \
+                 the stale on-disk token. In-memory session continues; \
+                 restart will require re-login.",
+            );
+            SessionTokenOutcome::InMemoryOnly
+        } else {
+            tracing::error!(
+                "Could not save NEW token AND could not remove the OLD token. \
+                 Refusing to enter the dashboard — the prior user's \
+                 credential could auto-resurrect on restart.",
+            );
+            self.error_modal.show(
+                "Auth session could not be saved AND the old token could not be \
+                 removed.\n\nThe app cannot safely proceed because the next \
+                 restart could auto-load the previous credential. Please fix \
+                 disk permissions and try again."
+                    .to_string(),
+            );
+            SessionTokenOutcome::StaleTokenSurvivesOnDisk
+        }
+    }
+
+    /// Install a full auth session into the in-memory API client and
+    /// attempt to persist it. Codex round 8 contract: on persist
+    /// failure we MUST positively delete any stale on-disk token
+    /// before allowing the in-memory session to continue, otherwise
+    /// the next restart would auto-load the prior user's credential.
+    pub(crate) fn set_session_tokens(
+        &mut self,
+        session: crate::auth::SessionTokens,
+    ) -> SessionTokenOutcome {
+        let path = self.resolved_token_path();
+        self.api.set_session_store_path(path.clone());
+        self.api.set_session(session.clone());
+        self.persist_session_with_stale_guard(&path, &session)
+    }
+
+    pub(crate) fn set_session_token(&mut self, token: &str) -> SessionTokenOutcome {
+        self.set_session_tokens(crate::auth::SessionTokens::new(token.to_string(), None))
+    }
+
+    fn install_token_response(
+        &mut self,
+        resp: shared::dto::auth::TokenResponse,
+    ) -> SessionTokenOutcome {
+        let path = self.resolved_token_path();
+        self.api.set_session_store_path(path.clone());
+        let session = self.api.apply_token_response(resp);
+        self.persist_session_with_stale_guard(&path, &session)
     }
 
     fn reset_to_login(&mut self) {
@@ -880,13 +1672,29 @@ impl App {
         self.dashboard.public_ip = None;
         self.dashboard.ip_fetch_generation += 1;
 
+        // Wipe live-tail buffer so the next user / session does NOT
+        // see the previous session's log lines (Codex round 7).
+        // Rebuild rather than just .clear()ing — keeps filter,
+        // scroll, and auto-scroll state fresh too.
+        self.live_tail = LiveTailScreen::new(self.config.live_tail_scrollback);
+        // Bump generation so any in-flight stream's queued events
+        // are now stale and will be dropped by the generation guard.
+        self.live_tail_generation = self.live_tail_generation.saturating_add(1);
+
+        // Codex round 8: if the disk delete failed, the helper
+        // already showed an error modal — leave it visible. Only
+        // dismiss when clear succeeded; otherwise the user must
+        // see and dismiss the failure modal so the stale-credential
+        // risk is acknowledged.
+        let clear_ok = self.clear_persisted_token_or_warn().is_ok();
         self.api.clear_token();
-        crate::auth::clear_token().ok();
         self.entitlements = None;
         self.current_screen = Screen::Login;
         self.screen_stack.clear();
         self.session_expired_pending_login = false;
-        self.error_modal.dismiss();
+        if clear_ok {
+            self.error_modal.dismiss();
+        }
     }
 
     fn begin_token_expired_flow(&mut self) {
@@ -895,12 +1703,23 @@ impl App {
         }
 
         self.cancel_in_flight_work();
+        // Same defense as reset_to_login: scrub live-tail state so
+        // the post-relogin user does not see the prior session's
+        // logs (Codex round 7).
+        self.live_tail = LiveTailScreen::new(self.config.live_tail_scrollback);
+        self.live_tail_generation = self.live_tail_generation.saturating_add(1);
+
+        let clear_ok = self.clear_persisted_token_or_warn().is_ok();
         self.api.clear_token();
-        crate::auth::clear_token().ok();
         self.entitlements = None;
         self.session_expired_pending_login = true;
-        self.error_modal
-            .show_with_title(" Session Expired ", TOKEN_EXPIRED_MODAL_MESSAGE.into());
+        if clear_ok {
+            // Standard session-expired modal. If clear FAILED, the
+            // helper already showed a more urgent modal explaining
+            // the stale-credential risk — leave that one up.
+            self.error_modal
+                .show_with_title(" Session Expired ", TOKEN_EXPIRED_MODAL_MESSAGE.into());
+        }
     }
 
     fn handle_route_error<F>(&mut self, err: ApiClientError, fallback: F)
@@ -962,6 +1781,7 @@ impl App {
             }
             Screen::Access => self.access.on_leave(),
             Screen::Settings => self.settings.on_leave(),
+            Screen::Mcp => self.mcp.on_leave(),
             Screen::ConnectSession => {
                 if let Some(session) = self.connect_session.as_mut() {
                     session.disconnect();
@@ -981,6 +1801,7 @@ impl App {
             Screen::LiveTail => self.live_tail.on_enter(),
             Screen::Access => self.access.on_enter(),
             Screen::Settings => self.settings.on_enter(),
+            Screen::Mcp => self.mcp.on_enter(),
             Screen::ConnectSession => vec![],
         };
 
@@ -1033,6 +1854,7 @@ impl App {
                 Screen::LiveTail => self.live_tail.on_enter(),
                 Screen::Access => self.access.on_enter(),
                 Screen::Settings => self.settings.on_enter(),
+                Screen::Mcp => self.mcp.on_enter(),
                 Screen::Login => self.login.on_enter(),
                 Screen::ConnectSession => vec![],
             };
@@ -1047,21 +1869,249 @@ impl App {
         self.ec2.set_entitlements(ent.clone());
         self.cloudwatch_search.set_entitlements(ent.clone());
         self.access.set_entitlements(ent.clone());
+        self.mcp.set_entitlements(ent.clone());
         self.entitlements = Some(ent);
     }
 
-    fn install_session(&mut self, session: crate::auth::SessionTokens) {
-        self.api.set_session(session.clone());
-        if let Err(err) = crate::auth::save_session(&session) {
-            tracing::warn!(error = %err, "failed to persist auth session");
+    async fn start_mcp_runtime(&mut self, terminal: &mut Tui, launch_client: bool) {
+        if let Some(runtime) = self.mcp_runtime.as_ref() {
+            self.mcp.set_running(runtime.status());
+            if launch_client {
+                self.launch_mcp_ai_client(terminal).await;
+            }
+            return;
+        }
+
+        let Some(entitlements) = self.entitlements.clone() else {
+            self.mcp
+                .set_error("Entitlements are not loaded; sign in again.".into());
+            return;
+        };
+
+        self.mcp.set_starting();
+        match McpRuntime::start(self.api.clone(), entitlements).await {
+            Ok(runtime) => {
+                let status = runtime.status().clone();
+                self.mcp.set_running(&status);
+                self.mcp_runtime = Some(runtime);
+                if launch_client {
+                    self.launch_mcp_ai_client(terminal).await;
+                }
+            }
+            Err(error) => {
+                self.mcp.set_error(error.to_string());
+            }
         }
     }
 
-    fn install_token_response(&mut self, resp: shared::dto::auth::TokenResponse) {
-        let session = self.api.apply_token_response(resp);
-        if let Err(err) = crate::auth::save_session(&session) {
-            tracing::warn!(error = %err, "failed to persist auth session");
+    fn stop_mcp_runtime(&mut self) {
+        if let Some(runtime) = self.mcp_runtime.take() {
+            if let Err(error) = runtime.stop() {
+                self.mcp
+                    .set_error(format!("Failed to stop MCP server: {error}"));
+                return;
+            }
         }
+        self.mcp.set_stopped();
+    }
+
+    async fn test_mcp_runtime(&mut self) {
+        let Some(runtime) = self.mcp_runtime.as_ref() else {
+            self.mcp.set_error("MCP server is not running.".into());
+            return;
+        };
+
+        let result = self.mcp_health_check(runtime).await.map(|_| ());
+
+        match result {
+            Ok(()) => self
+                .mcp
+                .set_status_line("Health check OK; server responded successfully.".into()),
+            Err(error) => self.mcp.set_error(error.to_string()),
+        }
+    }
+
+    fn reject_direct_mcp_launch_when_stopped(&mut self) -> bool {
+        if self.mcp_runtime.is_none() {
+            self.mcp
+                .set_error("MCP server is not running; press e to enable + launch first.".into());
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn mcp_health_check(
+        &self,
+        runtime: &McpRuntime,
+    ) -> Result<(crate::mcp::McpSessionFile, String)> {
+        let status = runtime.status();
+        let raw = std::fs::read_to_string(&status.session_file)?;
+        let session: crate::mcp::McpSessionFile = serde_json::from_str(&raw)?;
+        let health_url = status.stable_endpoint.replace("/mcp", "/healthz");
+
+        let response = reqwest::Client::new()
+            .get(&health_url)
+            .header("Authorization", session.authorization_header.clone())
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok((session, health_url))
+        } else {
+            Err(anyhow::anyhow!(
+                "health check failed: {}",
+                response.status()
+            ))
+        }
+    }
+
+    async fn launch_mcp_ai_client(&mut self, terminal: &mut Tui) {
+        let Some(runtime) = self.mcp_runtime.as_ref() else {
+            self.mcp.set_error("MCP server is not running.".into());
+            return;
+        };
+
+        let endpoint = runtime.status().stable_endpoint.clone();
+        let (session, health_url) = match self.mcp_health_check(runtime).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.mcp
+                    .set_error(format!("MCP health check failed before AI launch: {error}"));
+                return;
+            }
+        };
+
+        self.suspend_for_external_command();
+        let result = self.run_mcp_ai_launcher(&endpoint, &health_url, &session);
+        self.resume_after_external_command(terminal);
+
+        match result {
+            Ok(Some(result)) => self.mcp.set_status_line(format!(
+                "{} launched in {}.",
+                result.client_label, result.terminal_label
+            )),
+            Ok(None) => self
+                .mcp
+                .set_status_line("AI client launch cancelled; MCP server is running.".into()),
+            Err(error) => self.mcp.set_error(error),
+        }
+    }
+
+    fn run_mcp_ai_launcher(
+        &self,
+        endpoint: &str,
+        health_url: &str,
+        session: &crate::mcp::McpSessionFile,
+    ) -> Result<Option<McpAiLaunchResult>, String> {
+        println!("\nCanopy MCP server is healthy: {health_url}");
+
+        let Some(client) = prompt_mcp_ai_client()? else {
+            return Ok(None);
+        };
+        let terminals = detect_supported_terminal_apps()?;
+        let Some(terminal) = prompt_mcp_terminal_app(&terminals)? else {
+            return Ok(None);
+        };
+
+        let client_label = match client {
+            McpAiClient::Codex => {
+                self.run_codex_with_mcp(endpoint, &session.bearer_token, &terminal)?;
+                "Codex CLI"
+            }
+            McpAiClient::Claude => {
+                self.run_claude_with_mcp(endpoint, &session.authorization_header, &terminal)?;
+                "Claude Code"
+            }
+        };
+
+        Ok(Some(McpAiLaunchResult {
+            client_label,
+            terminal_label: terminal.display_name,
+        }))
+    }
+
+    fn run_codex_with_mcp(
+        &self,
+        endpoint: &str,
+        bearer_token: &str,
+        terminal: &DetectedTerminalApp,
+    ) -> Result<(), String> {
+        let codex_bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
+        let codex_bin = resolve_command(&codex_bin)?;
+
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+	set -uo pipefail
+	cleanup() {{
+	  {codex_bin} mcp remove {server_name} >/dev/null 2>&1 || true
+	  rm -f "$0"
+	}}
+	trap cleanup EXIT
+
+export CANOPY_MCP_BEARER_TOKEN={bearer_token}
+echo "Configuring Codex MCP server '{server_name}' -> {endpoint}"
+{codex_bin} mcp remove {server_name} >/dev/null 2>&1 || true
+{codex_bin} mcp add {server_name} --url {endpoint} --bearer-token-env-var CANOPY_MCP_BEARER_TOKEN
+config_rc=$?
+if [ "$config_rc" -ne 0 ]; then
+  echo
+  echo "Failed to configure Codex MCP server. Exit status: $config_rc"
+  read -r -p "Press Enter to close this window..."
+  exit "$config_rc"
+fi
+echo
+echo "Starting Codex CLI with Canopy MCP..."
+{codex_bin}
+rc=$?
+echo
+echo "Codex CLI exited with status $rc."
+read -r -p "Press Enter to close this window..."
+exit "$rc"
+"#,
+            bearer_token = shell_single_quote(bearer_token),
+            server_name = shell_single_quote(&mcp_ai_client_server_name()),
+            endpoint = shell_single_quote(endpoint),
+            codex_bin = shell_single_quote(&codex_bin),
+        );
+        let script_path = write_temp_launch_script("codex-mcp", &script_body)?;
+        open_launch_script(&script_path, terminal)
+    }
+
+    fn run_claude_with_mcp(
+        &self,
+        endpoint: &str,
+        authorization_header: &str,
+        terminal: &DetectedTerminalApp,
+    ) -> Result<(), String> {
+        let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+        let claude_bin = resolve_command(&claude_bin)?;
+
+        let config_path = write_temp_claude_mcp_config(endpoint, authorization_header)?;
+        let config_path_str = config_path
+            .to_str()
+            .ok_or_else(|| "Temporary Claude MCP config path is not UTF-8.".to_string())?;
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+set -uo pipefail
+cleanup() {{
+  rm -f {config_path}
+  rm -f "$0"
+}}
+trap cleanup EXIT
+
+echo "Starting Claude Code with temporary Canopy MCP config..."
+{claude_bin} --mcp-config {config_path}
+rc=$?
+echo
+echo "Claude Code exited with status $rc."
+read -r -p "Press Enter to close this window..."
+exit "$rc"
+"#,
+            claude_bin = shell_single_quote(&claude_bin),
+            config_path = shell_single_quote(config_path_str),
+        );
+        let script_path = write_temp_launch_script("claude-mcp", &script_body)?;
+        open_launch_script(&script_path, terminal)
     }
 
     // ── Async operations ────────────────────────────────
@@ -1069,9 +2119,19 @@ impl App {
     async fn do_dev_login(&mut self, username: &str) {
         match self.api.dev_login(username).await {
             Ok(resp) => {
-                self.install_session(crate::auth::SessionTokens::new(resp.access_token, None));
-                if self.fetch_entitlements().await {
-                    self.enter_dashboard();
+                // Codex round 8: same guard as TokenReceived — refuse
+                // to proceed when save AND stale-clear both fail.
+                match self
+                    .set_session_tokens(crate::auth::SessionTokens::new(resp.access_token, None))
+                {
+                    SessionTokenOutcome::PersistedFresh | SessionTokenOutcome::InMemoryOnly => {
+                        if self.fetch_entitlements().await {
+                            self.enter_dashboard();
+                        }
+                    }
+                    SessionTokenOutcome::StaleTokenSurvivesOnDisk => {
+                        self.api.clear_token();
+                    }
                 }
             }
             Err(e) => {
@@ -1626,6 +2686,221 @@ impl App {
         });
     }
 
+    /// Apply a `FilterEventsLoaded` action to the screen state.
+    ///
+    /// Stale-generation guard: a response from an older spawned task
+    /// (whose generation no longer matches the current
+    /// `fetch_generation`) is silently dropped, so a brand-new search
+    /// cannot be overwritten by a late reply from the previous one.
+    ///
+    /// Extracted as a `&mut self` reducer so unit tests can exercise
+    /// the dispatcher contract without constructing a `Tui` backend.
+    pub(crate) fn apply_filter_events_loaded(
+        &mut self,
+        events: Vec<shared::dto::cloudwatch::LogEvent>,
+        next_token: Option<String>,
+        append: bool,
+        generation: u64,
+    ) {
+        if generation != self.cloudwatch_search.fetch_generation {
+            return;
+        }
+        if append {
+            self.cloudwatch_search.append_events(events, next_token);
+        } else {
+            self.cloudwatch_search.set_events(events, next_token);
+        }
+    }
+
+    /// Apply a `FilterEventsFetchFailed` action. Stale generations are
+    /// dropped without surfacing the error so the user does not see
+    /// stale "Error: ..." messages bleed through into a new search.
+    pub(crate) fn apply_filter_events_fetch_failed(&mut self, err: String, generation: u64) {
+        if generation != self.cloudwatch_search.fetch_generation {
+            return;
+        }
+        self.cloudwatch_search.set_error(err);
+    }
+
+    /// Apply a `ConnectSessionStdoutReady` action. Drains the PTY
+    /// output buffer if a session is alive; otherwise a silent no-op
+    /// so late signals from a torn-down session do not crash.
+    pub(crate) fn apply_connect_session_stdout_ready(&mut self) {
+        if let Some(session) = self.connect_session.as_mut() {
+            session.process_pending_output();
+        }
+    }
+
+    /// Apply a `ConnectSessionFailure` action. The error message is
+    /// surfaced inside the active session as a terminal-state
+    /// overlay; if no session is alive the message is dropped (the
+    /// matching screen is gone, the user already moved on).
+    pub(crate) fn apply_connect_session_failure(&mut self, message: String) {
+        if let Some(session) = self.connect_session.as_mut() {
+            session.fail(message);
+        }
+    }
+
+    /// Apply a `ConnectSessionUserDisconnect` action (Ctrl+]/Ctrl+5).
+    /// Forwarded to the session so it tears down the PTY and shows the
+    /// "Disconnected" final state; no-op if no session is active.
+    pub(crate) fn apply_connect_session_user_disconnect(&mut self) {
+        if let Some(session) = self.connect_session.as_mut() {
+            session.disconnect();
+        }
+    }
+
+    /// Apply a `ConnectSessionExit` action — the user dismissed the
+    /// terminal screen with Enter. Drops the session and returns the
+    /// app to the EC2 inventory.
+    pub(crate) fn apply_connect_session_exit(&mut self) {
+        self.connect_session = None;
+        self.current_screen = Screen::Ec2Inventory;
+    }
+
+    /// Decide whether to start a new live-tail stream and, if so,
+    /// install the cancel token + flip the UI to Connected. Returns
+    /// `Some(token)` for the caller to hand to the background task;
+    /// returns `None` when a stream is already in flight (the caller
+    /// must NOT spawn a new task in that case).
+    ///
+    /// Codex round 3: prior code always spawned a new stream and
+    /// overwrote `live_tail_cancel`, which meant two queued
+    /// `StartLiveTail` actions left an orphaned old stream whose
+    /// eventual `Action::StopLiveTail` would mis-cancel the new
+    /// stream. This idempotency check closes that race at the
+    /// source (the handler only spawns when `try_arm` returns Some).
+    pub(crate) fn try_arm_live_tail_stream(
+        &mut self,
+    ) -> Option<(tokio_util::sync::CancellationToken, u64)> {
+        if self.live_tail_cancel.is_some() {
+            // Already streaming — refuse to install a second token.
+            tracing::debug!(
+                "Live tail: ignoring duplicate StartLiveTail (stream already in flight)",
+            );
+            return None;
+        }
+        // Bump the generation. Saturating-add so wraparound after
+        // 2^64 arms (unreachable in practice) doesn't panic.
+        self.live_tail_generation = self.live_tail_generation.saturating_add(1);
+        self.live_tail.set_connected();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.live_tail_cancel = Some(cancel.clone());
+        Some((cancel, self.live_tail_generation))
+    }
+
+    /// Apply a `StopLiveTail` action — cancel the background WS task
+    /// (if any) and transition the screen into the Disconnected
+    /// state. Idempotent: calling twice is harmless because
+    /// `take()` clears the token and `set_disconnected` is a state
+    /// setter, not a transition.
+    pub(crate) fn apply_stop_live_tail(&mut self) {
+        if let Some(cancel) = self.live_tail_cancel.take() {
+            cancel.cancel();
+        }
+        self.live_tail.set_disconnected();
+    }
+
+    /// Apply a `PauseLiveTail` action — flip the UI into Paused
+    /// state. The background WS task keeps running so events keep
+    /// arriving and accumulating in the scrollback; only the visible
+    /// indicator changes. (Pause is purely a UI affordance for the
+    /// human; the AWS API has no "pause" for live tail.)
+    pub(crate) fn apply_pause_live_tail(&mut self) {
+        self.live_tail.set_paused();
+    }
+
+    /// Apply a `ResumeLiveTail` action — flip the UI back into the
+    /// Connected state from Paused. No background work is restarted
+    /// because the WS task never actually stopped; this is purely
+    /// the inverse of `apply_pause_live_tail`.
+    pub(crate) fn apply_resume_live_tail(&mut self) {
+        self.live_tail.set_connected();
+    }
+
+    /// Apply a `LiveTailEvent(event)` action — append the event to
+    /// the live-tail scrollback. `push_event` enforces the scrollback
+    /// cap configured at construction, so this stays bounded.
+    pub(crate) fn apply_live_tail_event(&mut self, event: shared::dto::cloudwatch::LiveTailEvent) {
+        self.live_tail.push_event(event);
+    }
+
+    /// Single entry point for the live-tail subset of `Action`. The
+    /// `handle_action` match arm delegates to this function so that
+    /// tests can drive the same dispatch chain production uses (give
+    /// `Action::*`, observe state mutation) without spinning up a
+    /// real `Tui` backend.
+    ///
+    /// Codex round 2 flagged that testing the `apply_*` helpers in
+    /// isolation does not catch a regression that deletes the
+    /// `handle_action` match arm: it would compile, silently swallow
+    /// the action, and the apply-level tests would still pass. By
+    /// funnelling production AND the tests through this function we
+    /// remove that gap — the only way an `Action::StopLiveTail`
+    /// reaches the screen state is by going through here.
+    pub(crate) fn dispatch_live_tail_action(&mut self, action: Action) {
+        match action {
+            Action::StopLiveTail => self.apply_stop_live_tail(),
+            Action::PauseLiveTail => self.apply_pause_live_tail(),
+            Action::ResumeLiveTail => self.apply_resume_live_tail(),
+            Action::LiveTailEvent { event, generation } => {
+                // Drop late-arriving events from a stream that has
+                // since been replaced (stop-then-rearm). Without
+                // this guard, a stop-and-rearm sequence could leak
+                // the old stream's tail-end events into the new
+                // stream's buffer.
+                //
+                // Also require an active stream (`live_tail_cancel
+                // .is_some()`). Codex round 6 pointed out that after
+                // stop/logout, `live_tail_generation` retains its
+                // last value — a stale event with that same gen
+                // would otherwise still get appended into the
+                // scrollback even though the UI says Disconnected.
+                let active =
+                    self.live_tail_cancel.is_some() && generation == self.live_tail_generation;
+                if active {
+                    self.apply_live_tail_event(event);
+                } else {
+                    tracing::debug!(
+                        active_gen = self.live_tail_generation,
+                        stale_gen = generation,
+                        cancel_armed = self.live_tail_cancel.is_some(),
+                        "Dropping LiveTailEvent: no active stream or generation mismatch",
+                    );
+                }
+            }
+            Action::LiveTailStreamEnded(generation) => {
+                // Same idea for the natural-completion signal:
+                // only the CURRENT stream is allowed to flip the UI
+                // back to Disconnected. A stale one is silently
+                // discarded (the new stream is still active).
+                // This is Codex round 5's flagged race fix.
+                let active =
+                    self.live_tail_cancel.is_some() && generation == self.live_tail_generation;
+                if active {
+                    self.apply_stop_live_tail();
+                } else {
+                    tracing::debug!(
+                        active_gen = self.live_tail_generation,
+                        stale_gen = generation,
+                        cancel_armed = self.live_tail_cancel.is_some(),
+                        "Dropping LiveTailStreamEnded: no active stream or generation mismatch",
+                    );
+                }
+            }
+            _ => {
+                // Not a live-tail action — caller should pre-filter
+                // via the `@` binding in `handle_action`. Silently
+                // ignore in release; trip in debug to surface
+                // mis-routing during development.
+                debug_assert!(
+                    false,
+                    "dispatch_live_tail_action called with non-live-tail Action: {action:?}",
+                );
+            }
+        }
+    }
+
     fn spawn_filter_search(&mut self, append: bool) {
         if self.cloudwatch_search.selected_log_group.is_empty() {
             self.cloudwatch_search
@@ -1921,15 +3196,32 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::Component;
     use crate::event::Screen;
+    use ratatui::{buffer::Buffer, layout::Rect};
     use shared::dto::ec2::Ec2Instance;
     use shared::dto::entitlements::*;
     use std::collections::HashMap;
 
     /// Helper: build an App with dev defaults for testing state-machine logic.
+    /// Installs a per-test tempdir-based `token_store_path` so the test
+    /// can call set_session_token / reset_to_login / etc. without
+    /// touching the real `~/Library/Application Support/canopy/token`
+    /// (Codex round 10: prior pre-existing tests would silently
+    /// clobber the developer's persisted credential).
     async fn test_app() -> App {
         let config = App::test_config();
-        App::new(config).await.unwrap()
+        let mut app = App::new(config).await.unwrap();
+        // Sandbox the token store so `cargo test` cannot touch the
+        // real on-disk file. The TempDir is leaked into the App via
+        // `into_path()` so it survives for the lifetime of this
+        // test's runtime (Drop on Application takes care of nothing
+        // here; the tempdir lives until the OS reaps /tmp).
+        let dir = tempfile::TempDir::new().expect("tempdir for test token store");
+        let token_store_path = dir.keep().join("token");
+        app.api.set_session_store_path(token_store_path.clone());
+        app.token_store_path = Some(token_store_path);
+        app
     }
 
     fn mock_entitlements() -> UserEntitlements {
@@ -1957,6 +3249,7 @@ mod tests {
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
+            database_scopes: vec![],
         }
     }
 
@@ -1981,6 +3274,261 @@ mod tests {
             security_groups: vec![],
             iam_role: None,
         }
+    }
+
+    fn detected_terminal(
+        display_name: &str,
+        bundle_id: &str,
+        adapter: TerminalLaunchAdapter,
+    ) -> DetectedTerminalApp {
+        DetectedTerminalApp {
+            display_name: display_name.into(),
+            bundle_id: bundle_id.into(),
+            app_path: PathBuf::from(format!("/Applications/{display_name}.app")),
+            adapter,
+        }
+    }
+
+    fn write_fake_app(
+        root: &Path,
+        app_name: &str,
+        bundle_id: &str,
+        display_name: &str,
+        executable_name: &str,
+    ) -> PathBuf {
+        let app_path = root.join(app_name);
+        let contents = app_path.join("Contents");
+        std::fs::create_dir_all(&contents).expect("create fake app contents");
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>{bundle_id}</string>
+  <key>CFBundleDisplayName</key>
+  <string>{display_name}</string>
+  <key>CFBundleName</key>
+  <string>{display_name}</string>
+  <key>CFBundleExecutable</key>
+  <string>{executable_name}</string>
+</dict>
+</plist>
+"#
+            ),
+        )
+        .expect("write fake Info.plist");
+        app_path
+    }
+
+    fn rendered_mcp_screen(app: &mut App) -> String {
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+        app.mcp.render(area, &mut buf);
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    // ── MCP launcher helpers ────────────────────────────────
+
+    #[test]
+    fn mcp_ai_client_choice_parser_accepts_aliases_and_cancel() {
+        assert_eq!(
+            parse_mcp_ai_client_choice("1").unwrap(),
+            Some(McpAiClient::Codex)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("codex").unwrap(),
+            Some(McpAiClient::Codex)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("c").unwrap(),
+            Some(McpAiClient::Codex)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("2").unwrap(),
+            Some(McpAiClient::Claude)
+        );
+        assert_eq!(
+            parse_mcp_ai_client_choice("claude").unwrap(),
+            Some(McpAiClient::Claude)
+        );
+        assert_eq!(parse_mcp_ai_client_choice("q").unwrap(), None);
+        assert_eq!(parse_mcp_ai_client_choice("").unwrap(), None);
+        assert!(parse_mcp_ai_client_choice("vim").is_err());
+    }
+
+    #[test]
+    fn terminal_choice_parser_accepts_index_name_bundle_id_and_cancel() {
+        let terminals = vec![
+            detected_terminal(
+                "iTerm2",
+                "com.googlecode.iterm2",
+                TerminalLaunchAdapter::ITerm2,
+            ),
+            detected_terminal(
+                "Warp",
+                "dev.warp.Warp-Stable",
+                TerminalLaunchAdapter::WarpStable,
+            ),
+        ];
+
+        assert_eq!(
+            parse_terminal_app_choice("1", &terminals)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "iTerm2"
+        );
+        assert_eq!(
+            parse_terminal_app_choice("warp", &terminals)
+                .unwrap()
+                .unwrap()
+                .bundle_id,
+            "dev.warp.Warp-Stable"
+        );
+        assert_eq!(
+            parse_terminal_app_choice("com.googlecode.iterm2", &terminals)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            "iTerm2"
+        );
+        assert!(parse_terminal_app_choice("q", &terminals)
+            .unwrap()
+            .is_none());
+        assert!(parse_terminal_app_choice("", &terminals).unwrap().is_none());
+        assert!(parse_terminal_app_choice("3", &terminals).is_err());
+        assert!(parse_terminal_app_choice("Ghostty", &terminals).is_err());
+    }
+
+    #[test]
+    fn terminal_discovery_lists_detected_supported_apps_and_skips_unsupported() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        write_fake_app(
+            root.path(),
+            "Warp.app",
+            "dev.warp.Warp-Stable",
+            "Warp",
+            "warp",
+        );
+        write_fake_app(
+            root.path(),
+            "Notes.app",
+            "com.apple.Notes",
+            "Notes",
+            "Notes",
+        );
+        write_fake_app(
+            root.path(),
+            "iTerm.app",
+            "com.googlecode.iterm2",
+            "iTerm2",
+            "iTerm2",
+        );
+        write_fake_app(
+            root.path(),
+            "Terminal.app",
+            "com.apple.Terminal",
+            "Terminal",
+            "Terminal",
+        );
+
+        let dirs = vec![root.path().to_path_buf(), root.path().to_path_buf()];
+        let terminals = detect_supported_terminal_apps_in(&dirs).unwrap();
+        let names = terminals
+            .iter()
+            .map(|terminal| terminal.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["Terminal", "iTerm2", "Warp"]);
+        assert_eq!(terminals.len(), 3, "duplicate scan dirs should be deduped");
+        assert!(terminals
+            .iter()
+            .all(|terminal| terminal.display_name != "Notes"));
+    }
+
+    #[test]
+    fn terminal_discovery_errors_when_no_supported_apps_exist() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        write_fake_app(
+            root.path(),
+            "Notes.app",
+            "com.apple.Notes",
+            "Notes",
+            "Notes",
+        );
+
+        let err = detect_supported_terminal_apps_in(&[root.path().to_path_buf()]).unwrap_err();
+        assert_eq!(
+            err,
+            "No supported terminal app was detected on this computer."
+        );
+    }
+
+    #[test]
+    fn terminal_launch_command_builders_escape_script_paths() {
+        let script_path = PathBuf::from("/tmp/canopy launch/it's quoted.command");
+
+        let terminal_script = terminal_applescript_do_script(&script_path).unwrap();
+        assert!(terminal_script.contains("tell application \"Terminal\" to do script"));
+        assert!(terminal_script.contains("/tmp/canopy launch/it'\\\\''s quoted.command"));
+
+        let iterm_script = iterm2_applescript_create_window(&script_path).unwrap();
+        assert!(iterm_script
+            .contains("tell application \"iTerm2\" to create window with default profile command"));
+        assert!(iterm_script.contains("/bin/bash -lc"));
+        assert!(iterm_script.contains("/tmp/canopy launch/it'\\\\''s quoted.command"));
+    }
+
+    #[test]
+    fn warp_tab_config_builder_writes_terminal_pane_commands_and_url() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let script_path = root.path().join("canopy launch.command");
+        let tab_config_path = root.path().join("canopy_mcp_test.toml");
+        let body = build_warp_tab_config(
+            "canopy_mcp_test",
+            &script_path,
+            &tab_config_path,
+            root.path(),
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&body).expect("valid TOML");
+        let pane = parsed["panes"].as_array().unwrap()[0].as_table().unwrap();
+        let commands = pane["commands"].as_array().unwrap();
+
+        assert_eq!(pane["type"].as_str(), Some("terminal"));
+        assert_eq!(
+            pane["directory"].as_str(),
+            Some(root.path().to_str().unwrap())
+        );
+        assert!(commands[0].as_str().unwrap().starts_with("rm -f "));
+        assert!(commands[1].as_str().unwrap().starts_with("/bin/bash -lc "));
+        assert!(commands[1]
+            .as_str()
+            .unwrap()
+            .contains("canopy launch.command"));
+        assert_eq!(
+            build_warp_tab_config_url("canopy_mcp_test", TerminalLaunchAdapter::WarpStable)
+                .unwrap(),
+            "warp://tab_config/canopy_mcp_test?new_window=true"
+        );
+        assert_eq!(
+            build_warp_tab_config_url("canopy_mcp_test", TerminalLaunchAdapter::WarpPreview)
+                .unwrap(),
+            "warppreview://tab_config/canopy_mcp_test?new_window=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_launch_without_runtime_sets_enable_first_error() {
+        let mut app = test_app().await;
+
+        assert!(app.reject_direct_mcp_launch_when_stopped());
+        assert!(app.mcp_runtime.is_none());
+        let text = rendered_mcp_screen(&mut app);
+        assert!(text.contains("MCP server is not running"));
+        assert!(text.contains("press e to enable + launch first"));
     }
 
     // ── Navigation ──────────────────────────────────────────
@@ -2228,6 +3776,311 @@ mod tests {
         assert!(!app.cloudwatch_search.is_loading());
     }
 
+    // ── Filter-events action handler (stale-generation contract) ─────
+
+    fn log_event(message: &str) -> shared::dto::cloudwatch::LogEvent {
+        shared::dto::cloudwatch::LogEvent {
+            timestamp: 1_700_000_000_000,
+            message: message.into(),
+            log_stream_name: Some("app/web".into()),
+            ingestion_time: Some(1_700_000_000_500),
+            event_id: Some(format!("evt-{message}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_with_matching_generation_replaces_events() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+
+        app.apply_filter_events_loaded(
+            vec![log_event("first"), log_event("second")],
+            Some("tok-next".into()),
+            /* append = */ false,
+            gen,
+        );
+
+        assert_eq!(app.cloudwatch_search.events.len(), 2);
+        assert_eq!(app.cloudwatch_search.events[0].message, "first");
+        assert_eq!(app.cloudwatch_search.events[1].message, "second");
+        assert!(app.cloudwatch_search.has_more);
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_with_stale_generation_does_not_overwrite_state() {
+        // Reproduces this race:
+        //   user runs search-1 (gen=1) → in-flight
+        //   user runs search-2 (gen=2) → returns first, populates "current"
+        //   search-1's response finally arrives with stale gen=1
+        // Expectation: search-1's payload is silently dropped.
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 1
+        app.cloudwatch_search.advance_fetch_generation(); // gen 2 (current)
+        let current_gen = app.cloudwatch_search.fetch_generation;
+
+        // search-2 result lands first.
+        app.apply_filter_events_loaded(vec![log_event("current-result")], None, false, current_gen);
+        assert_eq!(app.cloudwatch_search.events.len(), 1);
+
+        // search-1's late reply arrives with stale gen.
+        let stale_gen = current_gen - 1;
+        app.apply_filter_events_loaded(
+            vec![
+                log_event("stale-A"),
+                log_event("stale-B"),
+                log_event("stale-C"),
+            ],
+            Some("stale-token".into()),
+            false,
+            stale_gen,
+        );
+
+        // Current state unchanged.
+        assert_eq!(app.cloudwatch_search.events.len(), 1);
+        assert_eq!(app.cloudwatch_search.events[0].message, "current-result");
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_append_extends_existing_events() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+        app.cloudwatch_search.set_events(
+            vec![log_event("page1-a"), log_event("page1-b")],
+            Some("tok".into()),
+        );
+
+        app.apply_filter_events_loaded(
+            vec![log_event("page2-c"), log_event("page2-d")],
+            None,
+            /* append = */ true,
+            gen,
+        );
+
+        assert_eq!(app.cloudwatch_search.events.len(), 4);
+        assert_eq!(app.cloudwatch_search.events[3].message, "page2-d");
+        assert!(!app.cloudwatch_search.has_more);
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_append_with_stale_generation_keeps_old_page() {
+        // Pagination race: user has page 1 loaded, presses `n` to
+        // load more (spawning gen=2). Then user starts a fresh search
+        // (gen=3, which clears events). The old `n` reply with gen=2
+        // arrives late; we must NOT append it to the new empty list.
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 1
+        app.cloudwatch_search
+            .set_events(vec![log_event("page1")], Some("tok".into()));
+
+        app.cloudwatch_search.advance_fetch_generation(); // gen 2 (n pressed)
+        let gen_for_n = app.cloudwatch_search.fetch_generation;
+
+        app.cloudwatch_search.advance_fetch_generation(); // gen 3 (new search)
+        app.cloudwatch_search.set_events(vec![], None);
+        assert!(app.cloudwatch_search.events.is_empty());
+
+        // Late n-page-2 reply at gen 2 arrives.
+        app.apply_filter_events_loaded(vec![log_event("stale-page2")], None, true, gen_for_n);
+
+        // New empty state is preserved; no stale append.
+        assert!(app.cloudwatch_search.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_with_empty_events_and_no_token_marks_end() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+
+        app.apply_filter_events_loaded(vec![], None, false, gen);
+
+        assert!(app.cloudwatch_search.events.is_empty());
+        assert!(!app.cloudwatch_search.has_more);
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_fetch_failed_with_matching_generation_sets_error() {
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation();
+        let gen = app.cloudwatch_search.fetch_generation;
+
+        app.apply_filter_events_fetch_failed("network timeout".into(), gen);
+
+        assert_eq!(
+            app.cloudwatch_search.error.as_deref(),
+            Some("network timeout")
+        );
+        assert!(!app.cloudwatch_search.is_loading());
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_fetch_failed_with_stale_generation_does_not_set_error() {
+        // A late error from a cancelled / superseded search must not
+        // surface to the user.
+        let mut app = test_app().await;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 1
+        let stale_gen = app.cloudwatch_search.fetch_generation;
+        app.cloudwatch_search.advance_fetch_generation(); // gen 2 (current)
+
+        app.apply_filter_events_fetch_failed("stale upstream 5xx".into(), stale_gen);
+
+        assert!(
+            app.cloudwatch_search.error.is_none(),
+            "stale fetch error should be silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_filter_events_loaded_does_not_panic_on_generation_zero_default() {
+        // Defensive: even if a caller forgets to advance the generation
+        // first, default (0) compared against current (0) should still
+        // accept the data — i.e. no off-by-one in the equality check.
+        let mut app = test_app().await;
+        let gen = app.cloudwatch_search.fetch_generation; // 0
+        app.apply_filter_events_loaded(vec![log_event("zero-gen")], None, false, gen);
+        assert_eq!(app.cloudwatch_search.events.len(), 1);
+    }
+
+    // ── ConnectSession reducer (Action::ConnectSession*) ─────────────
+
+    /// Spawn a real PTY-backed session attached to `app.connect_session`
+    /// so the reducer tests run against the same code path production
+    /// uses. The session runs `sleep 30` so it stays alive long enough
+    /// for the assertions; tests clean it up at the end via disconnect.
+    #[cfg(unix)]
+    fn attach_sleeping_session(app: &mut App) {
+        use crate::components::connect_session::{ConnectSessionLaunch, ConnectSessionScreen};
+
+        let launch = ConnectSessionLaunch {
+            instance_id: "i-test123".into(),
+            instance_name: Some("test".into()),
+            account_id: "111111111111".into(),
+            region: "us-east-1".into(),
+            method: shared::dto::ec2::ConnectMethod::Ssh,
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_vars: std::collections::HashMap::new(),
+            max_session_seconds: 60,
+            cols: 80,
+            rows: 24,
+        };
+        let session =
+            ConnectSessionScreen::spawn(launch, app.action_tx.clone()).expect("spawn PTY session");
+        app.connect_session = Some(session);
+        app.current_screen = Screen::ConnectSession;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_connect_session_exit_clears_session_and_returns_to_ec2_inventory() {
+        let mut app = test_app().await;
+        attach_sleeping_session(&mut app);
+        assert!(app.connect_session.is_some());
+        assert!(matches!(app.current_screen, Screen::ConnectSession));
+
+        app.apply_connect_session_exit();
+
+        assert!(app.connect_session.is_none());
+        assert!(matches!(app.current_screen, Screen::Ec2Inventory));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_connect_session_user_disconnect_drains_session_without_clearing_screen() {
+        // Ctrl+] / Ctrl+5: user wants to leave the session but stay
+        // on the screen so they can read the "Disconnected" message
+        // and decide when to dismiss. The session should be torn
+        // down (terminal state) but app.connect_session stays Some
+        // until the user presses Enter to exit.
+        let mut app = test_app().await;
+        attach_sleeping_session(&mut app);
+
+        app.apply_connect_session_user_disconnect();
+
+        assert!(
+            app.connect_session.is_some(),
+            "session should remain on screen until user dismisses"
+        );
+        assert!(matches!(app.current_screen, Screen::ConnectSession));
+        // After disconnect, pressing Enter on the screen should yield
+        // ConnectSessionExit. We don't simulate that here; the
+        // disconnect-only behavior is the contract under test.
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_connect_session_failure_propagates_message_to_session_overlay() {
+        // The session itself records the failure as a terminal-state
+        // CopyMessage-style overlay so the user sees why their PTY
+        // session ended.
+        let mut app = test_app().await;
+        attach_sleeping_session(&mut app);
+
+        app.apply_connect_session_failure("PTY write to pty failed: broken pipe".into());
+
+        // Session is still attached (user can still see + dismiss).
+        assert!(app.connect_session.is_some());
+        // Screen does not auto-return.
+        assert!(matches!(app.current_screen, Screen::ConnectSession));
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_stdout_ready_is_no_op_when_no_session_attached() {
+        // Late signal: PTY reader thread fired ConnectSessionStdoutReady
+        // after the user already exited the session screen. Must not
+        // panic, must not change app state.
+        let mut app = test_app().await;
+        assert!(app.connect_session.is_none());
+        let prev_screen = app.current_screen.clone();
+
+        app.apply_connect_session_stdout_ready();
+
+        assert!(app.connect_session.is_none());
+        assert_eq!(app.current_screen, prev_screen);
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_failure_is_no_op_when_no_session_attached() {
+        // Same race: PTY write thread surfaced a failure but the
+        // session screen has already been torn down. Drop silently.
+        let mut app = test_app().await;
+        assert!(app.connect_session.is_none());
+
+        app.apply_connect_session_failure("late error from torn-down session".into());
+
+        // No panics, no error_modal pop-up — just dropped.
+        assert!(app.connect_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_user_disconnect_is_no_op_when_no_session_attached() {
+        // Defensive: if user somehow triggers ConnectSessionUserDisconnect
+        // while the screen has already been popped, nothing happens.
+        let mut app = test_app().await;
+        assert!(app.connect_session.is_none());
+
+        app.apply_connect_session_user_disconnect();
+
+        assert!(app.connect_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_connect_session_exit_when_already_inactive_still_lands_on_ec2_inventory() {
+        // Idempotency: exit while session is already None should still
+        // route the user back to the inventory (covers Esc fallthrough
+        // edge cases).
+        let mut app = test_app().await;
+        app.connect_session = None;
+        app.current_screen = Screen::Login; // some unrelated screen
+
+        app.apply_connect_session_exit();
+
+        assert!(app.connect_session.is_none());
+        assert!(matches!(app.current_screen, Screen::Ec2Inventory));
+    }
+
     #[test]
     fn session_countdown_renders_remaining_bar() {
         assert_eq!(
@@ -2365,6 +4218,683 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|msg| msg.contains("UNAUTHORIZED")));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Phase A — Core user flows
+    // ─────────────────────────────────────────────────────────────────
+
+    // ── Login / post-auth: set_entitlements → enter_dashboard ────────
+
+    #[tokio::test]
+    async fn login_success_propagates_entitlements_to_ec2_screen() {
+        // After login the Access screen, EC2 screen, CloudWatch search,
+        // and Dashboard all need to see the user's entitlements.
+        // `set_entitlements` is the single fan-out point; the test
+        // locks that it actually reaches each screen.
+        let mut app = test_app().await;
+        let ent = mock_entitlements();
+
+        app.set_entitlements(ent.clone());
+
+        assert!(app.entitlements.is_some(), "app should retain entitlements");
+        // EC2 screen learns its allowed scopes from entitlements.
+        assert!(!app.ec2.available_accounts.is_empty());
+        assert!(!app.ec2.available_regions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn login_success_lands_on_dashboard_with_clean_back_stack() {
+        // The post-login transition: `enter_dashboard` sets the
+        // current screen and produces a fresh back stack (no stale
+        // entries from before login). Any actions emitted by
+        // Dashboard's on_enter (e.g. FetchPublicIp when public-IP
+        // display is enabled) flow through the action channel.
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+
+        app.enter_dashboard();
+
+        assert_eq!(app.current_screen, Screen::Dashboard);
+        assert!(
+            app.screen_stack.is_empty(),
+            "Dashboard is the root after login, no back-stack"
+        );
+
+        // Drain the action channel and verify nothing unexpected like
+        // an error or quit slipped through. We don't require a
+        // specific action because Dashboard's on_enter is config-driven
+        // (FetchPublicIp only when show_public_ip is true).
+        while let Ok(action) = app.action_rx.try_recv() {
+            assert!(
+                !matches!(action, Action::Quit | Action::ShowError(_)),
+                "enter_dashboard must not emit Quit or ShowError, got {action:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_dashboard_does_not_clear_existing_screen_stack() {
+        // Boundary: if the user navigates away from Dashboard and then
+        // a TokenReceived flow lands them back on Dashboard, the back
+        // stack should NOT inherit stale entries from before login
+        // (the prior session was wiped by reset_to_login). After a
+        // fresh login the stack starts empty.
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        app.navigate_to(Screen::Ec2Inventory);
+        app.navigate_to(Screen::CloudWatchSearch);
+        // Pretend the screen_stack was reset by reset_to_login then
+        // login lands the user on Dashboard.
+        app.screen_stack.clear();
+
+        app.enter_dashboard();
+
+        assert_eq!(app.current_screen, Screen::Dashboard);
+        assert!(app.screen_stack.is_empty());
+    }
+
+    // ── Logout: `reset_to_login` is testable directly now ────────────
+
+    #[tokio::test]
+    async fn reset_to_login_clears_token_entitlements_and_returns_to_login_screen() {
+        let mut app = test_app().await;
+        app.api.set_token("active-session-token".into());
+        app.set_entitlements(mock_entitlements());
+        app.enter_dashboard();
+        app.navigate_to(Screen::Ec2Inventory);
+        assert!(app.api.has_token());
+        assert!(app.entitlements.is_some());
+
+        app.reset_to_login();
+
+        assert_eq!(app.current_screen, Screen::Login);
+        assert!(app.screen_stack.is_empty(), "back stack cleared");
+        assert!(app.entitlements.is_none(), "entitlements cleared");
+        assert!(!app.api.has_token(), "in-memory API client token cleared");
+        assert!(
+            !app.error_modal.is_visible(),
+            "any prior modal must be dismissed on logout"
+        );
+        assert!(
+            !app.session_expired_pending_login,
+            "session-expired flag reset to false"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_login_advances_generations_to_drop_in_flight_async_results() {
+        // Race-safety: while logged in, the user may have an EC2 list
+        // request and a CloudWatch search in flight. Logging out
+        // must bump fetch_generation on each screen so late replies
+        // are silently dropped by the generation guard in the
+        // matching action handler (covered separately by #9 / R3).
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        let ec2_gen_before = app.ec2.fetch_generation;
+        let cw_gen_before = app.cloudwatch_search.fetch_generation;
+
+        app.reset_to_login();
+
+        assert!(
+            app.ec2.fetch_generation > ec2_gen_before,
+            "ec2 generation must advance: was {ec2_gen_before}, now {}",
+            app.ec2.fetch_generation
+        );
+        assert!(
+            app.cloudwatch_search.fetch_generation > cw_gen_before,
+            "cw search generation must advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_login_cancels_in_flight_cancellation_tokens() {
+        // EC2/CW/LiveTail spawn tokio tasks that hold a CancellationToken
+        // clone. On logout the app side of each token must be cancelled
+        // so the tasks unwind.
+        let mut app = test_app().await;
+        let ec2_token = tokio_util::sync::CancellationToken::new();
+        let cw_token = tokio_util::sync::CancellationToken::new();
+        let lt_token = tokio_util::sync::CancellationToken::new();
+        app.ec2_fetch_cancel = Some(ec2_token.clone());
+        app.cw_fetch_cancel = Some(cw_token.clone());
+        app.live_tail_cancel = Some(lt_token.clone());
+
+        app.reset_to_login();
+
+        assert!(ec2_token.is_cancelled(), "EC2 fetch must be cancelled");
+        assert!(cw_token.is_cancelled(), "CW fetch must be cancelled");
+        assert!(
+            lt_token.is_cancelled(),
+            "Live Tail stream must be cancelled"
+        );
+        assert!(app.ec2_fetch_cancel.is_none(), "stale handle cleared");
+        assert!(app.cw_fetch_cancel.is_none());
+        assert!(app.live_tail_cancel.is_none());
+    }
+
+    // ── Token-expired flow (begin + dismiss path) ────────────────────
+
+    #[tokio::test]
+    async fn begin_token_expired_flow_is_idempotent_within_one_session_expiry() {
+        // Multiple failing API calls may all surface as `TokenExpired`
+        // before the user can dismiss the modal. The second invocation
+        // must NOT re-show the modal or re-cancel anything — otherwise
+        // the modal would jitter and audit-worthy state would be
+        // double-mutated.
+        let mut app = test_app().await;
+        app.api.set_token("expired".into());
+        app.set_entitlements(mock_entitlements());
+
+        app.begin_token_expired_flow();
+        assert!(app.session_expired_pending_login);
+        assert!(app.error_modal.is_visible());
+        let api_has_token_after_first = app.api.has_token();
+
+        // Second call while modal is already showing — must be a no-op.
+        app.begin_token_expired_flow();
+
+        assert!(app.session_expired_pending_login);
+        assert!(app.error_modal.is_visible());
+        // Token was already cleared by the first call; second is no-op.
+        assert_eq!(app.api.has_token(), api_has_token_after_first);
+    }
+
+    #[tokio::test]
+    async fn token_expired_flow_does_not_change_screen_until_user_dismisses_modal() {
+        // The user might be deep in CloudWatch or PTY when their token
+        // expires. We surface the modal on top of the current screen
+        // and only navigate after the user acknowledges (Enter).
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        app.navigate_to(Screen::Ec2Inventory);
+        app.navigate_to(Screen::CloudWatchSearch);
+
+        app.begin_token_expired_flow();
+
+        // Screen unchanged — modal is the overlay
+        assert_eq!(app.current_screen, Screen::CloudWatchSearch);
+        assert!(app.error_modal.is_visible());
+    }
+
+    #[tokio::test]
+    async fn dismiss_error_during_session_expired_pending_login_returns_to_login() {
+        // Reproduces the Token-Expired dismissal path: user sees the
+        // modal, presses Enter, which fires Action::DismissError;
+        // because session_expired_pending_login is set, the dismissal
+        // handler also runs reset_to_login.
+        let mut app = test_app().await;
+        app.set_entitlements(mock_entitlements());
+        app.navigate_to(Screen::Ec2Inventory);
+        app.begin_token_expired_flow();
+        assert!(app.error_modal.is_visible());
+        assert!(app.session_expired_pending_login);
+
+        // Inline the DismissError handler logic since handle_action
+        // needs a Tui. (See Action::DismissError arm in app.rs.)
+        app.error_modal.dismiss();
+        if app.session_expired_pending_login {
+            app.reset_to_login();
+        }
+
+        assert_eq!(app.current_screen, Screen::Login);
+        assert!(!app.session_expired_pending_login);
+        assert!(!app.error_modal.is_visible());
+        assert!(!app.api.has_token());
+    }
+
+    #[tokio::test]
+    async fn token_expired_recovery_re_login_clears_pending_flag() {
+        // After re-login, the session_expired_pending_login flag must
+        // be false so a future token expiry can trigger a fresh modal.
+        let mut app = test_app().await;
+        app.begin_token_expired_flow();
+        assert!(app.session_expired_pending_login);
+
+        app.reset_to_login();
+        // User now logs in again.
+        app.set_entitlements(mock_entitlements());
+        app.api.set_token("fresh-token".into());
+        app.enter_dashboard();
+
+        // A subsequent expiry should be able to fire the modal again.
+        app.begin_token_expired_flow();
+        assert!(app.error_modal.is_visible());
+        assert!(app.session_expired_pending_login);
+    }
+
+    // ── Live Tail action handlers ────────────────────────────────────
+
+    /// Build a minimal `LiveTailEvent` fixture matching the
+    /// `shared::dto::cloudwatch::LiveTailEvent` wire shape (timestamp,
+    /// message, log_group_name, log_stream_name — all required).
+    fn live_tail_event(ts: i64, msg: &str) -> shared::dto::cloudwatch::LiveTailEvent {
+        shared::dto::cloudwatch::LiveTailEvent {
+            timestamp: ts,
+            message: msg.into(),
+            log_group_name: "/app/web-service".into(),
+            log_stream_name: "stream-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatching_stop_live_tail_action_cancels_token_and_disconnects() {
+        // Exercise the SAME entry point that the production
+        // `handle_action` match arm uses (`dispatch_live_tail_action`),
+        // not the apply_* helpers directly. Codex round 2: testing
+        // apply_* in isolation lets a regression that breaks the
+        // dispatch fn body slip past. Going through the dispatch
+        // chain closes that loop.
+        let mut app = test_app().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        app.live_tail_cancel = Some(cancel.clone());
+        app.live_tail.set_connected();
+        assert_eq!(app.live_tail.connection_state, "Connected");
+
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+
+        assert!(
+            cancel.is_cancelled(),
+            "stop must cancel the in-flight WS task token so the background loop terminates",
+        );
+        assert!(
+            app.live_tail_cancel.is_none(),
+            "stop must drop the stored token so a fresh start can install a new one",
+        );
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+    }
+
+    #[tokio::test]
+    async fn dispatching_pause_live_tail_action_keeps_buffer_but_pauses_state() {
+        let mut app = test_app().await;
+        app.live_tail.set_connected();
+        // Seed an event so we can assert the buffer survives pause.
+        app.live_tail
+            .push_event(live_tail_event(1_700_000_000_000, "before-pause"));
+        let before = app.live_tail.events.len();
+
+        app.dispatch_live_tail_action(Action::PauseLiveTail);
+
+        assert_eq!(app.live_tail.connection_state, "Paused");
+        assert_eq!(
+            app.live_tail.events.len(),
+            before,
+            "pause must not drop buffered events",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatching_resume_live_tail_action_transitions_paused_to_connected() {
+        let mut app = test_app().await;
+        app.live_tail.set_paused();
+        assert_eq!(app.live_tail.connection_state, "Paused");
+
+        app.dispatch_live_tail_action(Action::ResumeLiveTail);
+
+        assert_eq!(app.live_tail.connection_state, "Connected");
+    }
+
+    #[tokio::test]
+    async fn dispatching_live_tail_event_actions_appends_to_buffer_in_arrival_order() {
+        let mut app = test_app().await;
+        // Arm so the dispatch fn matches our generation.
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "first"),
+            generation: gen,
+        });
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(2, "second"),
+            generation: gen,
+        });
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(3, "third"),
+            generation: gen,
+        });
+
+        assert_eq!(app.live_tail.events.len(), 3);
+        assert_eq!(
+            app.live_tail.events[0].message, "first",
+            "events must be appended in arrival order, not reverse-chronological",
+        );
+        assert_eq!(app.live_tail.events[2].message, "third");
+    }
+
+    #[tokio::test]
+    async fn dispatching_stale_live_tail_event_from_old_stream_is_silently_dropped() {
+        // Codex round 5: the stop-then-rearm race meant a late-
+        // arriving event from a previously-active stream could
+        // bleed into the new stream's buffer.
+        let mut app = test_app().await;
+
+        // Arm stream #1 (generation 1), then stop it, then arm
+        // stream #2 (generation 2).
+        let _ = app.try_arm_live_tail_stream();
+        let gen_old = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        let _ = app.try_arm_live_tail_stream();
+        let gen_new = app.live_tail_generation;
+        assert_ne!(gen_old, gen_new, "rearm must bump the generation");
+
+        // Late event from the OLD stream — must NOT land in the buffer.
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(99, "stale-late-event"),
+            generation: gen_old,
+        });
+        assert_eq!(
+            app.live_tail.events.len(),
+            0,
+            "stale events must be dropped, got {:?}",
+            app.live_tail.events,
+        );
+
+        // Event from the NEW (current) stream — must land normally.
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(100, "fresh-event"),
+            generation: gen_new,
+        });
+        assert_eq!(app.live_tail.events.len(), 1);
+        assert_eq!(app.live_tail.events[0].message, "fresh-event");
+    }
+
+    #[tokio::test]
+    async fn dispatching_live_tail_event_after_stop_without_rearm_is_silently_dropped() {
+        // Codex round 6: after StopLiveTail (no subsequent rearm),
+        // a stale event still in the action channel must NOT appear
+        // in the scrollback. The previous gen-only check would have
+        // accepted it because `live_tail_generation` retains its
+        // last value across teardown.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+
+        // Stop — clears live_tail_cancel, but live_tail_generation
+        // is intentionally NOT bumped (it identifies "the most
+        // recent stream", not "the currently-running one").
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        assert!(app.live_tail_cancel.is_none());
+        assert_eq!(app.live_tail_generation, gen);
+
+        // Late event arriving AFTER stop with the just-stopped
+        // stream's gen — must NOT be appended.
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "post-stop-leak"),
+            generation: gen,
+        });
+        assert_eq!(
+            app.live_tail.events.len(),
+            0,
+            "after stop, events from the just-stopped stream must NOT bleed into the buffer, got {:?}",
+            app.live_tail.events,
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatching_live_tail_stream_ended_after_stop_does_not_redisconnect() {
+        // Same idea for the stream-ended signal — already-disconnected
+        // app must not be flipped by a late-arriving ended signal
+        // (no-op rather than disrupting the user's flow).
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+
+        // Late ended-signal from the just-stopped stream.
+        app.dispatch_live_tail_action(Action::LiveTailStreamEnded(gen));
+
+        assert_eq!(
+            app.live_tail.connection_state, "Disconnected",
+            "state already Disconnected — a stale end signal must not toggle anything",
+        );
+        assert!(app.live_tail_cancel.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatching_stale_live_tail_stream_ended_does_not_disconnect_new_stream() {
+        // The headline race from Codex round 5: stream A's natural
+        // completion sends LiveTailStreamEnded; if stream B has
+        // already been armed in the meantime, that stale signal
+        // must NOT flip the UI to Disconnected.
+        let mut app = test_app().await;
+
+        let _ = app.try_arm_live_tail_stream();
+        let gen_old = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        let _ = app.try_arm_live_tail_stream();
+        let gen_new = app.live_tail_generation;
+        assert_eq!(app.live_tail.connection_state, "Connected");
+
+        // Late "ended" signal from the OLD stream.
+        app.dispatch_live_tail_action(Action::LiveTailStreamEnded(gen_old));
+
+        assert_eq!(
+            app.live_tail.connection_state, "Connected",
+            "stale LiveTailStreamEnded must not disconnect the new stream",
+        );
+        assert!(
+            app.live_tail_cancel.is_some(),
+            "stale LiveTailStreamEnded must not clear the new stream's cancel token",
+        );
+
+        // The current stream's ended signal IS honored.
+        app.dispatch_live_tail_action(Action::LiveTailStreamEnded(gen_new));
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+        assert!(app.live_tail_cancel.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_arm_live_tail_stream_is_idempotent_under_double_start() {
+        // Codex round 3 regression guard: two queued StartLiveTail
+        // actions used to:
+        //   1. spawn stream A with token A → stored in live_tail_cancel
+        //   2. spawn stream B with token B → OVERWRITES live_tail_cancel
+        //      (token A leaks; stream A keeps running)
+        //   3. eventually stream A emits Action::StopLiveTail
+        //   4. apply_stop_live_tail() cancels token B — the NEW stream — wrongly
+        //
+        // The fix: try_arm_live_tail_stream returns None when a
+        // stream is already in flight, so the handler refuses to
+        // spawn a second one and the original token survives.
+        let mut app = test_app().await;
+
+        // First call arms the stream — returns (cancel_token, generation).
+        let (token_a, gen_a) = app
+            .try_arm_live_tail_stream()
+            .expect("first call must succeed (no stream in flight)");
+        assert!(
+            app.live_tail_cancel.is_some(),
+            "first arm must install a cancel token",
+        );
+        assert_eq!(
+            app.live_tail.connection_state, "Connected",
+            "first arm must flip UI state to Connected",
+        );
+        assert_eq!(
+            gen_a, app.live_tail_generation,
+            "returned generation must match the stored field",
+        );
+
+        // Second call must NOT install a new token.
+        let token_b = app.try_arm_live_tail_stream();
+        assert!(
+            token_b.is_none(),
+            "duplicate StartLiveTail must yield None (no new spawn)",
+        );
+        assert_eq!(
+            app.live_tail_generation, gen_a,
+            "refused arm must NOT bump the generation",
+        );
+
+        // Now prove token identity *bidirectionally*. Codex round 4
+        // pointed out that one-way propagation (`token_a.cancel() ⇒
+        // stored.is_cancelled()`) is satisfied even by a child
+        // token — a buggy impl that returned `parent.child_token()`
+        // would pass that single check, but `apply_stop_live_tail`
+        // would then cancel only the stored CHILD, leaving the
+        // background stream's parent token uncancelled. So we test
+        // BOTH directions:
+        //
+        //   * cancelling `stored` propagates to `token_a`  → proves
+        //     `stored` is not a child of `token_a`
+        //   * cancelling `token_a` propagates to `stored`  → proves
+        //     `token_a` is not a child of `stored`
+        //
+        // Both directions hold only when both handles share the
+        // same root (i.e. are clones of each other).
+        let stored = app
+            .live_tail_cancel
+            .clone()
+            .expect("stored token must survive the duplicate-arm refusal");
+        assert!(!stored.is_cancelled());
+        assert!(!token_a.is_cancelled());
+
+        // Direction 1: cancel the stored handle, check token_a sees it.
+        stored.cancel();
+        assert!(
+            token_a.is_cancelled(),
+            "stored→token_a propagation failed — `stored` is a CHILD of `token_a`, \
+             not the same token; the duplicate-arm path silently substituted a \
+             child token. Cancelling the stored handle therefore leaves the \
+             background task uncancelled, recreating the orphan-stream bug.",
+        );
+
+        // Direction 2: a freshly-armed token's cancel must propagate
+        // both ways too. Use a fresh app so we don't reuse the
+        // already-cancelled handles above.
+        let mut app2 = test_app().await;
+        let (task_token, _gen) = app2.try_arm_live_tail_stream().expect("first arm");
+        let stored2 = app2.live_tail_cancel.clone().expect("stored 2");
+        task_token.cancel();
+        assert!(
+            stored2.is_cancelled(),
+            "token_a→stored propagation failed — `token_a` is a CHILD of `stored`. \
+             This is the inverse of the bug above and equally orphan-prone.",
+        );
+    }
+
+    #[tokio::test]
+    async fn try_arm_live_tail_stream_re_arms_after_stop() {
+        // Companion to the idempotency test: once the stream has
+        // been stopped (cancel token taken / state Disconnected),
+        // a fresh StartLiveTail MUST be allowed through again.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        assert!(app.live_tail_cancel.is_none());
+
+        let second_arm = app.try_arm_live_tail_stream();
+        assert!(
+            second_arm.is_some(),
+            "post-stop arm must succeed — otherwise the user could never restart live tail",
+        );
+        assert_eq!(app.live_tail.connection_state, "Connected");
+    }
+
+    #[tokio::test]
+    async fn set_session_token_returns_persisted_fresh_or_in_memory_only_on_happy_path() {
+        // Sanity: when save_token succeeds (happy path), the
+        // outcome is PersistedFresh; if save fails BUT clear of
+        // stale token succeeds, it's InMemoryOnly. In either case
+        // the caller is allowed to proceed to the dashboard.
+        // StaleTokenSurvivesOnDisk is the only "refuse-to-proceed"
+        // path and Codex round 8's contract — this test pins that
+        // the happy path doesn't accidentally return the refuse-
+        // to-proceed variant.
+        let mut app = test_app().await;
+
+        let outcome = app.set_session_token("fresh-token-xyz");
+
+        assert!(
+            matches!(
+                outcome,
+                SessionTokenOutcome::PersistedFresh | SessionTokenOutcome::InMemoryOnly,
+            ),
+            "happy-path login must NOT yield StaleTokenSurvivesOnDisk, got {outcome:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_to_login_clears_live_tail_events_so_next_user_does_not_see_prior_logs() {
+        // Codex round 7: a logout must scrub previously-buffered
+        // log lines from the LiveTailScreen, otherwise a second
+        // user logging in on the same TUI process can navigate to
+        // Live Tail and see prior CloudWatch output. This is a
+        // cross-user log isolation contract.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "user-a-secret-log-line"),
+            generation: gen,
+        });
+        assert_eq!(app.live_tail.events.len(), 1, "fixture sanity");
+
+        app.reset_to_login();
+
+        assert!(
+            app.live_tail.events.is_empty(),
+            "logout must clear the live-tail buffer, found leaked event(s): {:?}",
+            app.live_tail.events,
+        );
+        assert_eq!(
+            app.current_screen,
+            Screen::Login,
+            "reset_to_login must also return to Login screen",
+        );
+        // Generation also bumped so any still-in-flight queued
+        // events from the previous session can't match against
+        // the new session's gen by accident.
+        assert!(
+            app.live_tail_generation > gen,
+            "logout must invalidate the prior generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_token_expired_flow_also_clears_live_tail_events() {
+        // Same invariant for the session-expiry path — Codex round 7
+        // explicitly listed token expiry as one of the teardown
+        // boundaries that must scrub buffered logs.
+        let mut app = test_app().await;
+        let _ = app.try_arm_live_tail_stream();
+        let gen = app.live_tail_generation;
+        app.dispatch_live_tail_action(Action::LiveTailEvent {
+            event: live_tail_event(1, "expired-session-log"),
+            generation: gen,
+        });
+        assert_eq!(app.live_tail.events.len(), 1);
+
+        app.begin_token_expired_flow();
+
+        assert!(
+            app.live_tail.events.is_empty(),
+            "session-expiry teardown must clear the live-tail buffer",
+        );
+        assert!(
+            app.live_tail_generation > gen,
+            "session-expiry must invalidate the prior generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_live_tail_when_no_token_is_active_is_a_safe_no_op() {
+        // Boundary / idempotent: user double-presses 's' to stop the
+        // stream. Second stop must not panic on the missing token.
+        let mut app = test_app().await;
+        assert!(app.live_tail_cancel.is_none());
+        app.live_tail.set_disconnected();
+
+        // Calling the dispatch fn twice in a row must be safe —
+        // the first call already took the (None) token slot.
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+        app.dispatch_live_tail_action(Action::StopLiveTail);
+
+        // No panic, still disconnected, still no cancel token in flight.
+        assert_eq!(app.live_tail.connection_state, "Disconnected");
+        assert!(app.live_tail_cancel.is_none());
     }
 
     // ── Update banner ───────────────────────────────────────

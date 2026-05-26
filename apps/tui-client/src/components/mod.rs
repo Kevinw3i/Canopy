@@ -7,6 +7,7 @@ pub mod error_modal;
 pub mod live_tail;
 pub mod loading;
 pub mod login;
+pub mod mcp;
 pub mod settings;
 pub mod time_range;
 pub mod time_range_modal;

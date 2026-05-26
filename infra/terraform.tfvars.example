@@ -24,6 +24,28 @@ image_tag = "v0.1.0"
 jwt_secret_arn        = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX"
 jwt_secret_version_id = ""  # Required: pin with `aws secretsmanager describe-secret --secret-id canopy/jwt-secret --query 'VersionIdsToStages' --output json`
 
+# Optional MCP database credentials. Create these secrets out-of-band; Terraform
+# stores only the secret ARNs and non-secret connection metadata.
+# SecretString shape:
+#   {"username":"canopy_readonly","password":"..."}
+# database_secret_arns = [
+#   "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/db/orders-prod-XXXXXX",
+# ]
+#
+# database_connections_toml = <<-TOML
+# [database_connections.orders_prod]
+# engine = "mysql"
+# host = "orders-prod.xxxxxx.ap-northeast-1.rds.amazonaws.com"
+# port = 3306
+# database = "orders"
+# secret_arn = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/db/orders-prod-XXXXXX"
+# readonly = true
+# connect_timeout_ms = 3000
+# statement_timeout_ms = 5000
+# explain_timeout_ms = 3000
+# max_connections = 4
+# TOML
+
 # ALB defaults to internal. Provide at least one CIDR (e.g. your VPC CIDR for internal).
 alb_allowed_cidrs = ["10.0.0.0/16"]
 # alb_internal    = false  # set to false + office CIDRs for public access

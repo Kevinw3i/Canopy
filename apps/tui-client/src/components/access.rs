@@ -194,3 +194,209 @@ impl Component for AccessScreen {
             .render(chunks[5], buf);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEventKind, KeyEventState};
+    use shared::dto::entitlements::{AllowedAccount, FeatureFlags};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn key_ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn sample_entitlements() -> UserEntitlements {
+        UserEntitlements {
+            user_id: "alice".into(),
+            email: "alice@example.com".into(),
+            display_name: "Alice".into(),
+            groups: vec!["engineers".into(), "ops".into()],
+            features: FeatureFlags {
+                can_view_ec2: true,
+                can_use_cloudwatch_search: true,
+                can_use_cloudwatch_tail: false,
+                can_use_ssm: true,
+                can_use_ec2_instance_connect: false,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111111111111".into(),
+                account_name: "production".into(),
+                role_arn: "arn:aws:iam::111111111111:role/CanopyRole".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into(), "ap-northeast-1".into()],
+            allowed_log_group_arns: vec!["arn:aws:logs:*:111111111111:log-group:/app/*".into()],
+            max_session_seconds: None,
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_os_users: vec![],
+            database_scopes: vec![],
+        }
+    }
+
+    fn rendered(screen: &mut AccessScreen, area: Rect) -> String {
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    // ── Key handling ──
+
+    #[test]
+    fn esc_key_returns_go_back_action() {
+        let mut screen = AccessScreen::new();
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Esc)),
+            Action::GoBack
+        ));
+    }
+
+    #[test]
+    fn q_key_returns_go_back_action() {
+        let mut screen = AccessScreen::new();
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('q'))),
+            Action::GoBack
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_returns_quit_action_even_on_access_screen() {
+        // Global quit shortcut must still take precedence.
+        let mut screen = AccessScreen::new();
+        assert!(matches!(
+            screen.handle_key(key_ctrl(KeyCode::Char('c'))),
+            Action::Quit
+        ));
+    }
+
+    #[test]
+    fn unrelated_keys_return_noop() {
+        let mut screen = AccessScreen::new();
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('z'),
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Tab,
+        ] {
+            let action = screen.handle_key(key(code));
+            assert!(
+                matches!(action, Action::Noop),
+                "{code:?} should be no-op, got {action:?}"
+            );
+        }
+    }
+
+    // ── Render: empty / null state ──
+
+    #[test]
+    fn render_without_entitlements_shows_loading_placeholder() {
+        let mut screen = AccessScreen::new();
+        let text = rendered(&mut screen, Rect::new(0, 0, 80, 24));
+
+        assert!(
+            text.contains("Loading entitlements..."),
+            "expected placeholder before entitlements load"
+        );
+    }
+
+    #[test]
+    fn render_does_not_panic_in_short_area() {
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(sample_entitlements());
+
+        // 1-row area is smaller than the layout demands; the
+        // ratatui Layout::split must clamp gracefully.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 1));
+        screen.render(Rect::new(0, 0, 80, 1), &mut buf);
+    }
+
+    // ── Render: populated state ──
+
+    #[test]
+    fn render_with_entitlements_shows_user_identity_fields() {
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(sample_entitlements());
+
+        let text = rendered(&mut screen, Rect::new(0, 0, 120, 40));
+
+        assert!(text.contains("alice"), "user_id should appear");
+        assert!(text.contains("alice@example.com"), "email should appear");
+        assert!(text.contains("Alice"), "display name should appear");
+        assert!(
+            text.contains("engineers") && text.contains("ops"),
+            "groups should appear"
+        );
+    }
+
+    #[test]
+    fn render_includes_all_feature_flag_labels() {
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(sample_entitlements());
+
+        let text = rendered(&mut screen, Rect::new(0, 0, 120, 40));
+
+        assert!(text.contains("EC2 View"));
+        assert!(text.contains("CloudWatch Search"));
+        assert!(text.contains("CloudWatch Live Tail"));
+        assert!(text.contains("SSM Session Manager"));
+        assert!(text.contains("EC2 Instance Connect"));
+    }
+
+    #[test]
+    fn render_shows_account_count_in_title_and_account_details() {
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(sample_entitlements());
+
+        let text = rendered(&mut screen, Rect::new(0, 0, 120, 40));
+
+        assert!(text.contains("Allowed Accounts (1)"));
+        assert!(text.contains("111111111111"));
+        assert!(text.contains("production"));
+    }
+
+    #[test]
+    fn render_shows_region_list_with_count() {
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(sample_entitlements());
+
+        let text = rendered(&mut screen, Rect::new(0, 0, 120, 40));
+
+        assert!(text.contains("us-east-1"));
+        assert!(text.contains("ap-northeast-1"));
+        assert!(text.contains("Allowed Regions (2)"));
+    }
+
+    #[test]
+    fn render_with_empty_entitlement_lists_shows_zero_counts() {
+        // Boundary: user has zero accounts / zero regions / zero log
+        // groups. Titles should show (0); no panic.
+        let mut empty = sample_entitlements();
+        empty.allowed_accounts.clear();
+        empty.allowed_regions.clear();
+        empty.allowed_log_group_arns.clear();
+
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(empty);
+
+        let text = rendered(&mut screen, Rect::new(0, 0, 120, 40));
+        assert!(text.contains("Allowed Accounts (0)"));
+        assert!(text.contains("Allowed Regions (0)"));
+        assert!(text.contains("Allowed Log Group Patterns (0)"));
+    }
+}

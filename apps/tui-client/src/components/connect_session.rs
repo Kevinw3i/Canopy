@@ -2198,6 +2198,171 @@ mod tests {
         cleanup_session(session);
     }
 
+    // ── F2 copy capture: buffer overflow / boundary ──────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_capture_aborts_when_buffer_exceeds_max_without_finding_markers() {
+        // Simulate a remote shell that produces a flood of output but
+        // never emits the BEGIN / ERROR markers (e.g. user pasted F2
+        // path into wrong shell, or remote command crashed mid-output).
+        // The capture buffer must bound itself at MAX_COPY_CAPTURE_BYTES
+        // and surface a clear error instead of growing unbounded.
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new(
+            "/tmp/never-finds-marker.log".into(),
+            "copyid-overflow",
+        ));
+
+        // Feed one large marker-free chunk past the cap. A single
+        // process_output call is dramatically faster than a per-chunk
+        // loop here because the vt100 parser path is short-circuited
+        // while the capture is active.
+        let oversize = vec![b'x'; MAX_COPY_CAPTURE_BYTES + 1024];
+        session.process_output(&oversize);
+
+        // After abort:
+        // 1. Capture cleared so subsequent PTY bytes flow normally
+        assert!(
+            session.copy_capture.is_none(),
+            "capture must be cleared after overflow"
+        );
+        // 2. Clipboard untouched
+        assert!(
+            clipboard
+                .bytes
+                .lock()
+                .expect("fake clipboard lock")
+                .is_empty(),
+            "no partial data should land in clipboard"
+        );
+        // 3. User sees an error overlay
+        match &session.overlay {
+            Some(ConnectOverlay::CopyMessage {
+                is_error, message, ..
+            }) => {
+                assert!(*is_error);
+                assert!(
+                    message.contains("did not contain Canopy markers")
+                        || message.contains("aborting"),
+                    "error message should explain overflow, got {message:?}"
+                );
+            }
+            other => panic!("expected error CopyMessage overlay, got {other:?}"),
+        }
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_capture_handles_marker_split_across_two_chunks() {
+        // PTY output frequently arrives in arbitrarily-sized chunks.
+        // The capture state machine must handle a BEGIN marker that
+        // spans a chunk boundary.
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new("/tmp/split.log".into(), "splitid"));
+
+        let encoded = general_purpose::STANDARD.encode("split content");
+        let begin = "__CANOPY_COPY_BEGIN_splitid__";
+        let end = "__CANOPY_COPY_END_splitid__";
+
+        // Send the marker in two parts that cut through it.
+        let split_at = 12;
+        let (begin_a, begin_b) = begin.split_at(split_at);
+        session.process_output(format!("prefix\r\n{begin_a}").as_bytes());
+        session.process_output(format!("{begin_b}\r\n{encoded}\r\n{end}\r\nDONE").as_bytes());
+
+        assert_eq!(
+            clipboard.bytes.lock().expect("lock").as_slice(),
+            b"split content"
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_capture_succeeds_at_max_file_size_boundary() {
+        // 5 MiB file (the documented MAX_COPY_FILE_BYTES) — the
+        // capture buffer headroom is 10 MiB so this must succeed.
+        // Decode result must equal what we encoded.
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new("/tmp/max-size.bin".into(), "maxid"));
+
+        let payload = vec![b'A'; MAX_COPY_FILE_BYTES];
+        let encoded = general_purpose::STANDARD.encode(&payload);
+        let output =
+            format!("__CANOPY_COPY_BEGIN_maxid__\r\n{encoded}\r\n__CANOPY_COPY_END_maxid__\r\n");
+        session.process_output(output.as_bytes());
+
+        let written = clipboard.bytes.lock().expect("lock").clone();
+        assert_eq!(written.len(), payload.len());
+        assert!(written.iter().all(|&b| b == b'A'));
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_capture_with_empty_payload_writes_empty_clipboard() {
+        // Remote file of length 0 — base64("") is "" — capture flow
+        // must still write an empty payload (or surface a clean
+        // success), not panic on decode.
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new("/tmp/empty.txt".into(), "emptyid"));
+
+        session.process_output(
+            b"__CANOPY_COPY_BEGIN_emptyid__\r\n\r\n__CANOPY_COPY_END_emptyid__\r\n",
+        );
+
+        let written = clipboard.bytes.lock().expect("lock").clone();
+        assert!(written.is_empty(), "empty file → empty clipboard payload");
+        assert!(matches!(
+            session.overlay,
+            Some(ConnectOverlay::CopyMessage {
+                is_error: false,
+                ..
+            })
+        ));
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_capture_treats_malformed_base64_as_error() {
+        // Garbage between markers — decode must fail and we surface
+        // a user-visible error, not silently swallow.
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.copy_capture = Some(CopyCapture::new("/tmp/bad.bin".into(), "garbageid"));
+
+        session.process_output(
+            b"__CANOPY_COPY_BEGIN_garbageid__\r\n!!!not valid base64@@@\r\n__CANOPY_COPY_END_garbageid__\r\n",
+        );
+
+        assert!(clipboard.bytes.lock().expect("lock").is_empty());
+        match &session.overlay {
+            Some(ConnectOverlay::CopyMessage {
+                is_error, message, ..
+            }) => {
+                assert!(*is_error);
+                assert!(
+                    message.to_lowercase().contains("decode"),
+                    "expected decode failure message, got {message:?}"
+                );
+            }
+            other => panic!("expected error overlay, got {other:?}"),
+        }
+        cleanup_session(session);
+    }
+
     #[cfg(unix)]
     #[test]
     fn tick_times_out_expired_session() {

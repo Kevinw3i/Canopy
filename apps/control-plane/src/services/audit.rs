@@ -443,6 +443,10 @@ mod tests {
             AuditAction::CloudwatchLiveTailStop,
             AuditAction::LogGroupList,
             AuditAction::EntitlementsView,
+            AuditAction::McpSessionRegister,
+            AuditAction::McpGuidanceSync,
+            AuditAction::McpDatabaseScopeList,
+            AuditAction::McpDatabaseQuery,
         ];
         for action in &actions {
             svc.event("test", action.clone(), AuditOutcome::Success)

@@ -85,6 +85,27 @@ impl EntitlementService {
         arns
     }
 
+    /// Whether the same entitlement rule that grants MCP CloudWatch access to
+    /// this scope also allows plaintext raw query/filter audit. The default is
+    /// encrypted-only raw audit.
+    pub async fn mcp_cloudwatch_raw_audit_plaintext_allowed(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+        log_group_names: &[String],
+    ) -> bool {
+        let store = self.store.read().await;
+        store.mcp_cloudwatch_raw_audit_plaintext_allowed(
+            &claims.sub,
+            &claims.email,
+            claims.email_verified,
+            account_id,
+            region,
+            log_group_names,
+        )
+    }
+
     /// Return the set of allowed accounts from rules that individually
     /// grant the given feature AND region. Used for scope-aware EC2
     /// fan-out instead of merged cartesian products.
@@ -357,6 +378,7 @@ mod tests {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec!["ec2-user".into()],
                     max_session_seconds: None,
+                    database_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-ops".into(),
@@ -382,6 +404,7 @@ mod tests {
                     excluded_tag_selectors: vec![],
                     allowed_os_users: vec!["ubuntu".into()],
                     max_session_seconds: Some(1800),
+                    database_scopes: vec![],
                 },
             ],
             memberships: vec![

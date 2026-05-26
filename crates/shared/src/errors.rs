@@ -36,6 +36,10 @@ impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new("BAD_REQUEST", message)
     }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new("SERVICE_UNAVAILABLE", message)
+    }
 }
 
 impl std::fmt::Display for ApiError {

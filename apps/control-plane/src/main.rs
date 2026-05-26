@@ -86,15 +86,29 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState::new(config).await?);
 
-    // Run startup preflight in background — health endpoint returns 503
-    // until OIDC discovery and STS identity checks pass.
+    // Run startup preflight + the self-healing DB reprobe loop on a
+    // single chained task. Codex round 31 added the reprobe loop;
+    // round 34 (HIGH) requires that the two stages NOT run
+    // concurrently — otherwise startup preflight and the reprobe
+    // loop can both write `db_connection_ready`/
+    // `db_connection_next_probe` for the same connection, racing
+    // and letting an older failure overwrite a newer success.
+    // Sequencing them makes the cooldown a single-writer invariant.
     {
-        let preflight_state = state.clone();
+        let task_state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = preflight_state.run_preflight().await {
+            if let Err(e) = task_state.run_preflight().await {
                 tracing::error!("Startup preflight failed: {e}");
                 // Service stays not-ready; ALB will deregister it.
+                // Do not start the reprobe loop — the global readiness
+                // gate is the higher-priority signal in this failure
+                // mode, and a reprobe loop that runs while
+                // `state.ready == false` would only generate noise.
+                return;
             }
+            // Only reached after startup preflight has set ready=true
+            // (and populated `db_connection_ready` per connection).
+            services::run_db_connection_reprobe_loop(task_state).await;
         });
     }
 
@@ -103,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::ec2::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
+        .merge(routes::mcp::router())
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,

@@ -53,6 +53,33 @@ pub enum AuditAction {
     CloudwatchLiveTailStop,
     LogGroupList,
     EntitlementsView,
+    /// Local MCP session lifecycle registration. This is separate from
+    /// `login` because the user is already authenticated; the event records
+    /// whether an MCP session can be opened for that authenticated actor.
+    McpSessionRegister,
+    /// MCP guidance delivery / sync lifecycle. Metadata records the guidance
+    /// id and version so data-access tools can prove the required guidance was
+    /// issued before use.
+    McpGuidanceSync,
+    /// MCP CloudWatch discovery. The operation lists authorized log groups
+    /// only; CloudWatch data access stays behind later MCP phases.
+    McpCloudwatchDiscovery,
+    /// MCP CloudWatch data-access preflight. No AWS data read happens here;
+    /// success means the server issued a scoped preflight token.
+    McpCloudwatchPreflight,
+    /// MCP CloudWatch FilterLogEvents data access.
+    McpCloudwatchSearch,
+    /// MCP CloudWatch Logs Insights start/poll data access.
+    McpCloudwatchInsights,
+    /// MCP database scope discovery. Scope details stay in metadata; secrets
+    /// and connection internals must not be exposed in the response or audit.
+    McpDatabaseScopeList,
+    /// MCP database data access. The operation details, including raw SQL,
+    /// scope, EXPLAIN result, and rejection reason, live in metadata rather
+    /// than being split across read/write action variants.
+    /// Raw SQL may contain PII or secrets typed by the user; treat audit output
+    /// as sensitive and redact at downstream audit/SIEM boundaries as needed.
+    McpDatabaseQuery,
 }
 
 impl AuditAction {
@@ -69,6 +96,14 @@ impl AuditAction {
             Self::CloudwatchLiveTailStop => "cloudwatch_live_tail_stop",
             Self::LogGroupList => "log_group_list",
             Self::EntitlementsView => "entitlements_view",
+            Self::McpSessionRegister => "mcp_session_register",
+            Self::McpGuidanceSync => "mcp_guidance_sync",
+            Self::McpCloudwatchDiscovery => "mcp_cloudwatch_discovery",
+            Self::McpCloudwatchPreflight => "mcp_cloudwatch_preflight",
+            Self::McpCloudwatchSearch => "mcp_cloudwatch_search",
+            Self::McpCloudwatchInsights => "mcp_cloudwatch_insights",
+            Self::McpDatabaseScopeList => "mcp_database_scope_list",
+            Self::McpDatabaseQuery => "mcp_database_query",
         }
     }
 }
@@ -100,6 +135,14 @@ mod tests {
             AuditAction::CloudwatchLiveTailStop,
             AuditAction::LogGroupList,
             AuditAction::EntitlementsView,
+            AuditAction::McpSessionRegister,
+            AuditAction::McpGuidanceSync,
+            AuditAction::McpCloudwatchDiscovery,
+            AuditAction::McpCloudwatchPreflight,
+            AuditAction::McpCloudwatchSearch,
+            AuditAction::McpCloudwatchInsights,
+            AuditAction::McpDatabaseScopeList,
+            AuditAction::McpDatabaseQuery,
         ] {
             let json = serde_json::to_value(&action).unwrap();
             assert_eq!(json, serde_json::Value::String(action.wire_name().into()));
@@ -123,6 +166,26 @@ mod tests {
 
         let back: AuditAction = serde_json::from_value(json).unwrap();
         assert!(matches!(back, AuditAction::Ec2Power));
+    }
+
+    #[test]
+    fn audit_action_mcp_roundtrip() {
+        for (action, expected) in [
+            (AuditAction::McpSessionRegister, "mcp_session_register"),
+            (AuditAction::McpGuidanceSync, "mcp_guidance_sync"),
+            (AuditAction::McpDatabaseScopeList, "mcp_database_scope_list"),
+            (AuditAction::McpDatabaseQuery, "mcp_database_query"),
+        ] {
+            let json = serde_json::to_value(&action).unwrap();
+            assert_eq!(json, expected);
+            assert_eq!(action.wire_name(), expected);
+
+            let back: AuditAction = serde_json::from_value(json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&back).unwrap(),
+                serde_json::to_string(&action).unwrap()
+            );
+        }
     }
 
     #[test]

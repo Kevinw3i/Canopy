@@ -23,6 +23,8 @@ pub struct UserEntitlements {
     /// a background timer that kills the spawned process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub database_scopes: Vec<DatabaseScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -41,6 +43,24 @@ pub struct FeatureFlags {
     pub can_stop_ec2: bool,
     #[serde(default)]
     pub can_reboot_ec2: bool,
+    /// Master switch for the local MCP server surface.
+    #[serde(default)]
+    pub can_use_mcp: bool,
+    /// Allows MCP CloudWatch tools when combined with `can_use_mcp`.
+    #[serde(default)]
+    pub can_use_mcp_cloudwatch: bool,
+    /// Allows plaintext raw MCP CloudWatch query/filter audit for scopes
+    /// authorized by the same entitlement rule. Default false keeps raw
+    /// values encrypted-only in durable audit metadata.
+    #[serde(default)]
+    pub can_view_mcp_raw_audit_plaintext: bool,
+    /// Reserved for future MCP EC2 tools. Product Phase 3 does not expose EC2 MCP tools.
+    #[serde(default)]
+    pub can_use_mcp_ec2: bool,
+    /// Allows MCP database tools. The control-plane still enforces
+    /// database_scopes, SQL validation, EXPLAIN gates, and DB credentials.
+    #[serde(default)]
+    pub can_use_mcp_database: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +119,42 @@ pub struct EntitlementRule {
     /// Maximum session duration in seconds. 0 or omitted = no limit.
     #[serde(default)]
     pub max_session_seconds: Option<u64>,
+    #[serde(default)]
+    pub database_scopes: Vec<DatabaseScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseScope {
+    pub name: String,
+    pub connection: String,
+    pub environment: String,
+    #[serde(default)]
+    pub allowed_schemas: Vec<String>,
+    #[serde(default)]
+    pub allowed_tables: Vec<String>,
+    #[serde(default)]
+    pub allowed_actions: Vec<String>,
+    pub max_rows: u64,
+    pub statement_timeout_ms: u64,
+    #[serde(default = "default_true")]
+    pub require_explain: bool,
+    pub max_examined_rows: u64,
+    #[serde(default)]
+    pub allow_full_table_scan: bool,
+    /// Whether MCP queries against this scope may read MySQL VIEW objects
+    /// instead of BASE TABLEs. Defaults to `false` for least-privilege:
+    /// the control-plane queries `information_schema.tables` for every
+    /// referenced entry in `allowed_tables` and rejects any that resolves
+    /// to a VIEW. Set `true` only after the operator has reviewed each
+    /// view's DEFINER, base-table expansion, and cross-schema reads — the
+    /// audit record will tag every query with `views_allowed = true` so
+    /// reviewers can spot scopes that took this opt-in.
+    #[serde(default)]
+    pub allow_views: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Membership record
@@ -176,6 +232,11 @@ mod tests {
         assert!(!flags.can_start_ec2);
         assert!(!flags.can_stop_ec2);
         assert!(!flags.can_reboot_ec2);
+        assert!(!flags.can_use_mcp);
+        assert!(!flags.can_use_mcp_cloudwatch);
+        assert!(!flags.can_view_mcp_raw_audit_plaintext);
+        assert!(!flags.can_use_mcp_ec2);
+        assert!(!flags.can_use_mcp_database);
     }
 
     #[test]
@@ -189,6 +250,11 @@ mod tests {
             can_start_ec2: true,
             can_stop_ec2: true,
             can_reboot_ec2: false,
+            can_use_mcp: true,
+            can_use_mcp_cloudwatch: true,
+            can_view_mcp_raw_audit_plaintext: true,
+            can_use_mcp_ec2: false,
+            can_use_mcp_database: true,
         };
         let json = serde_json::to_value(&flags).unwrap();
         assert_eq!(json["can_view_ec2"], true);
@@ -196,12 +262,22 @@ mod tests {
         assert_eq!(json["can_start_ec2"], true);
         assert_eq!(json["can_stop_ec2"], true);
         assert_eq!(json["can_reboot_ec2"], false);
+        assert_eq!(json["can_use_mcp"], true);
+        assert_eq!(json["can_use_mcp_cloudwatch"], true);
+        assert_eq!(json["can_view_mcp_raw_audit_plaintext"], true);
+        assert_eq!(json["can_use_mcp_ec2"], false);
+        assert_eq!(json["can_use_mcp_database"], true);
         let back: FeatureFlags = serde_json::from_value(json).unwrap();
         assert!(back.can_view_ec2);
         assert!(!back.can_use_ec2_instance_connect);
         assert!(back.can_start_ec2);
         assert!(back.can_stop_ec2);
         assert!(!back.can_reboot_ec2);
+        assert!(back.can_use_mcp);
+        assert!(back.can_use_mcp_cloudwatch);
+        assert!(back.can_view_mcp_raw_audit_plaintext);
+        assert!(!back.can_use_mcp_ec2);
+        assert!(back.can_use_mcp_database);
     }
 
     /// Existing entitlements.toml / persisted JSON without the new
@@ -222,6 +298,33 @@ mod tests {
         assert!(!flags.can_start_ec2);
         assert!(!flags.can_stop_ec2);
         assert!(!flags.can_reboot_ec2);
+        assert!(!flags.can_use_mcp);
+        assert!(!flags.can_use_mcp_cloudwatch);
+        assert!(!flags.can_view_mcp_raw_audit_plaintext);
+        assert!(!flags.can_use_mcp_ec2);
+        assert!(!flags.can_use_mcp_database);
+    }
+
+    #[test]
+    fn feature_flags_backward_compat_without_mcp_keys() {
+        let json = serde_json::json!({
+            "can_view_ec2": true,
+            "can_use_cloudwatch_search": true,
+            "can_use_cloudwatch_tail": false,
+            "can_use_ssm": false,
+            "can_use_ec2_instance_connect": false,
+            "can_start_ec2": false,
+            "can_stop_ec2": false,
+            "can_reboot_ec2": false
+        });
+        let flags: FeatureFlags = serde_json::from_value(json).unwrap();
+        assert!(flags.can_view_ec2);
+        assert!(flags.can_use_cloudwatch_search);
+        assert!(!flags.can_use_mcp);
+        assert!(!flags.can_use_mcp_cloudwatch);
+        assert!(!flags.can_view_mcp_raw_audit_plaintext);
+        assert!(!flags.can_use_mcp_ec2);
+        assert!(!flags.can_use_mcp_database);
     }
 
     #[test]
@@ -240,6 +343,7 @@ mod tests {
         assert!(rule.excluded_tag_selectors.is_empty());
         assert!(rule.allowed_os_users.is_empty());
         assert!(rule.max_session_seconds.is_none());
+        assert!(rule.database_scopes.is_empty());
         // features should default to all-false
         assert!(!rule.features.can_view_ec2);
     }
@@ -259,6 +363,7 @@ mod tests {
             excluded_tag_selectors: vec![],
             allowed_os_users: vec![],
             max_session_seconds: None,
+            database_scopes: vec![],
         };
         let json = serde_json::to_string(&ent).unwrap();
         assert!(!json.contains("excluded_tag_selectors"));
@@ -295,6 +400,20 @@ mod tests {
             }],
             allowed_os_users: vec!["ec2-user".into()],
             max_session_seconds: Some(3600),
+            database_scopes: vec![DatabaseScope {
+                name: "orders_prod_readonly".into(),
+                connection: "orders_prod".into(),
+                environment: "production".into(),
+                allowed_schemas: vec!["orders".into()],
+                allowed_tables: vec!["orders".into(), "order_items".into()],
+                allowed_actions: vec!["select".into()],
+                max_rows: 100,
+                statement_timeout_ms: 5000,
+                require_explain: true,
+                max_examined_rows: 10000,
+                allow_full_table_scan: false,
+                allow_views: false,
+            }],
         };
         let json = serde_json::to_value(&ent).unwrap();
         let back: UserEntitlements = serde_json::from_value(json).unwrap();
@@ -304,6 +423,29 @@ mod tests {
         assert_eq!(back.allowed_accounts[0].account_id, "111");
         assert_eq!(back.excluded_tag_selectors.len(), 1);
         assert_eq!(back.max_session_seconds, Some(3600));
+        assert_eq!(back.database_scopes.len(), 1);
+    }
+
+    #[test]
+    fn database_scope_roundtrip() {
+        let toml = r#"
+            name = "orders_prod_readonly"
+            connection = "orders_prod"
+            environment = "production"
+            allowed_schemas = ["orders"]
+            allowed_tables = ["orders", "order_items"]
+            allowed_actions = ["select"]
+            max_rows = 100
+            statement_timeout_ms = 5000
+            require_explain = true
+            max_examined_rows = 10000
+            allow_full_table_scan = false
+        "#;
+        let scope: DatabaseScope = toml::from_str(toml).unwrap();
+        assert_eq!(scope.name, "orders_prod_readonly");
+        assert_eq!(scope.connection, "orders_prod");
+        assert!(scope.require_explain);
+        assert!(!scope.allow_full_table_scan);
     }
 
     #[test]
