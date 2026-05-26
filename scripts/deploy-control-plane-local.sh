@@ -23,6 +23,7 @@ ECS_CLUSTER="${ECS_CLUSTER:-}"
 ECS_SERVICE="${ECS_SERVICE:-}"
 TARGET_GROUP_NAME="${TARGET_GROUP_NAME:-}"
 TARGET_GROUP_ARN="${TARGET_GROUP_ARN:-}"
+LOG_GROUP_NAME="${LOG_GROUP_NAME:-}"
 PLAN_FILE="${PLAN_FILE:-tfplan.phase2}"
 
 IMAGE_TAG=""
@@ -49,6 +50,7 @@ Options:
   --service <name>        ECS service name. Default: Terraform ecs_service_name output, then control-plane.
   --target-group <name>   ALB target group name. Used only when no target group ARN is set.
   --target-group-arn <arn> ALB target group ARN. Default: Terraform target_group_arn output, then <project>-tg.
+  --log-group <name>      CloudWatch Logs log group. Default: Terraform log_group_name output, then /ecs/<project>/control-plane.
   --plan-only             Stop after writing the Terraform plan. Does not build or push the image.
   --tail-logs             Tail CloudWatch logs after deploy.
   --yes                   Do not prompt before AWS-changing steps.
@@ -57,7 +59,7 @@ Options:
 Environment overrides:
   AWS_PROFILE, AWS_REGION, TERRAFORM_DIR, ENTITLEMENTS_FILE, DOCKER_PLATFORM,
   CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME, TARGET_GROUP_ARN,
-  PLAN_FILE
+  LOG_GROUP_NAME, PLAN_FILE
 EOF
 }
 
@@ -138,6 +140,11 @@ while [ "$#" -gt 0 ]; do
     --target-group-arn)
       TARGET_GROUP_ARN="${2:-}"
       [ -n "$TARGET_GROUP_ARN" ] || fail "--target-group-arn requires a value"
+      shift 2
+      ;;
+    --log-group)
+      LOG_GROUP_NAME="${2:-}"
+      [ -n "$LOG_GROUP_NAME" ] || fail "--log-group requires a value"
       shift 2
       ;;
     --plan-only)
@@ -229,6 +236,11 @@ fi
 
 if [ -z "$TARGET_GROUP_ARN" ] && [ -z "$TARGET_GROUP_NAME" ]; then
   TARGET_GROUP_NAME="${TF_PROJECT}-tg"
+fi
+
+if [ -z "$LOG_GROUP_NAME" ]; then
+  LOG_GROUP_NAME="$(tf_output_raw log_group_name)"
+  LOG_GROUP_NAME="${LOG_GROUP_NAME:-/ecs/$TF_PROJECT/control-plane}"
 fi
 
 TF_CPU_ARCH="$(
@@ -421,12 +433,12 @@ if [ -n "$ALB_DNS" ]; then
   echo "ALB DNS:        $ALB_DNS"
   echo "Health check:   curl -k -I https://$ALB_DNS/health"
 fi
-echo "CloudWatch:     AWS_PROFILE=$AWS_PROFILE_NAME aws logs tail /ecs/canopy/control-plane --region $AWS_REGION --since 30m --follow"
+echo "CloudWatch:     AWS_PROFILE=$AWS_PROFILE_NAME aws logs tail $LOG_GROUP_NAME --region $AWS_REGION --since 30m --follow"
 
 if [ "$TAIL_LOGS" -eq 1 ]; then
   echo ""
   echo "== Tail logs =="
-  run_aws logs tail /ecs/canopy/control-plane \
+  run_aws logs tail "$LOG_GROUP_NAME" \
     --region "$AWS_REGION" \
     --since 30m \
     --follow
