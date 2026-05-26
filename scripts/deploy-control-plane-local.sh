@@ -45,8 +45,8 @@ Options:
   --entitlements <path>   Entitlements file in repo root. Default: ${ENTITLEMENTS_FILE}
   --platform <platform>   Docker platform. Default: auto from Terraform cpu_architecture
   --cargo-jobs <n>        Cargo parallel jobs inside Docker. Default: ${CARGO_BUILD_JOBS}
-  --cluster <name>        ECS cluster name. Default: Terraform ecs_cluster_name output.
-  --service <name>        ECS service name. Default: Terraform ecs_service_name output.
+  --cluster <name>        ECS cluster name. Default: Terraform ecs_cluster_name output, then <project>.
+  --service <name>        ECS service name. Default: Terraform ecs_service_name output, then control-plane.
   --target-group <name>   ALB target group name. Used only when no target group ARN is set.
   --target-group-arn <arn> ALB target group ARN. Default: Terraform target_group_arn output, then <project>-tg.
   --plan-only             Stop after writing the Terraform plan. Does not build or push the image.
@@ -215,12 +215,12 @@ TF_PROJECT="${TF_PROJECT:-canopy}"
 
 if [ -z "$ECS_CLUSTER" ]; then
   ECS_CLUSTER="$(tf_output_raw ecs_cluster_name)"
-  [ -n "$ECS_CLUSTER" ] || fail "Unable to resolve ECS cluster. Set --cluster or ensure terraform output ecs_cluster_name exists."
+  ECS_CLUSTER="${ECS_CLUSTER:-$TF_PROJECT}"
 fi
 
 if [ -z "$ECS_SERVICE" ]; then
   ECS_SERVICE="$(tf_output_raw ecs_service_name)"
-  [ -n "$ECS_SERVICE" ] || fail "Unable to resolve ECS service. Set --service or ensure terraform output ecs_service_name exists."
+  ECS_SERVICE="${ECS_SERVICE:-control-plane}"
 fi
 
 if [ -z "$TARGET_GROUP_ARN" ] && [ -z "$TARGET_GROUP_NAME" ]; then
