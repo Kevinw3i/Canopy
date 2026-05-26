@@ -213,6 +213,12 @@ fn cluster_ref_authorized(
     region: &str,
     cluster_ref: &str,
 ) -> bool {
+    if let Some((cluster_region, cluster_account)) = ecs_arn_region_account(cluster_ref) {
+        if cluster_region != region || cluster_account != account_id {
+            return false;
+        }
+    }
+
     cluster_patterns_for_account_region(rule_scopes, account_id, region)
         .iter()
         .any(|pattern| crate::services::ecs::cluster_matches_pattern(pattern, cluster_ref))
@@ -1568,6 +1574,36 @@ mod tests {
             "111111111111",
             "us-east-1",
             &cluster_arn("us-east-1", "111111111111", "other-cluster")
+        ));
+    }
+
+    #[test]
+    fn cluster_ref_authorized_rejects_other_account_or_region_arn() {
+        let mut scope = route_scope();
+        scope.account_ids = vec!["111111111111".into(), "222222222222".into()];
+        scope.regions = vec!["us-east-1".into(), "ap-northeast-1".into()];
+        scope.cluster_patterns = vec![
+            cluster_arn("us-east-1", "*", DEV_MOCK_CLUSTER_NAME),
+            cluster_arn("*", "111111111111", DEV_MOCK_CLUSTER_NAME),
+        ];
+
+        assert!(cluster_ref_authorized(
+            std::slice::from_ref(&scope),
+            "111111111111",
+            "us-east-1",
+            &cluster_arn("us-east-1", "111111111111", DEV_MOCK_CLUSTER_NAME)
+        ));
+        assert!(!cluster_ref_authorized(
+            std::slice::from_ref(&scope),
+            "222222222222",
+            "us-east-1",
+            &cluster_arn("us-east-1", "111111111111", DEV_MOCK_CLUSTER_NAME)
+        ));
+        assert!(!cluster_ref_authorized(
+            &[scope],
+            "111111111111",
+            "ap-northeast-1",
+            &cluster_arn("us-east-1", "111111111111", DEV_MOCK_CLUSTER_NAME)
         ));
     }
 
