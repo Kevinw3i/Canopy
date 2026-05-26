@@ -271,6 +271,7 @@ aws iam create-role \
 
 # control-plane 需要的權限：
 # - STS AssumeRole（跨帳號存取）
+# - STS GetCallerIdentity（startup preflight）
 # - IAM SimulatePrincipalPolicy（connect/ECS Exec 前檢查候選 AssumeRole）
 # - CloudWatch Logs（自身 log + 查詢）
 # - EC2 DescribeInstances, DescribeInstanceConnectEndpoints
@@ -299,6 +300,12 @@ aws iam put-role-policy \
         "Resource": [
           "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"
         ]
+      },
+      {
+        "Sid": "StsIdentity",
+        "Effect": "Allow",
+        "Action": "sts:GetCallerIdentity",
+        "Resource": "*"
       },
       {
         "Sid": "DirectAccessFallback",
@@ -598,13 +605,19 @@ docker tag canopy/control-plane:$VERSION \
 docker push \
   <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:$VERSION
 
-# 2. 更新 task definition 的 image tag
-#    （編輯 task-def.json 改 image tag，重新 register）
+# 2. 更新 task definition 的 image tag 並 register 新 revision
+#    （重用 Step 9 的 task-def.json，將 image 改成剛 push 的 $VERSION）
+TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+  --cli-input-json file:///tmp/task-def.json \
+  --region ap-northeast-1 \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text)
 
-# 3. 更新 service（觸發 rolling update）
+# 3. 更新 service 到新 revision（觸發 rolling update）
 aws ecs update-service \
   --cluster canopy \
   --service control-plane \
+  --task-definition "$TASK_DEFINITION_ARN" \
   --force-new-deployment \
   --region ap-northeast-1
 
