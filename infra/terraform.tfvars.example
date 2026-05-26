@@ -21,8 +21,9 @@ image_tag = "v0.1.0"
 
 # JWT secret — create out-of-band, pass ARN here (never stored in Terraform state)
 # aws secretsmanager create-secret --name canopy/jwt-secret --secret-string "$(openssl rand -base64 44)"
+# aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secret --query 'Versions[?VersionStages[0]==`AWSCURRENT`].VersionId | [0]' --output text
 jwt_secret_arn        = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX"
-jwt_secret_version_id = ""  # Required: pin with `aws secretsmanager describe-secret --secret-id canopy/jwt-secret --query 'VersionIdsToStages' --output json`
+jwt_secret_version_id = "<JWT_SECRET_VERSION_ID>"
 
 # ALB defaults to internal. Provide at least one CIDR (e.g. your VPC CIDR for internal).
 alb_allowed_cidrs = ["10.0.0.0/16"]

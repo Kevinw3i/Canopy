@@ -165,7 +165,7 @@ variable "jwt_secret_arn" {
 }
 
 variable "jwt_secret_version_id" {
-  description = "Secrets Manager version ID for the JWT secret. Pin this during rolling deployments to ensure all tasks use the same key. Leave empty to use AWSCURRENT."
+  description = "Secrets Manager version ID for the JWT secret. Required when create_service = true so rolling deployments pin every task to the same key."
   type        = string
   default     = ""
 }
