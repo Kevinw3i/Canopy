@@ -282,11 +282,9 @@ cd /path/to/Canopy
 
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
+ECR_REPOSITORY=$(echo "$ECR_URL" | cut -d/ -f2-)
 AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
 AWS_REGION=${AWS_REGION:-ap-northeast-1}
-
-aws ecr get-login-password --region "$AWS_REGION" | \
-  docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
@@ -298,6 +296,29 @@ case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm
   -var="create_service=true" \
   -var="image_tag=$VERSION"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+terraform -chdir=infra plan \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION" \
+  -out=tfplan.phase2
+
+if TAG_CHECK_OUTPUT=$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$VERSION" 2>&1); then
+  echo "$TAG_CHECK_OUTPUT"
+  echo "ECR image tag already exists: $VERSION"
+  exit 1
+else
+  TAG_CHECK_STATUS=$?
+  if ! grep -q "ImageNotFoundException" <<< "$TAG_CHECK_OUTPUT"; then
+    echo "$TAG_CHECK_OUTPUT"
+    exit "$TAG_CHECK_STATUS"
+  fi
+fi
+
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   -t "$ECR_URL:$VERSION" \
@@ -318,10 +339,7 @@ echo "Image tag: $VERSION"
 ## Step 7：Phase 2 — 啟動 ECS Service
 
 ```bash
-cd infra
-terraform apply \
-  -var="create_service=true" \
-  -var="image_tag=$VERSION"
+terraform -chdir=infra apply tfplan.phase2
 ```
 
 Terraform 會建立 ECS Task Definition + Service，Fargate 拉取你剛 push 的 image 並啟動。
@@ -331,22 +349,29 @@ Terraform 會建立 ECS Task Definition + Service，Fargate 拉取你剛 push �
 ## Step 8：驗證部署
 
 ```bash
+AWS_REGION=${AWS_REGION:-$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)}
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
 # 等待 service 穩定
 aws ecs wait services-stable \
   --cluster $(cd infra && terraform output -raw ecs_cluster_name) \
-  --services $(cd infra && terraform output -raw ecs_service_name)
+  --services $(cd infra && terraform output -raw ecs_service_name) \
+  --region "$AWS_REGION"
 
 # 檢查 service 狀態
 aws ecs describe-services \
   --cluster $(cd infra && terraform output -raw ecs_cluster_name) \
   --services $(cd infra && terraform output -raw ecs_service_name) \
+  --region "$AWS_REGION" \
   --query 'services[0].{status:status,running:runningCount,desired:desiredCount}'
 
 # 測試 health endpoint
 curl -s https://$(cd infra && terraform output -raw alb_dns_name)/health
 
 # 查看容器日誌
-aws logs tail $(cd infra && terraform output -raw log_group_name) --follow
+aws logs tail $(cd infra && terraform output -raw log_group_name) \
+  --region "$AWS_REGION" \
+  --follow
 ```
 
 ---
@@ -357,6 +382,10 @@ aws logs tail $(cd infra && terraform output -raw log_group_name) --follow
 
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
+ECR_REGISTRY=$(echo "$ECR_URL" | cut -d/ -f1)
+ECR_REPOSITORY=$(echo "$ECR_URL" | cut -d/ -f2-)
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
@@ -368,6 +397,29 @@ case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm
   -var="image_tag=$VERSION"
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 
+terraform -chdir=infra plan \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION" \
+  -out=tfplan.phase2
+
+if TAG_CHECK_OUTPUT=$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$VERSION" 2>&1); then
+  echo "$TAG_CHECK_OUTPUT"
+  echo "ECR image tag already exists: $VERSION"
+  exit 1
+else
+  TAG_CHECK_STATUS=$?
+  if ! grep -q "ImageNotFoundException" <<< "$TAG_CHECK_OUTPUT"; then
+    echo "$TAG_CHECK_OUTPUT"
+    exit "$TAG_CHECK_STATUS"
+  fi
+fi
+
+aws ecr get-login-password --region "$AWS_REGION" | \
+  docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   -t "$ECR_URL:$VERSION" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
@@ -376,10 +428,7 @@ DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
 
 docker push "$ECR_URL:$VERSION"
 
-cd infra
-terraform apply \
-  -var="create_service=true" \
-  -var="image_tag=$VERSION"
+terraform -chdir=infra apply tfplan.phase2
 ```
 
 > **Entitlements 變更注意：** entitlements 是 bake 進 image 的，rolling update 期間
