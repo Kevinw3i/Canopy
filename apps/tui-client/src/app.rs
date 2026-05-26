@@ -175,6 +175,32 @@ fn wrapper_session_limit(max_session_seconds: Option<u64>) -> Option<u64> {
     max_session_seconds.filter(|secs| *secs > 0)
 }
 
+fn ecs_tasks_warning_messages(
+    failed_scopes: &[String],
+    task_count: usize,
+    total_count: usize,
+    truncated: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !failed_scopes.is_empty() {
+        warnings.push(format!(
+            "Some ECS scopes failed to respond:\n{}",
+            failed_scopes.join("\n")
+        ));
+    }
+    if truncated {
+        let count_text = if total_count > task_count {
+            format!("showing {task_count} of at least {total_count}")
+        } else {
+            format!("showing {task_count}; additional results may exist")
+        };
+        warnings.push(format!(
+            "ECS task results were truncated: {count_text}. Narrow the account or region filter."
+        ));
+    }
+    warnings
+}
+
 struct ConnectTarget<'a> {
     instance_id: &'a str,
     instance_name: Option<&'a str>,
@@ -556,15 +582,21 @@ impl App {
             Action::RefreshEcsTasks => {
                 self.spawn_ecs_tasks_fetch();
             }
-            Action::EcsTasksLoaded(tasks, failed_scopes, generation) => {
+            Action::EcsTasksLoaded {
+                tasks,
+                failed_scopes,
+                total_count,
+                truncated,
+                generation,
+            } => {
                 if generation != self.ec2.fetch_generation {
                     return;
                 }
-                if !failed_scopes.is_empty() {
-                    self.error_modal.show(format!(
-                        "Some ECS scopes failed to respond:\n{}",
-                        failed_scopes.join("\n")
-                    ));
+                let task_count = tasks.len();
+                let warnings =
+                    ecs_tasks_warning_messages(&failed_scopes, task_count, total_count, truncated);
+                if !warnings.is_empty() {
+                    self.error_modal.show(warnings.join("\n\n"));
                 }
                 self.ec2.set_tasks(tasks);
             }
@@ -1289,11 +1321,13 @@ impl App {
 
             match result {
                 Ok(resp) => {
-                    let _ = tx.send(Action::EcsTasksLoaded(
-                        resp.tasks,
-                        resp.failed_scopes,
+                    let _ = tx.send(Action::EcsTasksLoaded {
+                        tasks: resp.tasks,
+                        failed_scopes: resp.failed_scopes,
+                        total_count: resp.total_count,
+                        truncated: resp.truncated,
                         generation,
-                    ));
+                    });
                 }
                 Err(e) => {
                     let action = Self::route_error_to_action(e, |msg| {
@@ -2483,6 +2517,24 @@ mod tests {
         assert_eq!(wrapper_session_limit(Some(3600)), Some(3600));
         assert_eq!(wrapper_session_limit(Some(0)), None);
         assert_eq!(wrapper_session_limit(None), None);
+    }
+
+    #[test]
+    fn ecs_tasks_warning_messages_reports_partial_and_truncated_results() {
+        let warnings =
+            ecs_tasks_warning_messages(&["account-a us-east-1 failed".into()], 200, 250, true);
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("Some ECS scopes failed"));
+        assert!(warnings[1].contains("showing 200 of at least 250"));
+    }
+
+    #[test]
+    fn ecs_tasks_warning_messages_handles_aws_side_truncation_without_exact_total() {
+        let warnings = ecs_tasks_warning_messages(&[], 50, 50, true);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("additional results may exist"));
     }
 
     // ── Logout resets state ─────────────────────────────────

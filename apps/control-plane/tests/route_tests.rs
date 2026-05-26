@@ -872,6 +872,34 @@ async fn ecs_exec_rejects_cross_account_task_arn_before_authorization() {
 }
 
 #[tokio::test]
+async fn ecs_exec_returns_forbidden_for_missing_task_to_avoid_existence_oracle() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+    let cluster_arn = format!(
+        "arn:aws:ecs:us-east-1:111111111111:cluster/{}",
+        shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+    );
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "cluster_arn": cluster_arn,
+        "task_arn": format!(
+            "arn:aws:ecs:us-east-1:111111111111:task/{}/missing-task",
+            shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+        ),
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(json["message"], "ECS exec not authorized");
+}
+
+#[tokio::test]
 async fn ecs_exec_execute_command_disabled_returns_422() {
     let config = dev_config();
     let token = issue_test_token(&config);
@@ -894,6 +922,45 @@ async fn ecs_exec_execute_command_disabled_returns_422() {
 
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(json["code"], "execute_command_disabled");
+}
+
+#[tokio::test]
+async fn ecs_exec_checks_task_scope_before_task_state_or_container_state() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform ECS rule");
+        rule.task_tag_selectors = vec![shared::dto::entitlements::TagSelector {
+            tags: HashMap::from([("Service".into(), vec!["web".into()])]),
+        }];
+    }
+    let app = build_app(state);
+    let cluster_arn = format!(
+        "arn:aws:ecs:us-east-1:111111111111:cluster/{}",
+        shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+    );
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "cluster_arn": cluster_arn,
+        "task_arn": format!(
+            "arn:aws:ecs:us-east-1:111111111111:task/{}/5555666677778888",
+            shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+        ),
+        "container_name": "worker"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(json["message"], "ECS exec not authorized");
 }
 
 #[tokio::test]

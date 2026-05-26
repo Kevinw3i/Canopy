@@ -23,6 +23,7 @@ use shared::errors::ApiError;
 pub(crate) const MAX_CLUSTERS_PER_REQUEST: usize = 10;
 pub(crate) const MAX_TASKS_PER_CLUSTER: usize = 50;
 pub(crate) const MAX_TASKS_PER_RESPONSE: usize = 200;
+const DEFAULT_TASKS_PAGE_SIZE: usize = 50;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -33,6 +34,22 @@ pub fn router() -> Router<Arc<AppState>> {
 struct RequiredIamSimulation {
     action: &'static str,
     resources: Vec<String>,
+}
+
+fn iam_string_context_entry(name: &str, value: &str) -> aws_sdk_iam::types::ContextEntry {
+    aws_sdk_iam::types::ContextEntry::builder()
+        .context_key_name(name)
+        .context_key_values(value)
+        .context_key_type(aws_sdk_iam::types::ContextKeyTypeEnum::String)
+        .build()
+}
+
+fn ecs_exec_simulation_context(req: &EcsExecRequest) -> Vec<aws_sdk_iam::types::ContextEntry> {
+    vec![
+        iam_string_context_entry("aws:RequestedRegion", &req.region),
+        iam_string_context_entry("ecs:cluster", &req.cluster_arn),
+        iam_string_context_entry("ecs:container-name", &req.container_name),
+    ]
 }
 
 fn required_ecs_exec_simulations(req: &EcsExecRequest) -> Vec<RequiredIamSimulation> {
@@ -113,6 +130,32 @@ fn requested_cluster_for_account_region(
             cluster_arn(region, account_id, cluster)
         }
     })
+}
+
+fn requested_tasks_page_size(page_size: u32) -> usize {
+    let requested = if page_size == 0 {
+        DEFAULT_TASKS_PAGE_SIZE
+    } else {
+        page_size as usize
+    };
+    requested.min(MAX_TASKS_PER_RESPONSE)
+}
+
+fn authorized_cluster_refs(
+    cluster_refs: Vec<String>,
+    allowed_cluster_patterns: &[String],
+) -> (Vec<String>, bool) {
+    let mut refs = cluster_refs
+        .into_iter()
+        .filter(|cluster| {
+            allowed_cluster_patterns
+                .iter()
+                .any(|pattern| crate::services::ecs::cluster_matches_pattern(pattern, cluster))
+        })
+        .collect::<Vec<_>>();
+    let truncated = refs.len() > MAX_CLUSTERS_PER_REQUEST;
+    refs.truncate(MAX_CLUSTERS_PER_REQUEST);
+    (refs, truncated)
 }
 
 fn scope_applies_to_account_region(
@@ -295,6 +338,13 @@ fn is_local_credential_mode(account: &AllowedAccount) -> bool {
     account.role_arn == "direct" || account.role_arn.starts_with("profile:")
 }
 
+fn first_assumable_account(accounts: &[AllowedAccount]) -> Option<AllowedAccount> {
+    accounts
+        .iter()
+        .find(|account| !is_local_credential_mode(account))
+        .cloned()
+}
+
 fn session_context(
     state: &AppState,
     entitlements: &shared::dto::entitlements::UserEntitlements,
@@ -419,18 +469,11 @@ async fn fetch_tasks_from_aws(
                     (cluster_refs, resp.next_token().is_some())
                 };
 
-                let cluster_refs = cluster_refs
-                    .into_iter()
-                    .filter(|cluster| {
-                        allowed_cluster_patterns.iter().any(|pattern| {
-                            crate::services::ecs::cluster_matches_pattern(pattern, cluster)
-                        })
-                    })
-                    .take(MAX_CLUSTERS_PER_REQUEST)
-                    .collect::<Vec<_>>();
+                let (cluster_refs, cluster_cap_truncated) =
+                    authorized_cluster_refs(cluster_refs, &allowed_cluster_patterns);
 
                 let mut tasks = Vec::new();
-                let mut truncated = clusters_truncated;
+                let mut truncated = clusters_truncated || cluster_cap_truncated;
                 for cluster in cluster_refs {
                     let list_resp = ecs
                         .list_tasks()
@@ -637,7 +680,7 @@ async fn list_tasks(
         .filter(|task| task_matches_request_filters(task, &req))
         .collect::<Vec<_>>();
     let total_count = filtered.len();
-    let page_size = (req.page_size as usize).min(MAX_TASKS_PER_RESPONSE).min(50);
+    let page_size = requested_tasks_page_size(req.page_size);
     let truncated = aws_truncated || total_count > page_size;
     let tasks = filtered.into_iter().take(page_size).collect::<Vec<_>>();
 
@@ -789,20 +832,25 @@ async fn select_account_for_exec(
         return Ok(matching.into_iter().next().unwrap());
     }
 
-    if matching.iter().any(is_local_credential_mode) {
+    let Some(first_assumable) = first_assumable_account(&matching) else {
         return Err((
             axum::http::StatusCode::FORBIDDEN,
             Json(ApiError::forbidden(
                 "ECS Exec requires an AssumeRole ARN, not direct/profile credentials",
             )),
         ));
-    }
+    };
 
     let iam_client = aws_sdk_iam::Client::new(&state.base_aws_config);
-    let mut saw_simulation_error = false;
-    let mut last_error = None;
+    let simulation_context = ecs_exec_simulation_context(req);
+    let mut all_sim_errored = true;
     for candidate in &matching {
+        if is_local_credential_mode(candidate) {
+            continue;
+        }
+
         let mut allowed = true;
+        let mut candidate_sim_errored = false;
         for required in required_ecs_exec_simulations(req) {
             let mut sim = iam_client
                 .simulate_principal_policy()
@@ -811,8 +859,12 @@ async fn select_account_for_exec(
             for resource in &required.resources {
                 sim = sim.resource_arns(resource);
             }
+            for context_entry in &simulation_context {
+                sim = sim.context_entries(context_entry.clone());
+            }
             match sim.send().await {
                 Ok(sim_resp) => {
+                    all_sim_errored = false;
                     let action_allowed = sim_resp.evaluation_results().iter().all(|result| {
                         matches!(
                             result.eval_decision(),
@@ -825,37 +877,40 @@ async fn select_account_for_exec(
                     }
                 }
                 Err(err) => {
-                    saw_simulation_error = true;
-                    last_error = Some(err.to_string());
+                    candidate_sim_errored = true;
+                    tracing::warn!(
+                        role = %candidate.role_arn,
+                        action = required.action,
+                        error = %err,
+                        "IAM simulation failed for ECS exec candidate"
+                    );
                     allowed = false;
                     break;
                 }
             }
+        }
+        if candidate_sim_errored {
+            continue;
         }
         if allowed {
             return Ok(candidate.clone());
         }
     }
 
-    if saw_simulation_error {
-        Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ApiError::internal(format!(
-                "IAM simulation failed for ECS exec{}",
-                last_error
-                    .as_deref()
-                    .map(|error| format!(": {error}"))
-                    .unwrap_or_default()
-            ))),
-        ))
-    } else {
-        Err((
-            axum::http::StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "No authorized role can perform ECS Exec",
-            )),
-        ))
+    if all_sim_errored {
+        tracing::warn!(
+            role = %first_assumable.role_arn,
+            "All IAM simulations failed for ECS exec; falling back to first AssumeRole candidate"
+        );
+        return Ok(first_assumable);
     }
+
+    Err((
+        axum::http::StatusCode::FORBIDDEN,
+        Json(ApiError::forbidden(
+            "No authorized role can perform ECS Exec",
+        )),
+    ))
 }
 
 fn select_account_for_describe(
@@ -874,13 +929,16 @@ fn select_account_for_describe(
         ));
     }
 
-    if !state.config.use_mock_aws() && matching.iter().any(is_local_credential_mode) {
-        return Err((
-            axum::http::StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "ECS Exec requires an AssumeRole ARN, not direct/profile credentials",
-            )),
-        ));
+    if !state.config.use_mock_aws() {
+        let Some(account) = first_assumable_account(&matching) else {
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "ECS Exec requires an AssumeRole ARN, not direct/profile credentials",
+                )),
+            ));
+        };
+        return Ok(account);
     }
 
     Ok(matching.into_iter().next().unwrap())
@@ -1030,12 +1088,29 @@ async fn exec_task(
     };
 
     let Some(task) = task else {
-        audit_deny(&state, "Task not found", Some("task_not_found"));
+        audit_deny(
+            &state,
+            "Task not found or not authorized",
+            Some("task_not_found_or_not_authorized"),
+        );
         return Err((
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ApiError::new("NOT_FOUND", "Task not found")),
+            axum::http::StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden("ECS exec not authorized")),
         ));
     };
+
+    let matching_scopes = matching_rule_scopes(&task, &rule_scopes);
+    if matching_scopes.is_empty() {
+        audit_deny(
+            &state,
+            "Task does not match ECS entitlement scope",
+            Some("scope_denied"),
+        );
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden("ECS exec not authorized")),
+        ));
+    }
 
     if let Err((kind, status, message)) = validate_task_for_exec(&task, &req) {
         state
@@ -1053,19 +1128,6 @@ async fn exec_task(
             )))
             .commit_best_effort();
         return Err((status, Json(ApiError::new(kind, message))));
-    }
-
-    let matching_scopes = matching_rule_scopes(&task, &rule_scopes);
-    if matching_scopes.is_empty() {
-        audit_deny(
-            &state,
-            "Task does not match ECS entitlement scope",
-            Some("scope_denied"),
-        );
-        return Err((
-            axum::http::StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden("ECS exec not authorized")),
-        ));
     }
 
     if matching_scopes
@@ -1242,6 +1304,14 @@ mod tests {
         }
     }
 
+    fn account(role_arn: &str) -> AllowedAccount {
+        AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "production".into(),
+            role_arn: role_arn.into(),
+        }
+    }
+
     fn exec_req() -> EcsExecRequest {
         let task = mock_tasks().remove(0);
         EcsExecRequest {
@@ -1261,6 +1331,20 @@ mod tests {
         assert!(actions.contains(&"ecs:DescribeTasks"));
         assert!(actions.contains(&"ssmmessages:CreateDataChannel"));
         assert!(actions.contains(&"ssmmessages:OpenControlChannel"));
+    }
+
+    #[test]
+    fn ecs_exec_simulation_context_includes_cluster_region_and_container() {
+        let req = exec_req();
+        let context = ecs_exec_simulation_context(&req);
+        let by_name = context
+            .iter()
+            .filter_map(|entry| Some((entry.context_key_name()?, entry.context_key_values())))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(by_name["aws:RequestedRegion"], [req.region.as_str()]);
+        assert_eq!(by_name["ecs:cluster"], [req.cluster_arn.as_str()]);
+        assert_eq!(by_name["ecs:container-name"], [req.container_name.as_str()]);
     }
 
     #[test]
@@ -1338,5 +1422,46 @@ mod tests {
             effective_task_fetch_regions(&req, &[], &[], "us-east-1".into()),
             vec!["ap-northeast-1"]
         );
+    }
+
+    #[test]
+    fn requested_tasks_page_size_honors_requested_size_up_to_response_cap() {
+        assert_eq!(requested_tasks_page_size(0), DEFAULT_TASKS_PAGE_SIZE);
+        assert_eq!(requested_tasks_page_size(1), 1);
+        assert_eq!(requested_tasks_page_size(200), 200);
+        assert_eq!(requested_tasks_page_size(500), MAX_TASKS_PER_RESPONSE);
+    }
+
+    #[test]
+    fn authorized_cluster_refs_marks_concrete_cluster_cap_truncated() {
+        let clusters = (0..(MAX_CLUSTERS_PER_REQUEST + 2))
+            .map(|idx| cluster_arn("us-east-1", "111111111111", &format!("app-{idx}")))
+            .collect::<Vec<_>>();
+
+        let (refs, truncated) = authorized_cluster_refs(clusters.clone(), &clusters);
+
+        assert_eq!(refs.len(), MAX_CLUSTERS_PER_REQUEST);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn first_assumable_account_skips_direct_and_profile_entries() {
+        let accounts = vec![
+            account("direct"),
+            account("profile:ops"),
+            account("arn:aws:iam::111111111111:role/CanopyRole"),
+        ];
+
+        let selected = first_assumable_account(&accounts).unwrap();
+        assert_eq!(
+            selected.role_arn,
+            "arn:aws:iam::111111111111:role/CanopyRole"
+        );
+    }
+
+    #[test]
+    fn first_assumable_account_returns_none_for_local_only_entries() {
+        let accounts = vec![account("direct"), account("profile:ops")];
+        assert!(first_assumable_account(&accounts).is_none());
     }
 }

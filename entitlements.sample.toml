@@ -113,7 +113,8 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 #
 # ECS Exec 會固定執行 `/bin/sh`，不接受使用者自訂 command；
 # control-plane 會先檢查 task/container scope、sidecar denylist、
-# IAM simulation 與 audit fail-closed。
+# 可用時做 IAM simulation，並透過 STS inline policy 與 audit fail-closed
+# 作為最終執行邊界。
 #
 # [[rules]]
 # id = "rule-platform-eng-ecs"

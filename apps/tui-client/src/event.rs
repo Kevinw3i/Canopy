@@ -42,7 +42,13 @@ pub enum Action {
     SelectInstance(usize),
     ToggleEcsView,
     RefreshEcsTasks,
-    EcsTasksLoaded(Vec<shared::dto::ecs::EcsTask>, Vec<String>, u64),
+    EcsTasksLoaded {
+        tasks: Vec<shared::dto::ecs::EcsTask>,
+        failed_scopes: Vec<String>,
+        total_count: usize,
+        truncated: bool,
+        generation: u64,
+    },
     EcsTasksFetchFailed(String, u64),
     ConnectEcsExec {
         account_id: String,
