@@ -236,14 +236,17 @@ cp entitlements.sample.toml entitlements.toml
 編輯 `entitlements.toml`，設定你的使用者、帳號、區域對應關係。
 格式說明見 [`entitlements.sample.toml`](../entitlements.sample.toml)。
 
-部署前先確認 entitlements 與 Terraform 變數一致：
+部署前先確認 Terraform 變數本身有效，並確認 entitlements 與 Terraform 變數一致：
 
 ```bash
+./scripts/validate-terraform-tfvars.sh infra
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
 
-這個檢查會同時驗證 `assumable_role_arns`、`enable_direct_access`、部署時禁止的
-`profile:*`，以及 ECS Exec rule 必須使用 AssumeRole ARN。
+第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
+ALB/DNS/subnet/service preconditions。第二個檢查會同時驗證
+`assumable_role_arns`、`enable_direct_access`、部署時禁止的 `profile:*`，
+以及 ECS Exec rule 必須使用 AssumeRole ARN。
 
 ---
 

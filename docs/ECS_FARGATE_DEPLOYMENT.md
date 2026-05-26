@@ -161,12 +161,14 @@ build 時透過 BuildKit secret 注入，Dockerfile 會把檔案 bake 到
 cp entitlements.sample.toml entitlements.toml
 vi entitlements.toml
 
+./scripts/validate-terraform-tfvars.sh infra
 ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
 
-這個檢查會確認 AssumeRole ARN 已列在 `assumable_role_arns`、使用
-`direct` 時已啟用 `enable_direct_access`、`profile:*` 未被部署到 ECS，
-且 ECS Exec rule 不使用 direct/profile credentials。
+第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
+ALB/DNS/subnet/service preconditions。第二個檢查會確認 AssumeRole ARN 已列在
+`assumable_role_arns`、使用 `direct` 時已啟用 `enable_direct_access`、
+`profile:*` 未被部署到 ECS，且 ECS Exec rule 不使用 direct/profile credentials。
 
 ---
 

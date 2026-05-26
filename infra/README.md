@@ -102,13 +102,16 @@ terraform apply \
 > **重要：** 因為 entitlements 是 bake 進 Docker image 的，rolling update 期間會有新舊授權規則同時生效的短暫窗口。
 > 如果此次變更包含 entitlements 修改，建議用 `desired_count=1` 先縮容，部署完再擴回原數量，以確保授權規則一致性。
 >
-> 部署前請先驗證 entitlements 與 Terraform 變數一致：
+> 部署前請先驗證 Terraform 變數本身有效，並驗證 entitlements 與 Terraform 變數一致：
 > ```bash
+> ./scripts/validate-terraform-tfvars.sh infra
 > ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 > ```
 >
-> 這個檢查會同時驗證 `assumable_role_arns`、`enable_direct_access`、部署時禁止的
-> `profile:*`，以及 ECS Exec rule 必須使用 AssumeRole ARN。
+> 第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
+> ALB/DNS/subnet/service preconditions。第二個檢查會同時驗證
+> `assumable_role_arns`、`enable_direct_access`、部署時禁止的 `profile:*`，
+> 以及 ECS Exec rule 必須使用 AssumeRole ARN。
 
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)

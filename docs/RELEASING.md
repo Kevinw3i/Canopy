@@ -210,7 +210,7 @@ GitHub repo secrets：
 |--------|------|
 | `AWS_GHA_ECR_PUSH_ROLE_ARN` | GitHub Actions 要 assume 的 AWS role ARN |
 | `CONTROL_PLANE_ENTITLEMENTS_TOML_B64` | `entitlements.toml` 的 base64 內容，build image 時寫回檔案 |
-| `CONTROL_PLANE_TFVARS_B64` | `infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 entitlements，並依 `cpu_architecture` 決定 Docker platform、依 `project` 決定 ECR repository |
+| `CONTROL_PLANE_TFVARS_B64` | `infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 Terraform 部署 preconditions 與 entitlements，並依 `cpu_architecture` 決定 Docker platform、依 `project` 決定 ECR repository |
 
 設定 secrets：
 
@@ -242,8 +242,9 @@ Workflow 完成後會推送 image：
 ```
 
 ECR repository 是 immutable，同一個 tag 不能重複推送。需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
-Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先驗證
-entitlements，再推送到 `<project>/control-plane`。如果 `project` 不是 `canopy`，
+Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先執行
+`scripts/validate-terraform-tfvars.sh infra` 驗證部署 preconditions，再驗證
+entitlements，最後推送到 `<project>/control-plane`。如果 `project` 不是 `canopy`，
 請同步調整 GitHub Actions ECR push role 的 repository ARN。
 
 ### 部署到 ECS
