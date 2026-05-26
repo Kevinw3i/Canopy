@@ -402,7 +402,10 @@ Control Plane 支援任何 OpenID Connect 提供者：
     "Principal": {
       "AWS": "arn:aws:iam::CONTROL_PLANE_ACCOUNT:role/CanopyBase"
     },
-    "Action": "sts:AssumeRole",
+    "Action": [
+      "sts:AssumeRole",
+      "sts:TagSession"
+    ],
     "Condition": {
       "StringEquals": {
         "sts:ExternalId": "canopy"
@@ -412,6 +415,10 @@ Control Plane 支援任何 OpenID Connect 提供者：
 }
 ```
 
+Control Plane 本身的 AWS 身分也需要在這些目標 role ARN 上具備
+`sts:AssumeRole`、`sts:TagSession` 和 `iam:SimulatePrincipalPolicy`，
+才能挑選可用 role，並替連線流程簽發範圍限縮的 STS 憑證。
+
 **Permission Policy**（這個 Role 可以做什麼）：
 ```json
 {
@@ -420,6 +427,7 @@ Control Plane 支援任何 OpenID Connect 提供者：
     "Effect": "Allow",
     "Action": [
       "ec2:DescribeInstances",
+      "ec2:DescribeInstanceConnectEndpoints",
       "logs:DescribeLogGroups",
       "logs:FilterLogEvents",
       "logs:StartQuery",
@@ -428,7 +436,16 @@ Control Plane 支援任何 OpenID Connect 提供者：
       "ssm:StartSession",
       "ssm:DescribeInstanceInformation",
       "ec2-instance-connect:SendSSHPublicKey",
-      "ec2-instance-connect:OpenTunnel"
+      "ec2-instance-connect:OpenTunnel",
+      "ecs:DescribeClusters",
+      "ecs:DescribeTasks",
+      "ecs:ListClusters",
+      "ecs:ListTasks",
+      "ecs:ExecuteCommand",
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel"
     ],
     "Resource": "*"
   }]
@@ -571,7 +588,7 @@ TUI                     Control Plane              OIDC 提供者
 
 - **伺服器端過濾**：EC2、ECS tasks 和 CloudWatch 資料在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **範圍隔離**：功能授權與資源範圍依規則逐一驗證，防止跨群組權限拼接。一個群組的功能不能套用到另一個群組的資源上
-- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 將主要動作限縮到特定執行個體或 ECS task，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）或 ECS cluster（`ecs:ExecuteCommand`）；ECS Exec 憑證另只包含必要的 `ecs:DescribeTasks` 與 `ssmmessages` 輔助動作
+- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 將主要動作限縮到特定執行個體或 ECS task，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）或 ECS cluster（`ecs:ExecuteCommand`）；ECS Exec 憑證另只包含必要的 `ecs:DescribeTasks` 與 `ssmmessages` 輔助動作，並限縮到請求的 AWS region
 - **帳號身份驗證**：`direct`/`profile:` 和 AssumeRole 憑證透過 `GetCallerIdentity` 驗證，確保與設定的 `account_id` 一致
 - **TUI 無 AWS 長期金鑰**：所有 AWS 存取都經由 Control Plane
 - **稽核失敗則拒絕**：持久化稽核日誌寫入失敗時，所有受保護的 API（包含登入、刷新、權限查詢）回傳 503。暫時性 I/O 錯誤可自行恢復，無需重啟

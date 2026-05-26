@@ -431,6 +431,7 @@ per-request inline session policy):
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceConnectEndpoints",
         "logs:DescribeLogGroups",
         "logs:FilterLogEvents",
         "logs:StartQuery",
