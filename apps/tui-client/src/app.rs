@@ -23,6 +23,9 @@ use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRun
 use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
+const LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE: &str =
+    "Live tail production streaming is not yet available. \
+This beta feature currently supports dev/mock control-plane streaming only.";
 
 pub struct App {
     config: ClientConfig,
@@ -942,11 +945,8 @@ impl App {
                         }
                     });
                 } else {
-                    self.error_modal.show(
-                        "Live tail WebSocket client is not yet available. \
-                         This feature is in beta."
-                            .into(),
-                    );
+                    self.error_modal
+                        .show(LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.into());
                 }
             }
             Action::StopLiveTail => {
@@ -2403,6 +2403,13 @@ mod tests {
         let ent = mock_entitlements();
 
         assert!(default_live_tail_request(&ent).is_none());
+    }
+
+    #[test]
+    fn live_tail_prod_unavailable_message_names_server_limit() {
+        assert!(LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.contains("production streaming"));
+        assert!(LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.contains("dev/mock"));
+        assert!(!LIVE_TAIL_PROD_UNAVAILABLE_MESSAGE.contains("client is not yet available"));
     }
 
     // ── Navigation ──────────────────────────────────────────
