@@ -181,7 +181,7 @@ encrypt        = true
 | `image_tag` | Phase 2 | 版本 tag 或 git SHA（不可使用 `latest`）；`create_service = false` 的 Phase 1 可留空 |
 | `alb_allowed_cidrs` | Yes | ALB 入站允許的 IPv4 CIDR 清單 |
 | `aws_region` | No | 預設 `ap-northeast-1` |
-| `cpu` / `memory` | No | 預設 512 / 1024 |
+| `cpu` / `memory` | No | 預設 512 / 1024；必須符合 AWS Fargate Linux task size 組合 |
 | `desired_count` | No | 預設 2（跨 AZ） |
 | `alb_internal` | No | 預設 `true`（內部 ALB） |
 | `sts_external_id` | No | 預設 `canopy`，跨帳號 AssumeRole 的 ExternalId；必須符合 STS ExternalId 格式限制 |

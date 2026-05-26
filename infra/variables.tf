@@ -108,12 +108,27 @@ variable "cpu" {
   description = "Fargate task CPU units"
   type        = number
   default     = 512
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.cpu)
+    error_message = "cpu must be a valid Fargate task CPU value: 256, 512, 1024, 2048, 4096, 8192, or 16384."
+  }
 }
 
 variable "memory" {
   description = "Fargate task memory (MiB)"
   type        = number
   default     = 1024
+
+  validation {
+    condition = contains(concat(
+      [512, 1024, 2048, 3072],
+      [for memory in range(4096, 30721, 1024) : memory],
+      [for memory in range(32768, 61441, 4096) : memory],
+      [for memory in range(65536, 122881, 8192) : memory],
+    ), var.memory)
+    error_message = "memory must be a valid Fargate task memory value in MiB."
+  }
 }
 
 variable "desired_count" {

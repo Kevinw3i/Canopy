@@ -1,5 +1,17 @@
 # ── Cluster ──────────────────────────────────────────────
 
+locals {
+  fargate_cpu_memory_pairs = toset(concat(
+    [for memory in [512, 1024, 2048] : "256:${memory}"],
+    [for memory in [1024, 2048, 3072, 4096] : "512:${memory}"],
+    [for memory in range(2048, 8193, 1024) : "1024:${memory}"],
+    [for memory in range(4096, 16385, 1024) : "2048:${memory}"],
+    [for memory in range(8192, 30721, 1024) : "4096:${memory}"],
+    [for memory in range(16384, 61441, 4096) : "8192:${memory}"],
+    [for memory in range(32768, 122881, 8192) : "16384:${memory}"],
+  ))
+}
+
 resource "aws_ecs_cluster" "main" {
   name = var.project
 
@@ -27,6 +39,10 @@ resource "aws_ecs_task_definition" "control_plane" {
     precondition {
       condition     = var.oidc_client_secret_arn == "" || var.oidc_client_secret_version_id != ""
       error_message = "oidc_client_secret_version_id is required when oidc_client_secret_arn is set."
+    }
+    precondition {
+      condition     = contains(local.fargate_cpu_memory_pairs, "${var.cpu}:${var.memory}")
+      error_message = "cpu and memory must be a valid AWS Fargate Linux task size combination."
     }
   }
   requires_compatibilities = ["FARGATE"]

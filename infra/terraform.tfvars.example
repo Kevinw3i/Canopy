@@ -19,6 +19,10 @@ acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/xxxxx
 # Image tag (required — use a versioned tag or git SHA, not "latest")
 image_tag = "v0.1.0"
 
+# Fargate Linux task size. Defaults are 512 CPU units and 1024 MiB memory.
+# cpu    = 512
+# memory = 1024
+
 # JWT secret — create out-of-band, pass ARN here (never stored in Terraform state)
 # aws secretsmanager create-secret --name canopy/jwt-secret --secret-string "$(openssl rand -base64 44)"
 # aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secret --query 'Versions[?VersionStages[0]==`AWSCURRENT`].VersionId | [0]' --output text
