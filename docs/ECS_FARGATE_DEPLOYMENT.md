@@ -22,8 +22,8 @@ Internet
 ┌─────────────────────────┐
 │  ECS Fargate Task       │  ← control-plane container
 │  ┌───────────────────┐  │
-│  │ control-plane     │  │  ← 從 Secrets Manager 讀 JWT secret
-│  │ port 8443         │  │  ← 從 S3/EFS 讀 entitlements.toml
+│  │ control-plane     │  │  ← JWT_SECRET 由 ECS secrets 注入
+│  │ port 8443         │  │  ← entitlements.toml 已 bake 進 image
 │  └───────────────────┘  │
 └────────┬────────────────┘
          │ AWS SDK (Task Role)
@@ -70,32 +70,26 @@ aws ecr get-login-password --region ap-northeast-1 | \
 
 ```bash
 # 在專案根目錄執行（因為 Dockerfile 需要 workspace context）
+VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 
-docker build \
+DOCKER_BUILDKIT=1 docker build \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
-  -t canopy/control-plane:latest \
+  -t canopy/control-plane:${VERSION} \
   -f apps/control-plane/Dockerfile .
 
 # Tag
-docker tag canopy/control-plane:latest \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:latest
+docker tag canopy/control-plane:${VERSION} \
+  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
 
 # Push
 docker push \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:latest
-```
-
-建議用 git tag 或 commit hash 做 image tag：
-
-```bash
-VERSION=$(git describe --tags --always)
-docker tag canopy/control-plane:latest \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
-docker push \
   <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
 ```
+
+ECR tag 應使用 git tag 或 commit hash；不要使用 `latest`，因為 Terraform
+範本將 repository 設為 immutable。
 
 ---
 
@@ -121,81 +115,44 @@ aws secretsmanager create-secret \
 
 ---
 
-## Step 4: 準備設定檔
+## Step 4: 準備啟動設定值
 
-建立生產用的 `config.toml`（不含 secret，secret 從環境變數注入）：
+正式 ECS 部署不需要預先產生 `config.toml`，也不要把 secret 寫進 repo、
+Terraform state、或 baked config file。Task definition 設定 `GENERATE_CONFIG=1`
+後，entrypoint 會從環境變數和 ECS-native `secrets` 在
+`/tmp/canopy-config.toml` 產生啟動設定。
 
-```toml
-# config.production.toml
+> **注意**：正式 ECS 部署建議使用 repo 內建的
+> [`scripts/docker-entrypoint.sh`](../scripts/docker-entrypoint.sh)。Dockerfile
+> 會把這個 entrypoint 放進 image；Terraform task definition 會用
+> ECS-native `secrets` 注入 `JWT_SECRET` / `OIDC_CLIENT_SECRET`，並設定
+> `GENERATE_CONFIG=1` 讓 entrypoint 在 `/tmp/canopy-config.toml` 產生啟動設定。
+> 這樣 secret 不需要寫進 repo、Terraform state、或 baked config file。
 
-bind_address = "0.0.0.0:8443"    # Fargate 容器內必須綁 0.0.0.0
-dev_mode = false
-
-entitlements_file = "/etc/canopy/entitlements.toml"
-
-# 不設 audit_log — audit 事件透過 tracing 輸出到 stdout
-# ECS 會自動把 stdout 送到 CloudWatch Logs
-
-cors_allowed_origins = ["https://your-domain.com"]
-
-[oidc]
-issuer_url = "https://accounts.google.com"
-client_id = "your-client-id"
-# client_secret 從環境變數注入（見 Step 6 task definition）
-
-[jwt]
-secret = "placeholder"           # 會被環境變數覆寫（見下方說明）
-expiry_seconds = 3600
-
-[aws]
-default_region = "ap-northeast-1"
-session_duration_seconds = 3600
-```
-
-> **注意**：目前 config 從 TOML 檔讀取，JWT secret 寫在檔案裡。
-> 若要從 Secrets Manager 注入，有兩種做法：
->
-> 1. **Container entrypoint script**：啟動時用 `aws secretsmanager get-secret-value` 取值，
->    用 `sed` 寫入 config.toml，再啟動 control-plane
-> 2. **改程式碼**：讓 `AppConfig` 支援從環境變數覆寫個別欄位（推薦，未來再做）
->
-> 以下用做法 1 的 wrapper script。
-
-建立 entrypoint wrapper：
+entrypoint 的行為摘要：
 
 ```bash
-# scripts/docker-entrypoint.sh
-#!/bin/sh
-set -e
-
-CONFIG_PATH="${CONFIG_PATH:-/etc/canopy/config.toml}"
-
-# 從 Secrets Manager 注入 JWT secret（如果環境變數有設定 ARN）
-if [ -n "$JWT_SECRET_ARN" ]; then
-  JWT_SECRET=$(aws secretsmanager get-secret-value \
-    --secret-id "$JWT_SECRET_ARN" \
-    --query SecretString --output text)
-  sed -i "s|^secret = .*|secret = \"${JWT_SECRET}\"|" "$CONFIG_PATH"
-fi
-
-exec control-plane "$@"
+GENERATE_CONFIG=1
+JWT_SECRET=<injected by ECS secrets>
+OIDC_ISSUER_URL=https://accounts.google.com
+OIDC_CLIENT_ID=<client id>
+ENTITLEMENTS_FILE=/etc/canopy/entitlements.toml
 ```
 
 ---
 
-## Step 5: 上傳設定檔到 S3
+## Step 5: 準備 entitlements build secret
+
+`entitlements.toml` 不 commit 到 repo，也不要放進 Terraform state。正式 image
+build 時透過 BuildKit secret 注入，Dockerfile 會把檔案 bake 到
+`/etc/canopy/entitlements.toml` 並設為唯讀。
 
 ```bash
-# 建立 S3 bucket（或用現有的）
-aws s3 mb s3://canopy-config-<ACCOUNT_ID> --region ap-northeast-1
+cp entitlements.sample.toml entitlements.toml
+vi entitlements.toml
 
-# 上傳設定檔
-aws s3 cp config.production.toml s3://canopy-config-<ACCOUNT_ID>/config.toml
-aws s3 cp entitlements.production.toml s3://canopy-config-<ACCOUNT_ID>/entitlements.toml
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
-
-> 或者直接把設定檔 bake 進 Docker image：在 Dockerfile 加 `COPY config.production.toml /etc/canopy/config.toml`。
-> S3 方式的優點是更新設定不需要重新 build image。
 
 ---
 
@@ -236,18 +193,8 @@ aws iam put-role-policy \
     }]
   }'
 
-# 加上 S3 設定檔讀取權限（如果用 S3 存設定）
-aws iam put-role-policy \
-  --role-name canopy-task-execution \
-  --policy-name config-s3-access \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::canopy-config-<ACCOUNT_ID>/*"
-    }]
-  }'
+# config 由 entrypoint 產生，entitlements 已 bake 進 image；
+# 目前不需要給 execution role 讀 S3 設定檔的權限。
 ```
 
 ### 6b. Task Role（control-plane 用來呼叫 AWS API）
@@ -345,7 +292,7 @@ cat > /tmp/task-def.json << 'EOF'
   "containerDefinitions": [
     {
       "name": "control-plane",
-      "image": "<ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:latest",
+      "image": "<ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:<IMAGE_TAG>",
       "essential": true,
       "portMappings": [
         {
@@ -354,8 +301,19 @@ cat > /tmp/task-def.json << 'EOF'
         }
       ],
       "environment": [
-        {"name": "CONFIG_PATH", "value": "/etc/canopy/config.toml"},
-        {"name": "RUST_LOG", "value": "control_plane=info,tower_http=info"}
+        {"name": "RUST_LOG", "value": "control_plane=info,tower_http=info"},
+        {"name": "GENERATE_CONFIG", "value": "1"},
+        {"name": "OIDC_ISSUER_URL", "value": "https://accounts.google.com"},
+        {"name": "OIDC_CLIENT_ID", "value": "<OIDC_CLIENT_ID>"},
+        {"name": "JWT_EXPIRY_SECONDS", "value": "3600"},
+        {"name": "AWS_DEFAULT_REGION", "value": "ap-northeast-1"},
+        {"name": "AWS_SESSION_DURATION_SECONDS", "value": "3600"},
+        {"name": "ENTITLEMENTS_FILE", "value": "/etc/canopy/entitlements.toml"},
+        {"name": "CORS_ALLOWED_ORIGINS", "value": "https://your-domain.com"},
+        {"name": "STS_EXTERNAL_ID", "value": "canopy"}
+      ],
+      "secrets": [
+        {"name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:<ACCOUNT_ID>:secret:canopy/jwt-secret-XXXXXX"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -383,13 +341,10 @@ aws ecs register-task-definition \
   --region ap-northeast-1
 ```
 
-> **設定檔注入方式**（擇一）：
->
-> 1. **Bake 進 image** — 最簡單，但更新設定需重新 build
-> 2. **S3 + init container** — 在 task definition 加一個 init container 從 S3 下載設定
-> 3. **EFS mount** — 掛載 EFS volume 存放設定檔
->
-> 建議初期用方式 1（把 config 和 entitlements COPY 進 Dockerfile），穩定後再改用方式 2 或 3。
+若 OIDC provider 使用 confidential client，另外在 `secrets` 加入
+`OIDC_CLIENT_SECRET`，並讓 execution role 可讀該 secret。`entitlements.toml`
+由 Docker build 透過 BuildKit secret bake 進 image，不要放進 task definition
+環境變數或 Terraform state。
 
 ---
 
@@ -520,7 +475,7 @@ canopy.your-domain.com  CNAME  canopy-alb-xxxx.ap-northeast-1.elb.amazonaws.com
 # 1. Build & push 新 image
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 
-docker build \
+DOCKER_BUILDKIT=1 docker build \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -t canopy/control-plane:v0.2.0 \

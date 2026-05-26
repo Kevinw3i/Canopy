@@ -78,7 +78,9 @@ aws ecr get-login-password --region ap-northeast-1 | \
 # Build & push（指定 linux/amd64 確保與 ECS 架構匹配）
 cd ..
 VERSION=$(git describe --tags --always)
-docker build --platform linux/amd64 -t "$ECR_URL:$VERSION" \
+ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "$ECR_URL:$VERSION" \
+  --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -f apps/control-plane/Dockerfile .
 docker push "$ECR_URL:$VERSION"
@@ -103,11 +105,13 @@ terraform apply -var="image_tag=$VERSION"
 ```bash
 ECR_URL=$(cd infra && terraform output -raw ecr_repository_url)
 VERSION=$(git describe --tags --always)
+ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
 # CPU_ARCH 須與 Terraform 的 cpu_architecture 一致（X86_64 → linux/amd64, ARM64 → linux/arm64）
 PLATFORM="linux/amd64"
 
 # Build + push（帶 platform 和 entitlements）
-docker build --platform "$PLATFORM" \
+DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
+  --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -t "$ECR_URL:$VERSION" \
   -f apps/control-plane/Dockerfile .
