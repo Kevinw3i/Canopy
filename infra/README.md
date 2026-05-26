@@ -180,11 +180,12 @@ encrypt        = true
 | `oidc_client_id` | Yes | OIDC client ID（不可為空或含 whitespace） |
 | `project` | No | 預設 `canopy`；1-28 字元，僅 lowercase letters、numbers、hyphens，且不可頭尾 hyphen |
 | `image_tag` | Phase 2 | 有效 Docker tag 或 git SHA（不可使用 `latest`）；`create_service = false` 的 Phase 1 可留空 |
-| `alb_allowed_cidrs` | Yes | ALB 入站允許的 IPv4 CIDR 清單 |
+| `alb_allowed_cidrs` | Yes | ALB 入站允許的 IPv4 CIDR 清單；public ALB 使用 `0.0.0.0/0` 時必須明確 opt-in |
 | `aws_region` | No | 預設 `ap-northeast-1` |
 | `cpu` / `memory` | No | 預設 512 / 1024；必須符合 AWS Fargate Linux task size 組合 |
 | `desired_count` | No | 預設 2（跨 AZ） |
 | `alb_internal` | No | 預設 `true`（內部 ALB） |
+| `allow_public_alb_world_cidr` | No | 預設 `false`；只有 public ALB 必須允許全網段時才設為 `true` |
 | `sts_external_id` | No | 預設 `canopy`，跨帳號 AssumeRole 的 ExternalId；必須符合 STS ExternalId 格式限制 |
 | `jwt_expiry_seconds` | No | 預設 3600；必須是正整數 |
 | `aws_session_duration_seconds` | No | 預設 3600；STS AssumeRole session 秒數，必須介於 900 到 43200 |

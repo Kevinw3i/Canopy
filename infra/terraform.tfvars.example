@@ -33,7 +33,8 @@ jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
 
 # ALB defaults to internal. Provide at least one CIDR (e.g. your VPC CIDR for internal).
 alb_allowed_cidrs = ["10.0.0.0/16"]
-# alb_internal    = false  # set to false + office CIDRs for public access
+# alb_internal    = false  # set to false + office/VPN CIDRs for public access
+# allow_public_alb_world_cidr = true  # explicit opt-in only if public ALB must allow the whole internet
 
 # Optional: Route 53 DNS record
 # Set both values to create the record; leave both commented to skip DNS.

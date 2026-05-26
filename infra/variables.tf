@@ -213,6 +213,12 @@ variable "alb_internal" {
   default     = true
 }
 
+variable "allow_public_alb_world_cidr" {
+  description = "Explicitly allow 0.0.0.0/0 on a public ALB. Defaults to false; prefer office or VPN CIDRs."
+  type        = bool
+  default     = false
+}
+
 variable "alb_allowed_cidrs" {
   description = "CIDR blocks allowed to reach the ALB on 443. Required for both internal and public modes."
   type        = list(string)

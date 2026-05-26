@@ -403,7 +403,9 @@ ALB_SG=$(aws ec2 create-security-group \
 
 aws ec2 authorize-security-group-ingress \
   --group-id $ALB_SG \
-  --protocol tcp --port 443 --cidr 0.0.0.0/0
+  --protocol tcp --port 443 --cidr <OFFICE_OR_VPN_CIDR>
+
+# 只有明確需要公開給全網際網路時，才改用 0.0.0.0/0。
 
 # ECS Task Security Group — 只允許來自 ALB 的流量
 TASK_SG=$(aws ec2 create-security-group \

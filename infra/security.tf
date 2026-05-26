@@ -10,6 +10,15 @@ resource "aws_security_group" "alb" {
       condition     = var.create_vpc || var.vpc_id != ""
       error_message = "vpc_id is required when create_vpc = false."
     }
+
+    precondition {
+      condition = (
+        var.alb_internal ||
+        var.allow_public_alb_world_cidr ||
+        !contains(var.alb_allowed_cidrs, "0.0.0.0/0")
+      )
+      error_message = "Public ALB cannot allow 0.0.0.0/0 unless allow_public_alb_world_cidr = true."
+    }
   }
 }
 
