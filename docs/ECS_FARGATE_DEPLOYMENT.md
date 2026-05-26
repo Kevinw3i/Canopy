@@ -72,8 +72,15 @@ aws ecr get-login-password --region ap-northeast-1 | \
 # 在專案根目錄執行（因為 Dockerfile 需要 workspace context）
 VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in
+  X86_64) PLATFORM="linux/amd64" ;;
+  ARM64) PLATFORM="linux/arm64" ;;
+  *) echo "Unsupported CPU_ARCH: $CPU_ARCH"; exit 1 ;;
+esac
 
 DOCKER_BUILDKIT=1 docker build \
+  --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -t canopy/control-plane:${VERSION} \
@@ -90,6 +97,9 @@ docker push \
 
 ECR tag 應使用 git tag 或 commit hash；不要使用 `latest`，因為 Terraform
 範本將 repository 設為 immutable。
+
+`CPU_ARCH` 必須和 ECS task definition 的 `runtimePlatform.cpuArchitecture`
+一致：`X86_64` 對應 `linux/amd64`，`ARM64` 對應 `linux/arm64`。
 
 ---
 
@@ -285,6 +295,10 @@ cat > /tmp/task-def.json << 'EOF'
   "family": "canopy-control-plane",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
   "cpu": "512",
   "memory": "1024",
   "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/canopy-task-execution",
@@ -474,8 +488,15 @@ canopy.your-domain.com  CNAME  canopy-alb-xxxx.ap-northeast-1.elb.amazonaws.com
 ```bash
 # 1. Build & push 新 image
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in
+  X86_64) PLATFORM="linux/amd64" ;;
+  ARM64) PLATFORM="linux/arm64" ;;
+  *) echo "Unsupported CPU_ARCH: $CPU_ARCH"; exit 1 ;;
+esac
 
 DOCKER_BUILDKIT=1 docker build \
+  --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
   -t canopy/control-plane:v0.2.0 \
