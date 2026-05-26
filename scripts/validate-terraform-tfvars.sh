@@ -16,6 +16,11 @@ command -v terraform >/dev/null 2>&1 || fail "Missing required command: terrafor
 [ -d "$TERRAFORM_DIR" ] || fail "Terraform dir not found: $TERRAFORM_DIR"
 [ -f "$TFVARS_PATH" ] || fail "Terraform tfvars not found: $TFVARS_PATH"
 
+if [ -z "${TF_PLUGIN_CACHE_DIR:-}" ] && [ -d "$TERRAFORM_DIR/.terraform/providers" ]; then
+  TF_PLUGIN_CACHE_DIR="$(cd "$TERRAFORM_DIR/.terraform/providers" && pwd -P)"
+  export TF_PLUGIN_CACHE_DIR
+fi
+
 TEST_DIR=".canopy-tfvars-validation-$$"
 TF_DATA_DIR_PATH="$(mktemp -d)"
 

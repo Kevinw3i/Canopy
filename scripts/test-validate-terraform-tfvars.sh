@@ -6,8 +6,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VALIDATOR="$SCRIPT_DIR/validate-terraform-tfvars.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
-export TF_PLUGIN_CACHE_DIR="$TMP_DIR/plugin-cache"
-mkdir "$TF_PLUGIN_CACHE_DIR"
+if [ -z "${TF_PLUGIN_CACHE_DIR:-}" ]; then
+  if [ -d "$REPO_ROOT/infra/.terraform/providers" ]; then
+    TF_PLUGIN_CACHE_DIR="$(cd "$REPO_ROOT/infra/.terraform/providers" && pwd -P)"
+  else
+    TF_PLUGIN_CACHE_DIR="$TMP_DIR/plugin-cache"
+    mkdir "$TF_PLUGIN_CACHE_DIR"
+  fi
+  export TF_PLUGIN_CACHE_DIR
+fi
 
 INFRA_DIR="$TMP_DIR/infra"
 mkdir "$INFRA_DIR"

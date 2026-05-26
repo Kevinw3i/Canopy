@@ -11,6 +11,11 @@ fail() {
 command -v terraform >/dev/null 2>&1 || fail "Missing required command: terraform"
 [ -d "$TERRAFORM_DIR" ] || fail "Terraform dir not found: $TERRAFORM_DIR"
 
+if [ -z "${TF_PLUGIN_CACHE_DIR:-}" ] && [ -d "$TERRAFORM_DIR/.terraform/providers" ]; then
+  TF_PLUGIN_CACHE_DIR="$(cd "$TERRAFORM_DIR/.terraform/providers" && pwd -P)"
+  export TF_PLUGIN_CACHE_DIR
+fi
+
 TF_DATA_DIR_PATH="$(mktemp -d)"
 
 cleanup() {
