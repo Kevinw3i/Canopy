@@ -35,10 +35,16 @@ fi
 
 # Check 3: all role ARNs present in assumable_role_arns (uncommented lines only)
 ROLE_ARNS=$(strip_comments "$ENTITLEMENTS" | \
-  grep -oE 'role_arn\s*=\s*"arn:aws:iam::[^"]+"' | \
+  grep -oE 'role_arn\s*=\s*"arn:[^"]+"' | \
   sed 's/role_arn[[:space:]]*=[[:space:]]*//' | tr -d '"' | sort -u || true)
 
 for arn in $ROLE_ARNS; do
+  if ! grep -qE '^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$' <<< "$arn"; then
+    echo "ERROR: role_arn in entitlements must be a concrete IAM role ARN without wildcards (value redacted)"
+    ERRORS=$((ERRORS + 1))
+    continue
+  fi
+
   if ! strip_comments "$TFVARS" | grep -qF "$arn"; then
     echo "ERROR: a role_arn in entitlements is not listed in $TFVARS assumable_role_arns (value redacted)"
     ERRORS=$((ERRORS + 1))

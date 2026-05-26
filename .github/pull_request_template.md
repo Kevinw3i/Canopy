@@ -8,6 +8,8 @@ Describe the change and why it is needed.
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --workspace`
 - [ ] `bash -n scripts/validate-entitlements.sh`
+- [ ] `bash -n scripts/test-validate-entitlements.sh`
+- [ ] `scripts/test-validate-entitlements.sh`
 - [ ] `sh -n scripts/docker-entrypoint.sh`
 - [ ] `bash -n scripts/test-docker-entrypoint.sh`
 - [ ] `scripts/test-docker-entrypoint.sh`
