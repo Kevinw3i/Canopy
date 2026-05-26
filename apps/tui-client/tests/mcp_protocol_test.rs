@@ -44,8 +44,8 @@ fn dev_admin_entitlements() -> UserEntitlements {
             can_reboot_ec2: false,
             can_use_mcp: true,
             can_use_mcp_cloudwatch: true,
-            can_use_mcp_ec2: false,
             can_use_mcp_database: true,
+            ..Default::default()
         },
         allowed_accounts: vec![],
         allowed_regions: vec![],

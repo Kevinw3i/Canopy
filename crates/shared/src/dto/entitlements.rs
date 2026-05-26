@@ -49,6 +49,11 @@ pub struct FeatureFlags {
     /// Allows MCP CloudWatch tools when combined with `can_use_mcp`.
     #[serde(default)]
     pub can_use_mcp_cloudwatch: bool,
+    /// Allows plaintext raw MCP CloudWatch query/filter audit for scopes
+    /// authorized by the same entitlement rule. Default false keeps raw
+    /// values encrypted-only in durable audit metadata.
+    #[serde(default)]
+    pub can_view_mcp_raw_audit_plaintext: bool,
     /// Reserved for future MCP EC2 tools. Product Phase 3 does not expose EC2 MCP tools.
     #[serde(default)]
     pub can_use_mcp_ec2: bool,
@@ -229,6 +234,7 @@ mod tests {
         assert!(!flags.can_reboot_ec2);
         assert!(!flags.can_use_mcp);
         assert!(!flags.can_use_mcp_cloudwatch);
+        assert!(!flags.can_view_mcp_raw_audit_plaintext);
         assert!(!flags.can_use_mcp_ec2);
         assert!(!flags.can_use_mcp_database);
     }
@@ -246,6 +252,7 @@ mod tests {
             can_reboot_ec2: false,
             can_use_mcp: true,
             can_use_mcp_cloudwatch: true,
+            can_view_mcp_raw_audit_plaintext: true,
             can_use_mcp_ec2: false,
             can_use_mcp_database: true,
         };
@@ -257,6 +264,7 @@ mod tests {
         assert_eq!(json["can_reboot_ec2"], false);
         assert_eq!(json["can_use_mcp"], true);
         assert_eq!(json["can_use_mcp_cloudwatch"], true);
+        assert_eq!(json["can_view_mcp_raw_audit_plaintext"], true);
         assert_eq!(json["can_use_mcp_ec2"], false);
         assert_eq!(json["can_use_mcp_database"], true);
         let back: FeatureFlags = serde_json::from_value(json).unwrap();
@@ -267,6 +275,7 @@ mod tests {
         assert!(!back.can_reboot_ec2);
         assert!(back.can_use_mcp);
         assert!(back.can_use_mcp_cloudwatch);
+        assert!(back.can_view_mcp_raw_audit_plaintext);
         assert!(!back.can_use_mcp_ec2);
         assert!(back.can_use_mcp_database);
     }
@@ -291,6 +300,7 @@ mod tests {
         assert!(!flags.can_reboot_ec2);
         assert!(!flags.can_use_mcp);
         assert!(!flags.can_use_mcp_cloudwatch);
+        assert!(!flags.can_view_mcp_raw_audit_plaintext);
         assert!(!flags.can_use_mcp_ec2);
         assert!(!flags.can_use_mcp_database);
     }
@@ -312,6 +322,7 @@ mod tests {
         assert!(flags.can_use_cloudwatch_search);
         assert!(!flags.can_use_mcp);
         assert!(!flags.can_use_mcp_cloudwatch);
+        assert!(!flags.can_view_mcp_raw_audit_plaintext);
         assert!(!flags.can_use_mcp_ec2);
         assert!(!flags.can_use_mcp_database);
     }

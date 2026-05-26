@@ -147,6 +147,11 @@ Insights polling 必須只帶 `query_token`。EC2 MCP data tools 尚未開放。
 查詢權限；後續會由獨立的 `can_use_mcp_cloudwatch` 與 control-plane MCP
 專用 route 控制。
 
+CloudWatch data tool 的 raw filter/query audit 預設只寫入加密欄位
+（`*_raw_encrypted`）。只有同一條 entitlement rule 同時授權該 account /
+region / log group scope，且明確設定 `can_view_mcp_raw_audit_plaintext = true`
+時，durable audit 才會寫入 plaintext raw 值。
+
 MCP Database v1 若啟用，會多兩個工具：
 
 - `canopy_list_database_scopes`

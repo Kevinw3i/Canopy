@@ -78,6 +78,8 @@ impl EntitlementStore {
             features.can_reboot_ec2 |= rule.features.can_reboot_ec2;
             features.can_use_mcp |= rule.features.can_use_mcp;
             features.can_use_mcp_cloudwatch |= rule.features.can_use_mcp_cloudwatch;
+            features.can_view_mcp_raw_audit_plaintext |=
+                rule.features.can_view_mcp_raw_audit_plaintext;
             features.can_use_mcp_ec2 |= rule.features.can_use_mcp_ec2;
             features.can_use_mcp_database |= rule.features.can_use_mcp_database;
 
@@ -331,6 +333,63 @@ impl EntitlementStore {
                         .any(|a| a.account_id == account_id)
             })
             .collect()
+    }
+
+    pub fn mcp_cloudwatch_raw_audit_plaintext_allowed(
+        &self,
+        user_id: &str,
+        email: &str,
+        email_verified: bool,
+        account_id: &str,
+        region: &str,
+        log_group_names: &[String],
+    ) -> bool {
+        if log_group_names.is_empty() {
+            return false;
+        }
+
+        let user_groups: Vec<String> = self
+            .memberships
+            .iter()
+            .filter(|m| m.user_id == user_id || (email_verified && m.user_id == email))
+            .map(|m| m.group.clone())
+            .collect();
+
+        self.rules.iter().any(|rule| {
+            if !user_groups.contains(&rule.group)
+                || !rule.features.can_use_mcp
+                || !rule.features.can_use_mcp_cloudwatch
+                || !rule.features.can_view_mcp_raw_audit_plaintext
+            {
+                return false;
+            }
+            if !rule
+                .allowed_accounts
+                .iter()
+                .any(|account| account.account_id == account_id)
+            {
+                return false;
+            }
+            if !rule.allowed_regions.is_empty()
+                && !rule.allowed_regions.iter().any(|allowed| allowed == region)
+            {
+                return false;
+            }
+            if rule.allowed_log_group_arns.is_empty() {
+                return true;
+            }
+            log_group_names.iter().all(|name| {
+                let variants = {
+                    let base = format!("arn:aws:logs:{region}:{account_id}:log-group:{name}");
+                    [base.clone(), format!("{base}:*")]
+                };
+                rule.allowed_log_group_arns.iter().any(|pattern| {
+                    variants
+                        .iter()
+                        .any(|arn| crate::services::entitlements::arn_matches_pattern(pattern, arn))
+                })
+            })
+        })
     }
 
     /// Convenience: check feature + account only.
@@ -625,6 +684,7 @@ mod tests {
         assert!(ent.features.can_reboot_ec2);
         assert!(ent.features.can_use_mcp);
         assert!(ent.features.can_use_mcp_cloudwatch);
+        assert!(!ent.features.can_view_mcp_raw_audit_plaintext);
         assert!(!ent.features.can_use_mcp_ec2);
         assert!(ent.features.can_use_mcp_database);
         assert_eq!(ent.database_scopes.len(), 1);
@@ -646,6 +706,7 @@ mod tests {
         assert!(!ent.features.can_reboot_ec2);
         assert!(ent.features.can_use_mcp);
         assert!(ent.features.can_use_mcp_cloudwatch);
+        assert!(!ent.features.can_view_mcp_raw_audit_plaintext);
         assert!(!ent.features.can_use_mcp_ec2);
         assert!(!ent.features.can_use_mcp_database);
         assert_eq!(ent.allowed_accounts.len(), 1);
@@ -678,10 +739,74 @@ mod tests {
         assert!(ent.features.can_reboot_ec2);
         assert!(ent.features.can_use_mcp);
         assert!(ent.features.can_use_mcp_cloudwatch);
+        assert!(!ent.features.can_view_mcp_raw_audit_plaintext);
         assert!(ent.features.can_use_mcp_database);
         // 5 account entries: two read/connect roles, two operator roles,
         // plus the readonly staging role (distinct role ARNs are preserved).
         assert_eq!(ent.allowed_accounts.len(), 5);
+    }
+
+    #[test]
+    fn mcp_cloudwatch_raw_audit_plaintext_requires_same_scoped_rule() {
+        let mut store = test_store();
+        store.rules.push(EntitlementRule {
+            id: "rule-raw-audit-reviewer".into(),
+            group: "raw-audit-reviewers".into(),
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_cloudwatch: true,
+                can_view_mcp_raw_audit_plaintext: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111111111111".into(),
+                account_name: "production".into(),
+                role_arn: "arn:aws:iam::111111111111:role/CanopyAuditRole".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec!["arn:aws:logs:*:111111111111:log-group:/infra/*".into()],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "raw-audit-reviewers".into(),
+        });
+
+        assert!(!store.mcp_cloudwatch_raw_audit_plaintext_allowed(
+            "dev-admin",
+            "admin@example.com",
+            true,
+            "111111111111",
+            "us-east-1",
+            &["/app/web-service".into()],
+        ));
+    }
+
+    #[test]
+    fn mcp_cloudwatch_raw_audit_plaintext_allows_matching_scoped_rule() {
+        let mut store = test_store();
+        store.rules[0].features.can_view_mcp_raw_audit_plaintext = true;
+
+        assert!(store.mcp_cloudwatch_raw_audit_plaintext_allowed(
+            "dev-admin",
+            "admin@example.com",
+            true,
+            "111111111111",
+            "us-east-1",
+            &["/app/web-service".into()],
+        ));
+        assert!(!store.mcp_cloudwatch_raw_audit_plaintext_allowed(
+            "dev-admin",
+            "admin@example.com",
+            true,
+            "111111111111",
+            "us-east-1",
+            &[],
+        ));
     }
 
     // ── Boundary tests ─────────────────────────────────
