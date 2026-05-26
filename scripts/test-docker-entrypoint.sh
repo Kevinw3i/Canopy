@@ -120,4 +120,12 @@ expect_entrypoint_failure \
   OIDC_CLIENT_ID='client' \
   JWT_EXPIRY_SECONDS='3600x'
 
+expect_entrypoint_failure \
+  "aws-session-duration" \
+  "AWS_SESSION_DURATION_SECONDS must be a positive integer" \
+  JWT_SECRET='jwt' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client' \
+  AWS_SESSION_DURATION_SECONDS='0'
+
 echo "docker-entrypoint generated config tests passed."
