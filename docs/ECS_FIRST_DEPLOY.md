@@ -63,7 +63,7 @@
 - AWS CLI v2（已 `aws configure`，有足夠權限）
 - Docker
 
-以下範例使用 Region `ap-northeast-1`，AWS CLI profile `--profile your-profile`（依你的環境替換或省略）。
+以下範例使用 Region `ap-northeast-1`。AWS CLI / Terraform 會使用 default credential chain；若需要指定 profile，先 `export AWS_PROFILE=<write-profile>`。
 
 ---
 

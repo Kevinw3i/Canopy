@@ -255,10 +255,11 @@ repository ARN 與允許區域。
 GitHub Actions 只負責 build/push image，不會自動修改 ECS。image 推送完成後，再手動執行 Terraform Phase 2：
 
 ```bash
-AWS_PROFILE=your-aws-profile terraform -chdir=infra plan \
+# 若需要指定 profile，先 export AWS_PROFILE=<write-profile>；未設定時使用 default credential chain。
+terraform -chdir=infra plan \
   -var="create_service=true" \
   -var="image_tag=cp-v0.1.0" \
   -out=tfplan.phase2
 
-AWS_PROFILE=your-aws-profile terraform -chdir=infra apply tfplan.phase2
+terraform -chdir=infra apply tfplan.phase2
 ```
