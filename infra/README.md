@@ -67,6 +67,25 @@ terraform apply -var="create_service=false"
 
 ### Phase 2: Build image + 啟動 ECS service
 
+建議從 repo root 使用本機部署 helper。它會先跑
+`validate-terraform-tfvars.sh`、`validate-entitlements.sh`、Terraform Phase 2
+plan、image tag collision 檢查、Docker build/push，最後 apply 並等待 ECS
+service stable：
+
+```bash
+cd /path/to/Canopy
+
+VERSION=cp-v0.1.0
+
+# 先只產生並檢查 Terraform Phase 2 plan，不 build/push/apply。
+./scripts/deploy-control-plane-local.sh "$VERSION" --plan-only
+
+# 確認 plan 後執行完整部署；預設會在 push 和 apply 前互動確認。
+./scripts/deploy-control-plane-local.sh "$VERSION"
+```
+
+如需手動拆步執行，流程如下：
+
 ```bash
 # 取得 ECR URL
 ECR_URL=$(terraform output -raw ecr_repository_url)
