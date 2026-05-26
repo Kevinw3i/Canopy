@@ -339,6 +339,13 @@ impl Ec2Screen {
         }
     }
 
+    fn search_label(&self) -> &'static str {
+        match self.view {
+            InventoryView::Ec2 => "Search (name, id, ip)",
+            InventoryView::Ecs => "Search (cluster, family, task, container)",
+        }
+    }
+
     fn can_view_inventory(&self, view: InventoryView) -> bool {
         match self.entitlements.as_ref() {
             Some(ent) => match view {
@@ -1462,6 +1469,7 @@ impl Component for Ec2Screen {
             .split(inner);
 
         // Search bar
+        self.search_input.label = self.search_label().to_string();
         self.search_input.render(main_chunks[0], buf);
 
         // Account/Region scope header
@@ -1509,7 +1517,12 @@ impl Component for Ec2Screen {
         let filter_label = self.state_filter.label();
 
         let count_display = if self.view == InventoryView::Ecs {
-            format!("{} tasks", total_count)
+            if self.search_input.value.trim().is_empty() {
+                format!("{} tasks", total_count)
+            } else {
+                let filtered_task_count = self.filtered_tasks().len();
+                format!("{}/{} tasks", filtered_task_count, total_count)
+            }
         } else if self.state_filter == StateFilter::All {
             format!("{} instances", total_count)
         } else {
@@ -2249,6 +2262,36 @@ mod tests {
         assert!(matches!(action, Action::RefreshEcsTasks));
         let ecs_text = rendered_text(&mut screen);
         assert!(ecs_text.contains("Ctrl+E: EC2"));
+    }
+
+    #[test]
+    fn ecs_view_search_label_describes_task_fields() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("Search (cluster, family, task, container)"));
+        assert!(!text.contains("Search (name, id, ip)"));
+    }
+
+    #[test]
+    fn ecs_view_status_counts_filtered_search_results() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut worker = ecs_task(vec!["worker"]);
+        worker.cluster_name = "jobs".into();
+        worker.family = Some("worker".into());
+        worker.task_id = Some("def456".into());
+        screen.set_tasks(vec![ecs_task(vec!["app"]), worker]);
+        screen.search_input.value = "worker".into();
+        screen.apply_ecs_filter();
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1/2 tasks"));
     }
 
     #[test]
