@@ -19,9 +19,10 @@ TERRAFORM_DIR="${TERRAFORM_DIR:-infra}"
 ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-entitlements.toml}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-}"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-ECS_CLUSTER="${ECS_CLUSTER:-canopy}"
-ECS_SERVICE="${ECS_SERVICE:-control-plane}"
-TARGET_GROUP_NAME="${TARGET_GROUP_NAME:-canopy-tg}"
+ECS_CLUSTER="${ECS_CLUSTER:-}"
+ECS_SERVICE="${ECS_SERVICE:-}"
+TARGET_GROUP_NAME="${TARGET_GROUP_NAME:-}"
+TARGET_GROUP_ARN="${TARGET_GROUP_ARN:-}"
 PLAN_FILE="${PLAN_FILE:-tfplan.phase2}"
 
 IMAGE_TAG=""
@@ -44,9 +45,10 @@ Options:
   --entitlements <path>   Entitlements file in repo root. Default: ${ENTITLEMENTS_FILE}
   --platform <platform>   Docker platform. Default: auto from Terraform cpu_architecture
   --cargo-jobs <n>        Cargo parallel jobs inside Docker. Default: ${CARGO_BUILD_JOBS}
-  --cluster <name>        ECS cluster name. Default: ${ECS_CLUSTER}
-  --service <name>        ECS service name. Default: ${ECS_SERVICE}
-  --target-group <name>   ALB target group name. Default: ${TARGET_GROUP_NAME}
+  --cluster <name>        ECS cluster name. Default: Terraform ecs_cluster_name output.
+  --service <name>        ECS service name. Default: Terraform ecs_service_name output.
+  --target-group <name>   ALB target group name. Used only when no target group ARN is set.
+  --target-group-arn <arn> ALB target group ARN. Default: Terraform target_group_arn output, then <project>-tg.
   --plan-only             Stop after writing the Terraform plan. Does not build or push the image.
   --tail-logs             Tail CloudWatch logs after deploy.
   --yes                   Do not prompt before AWS-changing steps.
@@ -54,7 +56,8 @@ Options:
 
 Environment overrides:
   AWS_PROFILE, AWS_REGION, TERRAFORM_DIR, ENTITLEMENTS_FILE, DOCKER_PLATFORM,
-  CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME, PLAN_FILE
+  CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME, TARGET_GROUP_ARN,
+  PLAN_FILE
 EOF
 }
 
@@ -84,6 +87,10 @@ confirm() {
 
 run_aws() {
   AWS_PROFILE="$AWS_PROFILE_NAME" aws "$@"
+}
+
+tf_output_raw() {
+  AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" output -raw "$1" 2>/dev/null || true
 }
 
 while [ "$#" -gt 0 ]; do
@@ -126,6 +133,11 @@ while [ "$#" -gt 0 ]; do
     --target-group)
       TARGET_GROUP_NAME="${2:-}"
       [ -n "$TARGET_GROUP_NAME" ] || fail "--target-group requires a value"
+      shift 2
+      ;;
+    --target-group-arn)
+      TARGET_GROUP_ARN="${2:-}"
+      [ -n "$TARGET_GROUP_ARN" ] || fail "--target-group-arn requires a value"
       shift 2
       ;;
     --plan-only)
@@ -187,6 +199,38 @@ fi
 [ -f "$TERRAFORM_DIR/terraform.tfvars" ] || fail "Terraform tfvars not found: $TERRAFORM_DIR/terraform.tfvars"
 [ -f "apps/control-plane/Dockerfile" ] || fail "Dockerfile not found: apps/control-plane/Dockerfile"
 
+TF_PROJECT="$(
+  awk -F= '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*project[[:space:]]*=/ {
+      value = $2
+      sub(/#.*/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      print value
+      exit
+    }
+  ' "$TERRAFORM_DIR/terraform.tfvars"
+)"
+TF_PROJECT="${TF_PROJECT:-canopy}"
+
+if [ -z "$ECS_CLUSTER" ]; then
+  ECS_CLUSTER="$(tf_output_raw ecs_cluster_name)"
+  [ -n "$ECS_CLUSTER" ] || fail "Unable to resolve ECS cluster. Set --cluster or ensure terraform output ecs_cluster_name exists."
+fi
+
+if [ -z "$ECS_SERVICE" ]; then
+  ECS_SERVICE="$(tf_output_raw ecs_service_name)"
+  [ -n "$ECS_SERVICE" ] || fail "Unable to resolve ECS service. Set --service or ensure terraform output ecs_service_name exists."
+fi
+
+if [ -z "$TARGET_GROUP_ARN" ] && [ -z "$TARGET_GROUP_NAME" ]; then
+  TARGET_GROUP_ARN="$(tf_output_raw target_group_arn)"
+fi
+
+if [ -z "$TARGET_GROUP_ARN" ] && [ -z "$TARGET_GROUP_NAME" ]; then
+  TARGET_GROUP_NAME="${TF_PROJECT}-tg"
+fi
+
 TF_CPU_ARCH="$(
   awk -F= '
     /^[[:space:]]*#/ { next }
@@ -227,6 +271,11 @@ echo "Entitlements file: $ENTITLEMENTS_FILE"
 echo "Entitlements SHA:  $ENTITLEMENTS_SHA"
 echo "ECS cluster:       $ECS_CLUSTER"
 echo "ECS service:       $ECS_SERVICE"
+if [ -n "$TARGET_GROUP_ARN" ]; then
+  echo "Target group ARN:  $TARGET_GROUP_ARN"
+else
+  echo "Target group name: $TARGET_GROUP_NAME"
+fi
 echo ""
 
 echo "== Validate entitlements =="
@@ -234,7 +283,7 @@ echo "== Validate entitlements =="
 
 echo ""
 echo "== Resolve ECR repository =="
-ECR_URL="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" output -raw ecr_repository_url)"
+ECR_URL="$(tf_output_raw ecr_repository_url)"
 [ -n "$ECR_URL" ] || fail "Terraform output ecr_repository_url is empty."
 ECR_REGISTRY="${ECR_URL%%/*}"
 ECR_REPOSITORY="${ECR_URL#*/}"
@@ -347,11 +396,15 @@ run_aws ecs describe-services \
 
 echo ""
 echo "== ALB target health =="
-TG_ARN="$(run_aws elbv2 describe-target-groups \
-  --names "$TARGET_GROUP_NAME" \
-  --region "$AWS_REGION" \
-  --query 'TargetGroups[0].TargetGroupArn' \
-  --output text)"
+if [ -n "$TARGET_GROUP_ARN" ]; then
+  TG_ARN="$TARGET_GROUP_ARN"
+else
+  TG_ARN="$(run_aws elbv2 describe-target-groups \
+    --names "$TARGET_GROUP_NAME" \
+    --region "$AWS_REGION" \
+    --query 'TargetGroups[0].TargetGroupArn' \
+    --output text)"
+fi
 
 run_aws elbv2 describe-target-health \
   --target-group-arn "$TG_ARN" \
