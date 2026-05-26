@@ -43,7 +43,7 @@ Production 模式下，Canopy 不接受 username 直接登入。所有使用者�
 | 設定 | 選什麼 |
 |------|--------|
 | Password policy | 用預設值即可（或依公司政策調整） |
-| Multi-factor authentication | **No MFA**（或選 Optional，依需求） |
+| Multi-factor authentication | 依公司政策選擇；若要強制 MFA，建議在 Cognito policy 強制，Canopy 再用 OIDC claim 設定做驗證 |
 | User account recovery | 勾選 **Email** |
 
 點擊 **Next**
@@ -143,6 +143,13 @@ issuer_url = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_AbCdEfGhI"
 client_id = "1a2b3c4d5e6f7g8h9i0j"
 # client_secret 不需要（PKCE public client）
 scopes = ["openid", "profile", "email"]
+
+# 可選：要求 Hosted UI 重新驗證，並限制最近一次認證時間。
+# 啟用 required_* 前，先確認 Cognito 實際 id_token 會回傳相符 acr/amr claim。
+# prompt = "login"
+# max_age_seconds = 300
+# required_acr_values = ["<your-cognito-acr>"]
+# required_amr_values = ["<your-cognito-amr>"]
 
 # Cognito 的 authorization endpoint 需要手動指定（它的 .well-known 回傳的是 hosted UI domain）
 authorization_endpoint = "https://canopy-yourcompany.auth.us-east-1.amazoncognito.com/oauth2/authorize"

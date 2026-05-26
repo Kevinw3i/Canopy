@@ -55,6 +55,18 @@ pub struct OidcConfig {
     pub client_secret: Option<String>,
     #[serde(default = "default_scopes")]
     pub scopes: Vec<String>,
+    /// Optional OIDC auth request controls for provider-enforced MFA.
+    #[serde(default)]
+    pub acr_values: Vec<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub max_age_seconds: Option<u64>,
+    /// Optional id_token claim requirements for app-side MFA enforcement.
+    #[serde(default)]
+    pub required_acr_values: Vec<String>,
+    #[serde(default)]
+    pub required_amr_values: Vec<String>,
 
     // Optional endpoint overrides — if omitted, discovered from issuer_url
     #[serde(default)]
@@ -132,6 +144,11 @@ impl AppConfig {
                 client_id: "dev-client-id".into(),
                 client_secret: None,
                 scopes: default_scopes(),
+                acr_values: vec![],
+                prompt: None,
+                max_age_seconds: None,
+                required_acr_values: vec![],
+                required_amr_values: vec![],
                 authorization_endpoint: None,
                 token_endpoint: None,
                 device_authorization_endpoint: None,
@@ -204,6 +221,11 @@ mod tests {
             client_id = "cid"
             client_secret = "csecret"
             scopes = ["openid"]
+            acr_values = ["urn:mfa"]
+            prompt = "login"
+            max_age_seconds = 300
+            required_acr_values = ["urn:mfa"]
+            required_amr_values = ["mfa"]
 
             [jwt]
             secret = "s3cret"
@@ -225,6 +247,11 @@ mod tests {
         );
         assert_eq!(config.jwt.expiry_seconds, 7200);
         assert_eq!(config.oidc.client_secret.as_deref(), Some("csecret"));
+        assert_eq!(config.oidc.acr_values, vec!["urn:mfa"]);
+        assert_eq!(config.oidc.prompt.as_deref(), Some("login"));
+        assert_eq!(config.oidc.max_age_seconds, Some(300));
+        assert_eq!(config.oidc.required_acr_values, vec!["urn:mfa"]);
+        assert_eq!(config.oidc.required_amr_values, vec!["mfa"]);
         assert_eq!(config.aws.default_region.as_deref(), Some("eu-west-1"));
         assert_eq!(config.aws.sts_external_id.as_deref(), Some("custom-id"));
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);

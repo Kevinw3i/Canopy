@@ -145,6 +145,7 @@ TUI                     Control Plane              OIDC Provider
 - **短期憑證**：透過 STS AssumeRole 取得暫時性憑證，附帶 Session Tags 供稽核
 - **連線範圍限縮**：連線操作使用 inline session policy 將主要動作限縮到目標執行個體或 ECS task；ECS Exec 只額外授予同區域必要的 task 描述與 `ssmmessages` channel 動作
 - **ECS scope 不跨規則拼接**：ECS task list / exec 的 account、role、region、cluster、task tag、container denylist 必須來自同一授權規則
+- **MFA 支援交由 OIDC Provider**：可透過 `acr_values`、`prompt`、`max_age_seconds` 要求 Provider 進行 MFA / re-auth，並可用 `required_acr_values`、`required_amr_values` 對 id_token claim 做 fail-closed 驗證
 - **稽核失敗則拒絕 (fail-closed)**：當稽核日誌寫入失敗時，後端拒絕處理請求
 - **開發模式防護**：禁止在非 loopback 位址啟用 dev_mode（除非明確覆寫）
 
@@ -601,12 +602,14 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - EC2 Instance Connect 支援判斷為近似值
 - AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
 - 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
+- MFA 目前為 OIDC Provider-driven；本機 TOTP/WebAuthn 註冊、復原碼與 step-up UI 尚未實作
 
 ### 未來規劃
 
 - [x] AWS Organizations 帳號自動發現
 - [x] SSM DescribeInstanceInformation 精確判斷受管理狀態
-- [ ] Multi-factor Authentication 支援
+- [x] OIDC Provider-driven Multi-factor Authentication 支援
+- [ ] 本機 TOTP/WebAuthn 註冊與 step-up UI
 - [ ] 自訂快捷鍵設定
 - [ ] 主題與配色自訂
 - [ ] 匯出稽核日誌至 CloudWatch Logs / S3

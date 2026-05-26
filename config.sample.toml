@@ -45,6 +45,17 @@ client_id = "your-client-id"                 # 從 OIDC Provider 取得
 # client_secret = "<oidc-client-secret>"     # 公開 PKCE 客戶端可省略
 scopes = ["openid", "profile", "email"]
 
+# 可選：要求 OIDC Provider 執行 MFA / re-auth。
+# 實際 MFA 方式由 Provider（Okta、Azure AD、Cognito 等）與其 policy 決定。
+# acr_values = ["urn:mfa"]
+# prompt = "login"
+# max_age_seconds = 300
+
+# 可選：登入後對 id_token claim 做 fail-closed 驗證。
+# 啟用前先確認 Provider 真的會回傳相符的 acr/amr/auth_time claim。
+# required_acr_values = ["urn:mfa"]
+# required_amr_values = ["mfa"]
+
 # 可選：手動指定端點（省略時自動從 issuer_url/.well-known 探索）
 # authorization_endpoint = "https://..."
 # token_endpoint = "https://..."

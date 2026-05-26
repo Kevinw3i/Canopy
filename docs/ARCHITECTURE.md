@@ -411,6 +411,11 @@ No shared state -- survives restarts and multi-replica routing.
 | `cors_allowed_origins` | `[]` | CORS origins (permissive in dev) |
 | `oidc.issuer_url` | -- | OIDC provider URL |
 | `oidc.client_id` | -- | OIDC client ID |
+| `oidc.acr_values` | `[]` | Optional auth context values sent to the OIDC provider |
+| `oidc.prompt` | -- | Optional OIDC prompt parameter, e.g. `login` |
+| `oidc.max_age_seconds` | -- | Optional OIDC `max_age`; also validates `auth_time` |
+| `oidc.required_acr_values` | `[]` | Optional accepted `acr` claim values for fail-closed MFA enforcement |
+| `oidc.required_amr_values` | `[]` | Optional required `amr` claim values for fail-closed MFA enforcement |
 | `oidc.jwks_uri` | auto | JWKS endpoint |
 | `jwt.secret` | -- | HMAC secret (JWTs + query tokens) |
 | `aws.session_duration_seconds` | `3600` | STS AssumeRole duration |
