@@ -4,6 +4,11 @@ variable "aws_region" {
   description = "AWS region for all resources"
   type        = string
   default     = "ap-northeast-1"
+
+  validation {
+    condition     = can(regex("^[a-z]{2,5}(-[a-z0-9]+)+-[0-9]+$", var.aws_region))
+    error_message = "aws_region must be a valid AWS region identifier such as ap-northeast-1."
+  }
 }
 
 variable "project" {
@@ -97,18 +102,39 @@ variable "vpc_id" {
   description = "VPC ID where resources are deployed"
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.vpc_id == "" || can(regex("^vpc-[0-9a-f]{8}([0-9a-f]{9})?$", var.vpc_id))
+    error_message = "vpc_id must be empty or a valid VPC ID."
+  }
 }
 
 variable "public_subnet_ids" {
   description = "Public subnets for the ALB (at least 2 AZs)"
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for id in var.public_subnet_ids :
+      can(regex("^subnet-[0-9a-f]{8}([0-9a-f]{9})?$", id))
+    ])
+    error_message = "public_subnet_ids must contain only valid subnet IDs."
+  }
 }
 
 variable "private_subnet_ids" {
   description = "Private subnets for ECS tasks (at least 2 AZs)"
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for id in var.private_subnet_ids :
+      can(regex("^subnet-[0-9a-f]{8}([0-9a-f]{9})?$", id))
+    ])
+    error_message = "private_subnet_ids must contain only valid subnet IDs."
+  }
 }
 
 # ── ECS ─────────────────────────────────────────────────

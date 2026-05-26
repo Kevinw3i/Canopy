@@ -5,9 +5,9 @@ aws_region         = "ap-northeast-1"
 # Networking:
 # Option A: use existing VPC/subnets.
 create_vpc         = false
-vpc_id             = "vpc-xxxxxxxxxxxxxxxxx"
-public_subnet_ids  = ["subnet-aaa", "subnet-bbb"]
-private_subnet_ids = ["subnet-ccc", "subnet-ddd"]
+vpc_id             = "vpc-00000000000000000"
+public_subnet_ids  = ["subnet-00000000000000001", "subnet-00000000000000002"]
+private_subnet_ids = ["subnet-00000000000000003", "subnet-00000000000000004"]
 
 # Option B: create a dedicated VPC. Set create_vpc = true and tune CIDRs.
 # create_vpc           = true
