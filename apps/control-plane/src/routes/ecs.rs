@@ -204,6 +204,27 @@ fn cluster_ref_authorized(
         .any(|pattern| crate::services::ecs::cluster_matches_pattern(pattern, cluster_ref))
 }
 
+fn concrete_cluster_pattern_regions(
+    rule_scopes: &[crate::services::ecs::EcsRuleScope],
+    account_id: &str,
+) -> Vec<String> {
+    let mut regions = std::collections::BTreeSet::new();
+    for scope in rule_scopes {
+        if !scope.account_ids.iter().any(|id| id == account_id) {
+            continue;
+        }
+        for pattern in &scope.cluster_patterns {
+            let Some((region, account)) = ecs_arn_region_account(pattern) else {
+                continue;
+            };
+            if region != "*" && (account == account_id || account == "*") {
+                regions.insert(region.to_string());
+            }
+        }
+    }
+    regions.into_iter().collect()
+}
+
 fn cluster_request_matches_any_rule_scope(
     req: &EcsTasksRequest,
     rule_scopes: &[crate::services::ecs::EcsRuleScope],
@@ -371,6 +392,7 @@ fn effective_task_fetch_regions(
     req: &EcsTasksRequest,
     rule_regions: &[String],
     entitlement_regions: &[String],
+    cluster_pattern_regions: &[String],
     default_region: String,
 ) -> Vec<String> {
     if let Some(region) = req.region.as_ref() {
@@ -379,6 +401,8 @@ fn effective_task_fetch_regions(
         rule_regions.to_vec()
     } else if !entitlement_regions.is_empty() {
         entitlement_regions.to_vec()
+    } else if !cluster_pattern_regions.is_empty() {
+        cluster_pattern_regions.to_vec()
     } else {
         vec![default_region]
     }
@@ -407,10 +431,13 @@ async fn fetch_tasks_from_aws(
             .default_region
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string());
+        let cluster_pattern_regions =
+            concrete_cluster_pattern_regions(rule_scopes, &account.account_id);
         let effective_regions = effective_task_fetch_regions(
             req,
             rule_regions,
             &entitlements.allowed_regions,
+            &cluster_pattern_regions,
             default_region,
         );
 
@@ -1410,6 +1437,23 @@ mod tests {
     }
 
     #[test]
+    fn concrete_cluster_pattern_regions_extracts_authorized_arn_regions() {
+        let mut scope = route_scope();
+        scope.regions = vec![];
+        scope.cluster_patterns = vec![
+            cluster_arn("ap-northeast-1", "111111111111", "api"),
+            cluster_arn("us-west-2", "111111111111", "worker-*"),
+            cluster_arn("*", "111111111111", "fallback"),
+            cluster_arn("eu-west-1", "222222222222", "other-account"),
+        ];
+
+        assert_eq!(
+            concrete_cluster_pattern_regions(&[scope], "111111111111"),
+            vec!["ap-northeast-1", "us-west-2"]
+        );
+    }
+
+    #[test]
     fn effective_regions_use_requested_region_for_all_region_scope() {
         let req = EcsTasksRequest {
             account_id: Some("111111111111".into()),
@@ -1419,8 +1463,24 @@ mod tests {
         };
 
         assert_eq!(
-            effective_task_fetch_regions(&req, &[], &[], "us-east-1".into()),
+            effective_task_fetch_regions(&req, &[], &[], &[], "us-east-1".into()),
             vec!["ap-northeast-1"]
+        );
+    }
+
+    #[test]
+    fn effective_regions_use_concrete_cluster_regions_before_default_region() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: None,
+            cluster: None,
+            page_size: 50,
+        };
+        let cluster_regions = vec!["ap-northeast-1".into(), "us-west-2".into()];
+
+        assert_eq!(
+            effective_task_fetch_regions(&req, &[], &[], &cluster_regions, "us-east-1".into()),
+            cluster_regions
         );
     }
 
