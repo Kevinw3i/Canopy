@@ -285,6 +285,23 @@ async fn mock_oidc_token(
     Form(form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
     match form.get("grant_type").map(String::as_str) {
+        Some("authorization_code")
+            if form.get("code").map(String::as_str) == Some("valid-code")
+                && form.get("code_verifier").map(String::as_str)
+                    == Some("valid-verifier-abcdefghijklmnopqrstuvwxyz0123456789")
+                && form.get("redirect_uri").map(String::as_str)
+                    == Some("http://localhost:9876/callback")
+                && form.get("client_id").map(String::as_str) == Some("test-client") =>
+        {
+            return axum::Json(json!({
+                "access_token": "oidc-code-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": state.id_token,
+                "refresh_token": "auth-code-refresh"
+            }))
+            .into_response();
+        }
         Some("refresh_token")
             if form.get("refresh_token").map(String::as_str) == Some("valid-refresh") =>
         {
@@ -1546,6 +1563,102 @@ async fn pkce_exchange_dev_mode_returns_token() {
     assert!(json["access_token"].is_string());
     assert_eq!(json["token_type"], "Bearer");
     assert!(json["expires_in"].as_u64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn pkce_exchange_prod_mode_uses_mock_oidc_and_audits_without_secrets() {
+    let issuer = start_mock_oidc().await;
+    let config = prod_config_with_mock_oidc(&issuer);
+    let audit = AuditFile::new("pkce-success");
+    let state = build_state_with_audit_file(config.clone(), &audit.path);
+    let app = build_app(state);
+    let redirect_uri = "http://localhost:9876/callback";
+    let code_verifier = "valid-verifier-abcdefghijklmnopqrstuvwxyz0123456789";
+
+    let start_body = json!({
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri
+    });
+    let start_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/auth/pkce/start")
+                .header("Content-Type", "application/json")
+                .body(Body::from(start_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(start_resp.status(), StatusCode::OK);
+    let start_json = body_json(start_resp.into_body()).await;
+    let authorize_url = start_json["authorize_url"].as_str().unwrap();
+    let pkce_state = start_json["state"].as_str().unwrap();
+    let auth = AuthService::new(config.clone());
+    assert!(auth.verify_pkce_state(pkce_state));
+
+    let authorize_url = reqwest::Url::parse(authorize_url).unwrap();
+    assert_eq!(authorize_url.origin().ascii_serialization(), issuer);
+    assert_eq!(authorize_url.path(), "/authorize");
+    let authorize_params: HashMap<_, _> = authorize_url.query_pairs().into_owned().collect();
+    let expected_challenge = {
+        use base64::Engine;
+        use sha2::Digest;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(code_verifier.as_bytes()))
+    };
+    assert_eq!(authorize_params.get("client_id").unwrap(), "test-client");
+    assert_eq!(authorize_params.get("redirect_uri").unwrap(), redirect_uri);
+    assert_eq!(authorize_params.get("state").unwrap(), pkce_state);
+    assert_eq!(
+        authorize_params.get("code_challenge").unwrap(),
+        &expected_challenge
+    );
+    assert_eq!(
+        authorize_params.get("code_challenge_method").unwrap(),
+        "S256"
+    );
+
+    let exchange_body = json!({
+        "code": "valid-code",
+        "code_verifier": code_verifier,
+        "state": pkce_state,
+        "redirect_uri": redirect_uri
+    });
+    let exchange_resp = app
+        .oneshot(
+            Request::post("/auth/pkce/exchange")
+                .header("Content-Type", "application/json")
+                .body(Body::from(exchange_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(exchange_resp.status(), StatusCode::OK);
+    let json = body_json(exchange_resp.into_body()).await;
+    assert!(json["access_token"].is_string());
+    assert_eq!(json["token_type"], "Bearer");
+    assert_eq!(json["refresh_token"], "auth-code-refresh");
+
+    let auth = AuthService::new(config);
+    let claims = auth
+        .validate_token(json["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.sub, "dev-admin");
+    assert_eq!(claims.email, "dev-admin@dev.local");
+    assert_eq!(claims.groups, vec!["platform-engineering"]);
+
+    let audit_contents = std::fs::read_to_string(&audit.path).unwrap();
+    assert!(audit_contents.contains(r#""actor":"dev-admin""#));
+    assert!(audit_contents.contains(r#""action":"login""#));
+    assert!(audit_contents.contains(r#""error_message":"pkce""#));
+    assert!(
+        !audit_contents.contains("valid-code")
+            && !audit_contents.contains(code_verifier)
+            && !audit_contents.contains("auth-code-refresh"),
+        "PKCE secrets must not be written to audit log: {audit_contents}"
+    );
 }
 
 #[tokio::test]

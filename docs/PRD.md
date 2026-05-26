@@ -499,7 +499,7 @@ group = "platform-engineering"
 
 ### 10.2 待補強的測試
 
-- OIDC 流程測試（mock HTTP server）
+- 更多 OIDC 流程測試（目前已涵蓋 device-code、refresh 與 PKCE authorization-code mock HTTP server）
 - 更多 WebSocket Live Tail 連線測試（目前已涵蓋 dev/mock session start、mock event 與 invalid token error）
 - 更多 TUI 元件渲染快照測試（目前已涵蓋 ECS inventory table 與 ECS Exec container picker）
 - 端到端測試（mock AWS 回應）
