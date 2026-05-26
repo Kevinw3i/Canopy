@@ -156,7 +156,7 @@ echo "JWT_ARN = $JWT_ARN"
 
 JWT_VER=$(aws secretsmanager list-secret-version-ids \
   --secret-id canopy/jwt-secret \
-  --query 'Versions[?VersionStages[0]==`AWSCURRENT`].VersionId | [0]' \
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
   --output text)
 echo "JWT_VER = $JWT_VER"
 ```

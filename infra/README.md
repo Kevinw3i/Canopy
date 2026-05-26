@@ -52,7 +52,7 @@ aws secretsmanager create-secret \
 # 取得 secret ARN 和 version ID，填入 terraform.tfvars
 JWT_ARN=$(aws secretsmanager describe-secret --secret-id canopy/jwt-secret --query ARN --output text)
 JWT_VER=$(aws secretsmanager list-secret-version-ids --secret-id canopy/jwt-secret \
-  --query 'Versions[?VersionStages[0]==`AWSCURRENT`].VersionId | [0]' --output text)
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' --output text)
 
 # 編輯 terraform.tfvars：
 #   jwt_secret_arn        = "<上面的 ARN>"
