@@ -17,7 +17,7 @@ AWS_PROFILE_NAME="${AWS_PROFILE:-your-aws-profile}"
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
 TERRAFORM_DIR="${TERRAFORM_DIR:-infra}"
 ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-entitlements.toml}"
-DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-}"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 ECS_CLUSTER="${ECS_CLUSTER:-canopy}"
 ECS_SERVICE="${ECS_SERVICE:-control-plane}"
@@ -42,7 +42,7 @@ Options:
   --profile <name>        AWS CLI profile. Default: ${AWS_PROFILE_NAME}
   --region <region>       AWS region. Default: ${AWS_REGION}
   --entitlements <path>   Entitlements file in repo root. Default: ${ENTITLEMENTS_FILE}
-  --platform <platform>   Docker platform. Default: ${DOCKER_PLATFORM}
+  --platform <platform>   Docker platform. Default: auto from Terraform cpu_architecture
   --cargo-jobs <n>        Cargo parallel jobs inside Docker. Default: ${CARGO_BUILD_JOBS}
   --cluster <name>        ECS cluster name. Default: ${ECS_CLUSTER}
   --service <name>        ECS service name. Default: ${ECS_SERVICE}
@@ -177,13 +177,41 @@ esac
 cd "$REPO_ROOT"
 
 need_cmd aws
-need_cmd docker
 need_cmd terraform
 need_cmd shasum
+if [ "$PLAN_ONLY" -eq 0 ]; then
+  need_cmd docker
+fi
 
 [ -f "$ENTITLEMENTS_FILE" ] || fail "Entitlements file not found: $ENTITLEMENTS_FILE"
 [ -f "$TERRAFORM_DIR/terraform.tfvars" ] || fail "Terraform tfvars not found: $TERRAFORM_DIR/terraform.tfvars"
 [ -f "apps/control-plane/Dockerfile" ] || fail "Dockerfile not found: apps/control-plane/Dockerfile"
+
+TF_CPU_ARCH="$(
+  awk -F= '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*cpu_architecture[[:space:]]*=/ {
+      value = $2
+      sub(/#.*/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      print value
+      exit
+    }
+  ' "$TERRAFORM_DIR/terraform.tfvars"
+)"
+TF_CPU_ARCH="${TF_CPU_ARCH:-X86_64}"
+
+case "$TF_CPU_ARCH" in
+  X86_64) EXPECTED_DOCKER_PLATFORM="linux/amd64" ;;
+  ARM64) EXPECTED_DOCKER_PLATFORM="linux/arm64" ;;
+  *) fail "Unsupported cpu_architecture in $TERRAFORM_DIR/terraform.tfvars: $TF_CPU_ARCH" ;;
+esac
+
+if [ -z "$DOCKER_PLATFORM" ]; then
+  DOCKER_PLATFORM="$EXPECTED_DOCKER_PLATFORM"
+elif [ "$DOCKER_PLATFORM" != "$EXPECTED_DOCKER_PLATFORM" ]; then
+  fail "--platform $DOCKER_PLATFORM does not match Terraform cpu_architecture=$TF_CPU_ARCH (expected $EXPECTED_DOCKER_PLATFORM)"
+fi
 
 ENTITLEMENTS_SHA="$(shasum -a 256 "$ENTITLEMENTS_FILE" | awk '{print $1}')"
 
@@ -193,6 +221,7 @@ echo "AWS region:        $AWS_REGION"
 echo "Terraform dir:     $TERRAFORM_DIR"
 echo "Image tag:         $IMAGE_TAG"
 echo "Docker platform:   $DOCKER_PLATFORM"
+echo "Terraform arch:    $TF_CPU_ARCH"
 echo "Cargo build jobs:  $CARGO_BUILD_JOBS"
 echo "Entitlements file: $ENTITLEMENTS_FILE"
 echo "Entitlements SHA:  $ENTITLEMENTS_SHA"

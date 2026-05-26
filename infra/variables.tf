@@ -102,6 +102,11 @@ variable "cpu_architecture" {
   description = "Fargate CPU architecture (X86_64 or ARM64). Must match the Docker image."
   type        = string
   default     = "X86_64"
+
+  validation {
+    condition     = contains(["X86_64", "ARM64"], var.cpu_architecture)
+    error_message = "cpu_architecture must be either X86_64 or ARM64."
+  }
 }
 
 variable "image_tag" {
