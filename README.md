@@ -417,7 +417,12 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
 }
 ```
 
-**Permission policy** (what the role can do):
+The control-plane's own AWS identity also needs `sts:AssumeRole`, `sts:TagSession`,
+and `iam:SimulatePrincipalPolicy` on these target role ARNs so it can choose a
+role and then mint scoped STS credentials for connect flows.
+
+**Permission policy** (what the target role can do before Canopy applies its
+per-request inline session policy):
 ```json
 {
   "Version": "2012-10-17",
@@ -434,7 +439,16 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
         "ssm:StartSession",
         "ssm:DescribeInstanceInformation",
         "ec2-instance-connect:SendSSHPublicKey",
-        "ec2-instance-connect:OpenTunnel"
+        "ec2-instance-connect:OpenTunnel",
+        "ecs:DescribeClusters",
+        "ecs:DescribeTasks",
+        "ecs:ListClusters",
+        "ecs:ListTasks",
+        "ecs:ExecuteCommand",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
       ],
       "Resource": "*"
     }
