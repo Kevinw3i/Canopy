@@ -325,6 +325,24 @@ expect_failure \
   "$TMP_DIR/gov.tfvars" \
   "allowed_clusters is empty"
 
+cat > "$TMP_DIR/single-quoted-cluster-entitlements.toml" <<EOF
+[[rules]]
+id = "single-quoted-cluster"
+allowed_clusters = ['prod']
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_success \
+  "single-quoted-cluster" \
+  "$TMP_DIR/single-quoted-cluster-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars"
+
 cat > "$TMP_DIR/broad-cluster-without-opt-in-entitlements.toml" <<EOF
 [[rules]]
 id = "ecs-broad-cluster"
@@ -341,6 +359,25 @@ EOF
 expect_failure \
   "broad-cluster-without-opt-in" \
   "$TMP_DIR/broad-cluster-without-opt-in-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "allow_broad_cluster_discovery=true"
+
+cat > "$TMP_DIR/single-quoted-broad-cluster-entitlements.toml" <<EOF
+[[rules]]
+id = "single-quoted-broad-cluster"
+allowed_clusters = ['cluster/*']
+
+[rules.features]
+can_view_ecs = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "single-quoted-broad-cluster" \
+  "$TMP_DIR/single-quoted-broad-cluster-entitlements.toml" \
   "$TMP_DIR/gov.tfvars" \
   "allow_broad_cluster_discovery=true"
 
@@ -420,5 +457,23 @@ expect_failure \
   "$TMP_DIR/ssm-without-os-users-entitlements.toml" \
   "$TMP_DIR/gov.tfvars" \
   "can_use_ssm=true but no allowed_os_users"
+
+cat > "$TMP_DIR/single-quoted-os-users-entitlements.toml" <<EOF
+[[rules]]
+id = "single-quoted-os-users"
+allowed_os_users = ['ec2-user']
+
+[rules.features]
+can_use_ssm = true
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_success \
+  "single-quoted-os-users" \
+  "$TMP_DIR/single-quoted-os-users-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars"
 
 echo "validate-entitlements tests passed."

@@ -181,13 +181,13 @@ function validate_cluster(pattern, name, first_star, literal_prefix_len) {
   }
 }
 function scan_cluster_entries(line, entry) {
-  while (line ~ /"[^"]+"/) {
-    entry = line
-    sub(/^[^"]*"/, "", entry)
-    sub(/".*$/, "", entry)
+  while (match(line, /["\047][^"\047]+["\047]/)) {
+    entry = substr(line, RSTART, RLENGTH)
+    sub(/^["\047]/, "", entry)
+    sub(/["\047]$/, "", entry)
     has_clusters = 1
     validate_cluster(entry)
-    sub(/"[^"]+"/, "", line)
+    line = substr(line, RSTART + RLENGTH)
   }
 }
 function flush_rule() {
@@ -309,7 +309,7 @@ in_rule && /^[[:space:]]*can_use_ssm[[:space:]]*=[[:space:]]*true/ {
 in_rule && /^[[:space:]]*allowed_os_users[[:space:]]*=/ {
   in_os_users = 1
 }
-in_rule && in_os_users && /"[^"]+"/ {
+in_rule && in_os_users && /["\047][^"\047]+["\047]/ {
   has_os_users = 1
 }
 in_rule && in_os_users && /\]/ {
