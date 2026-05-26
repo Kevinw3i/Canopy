@@ -279,11 +279,21 @@ variable "secrets_kms_key_arns" {
 variable "oidc_issuer_url" {
   description = "OIDC provider issuer URL"
   type        = string
+
+  validation {
+    condition     = can(regex("^https://[^[:space:]?#]+$", var.oidc_issuer_url))
+    error_message = "oidc_issuer_url must be an HTTPS issuer URL without whitespace, query, or fragment."
+  }
 }
 
 variable "oidc_client_id" {
   description = "OIDC client ID"
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.oidc_client_id)) > 0 && length(regexall("[[:space:]]", var.oidc_client_id)) == 0
+    error_message = "oidc_client_id must be non-empty and contain no whitespace."
+  }
 }
 
 variable "oidc_client_secret_arn" {
@@ -351,6 +361,14 @@ variable "cors_allowed_origins" {
   description = "CORS allowed origins list"
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for origin in var.cors_allowed_origins :
+      can(regex("^https?://([A-Za-z0-9.-]+|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?$", origin))
+    ])
+    error_message = "cors_allowed_origins must contain origins only, such as https://canopy.example.com or http://localhost:9876."
+  }
 }
 
 variable "log_retention_days" {

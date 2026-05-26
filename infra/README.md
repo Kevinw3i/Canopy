@@ -176,8 +176,8 @@ encrypt        = true
 | `private_subnet_ids` | Yes | `create_vpc = false` 時必須至少 2 個 private subnets；ECS task 所在 subnets |
 | `acm_certificate_arn` | Yes | HTTPS 憑證 ACM certificate ARN |
 | `jwt_secret_arn` | Yes | Secrets Manager secret ARN（JWT 簽署密鑰，須在 Terraform 外建立） |
-| `oidc_issuer_url` | Yes | OIDC provider URL |
-| `oidc_client_id` | Yes | OIDC client ID |
+| `oidc_issuer_url` | Yes | OIDC provider HTTPS issuer URL（不可含 query、fragment 或 whitespace） |
+| `oidc_client_id` | Yes | OIDC client ID（不可為空或含 whitespace） |
 | `project` | No | 預設 `canopy`；1-28 字元，僅 lowercase letters、numbers、hyphens，且不可頭尾 hyphen |
 | `image_tag` | Phase 2 | 版本 tag 或 git SHA（不可使用 `latest`）；`create_service = false` 的 Phase 1 可留空 |
 | `alb_allowed_cidrs` | Yes | ALB 入站允許的 IPv4 CIDR 清單 |
@@ -192,7 +192,7 @@ encrypt        = true
 | `assumable_role_arns` | No | 跨帳號 AssumeRole 的目標 IAM role ARN 清單；不允許 wildcard |
 | `enable_direct_access` | No | 預設 `false`；設為 `true` 時允許 `role_arn = "direct"` 查看部署帳號的 EC2、ECS task inventory、CloudWatch Logs |
 | `log_retention_days` | No | 預設 90 天；必須是 CloudWatch Logs 支援的 retention 天數 |
-| `cors_allowed_origins` | No | CORS 允許的來源 |
+| `cors_allowed_origins` | No | CORS 允許的 origins；只接受 scheme + host + optional port |
 
 ## 監控
 
