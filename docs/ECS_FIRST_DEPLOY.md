@@ -254,6 +254,24 @@ ALB/DNS/subnet/service preconditions。第二個檢查會同時驗證
 
 ## Step 6：Build & Push Docker Image
 
+建議從 repo root 使用本機部署 helper 執行 Step 6-8。它會先驗證
+Terraform Phase 2 inputs 與 entitlements，再產生 plan、檢查 image tag
+是否已存在、build/push image、apply Terraform，最後等待 ECS service stable：
+
+```bash
+cd /path/to/Canopy
+
+VERSION=cp-v0.1.0
+
+# 先只產生並檢查 Terraform Phase 2 plan，不 build/push/apply。
+./scripts/deploy-control-plane-local.sh "$VERSION" --plan-only
+
+# 確認 plan 後執行完整部署；預設會在 push 和 apply 前互動確認。
+./scripts/deploy-control-plane-local.sh "$VERSION"
+```
+
+如果需要拆開手動執行，保留下列 Step 6-8 流程。
+
 ```bash
 cd /path/to/Canopy
 
