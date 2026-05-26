@@ -286,10 +286,10 @@ TUI                     Control Plane              OIDC Provider
 - 依嚴重等級上色：ERROR=紅、WARN=黃、INFO=綠、DEBUG=藍
 - 顯示連線狀態、每秒事件數、緩衝事件數
 - 透過 WebSocket 連線至 Control Plane
-- 斷線時以指數退避重新連線
+- 斷線時停止串流並顯示錯誤（自動重連仍待補）
 - 清除緩衝區（`c`）
 
-**目前狀態**：Beta 功能，受 `enable_live_tail` feature flag 控制。生產模式下 WebSocket 端點回傳 404，開發模式使用模擬事件。
+**目前狀態**：Beta 功能，受 `enable_live_tail` feature flag 控制。TUI 已可在開發模式連到 Control Plane WebSocket 並串流 mock 事件；生產模式下 WebSocket 端點仍回傳 404。
 
 ### 5.6 存取/身分畫面 (Access)
 
@@ -500,7 +500,7 @@ group = "platform-engineering"
 ### 10.2 待補強的測試
 
 - 更多 OIDC 流程測試（目前已涵蓋 device-code、refresh 與 PKCE authorization-code mock HTTP server）
-- 更多 WebSocket Live Tail 連線測試（目前已涵蓋 dev/mock session start、mock event 與 invalid token error）
+- 更多 WebSocket Live Tail 連線測試（目前已涵蓋 dev/mock session start、mock event、invalid token error 與 TUI WebSocket event action E2E）
 - 更多 TUI 元件渲染快照測試（目前已涵蓋 ECS inventory table 與 ECS Exec container picker）
 - 更多端到端測試（目前已涵蓋 TUI ApiClient → control-plane → mock AWS 的 auth、entitlements、EC2、ECS、CloudWatch log groups/filter events）
 
@@ -556,7 +556,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 
 ### 目前限制
 
-- Live Tail 為 beta 功能，WebSocket 客戶端尚未完整實作
+- Live Tail 為 beta 功能，TUI WebSocket 客戶端目前支援 dev/mock 串流；production real-AWS streaming、自動重連與 log group picker 尚未完整
 - ECS 目前支援 task inventory 與 ECS Exec，不支援 ECS service/deployment 管理
 - ECS broad cluster discovery 需要明確 opt-in，且 response 仍受服務端上限保護
 - OIDC 刷新 Token 流程未完整
@@ -567,7 +567,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 
 ### 未來規劃
 
-- [ ] 完整的 WebSocket Live Tail 實作
+- [ ] Production CloudWatch Live Tail streaming、自動重連與 log group picker
 - [ ] 資料庫後端的權限管理
 - [ ] AWS Organizations 帳號自動發現
 - [ ] SSM DescribeInstanceInformation 精確判斷受管理狀態

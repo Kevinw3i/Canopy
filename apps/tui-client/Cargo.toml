@@ -24,7 +24,9 @@ base64.workspace = true
 portable-pty = "0.9"
 vt100 = "0.16"
 
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-util = "0.7"
+tokio-tungstenite = "0.24"
 toml = "0.8"
 dirs = "5"
 open = "5"

@@ -9,12 +9,13 @@ use control_plane::routes;
 use control_plane::services::audit::AuditService;
 use control_plane::services::oidc::OidcClient;
 use control_plane::services::AppState;
-use shared::dto::cloudwatch::{FilterLogEventsRequest, LogGroupsRequest};
+use shared::dto::cloudwatch::{FilterLogEventsRequest, LogGroupsRequest, StartLiveTailRequest};
 use shared::dto::ec2::Ec2ListRequest;
 use shared::dto::ecs::{EcsTasksRequest, DEV_MOCK_CLUSTER_NAME};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tui_client::api_client::ApiClient;
+use tui_client::event::Action;
 
 fn dev_config() -> AppConfig {
     AppConfig {
@@ -175,4 +176,54 @@ async fn tui_api_client_exercises_control_plane_mock_aws_e2e() {
         event.log_stream_name.as_deref() == Some("web-prod-01/application")
             && event.message.contains("Request received")
     }));
+}
+
+#[tokio::test]
+async fn live_tail_ws_streams_mock_control_plane_events_to_tui_actions() {
+    let base_url = start_control_plane_mock_aws().await;
+    let client = ApiClient::new(&base_url).unwrap();
+    let login = client.dev_login("dev-admin").await.unwrap();
+    let request = StartLiveTailRequest {
+        account_id: "111111111111".into(),
+        region: "us-east-1".into(),
+        log_group_arns: vec![
+            "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service".into(),
+        ],
+        filter_pattern: None,
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stream_cancel = cancel.clone();
+    let token = login.access_token.clone();
+
+    let handle = tokio::spawn(async move {
+        tui_client::live_tail_ws::stream_live_tail(
+            &base_url,
+            Some(&token),
+            request,
+            tx,
+            stream_cancel,
+        )
+        .await
+    });
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(Action::LiveTailEvent(event)) => break event,
+                Some(Action::ShowError(message)) => panic!("live tail error: {message}"),
+                Some(_) => {}
+                None => panic!("live tail action channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for live tail event");
+
+    assert_eq!(event.log_group_name, "/app/web-service");
+    assert_eq!(event.log_stream_name, "web-prod-01/application");
+    assert!(event.message.contains("Simulated log event #1"));
+
+    cancel.cancel();
+    handle.await.unwrap().unwrap();
 }

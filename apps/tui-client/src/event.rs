@@ -136,6 +136,9 @@ pub enum Action {
     PauseLiveTail,
     ResumeLiveTail,
     LiveTailEvent(shared::dto::cloudwatch::LiveTailEvent),
+    LiveTailSessionUpdate {
+        events_per_second: Option<f64>,
+    },
 
     // Dashboard
     FetchPublicIp,

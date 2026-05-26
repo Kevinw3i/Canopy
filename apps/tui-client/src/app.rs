@@ -1,5 +1,5 @@
 use anyhow::Result;
-use shared::dto::cloudwatch::FilterLogEventsRequest;
+use shared::dto::cloudwatch::{FilterLogEventsRequest, StartLiveTailRequest};
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest, Ec2PowerRequest};
 use shared::dto::ecs::{EcsExecRequest, EcsTasksRequest};
 use shared::dto::entitlements::UserEntitlements;
@@ -95,6 +95,76 @@ fn cloudwatch_quick_search_filter_pattern(query: &str) -> Option<String> {
     }
     pattern.push('"');
     Some(pattern)
+}
+
+fn default_live_tail_request(entitlements: &UserEntitlements) -> Option<StartLiveTailRequest> {
+    if !entitlements.features.can_use_cloudwatch_tail {
+        return None;
+    }
+
+    let account_id = entitlements.allowed_accounts.first()?.account_id.clone();
+    let region = entitlements.allowed_regions.first()?.clone();
+    let log_group_arn = entitlements
+        .allowed_log_group_arns
+        .iter()
+        .find_map(|pattern| concrete_live_tail_log_group_arn(pattern, &account_id, &region))
+        .unwrap_or_else(|| {
+            format!("arn:aws:logs:{region}:{account_id}:log-group:/app/web-service")
+        });
+
+    Some(StartLiveTailRequest {
+        account_id,
+        region,
+        log_group_arns: vec![log_group_arn],
+        filter_pattern: None,
+    })
+}
+
+fn concrete_live_tail_log_group_arn(
+    pattern: &str,
+    account_id: &str,
+    region: &str,
+) -> Option<String> {
+    let mut arn_parts = pattern.splitn(7, ':');
+    let [Some("arn"), Some(_partition), Some("logs"), Some(pattern_region), Some(pattern_account), Some("log-group"), Some(_group)] = [
+        arn_parts.next(),
+        arn_parts.next(),
+        arn_parts.next(),
+        arn_parts.next(),
+        arn_parts.next(),
+        arn_parts.next(),
+        arn_parts.next(),
+    ] else {
+        return None;
+    };
+
+    if pattern_account != account_id && pattern_account != "*" {
+        return None;
+    }
+    if pattern_region != region && pattern_region != "*" {
+        return None;
+    }
+
+    let (_, group_pattern) = pattern.split_once(":log-group:")?;
+    let group_pattern = group_pattern.strip_suffix(":*").unwrap_or(group_pattern);
+    let group_name = if group_pattern.contains('*') {
+        let base = group_pattern
+            .split('*')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        if base.is_empty() {
+            "/app/web-service".to_string()
+        } else {
+            format!("{base}/web-service")
+        }
+    } else {
+        group_pattern.to_string()
+    };
+
+    Some(format!(
+        "arn:aws:logs:{region}:{account_id}:log-group:{group_name}"
+    ))
 }
 
 fn should_auto_continue_empty_filter_page(
@@ -839,6 +909,17 @@ impl App {
             // Live Tail
             Action::StartLiveTail => {
                 if self.config.dev_mode {
+                    let Some(request) = self
+                        .entitlements
+                        .as_ref()
+                        .and_then(default_live_tail_request)
+                    else {
+                        self.error_modal.show(
+                            "No Live Tail log group is available with your current entitlements"
+                                .into(),
+                        );
+                        return;
+                    };
                     // Dev mode: connect to the control-plane's WebSocket
                     // and stream simulated events into the live tail screen.
                     self.live_tail.set_connected();
@@ -851,6 +932,7 @@ impl App {
                         if let Err(e) = crate::live_tail_ws::stream_live_tail(
                             &base_url,
                             token.as_deref(),
+                            request,
                             tx,
                             cancel,
                         )
@@ -881,6 +963,9 @@ impl App {
             }
             Action::LiveTailEvent(event) => {
                 self.live_tail.push_event(event);
+            }
+            Action::LiveTailSessionUpdate { events_per_second } => {
+                self.live_tail.set_events_per_second(events_per_second);
             }
 
             // Dashboard
@@ -2278,6 +2363,46 @@ mod tests {
             security_groups: vec![],
             iam_role: None,
         }
+    }
+
+    #[test]
+    fn default_live_tail_request_concretizes_dev_wildcard_log_group() {
+        let mut ent = mock_entitlements();
+        ent.features.can_use_cloudwatch_tail = true;
+        ent.allowed_log_group_arns = vec!["arn:aws:logs:*:111111111111:log-group:/app/*".into()];
+
+        let req = default_live_tail_request(&ent).unwrap();
+
+        assert_eq!(req.account_id, "111111111111");
+        assert_eq!(req.region, "us-east-1");
+        assert_eq!(
+            req.log_group_arns,
+            vec!["arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"]
+        );
+    }
+
+    #[test]
+    fn default_live_tail_request_skips_other_account_patterns() {
+        let mut ent = mock_entitlements();
+        ent.features.can_use_cloudwatch_tail = true;
+        ent.allowed_log_group_arns = vec![
+            "arn:aws:logs:*:222222222222:log-group:/app/*".into(),
+            "arn:aws:logs:*:111111111111:log-group:/service/*".into(),
+        ];
+
+        let req = default_live_tail_request(&ent).unwrap();
+
+        assert_eq!(
+            req.log_group_arns,
+            vec!["arn:aws:logs:us-east-1:111111111111:log-group:/service/web-service"]
+        );
+    }
+
+    #[test]
+    fn default_live_tail_request_requires_tail_entitlement() {
+        let ent = mock_entitlements();
+
+        assert!(default_live_tail_request(&ent).is_none());
     }
 
     // ── Navigation ──────────────────────────────────────────

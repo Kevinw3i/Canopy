@@ -71,9 +71,14 @@ impl LiveTailScreen {
         self.connection_state = "Paused".into();
     }
 
+    pub fn set_events_per_second(&mut self, events_per_second: Option<f64>) {
+        self.events_per_second = events_per_second.unwrap_or(0.0);
+    }
+
     pub fn set_disconnected(&mut self) {
         self.state = TailState::Stopped;
         self.connection_state = "Disconnected".into();
+        self.events_per_second = 0.0;
     }
 
     fn filtered_events(&self) -> Vec<&LiveTailEvent> {
@@ -287,6 +292,25 @@ mod tests {
         }
     }
 
+    fn rendered_snapshot(screen: &mut LiveTailScreen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        buf.content
+            .chunks(width as usize)
+            .take(height as usize)
+            .map(|row| {
+                let mut line = String::new();
+                for cell in row {
+                    line.push_str(cell.symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     // ── State machine ──
 
     #[test]
@@ -472,5 +496,22 @@ mod tests {
         screen.filter_input.value = "error".into();
         assert_eq!(screen.filtered_events().len(), 1);
         assert_eq!(screen.filtered_events()[0].message, "ERROR crash");
+    }
+
+    #[test]
+    fn render_shows_session_update_and_streamed_event() {
+        let mut screen = LiveTailScreen::new(100);
+        screen.set_connected();
+        screen.set_events_per_second(Some(0.5));
+        screen.push_event(sample_event(
+            r#"{"level":"INFO","msg":"Simulated log event #1"}"#,
+        ));
+
+        let snapshot = rendered_snapshot(&mut screen, 100, 14);
+
+        assert!(snapshot.contains("Connected | 0.5 events/sec | 1 events buffered"));
+        assert!(snapshot.contains("[stream-1]"));
+        assert!(snapshot.contains("Simulated log event #1"));
+        assert!(snapshot.contains("s: start/stop | p: pause/resume"));
     }
 }
