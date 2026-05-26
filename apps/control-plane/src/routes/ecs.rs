@@ -132,6 +132,22 @@ fn requested_cluster_for_account_region(
     })
 }
 
+fn concrete_cluster_arn_region_account(arn: &str) -> Option<(&str, &str)> {
+    let (region, account) = ecs_arn_region_account(arn)?;
+    let resource = arn.splitn(6, ':').nth(5)?;
+    let cluster_name = resource.strip_prefix("cluster/")?;
+    if region.is_empty()
+        || account.is_empty()
+        || cluster_name.is_empty()
+        || region.contains('*')
+        || account.contains('*')
+        || cluster_name.contains('*')
+    {
+        return None;
+    }
+    Some((region, account))
+}
+
 fn requested_tasks_page_size(page_size: u32) -> usize {
     let requested = if page_size == 0 {
         DEFAULT_TASKS_PAGE_SIZE
@@ -331,12 +347,26 @@ fn validate_tasks_request_scope(
     req: &EcsTasksRequest,
     rule_scopes: &[crate::services::ecs::EcsRuleScope],
 ) -> Result<(), (axum::http::StatusCode, Json<ApiError>)> {
+    if req
+        .cluster
+        .as_deref()
+        .is_some_and(|cluster| cluster.contains('*'))
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(
+                "Cluster wildcard filters are not allowed",
+            )),
+        ));
+    }
+
     if let Some(cluster) = req
         .cluster
         .as_deref()
         .filter(|cluster| cluster.starts_with("arn:"))
     {
-        let Some((cluster_region, cluster_account)) = ecs_arn_region_account(cluster) else {
+        let Some((cluster_region, cluster_account)) = concrete_cluster_arn_region_account(cluster)
+        else {
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(ApiError::bad_request("Invalid ECS cluster ARN")),
@@ -1558,6 +1588,66 @@ mod tests {
 
         let err = validate_tasks_request_scope(&req, &[route_scope()]).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn cluster_request_scope_accepts_concrete_cluster_arn() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: Some("us-east-1".into()),
+            cluster: Some(cluster_arn(
+                "us-east-1",
+                "111111111111",
+                DEV_MOCK_CLUSTER_NAME,
+            )),
+            page_size: 50,
+        };
+
+        assert!(validate_tasks_request_scope(&req, &[route_scope()]).is_ok());
+    }
+
+    #[test]
+    fn cluster_request_scope_rejects_wildcard_short_cluster_filter() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: Some("us-east-1".into()),
+            cluster: Some("prod-*".into()),
+            page_size: 50,
+        };
+
+        let err = validate_tasks_request_scope(&req, &[route_scope()]).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Cluster wildcard filters are not allowed");
+    }
+
+    #[test]
+    fn cluster_request_scope_rejects_wildcard_cluster_arn_filter() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: Some("us-east-1".into()),
+            cluster: Some(cluster_arn("us-east-1", "111111111111", "prod-*")),
+            page_size: 50,
+        };
+
+        let err = validate_tasks_request_scope(&req, &[route_scope()]).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Cluster wildcard filters are not allowed");
+    }
+
+    #[test]
+    fn cluster_request_scope_rejects_non_cluster_arn_filter() {
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: Some("us-east-1".into()),
+            cluster: Some(format!(
+                "arn:aws:ecs:us-east-1:111111111111:task/{DEV_MOCK_CLUSTER_NAME}/abc123"
+            )),
+            page_size: 50,
+        };
+
+        let err = validate_tasks_request_scope(&req, &[route_scope()]).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.message, "Invalid ECS cluster ARN");
     }
 
     #[test]
