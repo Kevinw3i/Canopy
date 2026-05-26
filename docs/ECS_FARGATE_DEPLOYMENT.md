@@ -121,6 +121,16 @@ aws secretsmanager create-secret \
   --name canopy/jwt-secret \
   --secret-string "$(openssl rand -base64 32)" \
   --region ap-northeast-1
+
+JWT_SECRET_ARN=$(aws secretsmanager describe-secret \
+  --secret-id canopy/jwt-secret \
+  --query ARN --output text \
+  --region ap-northeast-1)
+JWT_SECRET_VERSION_ID=$(aws secretsmanager list-secret-version-ids \
+  --secret-id canopy/jwt-secret \
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
+  --output text \
+  --region ap-northeast-1)
 ```
 
 如果有 OIDC client secret：
@@ -130,7 +140,21 @@ aws secretsmanager create-secret \
   --name canopy/oidc-client-secret \
   --secret-string "your-oidc-client-secret" \
   --region ap-northeast-1
+
+OIDC_CLIENT_SECRET_ARN=$(aws secretsmanager describe-secret \
+  --secret-id canopy/oidc-client-secret \
+  --query ARN --output text \
+  --region ap-northeast-1)
+OIDC_CLIENT_SECRET_VERSION_ID=$(aws secretsmanager list-secret-version-ids \
+  --secret-id canopy/oidc-client-secret \
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
+  --output text \
+  --region ap-northeast-1)
 ```
+
+Task definition 的 ECS secret `valueFrom` 建議 pin 到明確 version ID：
+`<SECRET_ARN>:::<VERSION_ID>`。這能避免 rolling update 期間新舊 task
+讀到不同 secret version。
 
 ---
 
@@ -375,7 +399,7 @@ cat > /tmp/task-def.json << 'EOF'
         {"name": "STS_EXTERNAL_ID", "value": "canopy"}
       ],
       "secrets": [
-        {"name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:<ACCOUNT_ID>:secret:canopy/jwt-secret-XXXXXX"}
+        {"name": "JWT_SECRET", "valueFrom": "<JWT_SECRET_ARN>:::<JWT_SECRET_VERSION_ID>"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -388,9 +412,9 @@ cat > /tmp/task-def.json << 'EOF'
       "healthCheck": {
         "command": ["CMD-SHELL", "curl -f http://localhost:8443/health || exit 1"],
         "interval": 15,
-        "timeout": 3,
-        "retries": 3,
-        "startPeriod": 10
+        "timeout": 5,
+        "retries": 5,
+        "startPeriod": 180
       },
       "stopTimeout": 30
     }
@@ -403,10 +427,18 @@ aws ecs register-task-definition \
   --region ap-northeast-1
 ```
 
-若 OIDC provider 使用 confidential client，另外在 `secrets` 加入
-`OIDC_CLIENT_SECRET`，並讓 execution role 可讀該 secret。`entitlements.toml`
-由 Docker build 透過 BuildKit secret bake 進 image，不要放進 task definition
-環境變數或 Terraform state。
+若 OIDC provider 使用 confidential client，另外在 `secrets` 加入下列項目，
+並讓 execution role 可讀該 secret：
+
+```json
+{
+  "name": "OIDC_CLIENT_SECRET",
+  "valueFrom": "<OIDC_CLIENT_SECRET_ARN>:::<OIDC_CLIENT_SECRET_VERSION_ID>"
+}
+```
+
+`entitlements.toml` 由 Docker build 透過 BuildKit secret bake 進 image，
+不要放進 task definition 環境變數或 Terraform state。
 
 ---
 
