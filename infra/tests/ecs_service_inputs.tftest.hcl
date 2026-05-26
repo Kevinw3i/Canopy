@@ -50,3 +50,27 @@ run "rejects_fractional_desired_count" {
     var.desired_count,
   ]
 }
+
+run "rejects_relative_entitlements_file" {
+  command = plan
+
+  variables {
+    entitlements_file = "entitlements.toml"
+  }
+
+  expect_failures = [
+    var.entitlements_file,
+  ]
+}
+
+run "rejects_parent_segment_entitlements_file" {
+  command = plan
+
+  variables {
+    entitlements_file = "/etc/canopy/../entitlements.toml"
+  }
+
+  expect_failures = [
+    var.entitlements_file,
+  ]
+}

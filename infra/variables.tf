@@ -375,6 +375,14 @@ variable "entitlements_file" {
   description = "Path to the entitlements TOML file inside the container. Production images bake this file via BuildKit secret."
   type        = string
   default     = "/etc/canopy/entitlements.toml"
+
+  validation {
+    condition = (
+      can(regex("^/[A-Za-z0-9._/-]+$", var.entitlements_file)) &&
+      !contains(split("/", var.entitlements_file), "..")
+    )
+    error_message = "entitlements_file must be an absolute container path without parent directory segments."
+  }
 }
 
 variable "jwt_expiry_seconds" {
