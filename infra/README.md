@@ -179,6 +179,11 @@ CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/
 CPU_ARCH=${CPU_ARCH:-X86_64}
 case "$CPU_ARCH" in X86_64) PLATFORM="linux/amd64" ;; ARM64) PLATFORM="linux/arm64" ;; *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;; esac
 
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
 # Build + push（帶 platform 和 entitlements）
 DOCKER_BUILDKIT=1 docker build --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
