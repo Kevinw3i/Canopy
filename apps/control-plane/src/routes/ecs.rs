@@ -424,6 +424,22 @@ fn effective_task_fetch_regions(
     }
 }
 
+fn rule_scopes_for_account_role(
+    rule_scopes: &[crate::services::ecs::EcsRuleScope],
+    account: &AllowedAccount,
+) -> Vec<crate::services::ecs::EcsRuleScope> {
+    rule_scopes
+        .iter()
+        .filter(|scope| {
+            scope.accounts.iter().any(|scope_account| {
+                scope_account.account_id == account.account_id
+                    && scope_account.role_arn == account.role_arn
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 async fn fetch_tasks_from_aws(
     state: &AppState,
     entitlements: &shared::dto::entitlements::UserEntitlements,
@@ -441,6 +457,11 @@ async fn fetch_tasks_from_aws(
             }
         }
 
+        let scoped_rule_scopes = rule_scopes_for_account_role(rule_scopes, account);
+        if scoped_rule_scopes.is_empty() {
+            continue;
+        }
+
         let default_region = state
             .config
             .aws
@@ -448,7 +469,7 @@ async fn fetch_tasks_from_aws(
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string());
         let cluster_pattern_regions =
-            concrete_cluster_pattern_regions(rule_scopes, &account.account_id);
+            concrete_cluster_pattern_regions(&scoped_rule_scopes, &account.account_id);
         let effective_regions = effective_task_fetch_regions(
             req,
             rule_regions,
@@ -460,13 +481,21 @@ async fn fetch_tasks_from_aws(
             let requested_cluster =
                 requested_cluster_for_account_region(req, &account.account_id, &region);
             if let Some(cluster_ref) = requested_cluster.as_deref() {
-                if !cluster_ref_authorized(rule_scopes, &account.account_id, &region, cluster_ref) {
+                if !cluster_ref_authorized(
+                    &scoped_rule_scopes,
+                    &account.account_id,
+                    &region,
+                    cluster_ref,
+                ) {
                     continue;
                 }
             }
 
-            let allowed_cluster_patterns =
-                cluster_patterns_for_account_region(rule_scopes, &account.account_id, &region);
+            let allowed_cluster_patterns = cluster_patterns_for_account_region(
+                &scoped_rule_scopes,
+                &account.account_id,
+                &region,
+            );
             if allowed_cluster_patterns.is_empty() {
                 continue;
             }
@@ -1603,6 +1632,26 @@ mod tests {
     fn first_assumable_account_returns_none_for_local_only_entries() {
         let accounts = vec![account("direct"), account("profile:ops")];
         assert!(first_assumable_account(&accounts).is_none());
+    }
+
+    #[test]
+    fn rule_scopes_for_account_role_keeps_cluster_scope_role_local() {
+        let mut read_scope = route_scope();
+        read_scope.accounts[0].role_arn = "arn:aws:iam::111111111111:role/ReadOnly".into();
+        read_scope.cluster_patterns = vec![cluster_arn("us-east-1", "111111111111", "read")];
+        let mut exec_scope = route_scope();
+        exec_scope.accounts[0].role_arn = "arn:aws:iam::111111111111:role/EcsExec".into();
+        exec_scope.cluster_patterns = vec![cluster_arn("ap-northeast-1", "111111111111", "exec")];
+        let selected = account("arn:aws:iam::111111111111:role/ReadOnly");
+
+        let scoped = rule_scopes_for_account_role(&[read_scope, exec_scope], &selected);
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].accounts[0].role_arn, selected.role_arn);
+        assert_eq!(
+            concrete_cluster_pattern_regions(&scoped, "111111111111"),
+            vec!["us-east-1"]
+        );
     }
 
     #[test]
