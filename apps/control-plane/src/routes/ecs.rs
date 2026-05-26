@@ -1227,6 +1227,21 @@ async fn exec_task(
         ));
     }
 
+    let eligible_scopes = container_eligible_rule_scopes(&matching_scopes, &req.container_name);
+    if eligible_scopes.is_empty() {
+        audit_deny(
+            &state,
+            "Container is excluded by ECS sidecar denylist",
+            Some("container_in_sidecar_denylist"),
+        );
+        return Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "Container is excluded by ECS sidecar denylist",
+            )),
+        ));
+    }
+
     if let Err((kind, status, message)) = validate_task_for_exec(&task, &req) {
         state
             .audit_service
@@ -1243,21 +1258,6 @@ async fn exec_task(
             )))
             .commit_best_effort();
         return Err((status, Json(ApiError::new(kind, message))));
-    }
-
-    let eligible_scopes = container_eligible_rule_scopes(&matching_scopes, &req.container_name);
-    if eligible_scopes.is_empty() {
-        audit_deny(
-            &state,
-            "Container is excluded by ECS sidecar denylist",
-            Some("container_in_sidecar_denylist"),
-        );
-        return Err((
-            axum::http::StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Container is excluded by ECS sidecar denylist",
-            )),
-        ));
     }
 
     let scoped_accounts = eligible_scopes

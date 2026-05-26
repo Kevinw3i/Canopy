@@ -925,6 +925,56 @@ async fn ecs_exec_execute_command_disabled_returns_422() {
 }
 
 #[tokio::test]
+async fn ecs_exec_checks_sidecar_denylist_before_task_or_container_state() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-exec-sidecar-before-state");
+    let state = build_state_with_audit_file(config, &audit.path);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform ECS rule");
+        rule.excluded_container_names = vec!["worker".into()];
+    }
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][1];
+    assert_eq!(task["enable_execute_command"], false);
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "worker"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(
+        json["message"],
+        "Container is excluded by ECS sidecar denylist"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "ecs_exec"
+                && event["metadata"]["error_kind"] == "container_in_sidecar_denylist"
+        })
+        .expect("ecs exec sidecar denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
 async fn ecs_exec_checks_task_scope_before_task_state_or_container_state() {
     let config = dev_config();
     let token = issue_test_token(&config);
