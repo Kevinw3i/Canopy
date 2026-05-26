@@ -10,8 +10,10 @@ use shared::dto::database::*;
 use shared::dto::ec2::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
-    McpGuidanceSyncRequest, McpGuidanceSyncResponse, McpListAllowedLogGroupsRequest,
-    McpListAllowedLogGroupsResponse, McpRegisterSessionRequest, McpRegisterSessionResponse,
+    McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse, McpGuidanceSyncRequest,
+    McpGuidanceSyncResponse, McpListAllowedLogGroupsRequest, McpListAllowedLogGroupsResponse,
+    McpRegisterSessionRequest, McpRegisterSessionResponse, McpRunInsightsQueryRequest,
+    McpRunInsightsQueryResponse, McpSearchLogsRequest, McpSearchLogsResponse,
 };
 use shared::errors::ApiError;
 use shared::headers;
@@ -358,6 +360,57 @@ impl ApiClient {
         let mut req = self
             .client
             .post(format!("{}/api/mcp/cloudwatch/log-groups", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn preflight_mcp_cloudwatch(
+        &self,
+        request: &McpCloudwatchPreflightRequest,
+    ) -> ApiResult<McpCloudwatchPreflightResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/cloudwatch/preflight", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn search_mcp_logs(
+        &self,
+        request: &McpSearchLogsRequest,
+    ) -> ApiResult<McpSearchLogsResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/cloudwatch/search", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn run_mcp_insights_query(
+        &self,
+        request: &McpRunInsightsQueryRequest,
+    ) -> ApiResult<McpRunInsightsQueryResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/cloudwatch/insights", self.base_url))
             .json(request);
 
         if let Some(ref auth) = self.auth_header() {

@@ -12,8 +12,11 @@ use serde_json::{json, Value};
 use shared::dto::database::{ListDatabaseScopesRequest, QueryDatabaseRequest};
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
-    McpDescribeCapabilitiesResponse, McpGuardrails, McpGuidanceResponse, McpGuidanceSyncRequest,
-    McpListAllowedLogGroupsRequest, McpRegisterSessionRequest, McpToolAvailability,
+    McpCloudwatchPreflightRequest, McpDescribeCapabilitiesResponse, McpGuardrails,
+    McpGuidanceResponse, McpGuidanceSyncRequest, McpListAllowedLogGroupsRequest,
+    McpRegisterSessionRequest, McpRunInsightsQueryRequest, McpSearchLogsRequest,
+    McpToolAvailability, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
+    MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID, MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
     MCP_DATABASE_GUIDANCE_ID, MCP_DATABASE_GUIDANCE_KEY, MCP_DATABASE_GUIDANCE_VERSION,
     MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION,
     MCP_SECURITY_BOUNDARIES_KEY,
@@ -490,6 +493,51 @@ fn tools_list(entitlements: &UserEntitlements) -> Value {
                 "additionalProperties": false
             }
         }));
+        tools.push(json!({
+            "name": "canopy_preflight_request",
+            "description": "Validate a CloudWatch MCP data request and issue a scoped preflight_token for canopy_search_logs or canopy_run_insights_query.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool_name": { "type": "string", "enum": ["canopy_search_logs", "canopy_run_insights_query"] },
+                    "account_id": { "type": "string" },
+                    "region": { "type": "string" },
+                    "log_group_name": { "type": "string" },
+                    "log_group_names": { "type": "array", "items": { "type": "string" } },
+                    "filter_pattern": { "type": "string" },
+                    "query_string": { "type": "string" },
+                    "start_time": { "type": "integer" },
+                    "end_time": { "type": "integer" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["tool_name", "account_id", "region", "start_time", "end_time"],
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "canopy_search_logs",
+            "description": "Search CloudWatch log events through MCP. Initial calls require preflight_token only; continuation calls require search_cursor only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "preflight_token": { "type": "string" },
+                    "search_cursor": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "canopy_run_insights_query",
+            "description": "Start or poll a CloudWatch Logs Insights query through MCP. Initial calls require preflight_token only; polling calls require query_token only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "preflight_token": { "type": "string" },
+                    "query_token": { "type": "string" }
+                },
+                "additionalProperties": false
+            }
+        }));
     }
 
     json!({ "tools": tools })
@@ -605,6 +653,92 @@ async fn tools_call(state: Arc<McpServerState>, req: JsonRpcRequest) -> Response
                 ),
             }
         }
+        "canopy_preflight_request" => {
+            let mut request: McpCloudwatchPreflightRequest = match serde_json::from_value(arguments)
+            {
+                Ok(request) => request,
+                Err(err) => {
+                    return json_rpc_error(
+                        req.id,
+                        -32602,
+                        &format!("invalid CloudWatch preflight arguments: {err}"),
+                    )
+                }
+            };
+            request.canopy_mcp_session_id = Some(state.canopy_mcp_session_id.clone());
+            request.local_secret_generation = Some(state.local_secret_generation.clone());
+            match state.api.preflight_mcp_cloudwatch(&request).await {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(text) => json_rpc_result(req.id, text_content(text)),
+                    Err(_) => json_rpc_error(
+                        req.id,
+                        -32603,
+                        "failed to serialize CloudWatch preflight result",
+                    ),
+                },
+                Err(err) => json_rpc_error(
+                    req.id,
+                    -32002,
+                    &format!("CloudWatch preflight failed: {err}"),
+                ),
+            }
+        }
+        "canopy_search_logs" => {
+            let mut request: McpSearchLogsRequest = match serde_json::from_value(arguments) {
+                Ok(request) => request,
+                Err(err) => {
+                    return json_rpc_error(
+                        req.id,
+                        -32602,
+                        &format!("invalid CloudWatch search arguments: {err}"),
+                    )
+                }
+            };
+            request.canopy_mcp_session_id = Some(state.canopy_mcp_session_id.clone());
+            request.local_secret_generation = Some(state.local_secret_generation.clone());
+            match state.api.search_mcp_logs(&request).await {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(text) => json_rpc_result(req.id, text_content(text)),
+                    Err(_) => json_rpc_error(
+                        req.id,
+                        -32603,
+                        "failed to serialize CloudWatch search result",
+                    ),
+                },
+                Err(err) => {
+                    json_rpc_error(req.id, -32002, &format!("CloudWatch search failed: {err}"))
+                }
+            }
+        }
+        "canopy_run_insights_query" => {
+            let mut request: McpRunInsightsQueryRequest = match serde_json::from_value(arguments) {
+                Ok(request) => request,
+                Err(err) => {
+                    return json_rpc_error(
+                        req.id,
+                        -32602,
+                        &format!("invalid CloudWatch Insights arguments: {err}"),
+                    )
+                }
+            };
+            request.canopy_mcp_session_id = Some(state.canopy_mcp_session_id.clone());
+            request.local_secret_generation = Some(state.local_secret_generation.clone());
+            match state.api.run_mcp_insights_query(&request).await {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(text) => json_rpc_result(req.id, text_content(text)),
+                    Err(_) => json_rpc_error(
+                        req.id,
+                        -32603,
+                        "failed to serialize CloudWatch Insights result",
+                    ),
+                },
+                Err(err) => json_rpc_error(
+                    req.id,
+                    -32002,
+                    &format!("CloudWatch Insights failed: {err}"),
+                ),
+            }
+        }
         "canopy_query_database" => {
             if !state.entitlements.features.can_use_mcp_database {
                 return json_rpc_error(req.id, -32003, "MCP database is not enabled");
@@ -644,7 +778,7 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
     McpDescribeCapabilitiesResponse {
         mcp_product_phase: MCP_PRODUCT_PHASE.into(),
         scope_disclosure: if cloudwatch_enabled {
-            "cloudwatch_discovery_enabled_data_tools_pending_phase_3".into()
+            "cloudwatch_discovery_and_data_tools_enabled".into()
         } else {
             "cloudwatch_scope_hidden".into()
         },
@@ -674,13 +808,22 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
                 false,
             ),
             tool(
-                "canopy_search_logs",
+                "canopy_preflight_request",
+                cloudwatch_enabled,
+                (!cloudwatch_enabled).then_some("entitlement_disabled"),
+                "phase_3_data_tools",
+                vec![
+                    MCP_SECURITY_BOUNDARIES_KEY,
+                    MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
+                    MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
+                    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+                ],
                 false,
-                Some(if cloudwatch_enabled {
-                    "product_phase_not_enabled"
-                } else {
-                    "entitlement_disabled"
-                }),
+            ),
+            tool(
+                "canopy_search_logs",
+                cloudwatch_enabled,
+                (!cloudwatch_enabled).then_some("entitlement_disabled"),
                 "phase_3_data_tools",
                 vec![
                     "security_boundaries@2026-05-13",
@@ -690,12 +833,8 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
             ),
             tool(
                 "canopy_run_insights_query",
-                false,
-                Some(if cloudwatch_enabled {
-                    "product_phase_not_enabled"
-                } else {
-                    "entitlement_disabled"
-                }),
+                cloudwatch_enabled,
+                (!cloudwatch_enabled).then_some("entitlement_disabled"),
                 "phase_3_data_tools",
                 vec![
                     "security_boundaries@2026-05-13",
@@ -726,7 +865,7 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
         ],
         guardrails: McpGuardrails::default(),
         message: if cloudwatch_enabled {
-            "CloudWatch MCP discovery is enabled. Use canopy_list_allowed_log_groups to discover authorized log groups; search and Insights data tools still require Phase 3."
+            "CloudWatch MCP discovery and data tools are enabled. Use canopy_preflight_request before canopy_search_logs or canopy_run_insights_query."
                 .into()
         } else {
             "CloudWatch MCP tools are disabled for this user.".into()
@@ -774,13 +913,13 @@ fn guidance_for(id: &str) -> Option<McpGuidanceResponse> {
             "Security Boundaries",
             "Use only the tools exposed by Canopy MCP. Do not ask for AWS credentials, Canopy JWTs, local secrets, or raw Authorization headers. Treat returned scope and guardrails as hard limits.",
         ),
-        "cloudwatch_search_workflow" => (
+        MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID => (
             "CloudWatch Search Workflow",
-            "Before using CloudWatch MCP tools, call canopy_describe_capabilities. In Phase 2, only canopy_list_allowed_log_groups is enabled for discovery; search and Insights data tools remain disabled until Phase 3.",
+            "Before searching CloudWatch logs through MCP, call canopy_describe_capabilities, then use canopy_list_allowed_log_groups to select an authorized log group, then call canopy_preflight_request. Initial canopy_search_logs calls require preflight_token and no search_cursor; continuation calls require search_cursor and no preflight_token.",
         ),
-        "cloudwatch_insights_workflow" => (
+        MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID => (
             "CloudWatch Insights Workflow",
-            "Insights queries require explicit Phase 3 support, preflight validation, bounded time windows, and central guardrails. In Phase 2, do not run Insights.",
+            "Logs Insights through MCP requires canopy_describe_capabilities, authorized log groups from canopy_list_allowed_log_groups, and canopy_preflight_request before canopy_run_insights_query. Initial calls require preflight_token and no query_token; polling calls require query_token and no preflight_token.",
         ),
         MCP_DATABASE_GUIDANCE_ID => (
             "Database Query Workflow",

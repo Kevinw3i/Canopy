@@ -64,6 +64,13 @@ pub enum AuditAction {
     /// MCP CloudWatch discovery. The operation lists authorized log groups
     /// only; CloudWatch data access stays behind later MCP phases.
     McpCloudwatchDiscovery,
+    /// MCP CloudWatch data-access preflight. No AWS data read happens here;
+    /// success means the server issued a scoped preflight token.
+    McpCloudwatchPreflight,
+    /// MCP CloudWatch FilterLogEvents data access.
+    McpCloudwatchSearch,
+    /// MCP CloudWatch Logs Insights start/poll data access.
+    McpCloudwatchInsights,
     /// MCP database scope discovery. Scope details stay in metadata; secrets
     /// and connection internals must not be exposed in the response or audit.
     McpDatabaseScopeList,
@@ -92,6 +99,9 @@ impl AuditAction {
             Self::McpSessionRegister => "mcp_session_register",
             Self::McpGuidanceSync => "mcp_guidance_sync",
             Self::McpCloudwatchDiscovery => "mcp_cloudwatch_discovery",
+            Self::McpCloudwatchPreflight => "mcp_cloudwatch_preflight",
+            Self::McpCloudwatchSearch => "mcp_cloudwatch_search",
+            Self::McpCloudwatchInsights => "mcp_cloudwatch_insights",
             Self::McpDatabaseScopeList => "mcp_database_scope_list",
             Self::McpDatabaseQuery => "mcp_database_query",
         }
@@ -128,6 +138,9 @@ mod tests {
             AuditAction::McpSessionRegister,
             AuditAction::McpGuidanceSync,
             AuditAction::McpCloudwatchDiscovery,
+            AuditAction::McpCloudwatchPreflight,
+            AuditAction::McpCloudwatchSearch,
+            AuditAction::McpCloudwatchInsights,
             AuditAction::McpDatabaseScopeList,
             AuditAction::McpDatabaseQuery,
         ] {

@@ -10,19 +10,22 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::dto::audit::{AuditAction, AuditOutcome};
-use shared::dto::cloudwatch::LogGroup;
+use shared::dto::cloudwatch::{LogEvent, LogGroup, QueryResultField, QueryStatistics, QueryStatus};
 use shared::dto::database::{
     ListDatabaseScopesRequest, ListDatabaseScopesResponse, QueryDatabaseRequest,
     QueryDatabaseResponse,
 };
 use shared::dto::mcp::{
-    lookup_mcp_guidance, McpGuardrails, McpGuidanceSyncRequest, McpGuidanceSyncResponse,
-    McpListAllowedLogGroupsRequest, McpListAllowedLogGroupsResponse, McpRegisterSessionRequest,
-    McpRegisterSessionResponse, MCP_DATABASE_GUIDANCE_KEY, MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
-    MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
+    lookup_mcp_guidance, McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse,
+    McpGuardrails, McpGuidanceSyncRequest, McpGuidanceSyncResponse, McpListAllowedLogGroupsRequest,
+    McpListAllowedLogGroupsResponse, McpRegisterSessionRequest, McpRegisterSessionResponse,
+    McpRunInsightsQueryRequest, McpRunInsightsQueryResponse, McpSearchLogsRequest,
+    McpSearchLogsResponse, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
+    MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY, MCP_DATABASE_GUIDANCE_KEY,
+    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
 };
 use shared::errors::ApiError;
 use std::collections::BTreeSet;
@@ -32,7 +35,7 @@ use uuid::Uuid;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::services::audit::AuditRequestContext;
 use crate::services::auth::Claims;
-use crate::services::cloudwatch::mock_log_groups;
+use crate::services::cloudwatch::{mock_log_events, mock_log_groups};
 use crate::services::database::{
     build_database_response, scope_summary, validate_select_sql_for_connection,
     ConnectionQueueFull, DatabaseConnectionUnavailable, DatabaseError, TableType, TableTypeQuery,
@@ -53,6 +56,22 @@ const DATABASE_QUERY_REQUIRED_GUIDANCE: &[&str] = &[
 const CLOUDWATCH_DISCOVERY_REQUIRED_GUIDANCE: &[&str] = &[MCP_SECURITY_BOUNDARIES_KEY];
 const CLOUDWATCH_DISCOVERY_TOOL: &str = "canopy_list_allowed_log_groups";
 const CLOUDWATCH_DISCOVERY_CURSOR_AAD: &[u8] = b"canopy:mcp:cloudwatch:discovery:v1";
+const CLOUDWATCH_PREFLIGHT_TOOL: &str = "canopy_preflight_request";
+const CLOUDWATCH_SEARCH_TOOL: &str = "canopy_search_logs";
+const CLOUDWATCH_INSIGHTS_TOOL: &str = "canopy_run_insights_query";
+const CLOUDWATCH_SEARCH_REQUIRED_GUIDANCE: &[&str] = &[
+    MCP_SECURITY_BOUNDARIES_KEY,
+    MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
+    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+];
+const CLOUDWATCH_INSIGHTS_REQUIRED_GUIDANCE: &[&str] = &[
+    MCP_SECURITY_BOUNDARIES_KEY,
+    MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
+    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+];
+const CLOUDWATCH_PREFLIGHT_TOKEN_AAD: &[u8] = b"canopy:mcp:cloudwatch:preflight:v1";
+const CLOUDWATCH_SEARCH_CURSOR_AAD: &[u8] = b"canopy:mcp:cloudwatch:search-cursor:v1";
+const CLOUDWATCH_INSIGHTS_QUERY_TOKEN_AAD: &[u8] = b"canopy:mcp:cloudwatch:insights-query-token:v1";
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -62,6 +81,12 @@ pub fn router() -> Router<Arc<AppState>> {
             "/api/mcp/cloudwatch/log-groups",
             post(list_allowed_log_groups),
         )
+        .route(
+            "/api/mcp/cloudwatch/preflight",
+            post(preflight_cloudwatch_data),
+        )
+        .route("/api/mcp/cloudwatch/search", post(search_logs))
+        .route("/api/mcp/cloudwatch/insights", post(run_insights_query))
         .route("/api/mcp/database/scopes", post(list_database_scopes))
         .route("/api/mcp/database/query", post(query_database))
 }
@@ -688,6 +713,489 @@ async fn list_allowed_log_groups(
         discovery_cursor,
         next_action_hint,
     }))
+}
+
+async fn preflight_cloudwatch_data(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<McpCloudwatchPreflightRequest>,
+) -> ApiResult<McpCloudwatchPreflightResponse> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Audit logging unavailable")),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let entitlements = ent_service.evaluate(&claims).await;
+    let guardrails = McpGuardrails::default();
+
+    let Some(required_guidance) = cloudwatch_required_guidance_for_tool(&req.tool_name) else {
+        audit_cloudwatch_preflight_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            "unknown_tool",
+            "Unknown MCP CloudWatch data tool",
+        )?;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request("Unknown MCP CloudWatch data tool")),
+        ));
+    };
+
+    if !entitlements.features.can_use_mcp_cloudwatch {
+        audit_cloudwatch_preflight_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            "entitlement_disabled",
+            "can_use_mcp_cloudwatch entitlement disabled",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden("MCP CloudWatch is not enabled")),
+        ));
+    }
+
+    if let Err(reason) = require_mcp_guidance(
+        &state,
+        &claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        required_guidance,
+    ) {
+        audit_cloudwatch_preflight_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            reason,
+            "Required MCP CloudWatch data guidance has not been completed",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "Required MCP CloudWatch data guidance has not been completed",
+            )),
+        ));
+    }
+
+    let log_group_names = match validate_cloudwatch_preflight_shape(&req, &guardrails) {
+        Ok(names) => names,
+        Err(reason) => {
+            audit_cloudwatch_preflight_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                reason,
+                "MCP CloudWatch preflight request failed guardrails",
+            )?;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(format!(
+                    "MCP CloudWatch preflight request failed guardrails: {reason}"
+                ))),
+            ));
+        }
+    };
+
+    let scoped_log_arns = match authorize_mcp_cloudwatch_scope(
+        &ent_service,
+        &claims,
+        &req.account_id,
+        &req.region,
+        &log_group_names,
+    )
+    .await
+    {
+        Ok(scoped_log_arns) => scoped_log_arns,
+        Err(reason) => {
+            audit_cloudwatch_preflight_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                reason,
+                "MCP CloudWatch preflight is not authorized for this scope",
+            )?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "MCP CloudWatch preflight is not authorized for this scope",
+                )),
+            ));
+        }
+    };
+
+    let expires_at = Utc::now() + Duration::seconds(guardrails.preflight_token_ttl_seconds as i64);
+    let payload = CloudwatchPreflightTokenPayload {
+        version: 1,
+        actor: claims.sub.clone(),
+        canopy_mcp_session_id: req.canopy_mcp_session_id.clone().unwrap_or_default(),
+        local_secret_generation: req.local_secret_generation.clone().unwrap_or_default(),
+        tool: req.tool_name.clone(),
+        account_id: req.account_id.clone(),
+        region: req.region.clone(),
+        log_group_names: log_group_names.clone(),
+        filter_pattern: req.filter_pattern.clone(),
+        query_string: req.query_string.clone(),
+        start_time: req.start_time,
+        end_time: req.end_time,
+        limit: req.limit,
+        max_events: guardrails.max_search_events,
+        guardrail_policy_id: cloudwatch_data_guardrail_policy_id(&guardrails),
+        entitlement_snapshot_hash: entitlement_snapshot_hash(&scoped_log_arns),
+        expires_at,
+    };
+    let preflight_token = encode_cloudwatch_token(&state, &payload, CLOUDWATCH_PREFLIGHT_TOKEN_AAD)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::internal(
+                    "Failed to seal MCP CloudWatch preflight token",
+                )),
+            )
+        })?;
+
+    state
+        .audit_service
+        .event(
+            &claims.sub,
+            AuditAction::McpCloudwatchPreflight,
+            AuditOutcome::Success,
+        )
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .target(Some(&log_group_names.join(",")))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_preflight",
+            "mcp_outcome_kind": "success",
+            "tool_name": req.tool_name,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "log_group_names": log_group_names,
+            "start_time": req.start_time,
+            "end_time": req.end_time,
+            "limit": req.limit,
+            "filter_pattern_raw": req.filter_pattern.as_deref(),
+            "query_string_raw": req.query_string.as_deref(),
+            "aws_execution_attempted": false,
+            "preflight_token_issued": true,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())?;
+
+    Ok(Json(McpCloudwatchPreflightResponse {
+        tool_name: req.tool_name,
+        account_id: req.account_id,
+        region: req.region,
+        log_group_names,
+        preflight_token,
+        expires_at,
+        guardrails,
+    }))
+}
+
+async fn search_logs(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<McpSearchLogsRequest>,
+) -> ApiResult<McpSearchLogsResponse> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Audit logging unavailable")),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let entitlements = ent_service.evaluate(&claims).await;
+    let guardrails = McpGuardrails::default();
+
+    if let Err(reason) = require_mcp_guidance(
+        &state,
+        &claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_SEARCH_REQUIRED_GUIDANCE,
+    ) {
+        audit_cloudwatch_search_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            None,
+            reason,
+            "Required MCP CloudWatch search guidance has not been completed",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "Required MCP CloudWatch search guidance has not been completed",
+            )),
+        ));
+    }
+
+    let context = match cloudwatch_search_context_from_request(&state, &claims, &req, &guardrails) {
+        Ok(context) => context,
+        Err(reason) => {
+            audit_cloudwatch_search_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                None,
+                reason,
+                "Invalid MCP CloudWatch search token mode",
+            )?;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(format!(
+                    "Invalid MCP CloudWatch search token mode: {reason}"
+                ))),
+            ));
+        }
+    };
+
+    let scoped_log_arns = match authorize_mcp_cloudwatch_scope(
+        &ent_service,
+        &claims,
+        &context.account_id,
+        &context.region,
+        std::slice::from_ref(&context.log_group_name),
+    )
+    .await
+    {
+        Ok(scoped_log_arns) => scoped_log_arns,
+        Err(reason) => {
+            audit_cloudwatch_search_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                Some(&context),
+                reason,
+                "MCP CloudWatch search is not authorized for this scope",
+            )?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "MCP CloudWatch search is not authorized for this scope",
+                )),
+            ));
+        }
+    };
+
+    if context.entitlement_snapshot_hash != entitlement_snapshot_hash(&scoped_log_arns) {
+        audit_cloudwatch_search_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            Some(&context),
+            "search_token_entitlement_changed",
+            "MCP CloudWatch search token entitlements no longer match",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "MCP CloudWatch search token is no longer valid for current entitlements",
+            )),
+        ));
+    }
+
+    audit_cloudwatch_search_attempt(&state, &claims.sub, &audit_ctx, &req, &context)?;
+
+    let search_result = if state.config.use_mock_aws() {
+        execute_mock_search(&context, &guardrails)
+    } else {
+        execute_aws_search(&state, &claims, &entitlements, &context)
+            .await
+            .inspect_err(|_| {
+                let _ = audit_cloudwatch_search_failure(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    &req,
+                    &context,
+                    "aws_filter_log_events_failed",
+                    "AWS FilterLogEvents failed",
+                );
+            })?
+    };
+
+    let search_cursor = if search_result.truncated {
+        search_result
+            .next_context
+            .map(|next_context| {
+                let next_context = attach_search_cursor_identity(next_context, &claims, &req);
+                encode_cloudwatch_token(&state, &next_context, CLOUDWATCH_SEARCH_CURSOR_AAD)
+                    .map_err(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiError::internal(
+                                "Failed to seal MCP CloudWatch search cursor",
+                            )),
+                        )
+                    })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    state
+        .audit_service
+        .event(
+            &claims.sub,
+            AuditAction::McpCloudwatchSearch,
+            AuditOutcome::Success,
+        )
+        .account(Some(&context.account_id))
+        .region(Some(&context.region))
+        .target(Some(&context.log_group_name))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_search",
+            "mcp_outcome_kind": "success",
+            "tool_name": CLOUDWATCH_SEARCH_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "log_group_name": context.log_group_name,
+            "start_time": context.start_time,
+            "end_time": context.end_time,
+            "limit": context.limit,
+            "filter_pattern_raw": context.filter_pattern.as_deref(),
+            "aws_execution_attempted": !state.config.use_mock_aws(),
+            "returned_count": search_result.events.len(),
+            "truncated": search_result.truncated,
+            "cursor_issued": search_cursor.is_some(),
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())?;
+
+    let next_action_hint = if search_result.truncated && search_cursor.is_some() {
+        Some("Use search_cursor to continue this exact CloudWatch search.".to_string())
+    } else if search_result.truncated {
+        Some(
+            "Narrow the time range or filter; the MCP search result budget was exhausted."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    Ok(Json(McpSearchLogsResponse {
+        account_id: context.account_id,
+        region: context.region,
+        log_group_name: context.log_group_name,
+        returned_count: search_result.events.len(),
+        events: search_result.events,
+        truncated: search_result.truncated,
+        search_cursor,
+        next_action_hint,
+    }))
+}
+
+async fn run_insights_query(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<McpRunInsightsQueryRequest>,
+) -> ApiResult<McpRunInsightsQueryResponse> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Audit logging unavailable")),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let entitlements = ent_service.evaluate(&claims).await;
+    let guardrails = McpGuardrails::default();
+
+    if let Err(reason) = require_mcp_guidance(
+        &state,
+        &claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_INSIGHTS_REQUIRED_GUIDANCE,
+    ) {
+        audit_cloudwatch_insights_denied(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            &req,
+            None,
+            reason,
+            "Required MCP CloudWatch Insights guidance has not been completed",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "Required MCP CloudWatch Insights guidance has not been completed",
+            )),
+        ));
+    }
+
+    match (req.preflight_token.as_deref(), req.query_token.as_deref()) {
+        (Some(preflight_token), None) => {
+            start_mcp_insights_query(
+                &state,
+                &claims,
+                &audit_ctx,
+                &ent_service,
+                &entitlements,
+                &req,
+                preflight_token,
+                &guardrails,
+            )
+            .await
+        }
+        (None, Some(query_token)) => {
+            poll_mcp_insights_query(
+                &state,
+                &claims,
+                &audit_ctx,
+                &ent_service,
+                &entitlements,
+                &req,
+                query_token,
+                &guardrails,
+            )
+            .await
+        }
+        _ => {
+            audit_cloudwatch_insights_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                None,
+                "invalid_token_mode",
+                "MCP Insights calls require exactly one of preflight_token or query_token",
+            )?;
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request(
+                    "MCP Insights calls require exactly one of preflight_token or query_token",
+                )),
+            ))
+        }
+    }
 }
 
 async fn list_database_scopes(
@@ -1412,6 +1920,1471 @@ fn cloudwatch_discovery_audit_failure_response() -> (StatusCode, Json<ApiError>)
     )
 }
 
+fn cloudwatch_data_audit_failure_response() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::internal(
+            "Audit logging failed — refusing to process CloudWatch MCP data request",
+        )),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudwatchPreflightTokenPayload {
+    version: u8,
+    actor: String,
+    canopy_mcp_session_id: String,
+    local_secret_generation: String,
+    tool: String,
+    account_id: String,
+    region: String,
+    log_group_names: Vec<String>,
+    filter_pattern: Option<String>,
+    query_string: Option<String>,
+    start_time: i64,
+    end_time: i64,
+    limit: Option<i32>,
+    max_events: u64,
+    guardrail_policy_id: String,
+    entitlement_snapshot_hash: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SearchCursorPayload {
+    version: u8,
+    actor: String,
+    canopy_mcp_session_id: String,
+    local_secret_generation: String,
+    account_id: String,
+    region: String,
+    log_group_name: String,
+    filter_pattern: Option<String>,
+    start_time: i64,
+    end_time: i64,
+    limit: i32,
+    aws_next_token: Option<String>,
+    mock_offset: Option<usize>,
+    returned_count: u64,
+    max_events: u64,
+    guardrail_policy_id: String,
+    entitlement_snapshot_hash: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct CloudwatchSearchContext {
+    account_id: String,
+    region: String,
+    log_group_name: String,
+    filter_pattern: Option<String>,
+    start_time: i64,
+    end_time: i64,
+    limit: i32,
+    aws_next_token: Option<String>,
+    mock_offset: Option<usize>,
+    returned_count: u64,
+    entitlement_snapshot_hash: String,
+}
+
+#[derive(Debug)]
+struct SearchExecutionResult {
+    events: Vec<LogEvent>,
+    truncated: bool,
+    next_context: Option<SearchCursorPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InsightsQueryTokenPayload {
+    version: u8,
+    actor: String,
+    canopy_mcp_session_id: String,
+    local_secret_generation: String,
+    account_id: String,
+    region: String,
+    log_group_names: Vec<String>,
+    query_string: String,
+    start_time: i64,
+    end_time: i64,
+    aws_query_id: String,
+    guardrail_policy_id: String,
+    entitlement_snapshot_hash: String,
+    expires_at: chrono::DateTime<Utc>,
+}
+
+fn cloudwatch_required_guidance_for_tool(tool_name: &str) -> Option<&'static [&'static str]> {
+    match tool_name {
+        CLOUDWATCH_SEARCH_TOOL => Some(CLOUDWATCH_SEARCH_REQUIRED_GUIDANCE),
+        CLOUDWATCH_INSIGHTS_TOOL => Some(CLOUDWATCH_INSIGHTS_REQUIRED_GUIDANCE),
+        _ => None,
+    }
+}
+
+fn cloudwatch_data_guardrail_policy_id(guardrails: &McpGuardrails) -> String {
+    format!(
+        "mcp-cloudwatch-data:v1:max_window={}:max_events={}:max_response_bytes={}:max_event_bytes={}:preflight_ttl={}:search_cursor_ttl={}:insights_token_ttl={}:insights_timeout={}",
+        guardrails.max_search_window_seconds,
+        guardrails.max_search_events,
+        guardrails.max_response_bytes,
+        guardrails.max_event_message_bytes,
+        guardrails.preflight_token_ttl_seconds,
+        guardrails.search_cursor_ttl_seconds,
+        guardrails.insights_query_token_ttl_seconds,
+        guardrails.default_insights_timeout_seconds,
+    )
+}
+
+fn validate_cloudwatch_preflight_shape(
+    req: &McpCloudwatchPreflightRequest,
+    guardrails: &McpGuardrails,
+) -> Result<Vec<String>, &'static str> {
+    if req.end_time <= req.start_time {
+        return Err("invalid_time_window");
+    }
+    if (req.end_time - req.start_time) as u64 > guardrails.max_search_window_seconds {
+        return Err("time_window_exceeds_guardrail");
+    }
+    let raw_len = req.filter_pattern.as_deref().unwrap_or_default().len()
+        + req.query_string.as_deref().unwrap_or_default().len();
+    if raw_len as u64 > guardrails.max_request_body_bytes {
+        return Err("raw_input_too_large");
+    }
+
+    match req.tool_name.as_str() {
+        CLOUDWATCH_SEARCH_TOOL => {
+            if req.query_string.is_some() {
+                return Err("query_string_not_allowed_for_search");
+            }
+            if !req.log_group_names.is_empty() {
+                return Err("log_group_names_not_allowed_for_search");
+            }
+            let Some(name) = req
+                .log_group_name
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
+                return Err("log_group_name_required");
+            };
+            if let Some(limit) = req.limit {
+                if limit <= 0 || limit as u64 > guardrails.max_search_events {
+                    return Err("limit_exceeds_guardrail");
+                }
+            }
+            Ok(vec![name.to_string()])
+        }
+        CLOUDWATCH_INSIGHTS_TOOL => {
+            if req.filter_pattern.is_some() {
+                return Err("filter_pattern_not_allowed_for_insights");
+            }
+            let names: Vec<String> = if !req.log_group_names.is_empty() {
+                req.log_group_names
+                    .iter()
+                    .map(|name| name.trim())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                req.log_group_name
+                    .as_ref()
+                    .map(|name| vec![name.trim().to_string()])
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            };
+            if names.is_empty() {
+                return Err("log_group_names_required");
+            }
+            if req
+                .query_string
+                .as_ref()
+                .map(|query| query.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err("query_string_required");
+            }
+            Ok(names)
+        }
+        _ => Err("unknown_tool"),
+    }
+}
+
+fn mcp_log_group_arn_variants(region: &str, account_id: &str, log_group_name: &str) -> Vec<String> {
+    let base = format!("arn:aws:logs:{region}:{account_id}:log-group:{log_group_name}");
+    vec![base.clone(), format!("{base}:*")]
+}
+
+fn mcp_log_group_matches_patterns(patterns: &[String], arn_variants: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        arn_variants
+            .iter()
+            .any(|arn| crate::services::entitlements::arn_matches_pattern(pattern, arn))
+    })
+}
+
+async fn authorize_mcp_cloudwatch_scope(
+    ent_service: &EntitlementService,
+    claims: &Claims,
+    account_id: &str,
+    region: &str,
+    log_group_names: &[String],
+) -> Result<Vec<String>, &'static str> {
+    if !ent_service
+        .has_feature_for_scope(claims, account_id, Some(region), None, None, |f| {
+            f.can_use_mcp && f.can_use_mcp_cloudwatch
+        })
+        .await
+    {
+        return Err("scope_not_authorized");
+    }
+
+    let scoped_log_arns = ent_service
+        .allowed_log_group_arns_for_scope(claims, account_id, region, |f| {
+            f.can_use_mcp && f.can_use_mcp_cloudwatch
+        })
+        .await;
+    if !scoped_log_arns.is_empty() {
+        for name in log_group_names {
+            let variants = mcp_log_group_arn_variants(region, account_id, name);
+            if !mcp_log_group_matches_patterns(&scoped_log_arns, &variants) {
+                return Err("log_group_not_authorized");
+            }
+        }
+    }
+    Ok(scoped_log_arns)
+}
+
+fn encode_cloudwatch_token<T: Serialize>(
+    state: &AppState,
+    payload: &T,
+    aad: &[u8],
+) -> Result<String, ()> {
+    let cipher = discovery_cursor_cipher(state)?;
+    let mut nonce_bytes = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = serde_json::to_vec(payload).map_err(|_| ())?;
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext.as_slice(),
+                aad,
+            },
+        )
+        .map_err(|_| ())?;
+    let envelope = DiscoveryCursorEnvelope {
+        version: 1,
+        alg: "AES-256-GCM".into(),
+        key_id: "jwt-secret-sha256:v1".into(),
+        nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
+        ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+    };
+    let envelope_json = serde_json::to_vec(&envelope).map_err(|_| ())?;
+    Ok(URL_SAFE_NO_PAD.encode(envelope_json))
+}
+
+fn decode_cloudwatch_token<T: DeserializeOwned>(
+    state: &AppState,
+    raw: &str,
+    aad: &[u8],
+) -> Result<T, &'static str> {
+    let envelope_bytes = URL_SAFE_NO_PAD
+        .decode(raw.as_bytes())
+        .map_err(|_| "cloudwatch_token_decode_failed")?;
+    let envelope: DiscoveryCursorEnvelope =
+        serde_json::from_slice(&envelope_bytes).map_err(|_| "cloudwatch_token_decode_failed")?;
+    if envelope.version != 1
+        || envelope.alg != "AES-256-GCM"
+        || envelope.key_id != "jwt-secret-sha256:v1"
+    {
+        return Err("cloudwatch_token_unsupported_version");
+    }
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(envelope.nonce.as_bytes())
+        .map_err(|_| "cloudwatch_token_decode_failed")?;
+    if nonce_bytes.len() != 12 {
+        return Err("cloudwatch_token_decode_failed");
+    }
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(envelope.ciphertext.as_bytes())
+        .map_err(|_| "cloudwatch_token_decode_failed")?;
+    let cipher = discovery_cursor_cipher(state).map_err(|_| "cloudwatch_token_key_unavailable")?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            aes_gcm::aead::Payload {
+                msg: ciphertext.as_slice(),
+                aad,
+            },
+        )
+        .map_err(|_| "cloudwatch_token_auth_failed")?;
+    serde_json::from_slice(&plaintext).map_err(|_| "cloudwatch_token_decode_failed")
+}
+
+fn validate_preflight_payload(
+    payload: &CloudwatchPreflightTokenPayload,
+    claims: &Claims,
+    session_id: Option<&str>,
+    local_secret_generation: Option<&str>,
+    expected_tool: &str,
+    guardrails: &McpGuardrails,
+) -> Result<(), &'static str> {
+    if payload.version != 1 || payload.tool != expected_tool {
+        return Err("preflight_token_tool_mismatch");
+    }
+    if payload.actor != claims.sub {
+        return Err("preflight_token_actor_mismatch");
+    }
+    if session_id != Some(payload.canopy_mcp_session_id.as_str()) {
+        return Err("preflight_token_session_mismatch");
+    }
+    if local_secret_generation != Some(payload.local_secret_generation.as_str()) {
+        return Err("preflight_token_generation_mismatch");
+    }
+    if payload.expires_at < Utc::now() {
+        return Err("preflight_token_expired");
+    }
+    if payload.max_events != guardrails.max_search_events
+        || payload.guardrail_policy_id != cloudwatch_data_guardrail_policy_id(guardrails)
+    {
+        return Err("preflight_token_policy_changed");
+    }
+    Ok(())
+}
+
+fn validate_search_cursor_payload(
+    payload: &SearchCursorPayload,
+    claims: &Claims,
+    session_id: Option<&str>,
+    local_secret_generation: Option<&str>,
+    guardrails: &McpGuardrails,
+) -> Result<(), &'static str> {
+    if payload.version != 1 {
+        return Err("search_cursor_unsupported_version");
+    }
+    if payload.actor != claims.sub {
+        return Err("search_cursor_actor_mismatch");
+    }
+    if session_id != Some(payload.canopy_mcp_session_id.as_str()) {
+        return Err("search_cursor_session_mismatch");
+    }
+    if local_secret_generation != Some(payload.local_secret_generation.as_str()) {
+        return Err("search_cursor_generation_mismatch");
+    }
+    if payload.expires_at < Utc::now() {
+        return Err("search_cursor_expired");
+    }
+    if payload.returned_count >= guardrails.max_search_events
+        || payload.max_events != guardrails.max_search_events
+        || payload.guardrail_policy_id != cloudwatch_data_guardrail_policy_id(guardrails)
+    {
+        return Err("search_cursor_exhausted_or_policy_changed");
+    }
+    Ok(())
+}
+
+fn cloudwatch_search_context_from_request(
+    state: &AppState,
+    claims: &Claims,
+    req: &McpSearchLogsRequest,
+    guardrails: &McpGuardrails,
+) -> Result<CloudwatchSearchContext, &'static str> {
+    match (req.preflight_token.as_deref(), req.search_cursor.as_deref()) {
+        (Some(preflight), None) => {
+            let payload: CloudwatchPreflightTokenPayload =
+                decode_cloudwatch_token(state, preflight, CLOUDWATCH_PREFLIGHT_TOKEN_AAD)?;
+            validate_preflight_payload(
+                &payload,
+                claims,
+                req.canopy_mcp_session_id.as_deref(),
+                req.local_secret_generation.as_deref(),
+                CLOUDWATCH_SEARCH_TOOL,
+                guardrails,
+            )?;
+            if payload.log_group_names.len() != 1 {
+                return Err("preflight_token_scope_mismatch");
+            }
+            Ok(CloudwatchSearchContext {
+                account_id: payload.account_id,
+                region: payload.region,
+                log_group_name: payload.log_group_names[0].clone(),
+                filter_pattern: payload.filter_pattern,
+                start_time: payload.start_time,
+                end_time: payload.end_time,
+                limit: payload
+                    .limit
+                    .unwrap_or(guardrails.max_search_events as i32)
+                    .min(guardrails.max_search_events as i32),
+                aws_next_token: None,
+                mock_offset: None,
+                returned_count: 0,
+                entitlement_snapshot_hash: payload.entitlement_snapshot_hash,
+            })
+        }
+        (None, Some(cursor)) => {
+            let payload: SearchCursorPayload =
+                decode_cloudwatch_token(state, cursor, CLOUDWATCH_SEARCH_CURSOR_AAD)?;
+            validate_search_cursor_payload(
+                &payload,
+                claims,
+                req.canopy_mcp_session_id.as_deref(),
+                req.local_secret_generation.as_deref(),
+                guardrails,
+            )?;
+            Ok(CloudwatchSearchContext {
+                account_id: payload.account_id,
+                region: payload.region,
+                log_group_name: payload.log_group_name,
+                filter_pattern: payload.filter_pattern,
+                start_time: payload.start_time,
+                end_time: payload.end_time,
+                limit: payload.limit,
+                aws_next_token: payload.aws_next_token,
+                mock_offset: payload.mock_offset,
+                returned_count: payload.returned_count,
+                entitlement_snapshot_hash: payload.entitlement_snapshot_hash,
+            })
+        }
+        _ => Err("invalid_token_mode"),
+    }
+}
+
+fn truncate_utf8(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    input[..end].to_string()
+}
+
+fn bounded_log_event(mut event: LogEvent, guardrails: &McpGuardrails) -> LogEvent {
+    event.message = truncate_utf8(&event.message, guardrails.max_event_message_bytes as usize);
+    event
+}
+
+fn max_events_per_response(guardrails: &McpGuardrails) -> u64 {
+    let per_event_budget = guardrails.max_event_message_bytes.saturating_add(1024);
+    let by_bytes = guardrails
+        .max_response_bytes
+        .checked_div(per_event_budget.max(1))
+        .unwrap_or(1)
+        .max(1);
+    by_bytes.min(guardrails.max_search_events).max(1)
+}
+
+fn truncate_insights_results_by_budget(
+    rows: Vec<Vec<QueryResultField>>,
+    guardrails: &McpGuardrails,
+) -> (Vec<Vec<QueryResultField>>, bool) {
+    let max_bytes = guardrails.max_response_bytes as usize;
+    let mut used = 2_usize; // JSON array brackets.
+    let mut out = Vec::new();
+
+    for row in rows {
+        let bounded_row = row
+            .into_iter()
+            .map(|mut field| {
+                field.value =
+                    truncate_utf8(&field.value, guardrails.max_event_message_bytes as usize);
+                field
+            })
+            .collect::<Vec<_>>();
+        let row_bytes = serde_json::to_vec(&bounded_row)
+            .map(|bytes| bytes.len())
+            .unwrap_or(max_bytes.saturating_add(1));
+        let comma = usize::from(!out.is_empty());
+        if used.saturating_add(comma).saturating_add(row_bytes) > max_bytes {
+            return (out, true);
+        }
+        used = used.saturating_add(comma).saturating_add(row_bytes);
+        out.push(bounded_row);
+    }
+
+    (out, false)
+}
+
+fn search_cursor_payload_from_context(
+    context: &CloudwatchSearchContext,
+    aws_next_token: Option<String>,
+    mock_offset: Option<usize>,
+    returned_count: u64,
+    guardrails: &McpGuardrails,
+) -> SearchCursorPayload {
+    SearchCursorPayload {
+        version: 1,
+        actor: String::new(),
+        canopy_mcp_session_id: String::new(),
+        local_secret_generation: String::new(),
+        account_id: context.account_id.clone(),
+        region: context.region.clone(),
+        log_group_name: context.log_group_name.clone(),
+        filter_pattern: context.filter_pattern.clone(),
+        start_time: context.start_time,
+        end_time: context.end_time,
+        limit: context.limit,
+        aws_next_token,
+        mock_offset,
+        returned_count,
+        max_events: guardrails.max_search_events,
+        guardrail_policy_id: cloudwatch_data_guardrail_policy_id(guardrails),
+        entitlement_snapshot_hash: context.entitlement_snapshot_hash.clone(),
+        expires_at: Utc::now() + Duration::seconds(guardrails.search_cursor_ttl_seconds as i64),
+    }
+}
+
+fn execute_mock_search(
+    context: &CloudwatchSearchContext,
+    guardrails: &McpGuardrails,
+) -> SearchExecutionResult {
+    let offset = context.mock_offset.unwrap_or(0);
+    let remaining_budget = guardrails
+        .max_search_events
+        .saturating_sub(context.returned_count);
+    let limit = (context.limit as u64)
+        .min(remaining_budget)
+        .min(max_events_per_response(guardrails)) as usize;
+    let all = mock_log_events();
+    let mut events = all
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .map(|event| bounded_log_event(event, guardrails))
+        .collect::<Vec<_>>();
+    let next_offset = offset + events.len();
+    let new_returned = context.returned_count + events.len() as u64;
+    let truncated = next_offset < all.len();
+    let next_context = if next_offset < all.len() && new_returned < guardrails.max_search_events {
+        let mut cursor = search_cursor_payload_from_context(
+            context,
+            None,
+            Some(next_offset),
+            new_returned,
+            guardrails,
+        );
+        cursor.actor = String::new();
+        Some(cursor)
+    } else {
+        None
+    };
+    events.shrink_to_fit();
+    SearchExecutionResult {
+        events,
+        truncated,
+        next_context,
+    }
+}
+
+async fn execute_aws_search(
+    state: &AppState,
+    claims: &Claims,
+    entitlements: &shared::dto::entitlements::UserEntitlements,
+    context: &CloudwatchSearchContext,
+) -> Result<SearchExecutionResult, (StatusCode, Json<ApiError>)> {
+    let guardrails = McpGuardrails::default();
+    let client = crate::routes::cloudwatch::get_cwl_client_for_account(
+        state,
+        entitlements,
+        &context.account_id,
+        &context.region,
+        &claims.sub,
+    )
+    .await?;
+    let remaining_budget = guardrails
+        .max_search_events
+        .saturating_sub(context.returned_count);
+    let limit = (context.limit as u64)
+        .min(remaining_budget)
+        .min(max_events_per_response(&guardrails))
+        .min(i32::MAX as u64) as i32;
+    let mut filter = client
+        .filter_log_events()
+        .log_group_name(&context.log_group_name)
+        .start_time(context.start_time)
+        .end_time(context.end_time)
+        .limit(limit);
+    if let Some(pattern) = context.filter_pattern.as_ref() {
+        filter = filter.filter_pattern(pattern);
+    }
+    if let Some(token) = context.aws_next_token.as_ref() {
+        filter = filter.next_token(token);
+    }
+    let resp = filter.send().await.map_err(|e| {
+        let service_error = e.as_service_error();
+        let is_invalid_parameter = service_error
+            .map(|err| err.is_invalid_parameter_exception())
+            .unwrap_or(false);
+        if is_invalid_parameter {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request("Invalid CloudWatch filter pattern")),
+            )
+        } else {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError::internal(format!(
+                    "AWS FilterLogEvents failed: {e}"
+                ))),
+            )
+        }
+    })?;
+    let events = resp
+        .events()
+        .iter()
+        .map(|event| {
+            bounded_log_event(
+                LogEvent {
+                    timestamp: event.timestamp().unwrap_or(0),
+                    message: event.message().unwrap_or_default().to_string(),
+                    log_stream_name: event.log_stream_name().map(str::to_string),
+                    ingestion_time: event.ingestion_time(),
+                    event_id: event.event_id().map(str::to_string),
+                },
+                &guardrails,
+            )
+        })
+        .collect::<Vec<_>>();
+    let new_returned = context.returned_count + events.len() as u64;
+    let next_token = resp.next_token().map(str::to_string);
+    let budget_exhausted = new_returned >= guardrails.max_search_events;
+    let truncated = next_token.is_some() || budget_exhausted;
+    let next_context = next_token.filter(|_| !budget_exhausted).map(|next_token| {
+        search_cursor_payload_from_context(
+            context,
+            Some(next_token),
+            None,
+            new_returned,
+            &guardrails,
+        )
+    });
+    Ok(SearchExecutionResult {
+        events,
+        truncated,
+        next_context,
+    })
+}
+
+fn attach_search_cursor_identity(
+    mut cursor: SearchCursorPayload,
+    claims: &Claims,
+    req: &McpSearchLogsRequest,
+) -> SearchCursorPayload {
+    cursor.actor = claims.sub.clone();
+    cursor.canopy_mcp_session_id = req.canopy_mcp_session_id.clone().unwrap_or_default();
+    cursor.local_secret_generation = req.local_secret_generation.clone().unwrap_or_default();
+    cursor
+}
+
+fn validate_insights_query_token_payload(
+    payload: &InsightsQueryTokenPayload,
+    claims: &Claims,
+    session_id: Option<&str>,
+    local_secret_generation: Option<&str>,
+    guardrails: &McpGuardrails,
+) -> Result<(), &'static str> {
+    if payload.version != 1 {
+        return Err("query_token_unsupported_version");
+    }
+    if payload.actor != claims.sub {
+        return Err("query_token_actor_mismatch");
+    }
+    if session_id != Some(payload.canopy_mcp_session_id.as_str()) {
+        return Err("query_token_session_mismatch");
+    }
+    if local_secret_generation != Some(payload.local_secret_generation.as_str()) {
+        return Err("query_token_generation_mismatch");
+    }
+    if payload.expires_at < Utc::now() {
+        return Err("query_token_expired");
+    }
+    if payload.guardrail_policy_id != cloudwatch_data_guardrail_policy_id(guardrails) {
+        return Err("query_token_policy_changed");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_mcp_insights_query(
+    state: &AppState,
+    claims: &Claims,
+    audit_ctx: &AuditRequestContext,
+    ent_service: &EntitlementService,
+    entitlements: &shared::dto::entitlements::UserEntitlements,
+    req: &McpRunInsightsQueryRequest,
+    preflight_token: &str,
+    guardrails: &McpGuardrails,
+) -> ApiResult<McpRunInsightsQueryResponse> {
+    let payload: CloudwatchPreflightTokenPayload =
+        match decode_cloudwatch_token(state, preflight_token, CLOUDWATCH_PREFLIGHT_TOKEN_AAD) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                audit_cloudwatch_insights_denied(
+                    state,
+                    &claims.sub,
+                    audit_ctx,
+                    req,
+                    None,
+                    reason,
+                    "Invalid MCP Insights preflight token",
+                )?;
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError::bad_request(
+                        "Invalid MCP Insights preflight token",
+                    )),
+                ));
+            }
+        };
+    if let Err(reason) = validate_preflight_payload(
+        &payload,
+        claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        CLOUDWATCH_INSIGHTS_TOOL,
+        guardrails,
+    ) {
+        audit_cloudwatch_insights_denied(
+            state,
+            &claims.sub,
+            audit_ctx,
+            req,
+            Some(&payload),
+            reason,
+            "MCP Insights preflight token is not valid for this request",
+        )?;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(
+                "MCP Insights preflight token is not valid for this request",
+            )),
+        ));
+    }
+
+    let scoped_log_arns = match authorize_mcp_cloudwatch_scope(
+        ent_service,
+        claims,
+        &payload.account_id,
+        &payload.region,
+        &payload.log_group_names,
+    )
+    .await
+    {
+        Ok(scoped_log_arns) => scoped_log_arns,
+        Err(reason) => {
+            audit_cloudwatch_insights_denied(
+                state,
+                &claims.sub,
+                audit_ctx,
+                req,
+                Some(&payload),
+                reason,
+                "MCP Insights query is not authorized for this scope",
+            )?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "MCP Insights query is not authorized for this scope",
+                )),
+            ));
+        }
+    };
+    if payload.entitlement_snapshot_hash != entitlement_snapshot_hash(&scoped_log_arns) {
+        audit_cloudwatch_insights_denied(
+            state,
+            &claims.sub,
+            audit_ctx,
+            req,
+            Some(&payload),
+            "preflight_token_entitlement_changed",
+            "MCP Insights preflight token entitlements no longer match",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "MCP Insights preflight token is no longer valid for current entitlements",
+            )),
+        ));
+    }
+
+    audit_cloudwatch_insights_attempt(state, &claims.sub, audit_ctx, req, &payload, "start")?;
+
+    let query_string = payload.query_string.clone().unwrap_or_default();
+    let aws_query_id = if state.config.use_mock_aws() {
+        Uuid::new_v4().to_string()
+    } else {
+        let client = crate::routes::cloudwatch::get_cwl_client_for_account(
+            state,
+            entitlements,
+            &payload.account_id,
+            &payload.region,
+            &claims.sub,
+        )
+        .await?;
+        let mut start = client
+            .start_query()
+            .query_string(&query_string)
+            .start_time(payload.start_time)
+            .end_time(payload.end_time);
+        for log_group_name in &payload.log_group_names {
+            start = start.log_group_names(log_group_name);
+        }
+        start
+            .send()
+            .await
+            .map_err(|e| {
+                let _ = audit_cloudwatch_insights_failure(
+                    state,
+                    &claims.sub,
+                    audit_ctx,
+                    req,
+                    Some(&payload),
+                    "aws_start_query_failed",
+                    "AWS StartQuery failed",
+                );
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError::internal(format!("AWS StartQuery failed: {e}"))),
+                )
+            })?
+            .query_id()
+            .ok_or_else(|| {
+                let _ = audit_cloudwatch_insights_failure(
+                    state,
+                    &claims.sub,
+                    audit_ctx,
+                    req,
+                    Some(&payload),
+                    "aws_start_query_missing_query_id",
+                    "AWS StartQuery returned no query_id",
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::internal("AWS StartQuery returned no query_id")),
+                )
+            })?
+            .to_string()
+    };
+
+    let query_payload = InsightsQueryTokenPayload {
+        version: 1,
+        actor: claims.sub.clone(),
+        canopy_mcp_session_id: req.canopy_mcp_session_id.clone().unwrap_or_default(),
+        local_secret_generation: req.local_secret_generation.clone().unwrap_or_default(),
+        account_id: payload.account_id.clone(),
+        region: payload.region.clone(),
+        log_group_names: payload.log_group_names.clone(),
+        query_string,
+        start_time: payload.start_time,
+        end_time: payload.end_time,
+        aws_query_id,
+        guardrail_policy_id: cloudwatch_data_guardrail_policy_id(guardrails),
+        entitlement_snapshot_hash: payload.entitlement_snapshot_hash.clone(),
+        expires_at: Utc::now()
+            + Duration::seconds(guardrails.insights_query_token_ttl_seconds as i64),
+    };
+    let query_token =
+        encode_cloudwatch_token(state, &query_payload, CLOUDWATCH_INSIGHTS_QUERY_TOKEN_AAD)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::internal(
+                        "Failed to seal MCP CloudWatch Insights query token",
+                    )),
+                )
+            })?;
+
+    audit_cloudwatch_insights_success(
+        state,
+        &claims.sub,
+        audit_ctx,
+        req,
+        &query_payload,
+        "started",
+        QueryStatus::Running,
+        0,
+        false,
+        !state.config.use_mock_aws(),
+    )?;
+
+    Ok(Json(McpRunInsightsQueryResponse {
+        account_id: query_payload.account_id,
+        region: query_payload.region,
+        log_group_names: query_payload.log_group_names,
+        query_token: Some(query_token),
+        status: QueryStatus::Running,
+        results: Vec::new(),
+        statistics: None,
+        terminal: false,
+        next_action_hint: Some("Use query_token to poll this exact Insights query.".into()),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn poll_mcp_insights_query(
+    state: &AppState,
+    claims: &Claims,
+    audit_ctx: &AuditRequestContext,
+    ent_service: &EntitlementService,
+    entitlements: &shared::dto::entitlements::UserEntitlements,
+    req: &McpRunInsightsQueryRequest,
+    query_token: &str,
+    guardrails: &McpGuardrails,
+) -> ApiResult<McpRunInsightsQueryResponse> {
+    let payload: InsightsQueryTokenPayload =
+        match decode_cloudwatch_token(state, query_token, CLOUDWATCH_INSIGHTS_QUERY_TOKEN_AAD) {
+            Ok(payload) => payload,
+            Err(reason) => {
+                audit_cloudwatch_insights_denied(
+                    state,
+                    &claims.sub,
+                    audit_ctx,
+                    req,
+                    None,
+                    reason,
+                    "Invalid MCP Insights query token",
+                )?;
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiError::bad_request("Invalid MCP Insights query token")),
+                ));
+            }
+        };
+    if let Err(reason) = validate_insights_query_token_payload(
+        &payload,
+        claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        guardrails,
+    ) {
+        audit_cloudwatch_insights_denied(
+            state,
+            &claims.sub,
+            audit_ctx,
+            req,
+            None,
+            reason,
+            "MCP Insights query token is not valid for this request",
+        )?;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(
+                "MCP Insights query token is not valid for this request",
+            )),
+        ));
+    }
+
+    let scoped_log_arns = match authorize_mcp_cloudwatch_scope(
+        ent_service,
+        claims,
+        &payload.account_id,
+        &payload.region,
+        &payload.log_group_names,
+    )
+    .await
+    {
+        Ok(scoped_log_arns) => scoped_log_arns,
+        Err(reason) => {
+            audit_cloudwatch_insights_denied(
+                state,
+                &claims.sub,
+                audit_ctx,
+                req,
+                None,
+                reason,
+                "MCP Insights query is not authorized for this scope",
+            )?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "MCP Insights query is not authorized for this scope",
+                )),
+            ));
+        }
+    };
+    if payload.entitlement_snapshot_hash != entitlement_snapshot_hash(&scoped_log_arns) {
+        audit_cloudwatch_insights_denied(
+            state,
+            &claims.sub,
+            audit_ctx,
+            req,
+            None,
+            "query_token_entitlement_changed",
+            "MCP Insights query token entitlements no longer match",
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "MCP Insights query token is no longer valid for current entitlements",
+            )),
+        ));
+    }
+
+    audit_cloudwatch_insights_attempt(state, &claims.sub, audit_ctx, req, &payload, "poll")?;
+
+    let (status, raw_results, statistics) = if state.config.use_mock_aws() {
+        (
+            QueryStatus::Complete,
+            mock_insights_results(),
+            Some(QueryStatistics {
+                records_matched: 2.0,
+                records_scanned: 1000.0,
+                bytes_scanned: 524288.0,
+            }),
+        )
+    } else {
+        let client = crate::routes::cloudwatch::get_cwl_client_for_account(
+            state,
+            entitlements,
+            &payload.account_id,
+            &payload.region,
+            &claims.sub,
+        )
+        .await?;
+        let resp = client
+            .get_query_results()
+            .query_id(&payload.aws_query_id)
+            .send()
+            .await
+            .map_err(|e| {
+                let _ = audit_cloudwatch_insights_failure(
+                    state,
+                    &claims.sub,
+                    audit_ctx,
+                    req,
+                    None,
+                    "aws_get_query_results_failed",
+                    "AWS GetQueryResults failed",
+                );
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError::internal(format!(
+                        "AWS GetQueryResults failed: {e}"
+                    ))),
+                )
+            })?;
+        let status = map_aws_query_status(resp.status());
+        let results = resp
+            .results()
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|field| QueryResultField {
+                        field: field.field().unwrap_or_default().to_string(),
+                        value: truncate_utf8(
+                            field.value().unwrap_or_default(),
+                            guardrails.max_event_message_bytes as usize,
+                        ),
+                    })
+                    .collect()
+            })
+            .collect();
+        let statistics = resp.statistics().map(|s| QueryStatistics {
+            records_matched: s.records_matched(),
+            records_scanned: s.records_scanned(),
+            bytes_scanned: s.bytes_scanned(),
+        });
+        (status, results, statistics)
+    };
+    let (results, results_truncated) = truncate_insights_results_by_budget(raw_results, guardrails);
+
+    let terminal = status.is_terminal();
+    audit_cloudwatch_insights_success(
+        state,
+        &claims.sub,
+        audit_ctx,
+        req,
+        &payload,
+        if terminal { "complete" } else { "poll" },
+        status.clone(),
+        results.len(),
+        results_truncated,
+        !state.config.use_mock_aws(),
+    )?;
+
+    let next_action_hint = if !terminal {
+        Some("Use query_token to continue polling this exact Insights query.".to_string())
+    } else if results_truncated {
+        Some(
+            "Narrow the query or time range; the MCP Insights response budget was exhausted."
+                .to_string(),
+        )
+    } else {
+        None
+    };
+
+    Ok(Json(McpRunInsightsQueryResponse {
+        account_id: payload.account_id,
+        region: payload.region,
+        log_group_names: payload.log_group_names,
+        query_token: (!terminal).then(|| query_token.to_string()),
+        status: status.clone(),
+        results,
+        statistics,
+        terminal,
+        next_action_hint,
+    }))
+}
+
+fn map_aws_query_status(
+    status: Option<&aws_sdk_cloudwatchlogs::types::QueryStatus>,
+) -> QueryStatus {
+    match status {
+        Some(aws_sdk_cloudwatchlogs::types::QueryStatus::Scheduled) => QueryStatus::Scheduled,
+        Some(aws_sdk_cloudwatchlogs::types::QueryStatus::Running) => QueryStatus::Running,
+        Some(aws_sdk_cloudwatchlogs::types::QueryStatus::Complete) => QueryStatus::Complete,
+        Some(aws_sdk_cloudwatchlogs::types::QueryStatus::Failed) => QueryStatus::Failed,
+        Some(aws_sdk_cloudwatchlogs::types::QueryStatus::Cancelled) => QueryStatus::Cancelled,
+        Some(aws_sdk_cloudwatchlogs::types::QueryStatus::Timeout) => QueryStatus::Timeout,
+        _ => QueryStatus::Unknown,
+    }
+}
+
+fn mock_insights_results() -> Vec<Vec<QueryResultField>> {
+    vec![
+        vec![
+            QueryResultField {
+                field: "@timestamp".into(),
+                value: "2025-03-15 10:30:00".into(),
+            },
+            QueryResultField {
+                field: "@message".into(),
+                value: "Request processed successfully".into(),
+            },
+        ],
+        vec![
+            QueryResultField {
+                field: "@timestamp".into(),
+                value: "2025-03-15 10:30:01".into(),
+            },
+            QueryResultField {
+                field: "@message".into(),
+                value: "Database query completed in 45ms".into(),
+            },
+        ],
+    ]
+}
+
+fn audit_cloudwatch_preflight_denied(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpCloudwatchPreflightRequest,
+    reason: &str,
+    message: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchPreflight,
+            AuditOutcome::Denied,
+        )
+        .account(Some(&req.account_id))
+        .region(Some(&req.region))
+        .target(req.log_group_name.as_deref())
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_preflight",
+            "mcp_outcome_kind": reason,
+            "tool_name": req.tool_name.as_str(),
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "log_group_name": req.log_group_name.as_deref(),
+            "log_group_names": req.log_group_names,
+            "start_time": req.start_time,
+            "end_time": req.end_time,
+            "limit": req.limit,
+            "filter_pattern_raw": "[redacted: denial path]",
+            "query_string_raw": "[redacted: denial path]",
+            "raw_inputs_redacted": true,
+            "aws_execution_attempted": false,
+            "rejection_reason": reason,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+fn audit_cloudwatch_search_denied(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpSearchLogsRequest,
+    context: Option<&CloudwatchSearchContext>,
+    reason: &str,
+    message: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchSearch,
+            AuditOutcome::Denied,
+        )
+        .account(context.map(|c| c.account_id.as_str()))
+        .region(context.map(|c| c.region.as_str()))
+        .target(context.map(|c| c.log_group_name.as_str()))
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_search",
+            "mcp_outcome_kind": reason,
+            "tool_name": CLOUDWATCH_SEARCH_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "has_preflight_token": req.preflight_token.is_some(),
+            "has_search_cursor": req.search_cursor.is_some(),
+            "account_id": context.map(|c| c.account_id.as_str()),
+            "region": context.map(|c| c.region.as_str()),
+            "log_group_name": context.map(|c| c.log_group_name.as_str()),
+            "filter_pattern_raw": "[redacted: denial path]",
+            "raw_inputs_redacted": true,
+            "aws_execution_attempted": false,
+            "rejection_reason": reason,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+fn audit_cloudwatch_search_attempt(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpSearchLogsRequest,
+    context: &CloudwatchSearchContext,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchSearch,
+            AuditOutcome::Success,
+        )
+        .account(Some(&context.account_id))
+        .region(Some(&context.region))
+        .target(Some(&context.log_group_name))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_search",
+            "mcp_outcome_kind": "attempt",
+            "tool_name": CLOUDWATCH_SEARCH_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "log_group_name": context.log_group_name.as_str(),
+            "start_time": context.start_time,
+            "end_time": context.end_time,
+            "limit": context.limit,
+            "filter_pattern_raw": context.filter_pattern.as_deref(),
+            "aws_execution_attempted": false,
+            "aws_execution_planned": true,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+fn audit_cloudwatch_search_failure(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpSearchLogsRequest,
+    context: &CloudwatchSearchContext,
+    reason: &str,
+    message: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchSearch,
+            AuditOutcome::Failure,
+        )
+        .account(Some(&context.account_id))
+        .region(Some(&context.region))
+        .target(Some(&context.log_group_name))
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_search",
+            "mcp_outcome_kind": reason,
+            "tool_name": CLOUDWATCH_SEARCH_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "log_group_name": context.log_group_name.as_str(),
+            "filter_pattern_raw": context.filter_pattern.as_deref(),
+            "aws_execution_attempted": true,
+            "rejection_reason": reason,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+fn audit_cloudwatch_insights_denied(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpRunInsightsQueryRequest,
+    preflight: Option<&CloudwatchPreflightTokenPayload>,
+    reason: &str,
+    message: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchInsights,
+            AuditOutcome::Denied,
+        )
+        .account(preflight.map(|p| p.account_id.as_str()))
+        .region(preflight.map(|p| p.region.as_str()))
+        .target(preflight.map(|p| p.log_group_names.join(",")).as_deref())
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_insights",
+            "mcp_outcome_kind": reason,
+            "tool_name": CLOUDWATCH_INSIGHTS_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "has_preflight_token": req.preflight_token.is_some(),
+            "has_query_token": req.query_token.is_some(),
+            "account_id": preflight.map(|p| p.account_id.as_str()),
+            "region": preflight.map(|p| p.region.as_str()),
+            "log_group_names": preflight.map(|p| p.log_group_names.as_slice()),
+            "query_string_raw": "[redacted: denial path]",
+            "raw_inputs_redacted": true,
+            "aws_execution_attempted": false,
+            "rejection_reason": reason,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+fn audit_cloudwatch_insights_attempt<T: Serialize>(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpRunInsightsQueryRequest,
+    payload: &T,
+    phase: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let metadata_payload = serde_json::to_value(payload).unwrap_or_else(|_| serde_json::json!({}));
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchInsights,
+            AuditOutcome::Success,
+        )
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_insights",
+            "mcp_outcome_kind": "attempt",
+            "tool_name": CLOUDWATCH_INSIGHTS_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "phase": phase,
+            "account_id": metadata_payload.get("account_id"),
+            "region": metadata_payload.get("region"),
+            "log_group_names": metadata_payload.get("log_group_names"),
+            "query_string_raw": metadata_payload.get("query_string"),
+            "aws_execution_attempted": false,
+            "aws_execution_planned": true,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+fn audit_cloudwatch_insights_failure(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpRunInsightsQueryRequest,
+    preflight: Option<&CloudwatchPreflightTokenPayload>,
+    reason: &str,
+    message: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchInsights,
+            AuditOutcome::Failure,
+        )
+        .account(preflight.map(|p| p.account_id.as_str()))
+        .region(preflight.map(|p| p.region.as_str()))
+        .error(Some(message))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_insights",
+            "mcp_outcome_kind": reason,
+            "tool_name": CLOUDWATCH_INSIGHTS_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "account_id": preflight.map(|p| p.account_id.as_str()),
+            "region": preflight.map(|p| p.region.as_str()),
+            "log_group_names": preflight.map(|p| p.log_group_names.as_slice()),
+            "query_string_raw": preflight.and_then(|p| p.query_string.as_deref()),
+            "aws_execution_attempted": true,
+            "rejection_reason": reason,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_cloudwatch_insights_success(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    req: &McpRunInsightsQueryRequest,
+    payload: &InsightsQueryTokenPayload,
+    outcome_kind: &str,
+    status: QueryStatus,
+    row_count: usize,
+    results_truncated: bool,
+    aws_execution_attempted: bool,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::McpCloudwatchInsights,
+            AuditOutcome::Success,
+        )
+        .account(Some(&payload.account_id))
+        .region(Some(&payload.region))
+        .target(Some(&payload.log_group_names.join(",")))
+        .metadata(audit_ctx.metadata(serde_json::json!({
+            "client_type": "mcp",
+            "surface": "mcp",
+            "mcp_event_kind": "cloudwatch_insights",
+            "mcp_outcome_kind": outcome_kind,
+            "tool_name": CLOUDWATCH_INSIGHTS_TOOL,
+            "canopy_mcp_session_id": req.canopy_mcp_session_id.as_deref(),
+            "local_secret_generation": req.local_secret_generation.as_deref(),
+            "log_group_names": payload.log_group_names,
+            "query_string_raw": payload.query_string,
+            "status": status,
+            "row_count": row_count,
+            "results_truncated": results_truncated,
+            "aws_execution_attempted": aws_execution_attempted,
+        })))
+        .commit_or_fail()
+        .map_err(|_| cloudwatch_data_audit_failure_response())
+}
+
 #[derive(Debug)]
 struct DiscoveryResult {
     log_groups: Vec<LogGroup>,
@@ -1860,6 +3833,48 @@ mod cloudwatch_discovery_tests {
             Err("discovery_cursor_entitlement_changed")
         );
     }
+
+    #[test]
+    fn response_event_cap_respects_byte_budget() {
+        let guardrails = McpGuardrails {
+            max_response_bytes: 64 * 1024,
+            max_event_message_bytes: 16 * 1024,
+            ..McpGuardrails::default()
+        };
+
+        let cap = max_events_per_response(&guardrails);
+
+        assert!(
+            cap < guardrails.max_search_events,
+            "byte budget should reduce the per-response page size"
+        );
+        assert!(cap >= 1);
+    }
+
+    #[test]
+    fn insights_results_truncate_at_response_budget() {
+        let guardrails = McpGuardrails {
+            max_response_bytes: 120,
+            max_event_message_bytes: 80,
+            ..McpGuardrails::default()
+        };
+        let rows = vec![
+            vec![QueryResultField {
+                field: "@message".into(),
+                value: "first row fits".into(),
+            }],
+            vec![QueryResultField {
+                field: "@message".into(),
+                value: "second row should exceed the tiny response budget".into(),
+            }],
+        ];
+
+        let (truncated_rows, truncated) = truncate_insights_results_by_budget(rows, &guardrails);
+
+        assert!(truncated);
+        assert_eq!(truncated_rows.len(), 1);
+        assert_eq!(truncated_rows[0][0].value, "first row fits");
+    }
 }
 
 fn audit_cloudwatch_discovery_denied(
@@ -1897,6 +3912,7 @@ fn audit_cloudwatch_discovery_denied(
         .map_err(|_| cloudwatch_discovery_audit_failure_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_cloudwatch_discovery_error(
     state: &AppState,
     actor: &str,

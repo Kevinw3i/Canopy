@@ -1,11 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::cloudwatch::LogGroup;
+use super::cloudwatch::{LogEvent, LogGroup, QueryResultField, QueryStatistics, QueryStatus};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-pub const MCP_PRODUCT_PHASE: &str = "phase_2_discovery";
+pub const MCP_PRODUCT_PHASE: &str = "phase_3_data_tools";
 pub const MCP_SECURITY_BOUNDARIES_KEY: &str = "security_boundaries@2026-05-13";
+pub const MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID: &str = "cloudwatch_search_workflow";
+pub const MCP_CLOUDWATCH_SEARCH_GUIDANCE_VERSION: &str = "2026-05-13";
+pub const MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY: &str = "cloudwatch_search_workflow@2026-05-13";
+pub const MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID: &str = "cloudwatch_insights_workflow";
+pub const MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_VERSION: &str = "2026-05-13";
+pub const MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY: &str = "cloudwatch_insights_workflow@2026-05-13";
 pub const MCP_DATABASE_GUIDANCE_ID: &str = "database_query_workflow";
 pub const MCP_DATABASE_GUIDANCE_VERSION: &str = "2026-05-13";
 pub const MCP_DATABASE_GUIDANCE_KEY: &str = "database_query_workflow@2026-05-13";
@@ -24,16 +30,16 @@ pub const MCP_GUIDANCE_CATALOG: &[McpGuidanceCatalogEntry] = &[
         content: "Use only the tools exposed by Canopy MCP. Do not ask for AWS credentials, Canopy JWTs, local secrets, or raw Authorization headers. Treat returned scope and guardrails as hard limits.",
     },
     McpGuidanceCatalogEntry {
-        id: "cloudwatch_search_workflow",
-        version: "2026-05-13",
+        id: MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID,
+        version: MCP_CLOUDWATCH_SEARCH_GUIDANCE_VERSION,
         title: "CloudWatch Search Workflow",
-        content: "Before using CloudWatch MCP tools, call canopy_describe_capabilities. In Phase 2, only canopy_list_allowed_log_groups is enabled for discovery; search and Insights data tools remain disabled until Phase 3.",
+        content: "Before searching CloudWatch logs through MCP, call canopy_describe_capabilities, then use canopy_list_allowed_log_groups to select an authorized log group, then call canopy_preflight_request. Initial canopy_search_logs calls require preflight_token and no search_cursor; continuation calls require search_cursor and no preflight_token. Raw filter patterns are audited only after guidance and preflight gates pass.",
     },
     McpGuidanceCatalogEntry {
-        id: "cloudwatch_insights_workflow",
-        version: "2026-05-13",
+        id: MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID,
+        version: MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_VERSION,
         title: "CloudWatch Insights Workflow",
-        content: "Insights queries require explicit Phase 3 support, preflight validation, bounded time windows, and central guardrails. In Phase 2, do not run Insights.",
+        content: "Logs Insights through MCP requires canopy_describe_capabilities, authorized log groups from canopy_list_allowed_log_groups, and canopy_preflight_request before canopy_run_insights_query. Initial calls require preflight_token and no query_token; polling calls require query_token and no preflight_token. Time windows, query text, response size, and concurrency are bounded by server guardrails.",
     },
     McpGuidanceCatalogEntry {
         id: "privacy_and_audit_notice",
@@ -140,6 +146,9 @@ pub struct McpGuardrails {
     pub max_describe_log_groups_pages: u64,
     pub max_discovery_results_scanned: u64,
     pub discovery_cursor_ttl_seconds: u64,
+    pub preflight_token_ttl_seconds: u64,
+    pub search_cursor_ttl_seconds: u64,
+    pub insights_query_token_ttl_seconds: u64,
     pub max_search_window_seconds: u64,
     pub max_search_events: u64,
     pub max_response_bytes: u64,
@@ -160,6 +169,9 @@ impl Default for McpGuardrails {
             max_describe_log_groups_pages: 5,
             max_discovery_results_scanned: 1_000,
             discovery_cursor_ttl_seconds: 10 * 60,
+            preflight_token_ttl_seconds: 5 * 60,
+            search_cursor_ttl_seconds: 10 * 60,
+            insights_query_token_ttl_seconds: 15 * 60,
             max_search_window_seconds: 6 * 60 * 60,
             max_search_events: 1000,
             max_response_bytes: 1024 * 1024,
@@ -215,6 +227,94 @@ pub struct McpListAllowedLogGroupsResponse {
     pub next_action_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpCloudwatchPreflightRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canopy_mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_secret_generation: Option<String>,
+    pub tool_name: String,
+    pub account_id: String,
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_group_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log_group_names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_string: Option<String>,
+    pub start_time: i64,
+    pub end_time: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpCloudwatchPreflightResponse {
+    pub tool_name: String,
+    pub account_id: String,
+    pub region: String,
+    pub log_group_names: Vec<String>,
+    pub preflight_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub guardrails: McpGuardrails,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSearchLogsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canopy_mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_secret_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSearchLogsResponse {
+    pub account_id: String,
+    pub region: String,
+    pub log_group_name: String,
+    pub events: Vec<LogEvent>,
+    pub returned_count: usize,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRunInsightsQueryRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canopy_mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_secret_generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpRunInsightsQueryResponse {
+    pub account_id: String,
+    pub region: String,
+    pub log_group_names: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_token: Option<String>,
+    pub status: QueryStatus,
+    pub results: Vec<Vec<QueryResultField>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statistics: Option<QueryStatistics>,
+    pub terminal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_action_hint: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,7 +330,7 @@ mod tests {
     #[test]
     fn constants_match_current_phase() {
         assert_eq!(MCP_PROTOCOL_VERSION, "2025-06-18");
-        assert_eq!(MCP_PRODUCT_PHASE, "phase_2_discovery");
+        assert_eq!(MCP_PRODUCT_PHASE, "phase_3_data_tools");
     }
 
     #[test]

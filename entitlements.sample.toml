@@ -38,14 +38,17 @@ can_use_ec2_instance_connect = true
 # "MCP / AI Tools" 頁面啟動本機 MCP server，並連接 Codex CLI
 # 或 Claude Code。
 #
-# Product Phase 2 提供 MCP 基礎工具：
+# Product Phase 3 提供 MCP 基礎工具與 CloudWatch data tools：
 #   - canopy_describe_capabilities
 #   - canopy_get_guidance
 #   - canopy_list_allowed_log_groups（需 can_use_mcp_cloudwatch=true）
+#   - canopy_preflight_request（需 can_use_mcp_cloudwatch=true）
+#   - canopy_search_logs（需 can_use_mcp_cloudwatch=true 與 preflight token）
+#   - canopy_run_insights_query（需 can_use_mcp_cloudwatch=true 與 preflight token / query token）
 # 並可在 can_use_mcp_database=true 且 database_scopes 授權時
 # 啟用 MCP Database v1。
 #
-# CloudWatch search / Insights / EC2 MCP data tools 是後續 phase；不要因為使用者
+# EC2 MCP data tools 是後續 phase；不要因為使用者
 # 有 TUI CloudWatch 權限就自動開 MCP CloudWatch。
 can_use_mcp = true
 can_use_mcp_cloudwatch = false

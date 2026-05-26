@@ -580,7 +580,7 @@ async fn register_database_guidance_ids(
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_2_discovery"
+        "product_phase": "phase_3_data_tools"
     });
     let register_resp = app
         .clone()
@@ -642,7 +642,7 @@ async fn mcp_guidance_sync_returns_server_owned_content_on_success() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_2_discovery"
+        "product_phase": "phase_3_data_tools"
     });
     let register_resp = app
         .clone()
@@ -711,7 +711,7 @@ async fn mcp_guidance_sync_rejects_unknown_guidance_id() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_2_discovery"
+        "product_phase": "phase_3_data_tools"
     });
     let register_resp = app
         .clone()
@@ -820,7 +820,7 @@ async fn mcp_guidance_sync_rejects_stale_local_secret_generation_with_403() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_2_discovery"
+        "product_phase": "phase_3_data_tools"
     });
     let register_resp = app
         .clone()
@@ -905,7 +905,7 @@ async fn mcp_guidance_sync_rejects_cross_actor_session_access_with_403() {
         "protocol_version": "2025-06-18",
         "client_name": "route-test",
         "client_version": "0.1.0",
-        "product_phase": "phase_2_discovery"
+        "product_phase": "phase_3_data_tools"
     });
     let register_resp = app
         .clone()
@@ -994,7 +994,7 @@ async fn mcp_guidance_sync_rejects_expired_session_with_403() {
             protocol_version: "2025-06-18".into(),
             client_name: "route-test".into(),
             client_version: "0.1.0".into(),
-            product_phase: "phase_2_discovery".into(),
+            product_phase: "phase_3_data_tools".into(),
             guidance_delivered: Default::default(),
             // Expired one hour ago.
             expires_at: now - Duration::hours(1),
@@ -1282,7 +1282,7 @@ async fn mcp_session_register_with_valid_entitlement_returns_session_id_and_forw
         "protocol_version": "2025-06-18",
         "client_name": "canopy-test-client",
         "client_version": "0.0.1",
-        "product_phase": "phase_2_discovery",
+        "product_phase": "phase_3_data_tools",
     });
     let resp = app
         .oneshot(
@@ -1326,7 +1326,7 @@ async fn mcp_session_register_with_valid_entitlement_returns_session_id_and_forw
     assert_eq!(success["metadata"]["client_type"], "mcp");
     assert_eq!(success["metadata"]["client_name"], "canopy-test-client");
     assert_eq!(success["metadata"]["client_version"], "0.0.1");
-    assert_eq!(success["metadata"]["product_phase"], "phase_2_discovery");
+    assert_eq!(success["metadata"]["product_phase"], "phase_3_data_tools");
 }
 
 #[tokio::test]
@@ -1346,7 +1346,7 @@ async fn mcp_session_register_without_can_use_mcp_returns_403_and_audits_denial(
         "protocol_version": "2025-06-18",
         "client_name": "denied-client",
         "client_version": "0.0.1",
-        "product_phase": "phase_2_discovery",
+        "product_phase": "phase_3_data_tools",
     });
     let resp = app
         .oneshot(
@@ -1394,7 +1394,7 @@ async fn mcp_session_register_with_unsupported_protocol_version_returns_400_and_
         "protocol_version": "1999-01-01",
         "client_name": "old-client",
         "client_version": "0.0.1",
-        "product_phase": "phase_2_discovery",
+        "product_phase": "phase_3_data_tools",
     });
     let resp = app
         .oneshot(
@@ -1436,7 +1436,7 @@ async fn mcp_session_register_without_authorization_header_returns_401() {
         "protocol_version": "2025-06-18",
         "client_name": "x",
         "client_version": "0.1",
-        "product_phase": "phase_2_discovery",
+        "product_phase": "phase_3_data_tools",
     });
     let resp = app
         .oneshot(
@@ -1465,7 +1465,7 @@ async fn mcp_session_register_with_missing_required_field_returns_4xx() {
         "protocol_version": "2025-06-18",
         "client_name": "x",
         "client_version": "0.1",
-        "product_phase": "phase_2_discovery",
+        "product_phase": "phase_3_data_tools",
     });
     let resp = app
         .oneshot(
@@ -1500,7 +1500,7 @@ async fn mcp_session_register_returns_distinct_session_ids_for_repeated_calls() 
         "protocol_version": "2025-06-18",
         "client_name": "x",
         "client_version": "0.1",
-        "product_phase": "phase_2_discovery",
+        "product_phase": "phase_3_data_tools",
     });
     let resp1 = app
         .clone()
@@ -2270,6 +2270,353 @@ async fn mcp_cloudwatch_discovery_rejects_invalid_cursor_and_audits_denial() {
     );
     assert_eq!(event["metadata"]["has_discovery_cursor"], true);
     assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_preflight_issues_search_token_and_audits_success() {
+    let audit = AuditFile::new("mcp-cloudwatch-preflight-search-success");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "ERROR",
+        "start_time": 1000,
+        "end_time": 2000,
+        "limit": 2
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["tool_name"], "canopy_search_logs");
+    assert_eq!(json["log_group_names"], json!(["/app/web-service"]));
+    assert!(json["preflight_token"]
+        .as_str()
+        .is_some_and(|s| s.len() > 32));
+
+    let lines = read_audit_events(&audit.path);
+    let event = lines
+        .iter()
+        .find(|event| event["action"] == "mcp_cloudwatch_preflight")
+        .expect("MCP CloudWatch preflight audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "success");
+    assert_eq!(event["metadata"]["tool_name"], "canopy_search_logs");
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_search_uses_preflight_then_cursor_and_audits() {
+    let audit = AuditFile::new("mcp-cloudwatch-search-preflight-cursor");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let preflight_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "INFO",
+        "start_time": 1000,
+        "end_time": 2000,
+        "limit": 2
+    });
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(preflight_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    let preflight_json = body_json(preflight.into_body()).await;
+    let preflight_token = preflight_json["preflight_token"].as_str().unwrap();
+
+    let search_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "preflight_token": preflight_token
+    });
+    let search = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/search")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(search_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(search.status(), StatusCode::OK);
+    let search_json = body_json(search.into_body()).await;
+    assert_eq!(search_json["returned_count"], 2);
+    assert_eq!(search_json["truncated"], true);
+    let cursor = search_json["search_cursor"]
+        .as_str()
+        .expect("search_cursor");
+
+    let continue_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "search_cursor": cursor
+    });
+    let continued = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/search")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(continue_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued.status(), StatusCode::OK);
+    let continued_json = body_json(continued.into_body()).await;
+    assert!(continued_json["returned_count"].as_u64().unwrap() > 0);
+
+    let lines = read_audit_events(&audit.path);
+    let search_successes = lines
+        .iter()
+        .filter(|event| {
+            event["action"] == "mcp_cloudwatch_search"
+                && event["metadata"]["mcp_outcome_kind"] == "success"
+        })
+        .count();
+    assert_eq!(search_successes, 2);
+    assert!(!serde_json::to_string(&search_json)
+        .unwrap()
+        .contains("aws_next_token"));
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_search_rejects_mixed_preflight_and_cursor() {
+    let audit = AuditFile::new("mcp-cloudwatch-search-mixed-token-mode");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "preflight_token": "not-used",
+        "search_cursor": "not-used"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/search")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let lines = read_audit_events(&audit.path);
+    let event = lines
+        .iter()
+        .find(|event| event["action"] == "mcp_cloudwatch_search")
+        .expect("MCP CloudWatch search denial audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "invalid_token_mode");
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_insights_starts_then_polls_with_query_token() {
+    let audit = AuditFile::new("mcp-cloudwatch-insights-start-poll");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_insights_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let preflight_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_run_insights_query",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_names": ["/app/web-service"],
+        "query_string": "fields @timestamp, @message | limit 2",
+        "start_time": 1000,
+        "end_time": 2000
+    });
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(preflight_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    let preflight_json = body_json(preflight.into_body()).await;
+    let preflight_token = preflight_json["preflight_token"].as_str().unwrap();
+
+    let start_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "preflight_token": preflight_token
+    });
+    let started = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/insights")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(start_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let started_json = body_json(started.into_body()).await;
+    assert_eq!(started_json["status"], "Running");
+    assert_eq!(started_json["terminal"], false);
+    let query_token = started_json["query_token"].as_str().expect("query_token");
+
+    let poll_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "query_token": query_token
+    });
+    let polled = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/insights")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(poll_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.status(), StatusCode::OK);
+    let polled_json = body_json(polled.into_body()).await;
+    assert_eq!(polled_json["status"], "Complete");
+    assert_eq!(polled_json["terminal"], true);
+    assert!(polled_json["query_token"].is_null());
+    assert_eq!(polled_json["results"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_preflight_denial_redacts_raw_inputs() {
+    let audit = AuditFile::new("mcp-cloudwatch-preflight-redacts-denial");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "SECRET_TOKEN_SHOULD_NOT_APPEAR",
+        "start_time": 1000,
+        "end_time": 1000 + (7 * 60 * 60),
+        "limit": 2
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let audit_json = serde_json::to_string(&read_audit_events(&audit.path)).unwrap();
+    assert!(
+        !audit_json.contains("SECRET_TOKEN_SHOULD_NOT_APPEAR"),
+        "denial audit must redact raw filter/query input: {audit_json}"
+    );
+    assert!(audit_json.contains("[redacted: denial path]"));
 }
 
 #[tokio::test]
