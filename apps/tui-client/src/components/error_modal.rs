@@ -60,6 +60,26 @@ impl ErrorModal {
         self.message.as_deref()
     }
 
+    fn message_lines(message: &str, max_lines: usize) -> Vec<Line<'static>> {
+        let max_lines = max_lines.max(1);
+        let mut raw_lines = message.lines().map(str::to_string).collect::<Vec<_>>();
+        if raw_lines.is_empty() {
+            raw_lines.push(String::new());
+        }
+        if raw_lines.len() > max_lines {
+            let omitted = raw_lines.len() - max_lines + 1;
+            raw_lines.truncate(max_lines);
+            if let Some(last) = raw_lines.last_mut() {
+                *last = format!("... {omitted} more lines");
+            }
+        }
+
+        raw_lines
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Red))))
+            .collect()
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let Some(ref message) = self.message else {
             return;
@@ -67,7 +87,13 @@ impl ErrorModal {
 
         // Center the modal
         let modal_width = 60u16.min(area.width.saturating_sub(4));
-        let modal_height = 8u16.min(area.height.saturating_sub(4));
+        let max_modal_height = area.height.saturating_sub(4);
+        if modal_width == 0 || max_modal_height == 0 {
+            return;
+        }
+        let raw_line_count = message.lines().count().max(1) as u16;
+        let desired_height = (raw_line_count + 5).max(6);
+        let modal_height = desired_height.min(max_modal_height);
         let modal_area = Rect {
             x: area.x + (area.width.saturating_sub(modal_width)) / 2,
             y: area.y + (area.height.saturating_sub(modal_height)) / 2,
@@ -85,18 +111,14 @@ impl ErrorModal {
         let inner = block.inner(modal_area);
         block.render(modal_area, buf);
 
-        let text = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                message.as_str(),
-                Style::default().fg(Color::Red),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press Esc or Enter to dismiss",
-                Style::default().fg(Color::Gray),
-            )),
-        ];
+        let max_message_lines = inner.height.saturating_sub(3).max(1) as usize;
+        let mut text = vec![Line::from("")];
+        text.extend(Self::message_lines(message, max_message_lines));
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            "Press Esc or Enter to dismiss",
+            Style::default().fg(Color::Gray),
+        )));
 
         Paragraph::new(text)
             .alignment(Alignment::Center)
@@ -109,6 +131,17 @@ impl ErrorModal {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn buffer_text(buf: &Buffer, area: Rect) -> String {
+        let mut text = String::new();
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -160,5 +193,39 @@ mod tests {
         let action = modal.handle_key(key(KeyCode::Char('x')));
         assert!(modal.is_visible());
         assert!(matches!(action, Action::Noop));
+    }
+
+    #[test]
+    fn message_lines_preserve_explicit_newlines() {
+        let lines = ErrorModal::message_lines("scope-a failed\nscope-b failed", 5);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "scope-a failed");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "scope-b failed");
+    }
+
+    #[test]
+    fn message_lines_truncate_when_modal_is_short() {
+        let lines = ErrorModal::message_lines("one\ntwo\nthree", 2);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "one");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "... 2 more lines");
+    }
+
+    #[test]
+    fn render_displays_multiline_message_lines() {
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        let mut modal = ErrorModal::new();
+        modal.show("Some ECS scopes failed:\naccount-a us-east-1\naccount-b eu-west-1".into());
+
+        modal.render(area, &mut buf);
+
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("Some ECS scopes failed:"));
+        assert!(text.contains("account-a us-east-1"));
+        assert!(text.contains("account-b eu-west-1"));
+        assert!(text.contains("Press Esc or Enter to dismiss"));
     }
 }
