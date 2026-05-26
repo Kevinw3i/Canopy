@@ -8,6 +8,26 @@ use shared::dto::entitlements::UserEntitlements;
 use super::Component;
 use crate::event::Action;
 
+fn selector_summary(selectors: &[shared::dto::entitlements::TagSelector]) -> String {
+    if selectors.is_empty() {
+        return "-".into();
+    }
+
+    selectors
+        .iter()
+        .map(|selector| {
+            let mut tags = selector
+                .tags
+                .iter()
+                .map(|(key, values)| format!("{}=[{}]", key, values.join("|")))
+                .collect::<Vec<_>>();
+            tags.sort();
+            tags.join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[derive(Default)]
 pub struct AccessScreen {
     pub entitlements: Option<UserEntitlements>,
@@ -52,15 +72,30 @@ impl Component for AccessScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),  // Identity
-                Constraint::Length(10), // Features
-                Constraint::Length(6),  // Accounts
-                Constraint::Length(3),  // Regions
-                Constraint::Length(8),  // ECS scopes
-                Constraint::Min(4),     // Log groups
-                Constraint::Length(2),  // Help
+                Constraint::Length(6), // Identity
+                Constraint::Min(8),    // Feature and scope columns
+                Constraint::Length(1), // Help
             ])
             .split(inner);
+        let body_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(chunks[1]);
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(10), // Features
+                Constraint::Min(4),     // Log groups
+            ])
+            .split(body_chunks[0]);
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4), // Accounts
+                Constraint::Length(3), // Regions
+                Constraint::Min(8),    // ECS scopes
+            ])
+            .split(body_chunks[1]);
 
         // Identity section
         let identity_lines = vec![
@@ -148,7 +183,7 @@ impl Component for AccessScreen {
             .border_style(Style::default().fg(Color::Cyan));
         Paragraph::new(feature_lines)
             .block(feature_block)
-            .render(chunks[1], buf);
+            .render(left_chunks[0], buf);
 
         // Accounts
         let account_lines: Vec<Line> = ent
@@ -171,7 +206,7 @@ impl Component for AccessScreen {
         Paragraph::new(account_lines)
             .block(accounts_block)
             .wrap(Wrap { trim: true })
-            .render(chunks[2], buf);
+            .render(right_chunks[0], buf);
 
         // Regions
         let regions_block = Block::default()
@@ -180,30 +215,12 @@ impl Component for AccessScreen {
             .border_style(Style::default().fg(Color::Cyan));
         Paragraph::new(ent.allowed_regions.join(", "))
             .block(regions_block)
-            .render(chunks[3], buf);
+            .render(right_chunks[1], buf);
 
         // ECS scopes
-        let selector_summary = |selectors: &[shared::dto::entitlements::TagSelector]| -> String {
-            if selectors.is_empty() {
-                "-".into()
-            } else {
-                selectors
-                    .iter()
-                    .map(|selector| {
-                        selector
-                            .tags
-                            .iter()
-                            .map(|(key, values)| format!("{}=[{}]", key, values.join("|")))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            }
-        };
         let ecs_lines = vec![
             Line::from(format!(
-                "  allowed_clusters: {}",
+                "  clusters: {}",
                 if ent.allowed_clusters.is_empty() {
                     "-".into()
                 } else {
@@ -211,15 +228,15 @@ impl Component for AccessScreen {
                 }
             )),
             Line::from(format!(
-                "  task_tag_selectors: {}",
+                "  task_tags: {}",
                 selector_summary(&ent.task_tag_selectors)
             )),
             Line::from(format!(
-                "  excluded_task_tag_selectors: {}",
+                "  excluded_task_tags: {}",
                 selector_summary(&ent.excluded_task_tag_selectors)
             )),
             Line::from(format!(
-                "  rule_local_excluded_container_names: {}",
+                "  excluded_containers: {}",
                 if ent.excluded_container_names.is_empty() {
                     "-".into()
                 } else {
@@ -227,7 +244,7 @@ impl Component for AccessScreen {
                 }
             )),
             Line::from(format!(
-                "  allow_broad_cluster_discovery: {}",
+                "  broad_discovery: {}",
                 if ent.allow_broad_cluster_discovery {
                     "true"
                 } else {
@@ -242,7 +259,7 @@ impl Component for AccessScreen {
         Paragraph::new(ecs_lines)
             .block(ecs_block)
             .wrap(Wrap { trim: true })
-            .render(chunks[4], buf);
+            .render(right_chunks[2], buf);
 
         // Log groups
         let lg_lines: Vec<Line> = ent
@@ -260,12 +277,12 @@ impl Component for AccessScreen {
         Paragraph::new(lg_lines)
             .block(lg_block)
             .wrap(Wrap { trim: true })
-            .render(chunks[5], buf);
+            .render(left_chunks[1], buf);
 
         // Help
         Paragraph::new("Esc/q: back")
             .style(Style::default().fg(Color::Gray))
-            .render(chunks[6], buf);
+            .render(chunks[2], buf);
     }
 }
 
@@ -275,8 +292,8 @@ mod tests {
     use shared::dto::entitlements::{AllowedAccount, FeatureFlags, TagSelector};
     use std::collections::HashMap;
 
-    fn rendered_text(screen: &mut AccessScreen) -> String {
-        let area = Rect::new(0, 0, 140, 40);
+    fn rendered_text_at(screen: &mut AccessScreen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf);
 
@@ -287,8 +304,7 @@ mod tests {
         out
     }
 
-    #[test]
-    fn render_includes_ecs_permissions_and_scope() {
+    fn sample_screen() -> AccessScreen {
         let mut screen = AccessScreen::new();
         screen.set_entitlements(UserEntitlements {
             user_id: "u1".into(),
@@ -321,16 +337,34 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
         });
+        screen
+    }
 
-        let text = rendered_text(&mut screen);
+    #[test]
+    fn render_includes_ecs_permissions_and_scope() {
+        let mut screen = sample_screen();
+
+        let text = rendered_text_at(&mut screen, 140, 40);
 
         assert!(text.contains("ECS Task View"));
         assert!(text.contains("ECS Exec"));
         assert!(text.contains("arn:aws:ecs:us-east-1:111:cluster/prod-*"));
         assert!(text.contains("Environment=[production]"));
         assert!(text.contains("CanopyDeny=[true]"));
-        assert!(text.contains("rule_local_excluded_container_names"));
+        assert!(text.contains("excluded_containers"));
         assert!(text.contains("envoy"));
-        assert!(text.contains("allow_broad_cluster_discovery: false"));
+        assert!(text.contains("broad_discovery: false"));
+    }
+
+    #[test]
+    fn render_keeps_ecs_scope_visible_at_standard_terminal_size() {
+        let mut screen = sample_screen();
+
+        let text = rendered_text_at(&mut screen, 80, 24);
+
+        assert!(text.contains("ECS Scope"));
+        assert!(text.contains("excluded_containers"));
+        assert!(text.contains("broad_discovery: false"));
+        assert!(text.contains("Esc/q: back"));
     }
 }
