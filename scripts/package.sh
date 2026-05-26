@@ -330,8 +330,8 @@ else
     if command -v aws &> /dev/null; then
         ok "$(aws --version 2>&1 | head -1)"
     else
-        warn "AWS CLI 安裝失敗，SSM/EIC 連線功能將無法使用"
-        warn "EC2 瀏覽和 CloudWatch 搜尋不受影響"
+        warn "AWS CLI 安裝失敗，SSM/EIC/ECS Exec 連線功能將無法使用"
+        warn "EC2/ECS 清查和 CloudWatch 搜尋不受影響"
     fi
 fi
 
@@ -399,8 +399,8 @@ else
     if command -v session-manager-plugin &> /dev/null; then
         ok "session-manager-plugin $(session-manager-plugin --version 2>&1)"
     else
-        warn "Session Manager Plugin 安裝失敗，SSM 連線功能將無法使用"
-        warn "EC2 瀏覽和 CloudWatch 搜尋不受影響"
+        warn "Session Manager Plugin 安裝失敗，SSM/ECS Exec 連線功能將無法使用"
+        warn "EC2/ECS 清查和 CloudWatch 搜尋不受影響"
     fi
 fi
 
@@ -457,8 +457,8 @@ if [ "$PASS" -ge 5 ]; then
     echo -e "${GREEN}安裝完成！${NC}"
 else
     echo -e "${YELLOW}安裝完成，但有部分項目未通過。${NC}"
-    echo "EC2 瀏覽和 CloudWatch 搜尋功能仍可正常使用。"
-    echo "SSM/EIC 連線功能需要 AWS CLI v2 和 Session Manager Plugin。"
+    echo "EC2/ECS 清查和 CloudWatch 搜尋功能仍可正常使用。"
+    echo "SSM/EIC/ECS Exec 連線功能需要 AWS CLI v2；SSM/ECS Exec 另需要 Session Manager Plugin。"
 fi
 
 echo ""

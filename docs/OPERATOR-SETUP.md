@@ -101,8 +101,8 @@ cd canopy-dist
 
 1. 安裝 `canopy` 二進位檔到 `/usr/local/bin/`
 2. 建立 TUI 設定檔（URL 已預填，路徑依作業系統決定）
-3. 偵測 AWS CLI v2，沒有就自動安裝
-4. 偵測 Session Manager Plugin，沒有就自動安裝
+3. 偵測 AWS CLI v2（用於 SSM/EIC/ECS Exec 連線），沒有就自動安裝
+4. 偵測 Session Manager Plugin（用於 SSM/ECS Exec），沒有就自動安裝
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
 6. 跑完整驗證，逐項報告結果
 
@@ -127,10 +127,10 @@ install.sh
 │      ├── macOS → ~/Library/Application Support/canopy/config.toml
 │      └── Linux → ${XDG_CONFIG_HOME:-~/.config}/canopy/config.toml
 │      （如果已存在則跳過，不覆寫）
-├── 5. 檢查 AWS CLI v2
+├── 5. 檢查 AWS CLI v2（SSM/EIC/ECS Exec 連線需要）
 │      ├── 已安裝 → 跳過
 │      └── 未安裝 → 下載並安裝（macOS .pkg / Linux .zip）
-├── 6. 檢查 Session Manager Plugin
+├── 6. 檢查 Session Manager Plugin（SSM/ECS Exec 需要）
 │      ├── 已安裝 → 跳過
 │      └── 未安裝 → 下載並安裝（macOS .pkg / Linux .deb/.rpm）
 └── 7. 驗證
