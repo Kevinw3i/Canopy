@@ -174,6 +174,17 @@ fn scope_applies_to_account_region(
                 .any(|scope_region| scope_region == region))
 }
 
+fn cluster_pattern_applies_to_account_region(
+    pattern: &str,
+    account_id: &str,
+    region: &str,
+) -> bool {
+    ecs_arn_region_account(pattern).map_or(true, |(pattern_region, pattern_account)| {
+        (pattern_region == "*" || pattern_region == region)
+            && (pattern_account == "*" || pattern_account == account_id)
+    })
+}
+
 fn cluster_patterns_for_account_region(
     rule_scopes: &[crate::services::ecs::EcsRuleScope],
     account_id: &str,
@@ -185,6 +196,9 @@ fn cluster_patterns_for_account_region(
             continue;
         }
         for pattern in &scope.cluster_patterns {
+            if !cluster_pattern_applies_to_account_region(pattern, account_id, region) {
+                continue;
+            }
             if !patterns.contains(pattern) {
                 patterns.push(pattern.clone());
             }
@@ -254,7 +268,21 @@ fn cluster_request_matches_any_rule_scope(
             }
             vec![region.to_string()]
         } else if scope.regions.is_empty() {
-            vec!["*".to_string()]
+            let mut concrete_regions = Vec::new();
+            for account_id in &account_ids {
+                for region in
+                    concrete_cluster_pattern_regions(std::slice::from_ref(scope), account_id)
+                {
+                    if !concrete_regions.contains(&region) {
+                        concrete_regions.push(region);
+                    }
+                }
+            }
+            if concrete_regions.is_empty() {
+                vec!["*".to_string()]
+            } else {
+                concrete_regions
+            }
         } else {
             scope.regions.clone()
         };
@@ -1513,6 +1541,40 @@ mod tests {
         };
 
         assert!(validate_tasks_request_scope(&req, &[scope]).is_err());
+    }
+
+    #[test]
+    fn cluster_request_scope_accepts_short_cluster_using_concrete_pattern_region() {
+        let mut scope = route_scope();
+        scope.regions.clear();
+        scope.cluster_patterns = vec![cluster_arn("ap-northeast-1", "111111111111", "app")];
+        let req = EcsTasksRequest {
+            account_id: Some("111111111111".into()),
+            region: None,
+            cluster: Some("app".into()),
+            page_size: 50,
+        };
+
+        assert!(validate_tasks_request_scope(&req, &[scope]).is_ok());
+    }
+
+    #[test]
+    fn cluster_patterns_for_account_region_excludes_other_concrete_regions() {
+        let mut scope = route_scope();
+        scope.regions.clear();
+        scope.cluster_patterns = vec![
+            cluster_arn("ap-northeast-1", "111111111111", "api"),
+            cluster_arn("*", "111111111111", "shared"),
+            cluster_arn("us-west-2", "111111111111", "worker"),
+        ];
+
+        assert_eq!(
+            cluster_patterns_for_account_region(&[scope], "111111111111", "ap-northeast-1"),
+            vec![
+                cluster_arn("ap-northeast-1", "111111111111", "api"),
+                cluster_arn("*", "111111111111", "shared")
+            ]
+        );
     }
 
     #[test]
