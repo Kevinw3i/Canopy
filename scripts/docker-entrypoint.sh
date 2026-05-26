@@ -9,9 +9,72 @@ OIDC_CLIENT_ID="${OIDC_CLIENT_ID:-}"
 OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:-}"
 CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-}"
 
+fatal() {
+  echo "FATAL: $*" >&2
+  exit 1
+}
+
 # ── Helper: escape a value for TOML double-quoted strings ──
 escape_toml() {
+  line_count=$(printf '%s\n' "$1" | wc -l | tr -d '[:space:]')
+  if [ "$line_count" != "1" ]; then
+    fatal "TOML string values must not contain newlines."
+  fi
+
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+trim() {
+  printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+toml_array_from_csv() {
+  rest="$1"
+  out=""
+
+  while :; do
+    case "$rest" in
+      *,*)
+        item=${rest%%,*}
+        rest=${rest#*,}
+        more=1
+        ;;
+      *)
+        item=$rest
+        more=0
+        ;;
+    esac
+
+    item=$(trim "$item")
+    if [ -n "$item" ]; then
+      escaped=$(escape_toml "$item")
+      if [ -n "$out" ]; then
+        out="${out}, "
+      fi
+      out="${out}\"${escaped}\""
+    fi
+
+    [ "$more" -eq 1 ] || break
+  done
+
+  printf '[%s]' "$out"
+}
+
+positive_int() {
+  name="$1"
+  value="$2"
+
+  case "$value" in
+    ''|*[!0-9]*)
+      fatal "$name must be a positive integer."
+      ;;
+  esac
+
+  if [ "$value" -le 0 ]; then
+    fatal "$name must be a positive integer."
+  fi
+
+  printf '%s' "$value"
 }
 
 # ── Resolve JWT secret ─────────────────────────────────────
@@ -44,6 +107,13 @@ if [ ! -f "$CONFIG_PATH" ] || [ "${GENERATE_CONFIG:-0}" = "1" ]; then
 
   # Escape secret values for safe TOML embedding
   SAFE_JWT_SECRET=$(escape_toml "$JWT_SECRET")
+  SAFE_BIND_ADDRESS=$(escape_toml "${BIND_ADDRESS:-0.0.0.0:8443}")
+  SAFE_OIDC_ISSUER_URL=$(escape_toml "$OIDC_ISSUER_URL")
+  SAFE_OIDC_CLIENT_ID=$(escape_toml "$OIDC_CLIENT_ID")
+  SAFE_AWS_DEFAULT_REGION=$(escape_toml "${AWS_DEFAULT_REGION:-ap-northeast-1}")
+  SAFE_STS_EXTERNAL_ID=$(escape_toml "${STS_EXTERNAL_ID:-canopy}")
+  SAFE_JWT_EXPIRY_SECONDS=$(positive_int "JWT_EXPIRY_SECONDS" "${JWT_EXPIRY_SECONDS:-3600}")
+  SAFE_AWS_SESSION_DURATION_SECONDS=$(positive_int "AWS_SESSION_DURATION_SECONDS" "${AWS_SESSION_DURATION_SECONDS:-3600}")
 
   CLIENT_SECRET_LINE=""
   if [ -n "$OIDC_CLIENT_SECRET" ]; then
@@ -53,34 +123,33 @@ if [ ! -f "$CONFIG_PATH" ] || [ "${GENERATE_CONFIG:-0}" = "1" ]; then
 
   # Default to the path baked into the image by the Dockerfile
   ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-/etc/canopy/entitlements.toml}"
-  ENTITLEMENTS_LINE="entitlements_file = \"${ENTITLEMENTS_FILE}\""
+  SAFE_ENTITLEMENTS_FILE=$(escape_toml "$ENTITLEMENTS_FILE")
+  ENTITLEMENTS_LINE="entitlements_file = \"${SAFE_ENTITLEMENTS_FILE}\""
+
+  CORS_LINE=""
+  if [ -n "$CORS_ALLOWED_ORIGINS" ]; then
+    CORS_LINE="cors_allowed_origins = $(toml_array_from_csv "$CORS_ALLOWED_ORIGINS")"
+  fi
 
   cat > "$WRITABLE_CONFIG" <<TOML
-bind_address = "${BIND_ADDRESS:-0.0.0.0:8443}"
+bind_address = "${SAFE_BIND_ADDRESS}"
+${CORS_LINE}
 ${ENTITLEMENTS_LINE}
 
 [oidc]
-issuer_url = "${OIDC_ISSUER_URL}"
-client_id  = "${OIDC_CLIENT_ID}"
+issuer_url = "${SAFE_OIDC_ISSUER_URL}"
+client_id  = "${SAFE_OIDC_CLIENT_ID}"
 ${CLIENT_SECRET_LINE}
 
 [jwt]
 secret         = "${SAFE_JWT_SECRET}"
-expiry_seconds = ${JWT_EXPIRY_SECONDS:-3600}
+expiry_seconds = ${SAFE_JWT_EXPIRY_SECONDS}
 
 [aws]
-default_region           = "${AWS_DEFAULT_REGION:-ap-northeast-1}"
-session_duration_seconds = ${AWS_SESSION_DURATION_SECONDS:-3600}
-sts_external_id          = "${STS_EXTERNAL_ID:-canopy}"
+default_region           = "${SAFE_AWS_DEFAULT_REGION}"
+session_duration_seconds = ${SAFE_AWS_SESSION_DURATION_SECONDS}
+sts_external_id          = "${SAFE_STS_EXTERNAL_ID}"
 TOML
-
-  # Append CORS origins at top level (before first [section])
-  if [ -n "$CORS_ALLOWED_ORIGINS" ]; then
-    # Trim whitespace around each comma-separated origin
-    CORS_ARRAY=$(printf '%s' "$CORS_ALLOWED_ORIGINS" | sed 's/[[:space:]]*,[[:space:]]*/", "/g')
-    sed -i "1a\\
-cors_allowed_origins = [\"${CORS_ARRAY}\"]" "$WRITABLE_CONFIG"
-  fi
 
   CONFIG_PATH="$WRITABLE_CONFIG"
   export CONFIG_PATH
