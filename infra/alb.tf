@@ -6,6 +6,21 @@ resource "aws_lb" "control_plane" {
   internal           = var.alb_internal
   security_groups    = [aws_security_group.alb.id]
   subnets            = var.alb_internal ? local.network_private_subnet_ids : local.network_public_subnet_ids
+
+  lifecycle {
+    precondition {
+      condition     = (var.route53_zone_id == "") == (var.domain_name == "")
+      error_message = "route53_zone_id and domain_name must be set together, or both left empty to skip DNS."
+    }
+    precondition {
+      condition     = var.create_vpc || length(var.private_subnet_ids) >= 2
+      error_message = "private_subnet_ids must contain at least two subnets when create_vpc = false."
+    }
+    precondition {
+      condition     = var.create_vpc || var.alb_internal || length(var.public_subnet_ids) >= 2
+      error_message = "public_subnet_ids must contain at least two subnets when create_vpc = false and alb_internal = false."
+    }
+  }
 }
 
 # ── Target Group ────────────────────────────────────────

@@ -76,6 +76,14 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = var.assumable_role_arns
       }] : [],
 
+      # Cross-account AssumeRole patterns for AWS Organizations account discovery.
+      length(var.assumable_role_arn_patterns) > 0 ? [{
+        Sid      = "AssumeDiscoveredTargetRoles"
+        Effect   = "Allow"
+        Action   = ["sts:AssumeRole", "sts:TagSession"]
+        Resource = var.assumable_role_arn_patterns
+      }] : [],
+
       # SimulatePrincipalPolicy for cross-account role selection (always when roles configured)
       length(var.assumable_role_arns) > 0 ? [{
         Sid      = "SimulatePolicy"
@@ -84,12 +92,33 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = var.assumable_role_arns
       }] : [],
 
+      # SimulatePrincipalPolicy for discovered role patterns.
+      length(var.assumable_role_arn_patterns) > 0 ? [{
+        Sid      = "SimulateDiscoveredPolicy"
+        Effect   = "Allow"
+        Action   = ["iam:SimulatePrincipalPolicy"]
+        Resource = var.assumable_role_arn_patterns
+      }] : [],
+
+      # Organizations account discovery is only needed when role patterns are configured.
+      length(var.assumable_role_arn_patterns) > 0 ? [{
+        Sid      = "OrganizationsAccountDiscovery"
+        Effect   = "Allow"
+        Action   = ["organizations:ListAccounts"]
+        Resource = "*"
+      }] : [],
+
       # Direct AWS access in deployment account (opt-in via enable_direct_access)
       var.enable_direct_access ? [{
         Sid    = "DirectAccess"
         Effect = "Allow"
         Action = [
           "ec2:DescribeInstances",
+          "ssm:DescribeInstanceInformation",
+          "ecs:DescribeClusters",
+          "ecs:DescribeTasks",
+          "ecs:ListClusters",
+          "ecs:ListTasks",
           "logs:DescribeLogGroups",
           "logs:FilterLogEvents",
           "logs:StartQuery",
@@ -97,6 +126,33 @@ resource "aws_iam_role_policy" "task_permissions" {
           "logs:StartLiveTail",
         ]
         Resource = "*"
+      }] : [],
+
+      # Optional direct audit event export to CloudWatch Logs.
+      var.audit_export_cloudwatch_log_group_name != "" ? [{
+        Sid    = "AuditCloudWatchLogsExport"
+        Effect = "Allow"
+        Action = [
+          "logs:DescribeLogStreams",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ]
+        Resource = [
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${var.audit_export_cloudwatch_log_group_name}",
+          "arn:aws:logs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:log-group:${var.audit_export_cloudwatch_log_group_name}:*",
+        ]
+      }] : [],
+
+      # Optional direct audit event export to S3.
+      var.audit_export_s3_bucket != "" ? [{
+        Sid    = "AuditS3Export"
+        Effect = "Allow"
+        Action = ["s3:PutObject"]
+        Resource = format(
+          "arn:aws:s3:::%s/%s",
+          var.audit_export_s3_bucket,
+          trim(var.audit_export_s3_prefix, "/") != "" ? format("%s/*", trim(var.audit_export_s3_prefix, "/")) : "*"
+        )
       }] : [],
 
       # STS GetCallerIdentity is always needed for preflight health check

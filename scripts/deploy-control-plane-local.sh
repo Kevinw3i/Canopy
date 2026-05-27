@@ -5,23 +5,24 @@
 # Usage:
 #   ./scripts/deploy-control-plane-local.sh cp-v0.1.0
 #   ./scripts/deploy-control-plane-local.sh cp-v0.1.0 --yes
-#   AWS_PROFILE=your-aws-profile ./scripts/deploy-control-plane-local.sh cp-v0.1.0
+#   ./scripts/deploy-control-plane-local.sh cp-v0.1.0 --profile write-profile
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Default is a placeholder so the script never ships an internal profile
-# name. Override with AWS_PROFILE env var or --profile flag.
-AWS_PROFILE_NAME="${AWS_PROFILE:-your-aws-profile}"
-AWS_REGION="${AWS_REGION:-ap-northeast-1}"
+# Use the default AWS credential chain unless AWS_PROFILE or --profile is set.
+AWS_PROFILE_NAME="${AWS_PROFILE:-}"
+AWS_REGION="${AWS_REGION:-}"
 TERRAFORM_DIR="${TERRAFORM_DIR:-infra}"
 ENTITLEMENTS_FILE="${ENTITLEMENTS_FILE:-entitlements.toml}"
-DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/arm64}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-}"
 CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-ECS_CLUSTER="${ECS_CLUSTER:-canopy}"
-ECS_SERVICE="${ECS_SERVICE:-control-plane}"
-TARGET_GROUP_NAME="${TARGET_GROUP_NAME:-canopy-tg}"
+ECS_CLUSTER="${ECS_CLUSTER:-}"
+ECS_SERVICE="${ECS_SERVICE:-}"
+TARGET_GROUP_NAME="${TARGET_GROUP_NAME:-}"
+TARGET_GROUP_ARN="${TARGET_GROUP_ARN:-}"
+LOG_GROUP_NAME="${LOG_GROUP_NAME:-}"
 PLAN_FILE="${PLAN_FILE:-tfplan.phase2}"
 
 IMAGE_TAG=""
@@ -39,22 +40,25 @@ Example:
   $0 cp-v0.1.0 --yes
 
 Options:
-  --profile <name>        AWS CLI profile. Default: ${AWS_PROFILE_NAME}
-  --region <region>       AWS region. Default: ${AWS_REGION}
+  --profile <name>        AWS CLI profile. Default: ${AWS_PROFILE_NAME:-default credential chain}
+  --region <region>       AWS region. Default: ${AWS_REGION:-Terraform aws_region, then ap-northeast-1}
   --entitlements <path>   Entitlements file in repo root. Default: ${ENTITLEMENTS_FILE}
-  --platform <platform>   Docker platform. Default: ${DOCKER_PLATFORM}
+  --platform <platform>   Docker platform. Default: auto from Terraform cpu_architecture
   --cargo-jobs <n>        Cargo parallel jobs inside Docker. Default: ${CARGO_BUILD_JOBS}
-  --cluster <name>        ECS cluster name. Default: ${ECS_CLUSTER}
-  --service <name>        ECS service name. Default: ${ECS_SERVICE}
-  --target-group <name>   ALB target group name. Default: ${TARGET_GROUP_NAME}
-  --plan-only             Stop after writing the Terraform plan. Does not build or push the image.
+  --cluster <name>        ECS cluster name. Default: Terraform ecs_cluster_name output, then <project>.
+  --service <name>        ECS service name. Default: Terraform ecs_service_name output, then control-plane.
+  --target-group <name>   ALB target group name. Used only when no target group ARN is set.
+  --target-group-arn <arn> ALB target group ARN. Default: Terraform target_group_arn output, then <project>-tg.
+  --log-group <name>      CloudWatch Logs log group. Default: Terraform log_group_name output, then /ecs/<project>/control-plane.
+  --plan-only             Stop after writing the Terraform plan. Skips ECR checks, build, push, and apply.
   --tail-logs             Tail CloudWatch logs after deploy.
   --yes                   Do not prompt before AWS-changing steps.
   -h, --help              Show this help.
 
 Environment overrides:
-  AWS_PROFILE, AWS_REGION, TERRAFORM_DIR, ENTITLEMENTS_FILE, DOCKER_PLATFORM,
-  CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME, PLAN_FILE
+  AWS_PROFILE, AWS_REGION, TF_VAR_aws_region, TERRAFORM_DIR, ENTITLEMENTS_FILE,
+  DOCKER_PLATFORM, CARGO_BUILD_JOBS, ECS_CLUSTER, ECS_SERVICE, TARGET_GROUP_NAME,
+  TARGET_GROUP_ARN, LOG_GROUP_NAME, PLAN_FILE
 EOF
 }
 
@@ -82,8 +86,24 @@ confirm() {
   esac
 }
 
+run_with_aws_profile() {
+  if [ -n "$AWS_PROFILE_NAME" ]; then
+    AWS_PROFILE="$AWS_PROFILE_NAME" "$@"
+  else
+    env -u AWS_PROFILE "$@"
+  fi
+}
+
 run_aws() {
-  AWS_PROFILE="$AWS_PROFILE_NAME" aws "$@"
+  run_with_aws_profile aws "$@"
+}
+
+run_terraform() {
+  run_with_aws_profile terraform -chdir="$TERRAFORM_DIR" "$@"
+}
+
+tf_output_raw() {
+  run_terraform output -raw "$1" 2>/dev/null || true
 }
 
 while [ "$#" -gt 0 ]; do
@@ -128,6 +148,16 @@ while [ "$#" -gt 0 ]; do
       [ -n "$TARGET_GROUP_NAME" ] || fail "--target-group requires a value"
       shift 2
       ;;
+    --target-group-arn)
+      TARGET_GROUP_ARN="${2:-}"
+      [ -n "$TARGET_GROUP_ARN" ] || fail "--target-group-arn requires a value"
+      shift 2
+      ;;
+    --log-group)
+      LOG_GROUP_NAME="${2:-}"
+      [ -n "$LOG_GROUP_NAME" ] || fail "--log-group requires a value"
+      shift 2
+      ;;
     --plan-only)
       PLAN_ONLY=1
       shift
@@ -166,6 +196,11 @@ if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
   fail "Invalid Docker image tag: $IMAGE_TAG"
 fi
 
+IMAGE_TAG_LOWER="$(printf '%s' "$IMAGE_TAG" | tr '[:upper:]' '[:lower:]')"
+if [ "$IMAGE_TAG_LOWER" = "latest" ]; then
+  fail "Using 'latest' is not allowed. Specify an explicit version tag or git SHA for deterministic deployments."
+fi
+
 if [[ ! "$CARGO_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
   fail "--cargo-jobs must be a positive integer: $CARGO_BUILD_JOBS"
 fi
@@ -176,36 +211,153 @@ esac
 
 cd "$REPO_ROOT"
 
-need_cmd aws
-need_cmd docker
 need_cmd terraform
 need_cmd shasum
+if [ "$PLAN_ONLY" -eq 0 ]; then
+  need_cmd aws
+  need_cmd docker
+fi
 
 [ -f "$ENTITLEMENTS_FILE" ] || fail "Entitlements file not found: $ENTITLEMENTS_FILE"
 [ -f "$TERRAFORM_DIR/terraform.tfvars" ] || fail "Terraform tfvars not found: $TERRAFORM_DIR/terraform.tfvars"
 [ -f "apps/control-plane/Dockerfile" ] || fail "Dockerfile not found: apps/control-plane/Dockerfile"
 
+TF_PROJECT="$(
+  awk -F= '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*project[[:space:]]*=/ {
+      value = $2
+      sub(/#.*/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      print value
+      exit
+    }
+  ' "$TERRAFORM_DIR/terraform.tfvars"
+)"
+TF_PROJECT="${TF_PROJECT:-canopy}"
+
+TF_AWS_REGION="$(
+  awk -F= '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*aws_region[[:space:]]*=/ {
+      value = $2
+      sub(/#.*/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      print value
+      exit
+    }
+  ' "$TERRAFORM_DIR/terraform.tfvars"
+)"
+AWS_REGION="${AWS_REGION:-${TF_AWS_REGION:-${TF_VAR_aws_region:-ap-northeast-1}}}"
+
+if [ -z "$ECS_CLUSTER" ]; then
+  ECS_CLUSTER="$(tf_output_raw ecs_cluster_name)"
+  ECS_CLUSTER="${ECS_CLUSTER:-$TF_PROJECT}"
+fi
+
+if [ -z "$ECS_SERVICE" ]; then
+  ECS_SERVICE="$(tf_output_raw ecs_service_name)"
+  ECS_SERVICE="${ECS_SERVICE:-control-plane}"
+fi
+
+if [ -z "$TARGET_GROUP_ARN" ] && [ -z "$TARGET_GROUP_NAME" ]; then
+  TARGET_GROUP_ARN="$(tf_output_raw target_group_arn)"
+fi
+
+if [ -z "$TARGET_GROUP_ARN" ] && [ -z "$TARGET_GROUP_NAME" ]; then
+  TARGET_GROUP_NAME="${TF_PROJECT}-tg"
+fi
+
+if [ -z "$LOG_GROUP_NAME" ]; then
+  LOG_GROUP_NAME="$(tf_output_raw log_group_name)"
+  LOG_GROUP_NAME="${LOG_GROUP_NAME:-/ecs/$TF_PROJECT/control-plane}"
+fi
+
+TF_CPU_ARCH="$(
+  awk -F= '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*cpu_architecture[[:space:]]*=/ {
+      value = $2
+      sub(/#.*/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      print value
+      exit
+    }
+  ' "$TERRAFORM_DIR/terraform.tfvars"
+)"
+TF_CPU_ARCH="${TF_CPU_ARCH:-X86_64}"
+
+case "$TF_CPU_ARCH" in
+  X86_64) EXPECTED_DOCKER_PLATFORM="linux/amd64" ;;
+  ARM64) EXPECTED_DOCKER_PLATFORM="linux/arm64" ;;
+  *) fail "Unsupported cpu_architecture in $TERRAFORM_DIR/terraform.tfvars: $TF_CPU_ARCH" ;;
+esac
+
+if [ -z "$DOCKER_PLATFORM" ]; then
+  DOCKER_PLATFORM="$EXPECTED_DOCKER_PLATFORM"
+elif [ "$DOCKER_PLATFORM" != "$EXPECTED_DOCKER_PLATFORM" ]; then
+  fail "--platform $DOCKER_PLATFORM does not match Terraform cpu_architecture=$TF_CPU_ARCH (expected $EXPECTED_DOCKER_PLATFORM)"
+fi
+
 ENTITLEMENTS_SHA="$(shasum -a 256 "$ENTITLEMENTS_FILE" | awk '{print $1}')"
 
 echo "== Canopy control-plane local deploy =="
-echo "AWS profile:       $AWS_PROFILE_NAME"
+echo "AWS profile:       ${AWS_PROFILE_NAME:-default credential chain}"
 echo "AWS region:        $AWS_REGION"
 echo "Terraform dir:     $TERRAFORM_DIR"
 echo "Image tag:         $IMAGE_TAG"
 echo "Docker platform:   $DOCKER_PLATFORM"
+echo "Terraform arch:    $TF_CPU_ARCH"
 echo "Cargo build jobs:  $CARGO_BUILD_JOBS"
 echo "Entitlements file: $ENTITLEMENTS_FILE"
 echo "Entitlements SHA:  $ENTITLEMENTS_SHA"
 echo "ECS cluster:       $ECS_CLUSTER"
 echo "ECS service:       $ECS_SERVICE"
+if [ -n "$TARGET_GROUP_ARN" ]; then
+  echo "Target group ARN:  $TARGET_GROUP_ARN"
+else
+  echo "Target group name: $TARGET_GROUP_NAME"
+fi
 echo ""
 
-echo "== Validate entitlements =="
-"$SCRIPT_DIR/validate-entitlements.sh" "$ENTITLEMENTS_FILE" "$TERRAFORM_DIR/terraform.tfvars"
+echo "== Validate Terraform inputs and entitlements =="
+run_with_aws_profile "$SCRIPT_DIR/validate-terraform-tfvars.sh" "$TERRAFORM_DIR" \
+  -var="create_service=true" \
+  -var="image_tag=$IMAGE_TAG"
+run_with_aws_profile "$SCRIPT_DIR/validate-entitlements.sh" "$ENTITLEMENTS_FILE" "$TERRAFORM_DIR/terraform.tfvars"
+
+echo ""
+echo "== Terraform Phase 2 plan =="
+run_terraform plan \
+  -var="create_service=true" \
+  -var="image_tag=$IMAGE_TAG" \
+  -out="$PLAN_FILE"
+
+PLAN_TEXT="$(run_terraform show -no-color "$PLAN_FILE")"
+printf '%s\n' "$PLAN_TEXT"
+
+if grep -Eq 'will be destroyed' <<< "$PLAN_TEXT"; then
+  echo ""
+  echo "ERROR: Terraform plan includes destroy actions. Refusing to continue."
+  echo "Review $TERRAFORM_DIR/$PLAN_FILE and fix the inputs before applying."
+  exit 1
+fi
+
+if grep -Eq 'must be replaced' <<< "$PLAN_TEXT"; then
+  echo ""
+  echo "WARNING: Terraform plan includes replacement actions."
+  echo "Review the plan above carefully before applying."
+fi
+
+if [ "$PLAN_ONLY" -eq 1 ]; then
+  echo ""
+  echo "Plan written to $TERRAFORM_DIR/$PLAN_FILE. Stop because --plan-only was set."
+  exit 0
+fi
 
 echo ""
 echo "== Resolve ECR repository =="
-ECR_URL="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" output -raw ecr_repository_url)"
+ECR_URL="$(tf_output_raw ecr_repository_url)"
 [ -n "$ECR_URL" ] || fail "Terraform output ecr_repository_url is empty."
 ECR_REGISTRY="${ECR_URL%%/*}"
 ECR_REPOSITORY="${ECR_URL#*/}"
@@ -235,34 +387,6 @@ if ! grep -q "ImageNotFoundException" <<< "$describe_output"; then
 fi
 
 echo "Tag is available: $IMAGE_TAG"
-
-echo ""
-echo "== Terraform Phase 2 plan =="
-AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" plan \
-  -var="create_service=true" \
-  -var="image_tag=$IMAGE_TAG" \
-  -out="$PLAN_FILE"
-
-PLAN_TEXT="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" show -no-color "$PLAN_FILE")"
-
-if grep -Eq 'will be destroyed' <<< "$PLAN_TEXT"; then
-  echo ""
-  echo "ERROR: Terraform plan includes destroy actions. Refusing to continue."
-  echo "Review $TERRAFORM_DIR/$PLAN_FILE and fix the inputs before applying."
-  exit 1
-fi
-
-if grep -Eq 'must be replaced' <<< "$PLAN_TEXT"; then
-  echo ""
-  echo "WARNING: Terraform plan includes replacement actions."
-  echo "Review the plan above carefully before applying."
-fi
-
-if [ "$PLAN_ONLY" -eq 1 ]; then
-  echo ""
-  echo "Plan written to $TERRAFORM_DIR/$PLAN_FILE. Stop because --plan-only was set."
-  exit 0
-fi
 
 echo ""
 echo "== Login to ECR =="
@@ -298,7 +422,7 @@ echo ""
 confirm "Apply Terraform Phase 2 plan and deploy ECS service '$ECS_SERVICE'?"
 
 echo "== Terraform Phase 2 apply =="
-AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" apply "$PLAN_FILE"
+run_terraform apply "$PLAN_FILE"
 
 echo ""
 echo "== Wait for ECS service to become stable =="
@@ -318,11 +442,18 @@ run_aws ecs describe-services \
 
 echo ""
 echo "== ALB target health =="
-TG_ARN="$(run_aws elbv2 describe-target-groups \
-  --names "$TARGET_GROUP_NAME" \
-  --region "$AWS_REGION" \
-  --query 'TargetGroups[0].TargetGroupArn' \
-  --output text)"
+if [ -n "$TARGET_GROUP_ARN" ]; then
+  TG_ARN="$TARGET_GROUP_ARN"
+else
+  TG_ARN="$(run_aws elbv2 describe-target-groups \
+    --names "$TARGET_GROUP_NAME" \
+    --region "$AWS_REGION" \
+    --query 'TargetGroups[0].TargetGroupArn' \
+    --output text)"
+  if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "None" ]; then
+    fail "Unable to resolve target group ARN for target group name: $TARGET_GROUP_NAME"
+  fi
+fi
 
 run_aws elbv2 describe-target-health \
   --target-group-arn "$TG_ARN" \
@@ -334,17 +465,21 @@ echo ""
 echo "== Done =="
 echo "Image deployed: $ECR_URL:$IMAGE_TAG"
 
-ALB_DNS="$(AWS_PROFILE="$AWS_PROFILE_NAME" terraform -chdir="$TERRAFORM_DIR" output -raw alb_dns_name 2>/dev/null || true)"
+ALB_DNS="$(run_terraform output -raw alb_dns_name 2>/dev/null || true)"
 if [ -n "$ALB_DNS" ]; then
   echo "ALB DNS:        $ALB_DNS"
   echo "Health check:   curl -k -I https://$ALB_DNS/health"
 fi
-echo "CloudWatch:     AWS_PROFILE=$AWS_PROFILE_NAME aws logs tail /ecs/canopy/control-plane --region $AWS_REGION --since 30m --follow"
+if [ -n "$AWS_PROFILE_NAME" ]; then
+  echo "CloudWatch:     AWS_PROFILE=$AWS_PROFILE_NAME aws logs tail $LOG_GROUP_NAME --region $AWS_REGION --since 30m --follow"
+else
+  echo "CloudWatch:     aws logs tail $LOG_GROUP_NAME --region $AWS_REGION --since 30m --follow"
+fi
 
 if [ "$TAIL_LOGS" -eq 1 ]; then
   echo ""
   echo "== Tail logs =="
-  run_aws logs tail /ecs/canopy/control-plane \
+  run_aws logs tail "$LOG_GROUP_NAME" \
     --region "$AWS_REGION" \
     --since 30m \
     --follow

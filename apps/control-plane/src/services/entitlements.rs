@@ -1,4 +1,5 @@
-use shared::dto::entitlements::UserEntitlements;
+use shared::dto::ec2::Ec2Instance;
+use shared::dto::entitlements::{AllowedAccount, FeatureFlags, UserEntitlements};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -106,6 +107,59 @@ impl EntitlementService {
         )
     }
 
+    /// Return accounts from rules that individually grant the requested feature
+    /// and cover this account, region, and every requested log group.
+    pub async fn scoped_accounts_for_log_groups(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+        log_group_arns: &[String],
+        feature_check: impl Fn(&FeatureFlags) -> bool,
+    ) -> Vec<AllowedAccount> {
+        let store = self.store.read().await;
+        let rules = store.matching_rules_for_scope(
+            &claims.sub,
+            &claims.email,
+            claims.email_verified,
+            account_id,
+            feature_check,
+        );
+        let mut accounts = Vec::new();
+
+        for rule in rules {
+            if !rule.allowed_regions.is_empty()
+                && !rule.allowed_regions.contains(&region.to_string())
+            {
+                continue;
+            }
+            if !rule.allowed_log_group_arns.is_empty()
+                && !log_group_arns.iter().all(|arn| {
+                    rule.allowed_log_group_arns
+                        .iter()
+                        .any(|pattern| arn_matches_pattern(pattern, arn))
+                })
+            {
+                continue;
+            }
+
+            for account in rule
+                .allowed_accounts
+                .iter()
+                .filter(|account| account.account_id == account_id)
+            {
+                if !accounts.iter().any(|existing: &AllowedAccount| {
+                    existing.account_id == account.account_id
+                        && existing.role_arn == account.role_arn
+                }) {
+                    accounts.push(account.clone());
+                }
+            }
+        }
+
+        accounts
+    }
+
     /// Return the set of allowed accounts from rules that individually
     /// grant the given feature AND region. Used for scope-aware EC2
     /// fan-out instead of merged cartesian products.
@@ -179,6 +233,146 @@ impl EntitlementService {
                 deny_selectors: rule.excluded_tag_selectors.clone(),
             })
             .collect()
+    }
+
+    /// Return accounts from rules that individually grant the feature and
+    /// match this concrete EC2 instance, including region and tag selectors.
+    ///
+    /// Mutating routes use this after DescribeInstances so the AWS role used
+    /// for the mutation is from the same entitlement rule that matched the
+    /// target instance, not a sibling rule for the same account.
+    pub async fn scoped_accounts_for_ec2_instance_feature(
+        &self,
+        claims: &Claims,
+        instance: &Ec2Instance,
+        feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
+    ) -> Vec<AllowedAccount> {
+        let store = self.store.read().await;
+        let user_groups: Vec<String> = store
+            .memberships
+            .iter()
+            .filter(|m| {
+                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
+            })
+            .map(|m| m.group.clone())
+            .collect();
+
+        let mut result = Vec::new();
+        for rule in &store.rules {
+            if !user_groups.contains(&rule.group) || !feature_check(&rule.features) {
+                continue;
+            }
+            if !rule
+                .allowed_accounts
+                .iter()
+                .any(|account| account.account_id == instance.account_id)
+            {
+                continue;
+            }
+            if !rule.allowed_regions.is_empty() && !rule.allowed_regions.contains(&instance.region)
+            {
+                continue;
+            }
+            if !rule.instance_tag_selectors.is_empty()
+                && !rule
+                    .instance_tag_selectors
+                    .iter()
+                    .any(|selector| selector.matches(&instance.tags))
+            {
+                continue;
+            }
+            if rule
+                .excluded_tag_selectors
+                .iter()
+                .any(|selector| selector.matches(&instance.tags))
+            {
+                continue;
+            }
+
+            for account in rule
+                .allowed_accounts
+                .iter()
+                .filter(|account| account.account_id == instance.account_id)
+            {
+                if !result.iter().any(|existing: &AllowedAccount| {
+                    existing.account_id == account.account_id
+                        && existing.role_arn == account.role_arn
+                }) {
+                    result.push(account.clone());
+                }
+            }
+        }
+        result
+    }
+
+    pub async fn ecs_rule_scopes_for_feature(
+        &self,
+        claims: &Claims,
+        feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
+    ) -> Vec<crate::services::ecs::EcsRuleScope> {
+        let store = self.store.read().await;
+        let user_groups: Vec<String> = store
+            .memberships
+            .iter()
+            .filter(|m| {
+                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
+            })
+            .map(|m| m.group.clone())
+            .collect();
+
+        store
+            .rules
+            .iter()
+            .filter(|rule| user_groups.contains(&rule.group) && feature_check(&rule.features))
+            .map(|rule| {
+                let account_ids: Vec<String> = rule
+                    .allowed_accounts
+                    .iter()
+                    .map(|account| account.account_id.clone())
+                    .collect();
+                crate::services::ecs::EcsRuleScope {
+                    accounts: rule.allowed_accounts.clone(),
+                    cluster_patterns: crate::services::ecs::normalize_cluster_patterns(
+                        &rule.allowed_clusters,
+                        &account_ids,
+                        &rule.allowed_regions,
+                    ),
+                    account_ids,
+                    regions: rule.allowed_regions.clone(),
+                    allow_selectors: rule.task_tag_selectors.clone(),
+                    deny_selectors: rule.excluded_task_tag_selectors.clone(),
+                    excluded_container_names: rule.excluded_container_names.clone(),
+                    allow_broad_cluster_discovery: rule.allow_broad_cluster_discovery,
+                }
+            })
+            .collect()
+    }
+
+    pub async fn ecs_has_feature_for_scope(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+        cluster_arn: &str,
+        feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
+    ) -> bool {
+        self.ecs_rule_scopes_for_feature(claims, feature_check)
+            .await
+            .into_iter()
+            .any(|scope| {
+                scope
+                    .account_ids
+                    .iter()
+                    .any(|account| account == account_id)
+                    && (scope.regions.is_empty()
+                        || scope
+                            .regions
+                            .iter()
+                            .any(|scope_region| scope_region == region))
+                    && scope.cluster_patterns.iter().any(|pattern| {
+                        crate::services::ecs::cluster_matches_pattern(pattern, cluster_arn)
+                    })
+            })
     }
 
     /// Convenience: check feature + account only.
@@ -336,6 +530,7 @@ mod tests {
 
     use crate::models::entitlements::EntitlementStore;
     use crate::services::auth::Claims;
+    use shared::dto::ec2::{Ec2Instance, InstanceState};
     use shared::dto::entitlements::*;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -349,6 +544,7 @@ mod tests {
             groups: vec![],
             exp: 9999999999,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         }
     }
@@ -376,6 +572,11 @@ mod tests {
                     allowed_log_group_arns: vec!["arn:aws:logs:*:111:log-group:/app/*".into()],
                     instance_tag_selectors: vec![],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![],
+                    task_tag_selectors: vec![],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec![],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec!["ec2-user".into()],
                     max_session_seconds: None,
                     database_scopes: vec![],
@@ -402,6 +603,11 @@ mod tests {
                         tags: HashMap::from([("Env".into(), vec!["staging".into()])]),
                     }],
                     excluded_tag_selectors: vec![],
+                    allowed_clusters: vec![],
+                    task_tag_selectors: vec![],
+                    excluded_task_tag_selectors: vec![],
+                    excluded_container_names: vec![],
+                    allow_broad_cluster_discovery: false,
                     allowed_os_users: vec!["ubuntu".into()],
                     max_session_seconds: Some(1800),
                     database_scopes: vec![],
@@ -537,5 +743,150 @@ mod tests {
             .collect();
         assert!(ids.contains(&"111"));
         assert!(ids.contains(&"222"));
+    }
+
+    #[tokio::test]
+    async fn scoped_ec2_instance_accounts_keep_role_and_tag_selector_together() {
+        let mut store = test_store();
+        store.rules.push(EntitlementRule {
+            id: "rule-eng-power-prod".into(),
+            group: "eng".into(),
+            features: FeatureFlags {
+                can_stop_ec2: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111".into(),
+                account_name: "prod".into(),
+                role_arn: "arn:aws:iam::111:role/PowerProd".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("Env".into(), vec!["prod".into()])]),
+            }],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        });
+        store.rules.push(EntitlementRule {
+            id: "rule-eng-power-staging".into(),
+            group: "eng".into(),
+            features: FeatureFlags {
+                can_stop_ec2: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111".into(),
+                account_name: "prod".into(),
+                role_arn: "arn:aws:iam::111:role/PowerStaging".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("Env".into(), vec!["staging".into()])]),
+            }],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        });
+
+        let svc = EntitlementService::new(Arc::new(RwLock::new(store)));
+        let claims = test_claims("alice", "alice@example.com");
+        let instance = Ec2Instance {
+            instance_id: "i-prod".into(),
+            account_id: "111".into(),
+            region: "us-east-1".into(),
+            name: Some("prod".into()),
+            private_ip: None,
+            public_ip: None,
+            state: InstanceState::Running,
+            platform: None,
+            instance_type: "t3.micro".into(),
+            ssm_managed: false,
+            instance_connect_capable: false,
+            environment: None,
+            tags: HashMap::from([("Env".into(), "prod".into())]),
+            launch_time: None,
+            vpc_id: None,
+            subnet_id: None,
+            security_groups: vec![],
+            iam_role: None,
+        };
+
+        let accounts = svc
+            .scoped_accounts_for_ec2_instance_feature(&claims, &instance, |f| f.can_stop_ec2)
+            .await;
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].role_arn, "arn:aws:iam::111:role/PowerProd");
+    }
+
+    #[tokio::test]
+    async fn ecs_rule_scopes_for_feature_filters_by_feature_only() {
+        let svc = make_service();
+        let claims = test_claims("alice", "alice@example.com");
+        let scopes = svc
+            .ecs_rule_scopes_for_feature(&claims, |f| f.can_view_ecs)
+            .await;
+        assert!(scopes.is_empty(), "test fixture has no ECS grant");
+    }
+
+    #[tokio::test]
+    async fn ecs_rule_scope_keeps_role_with_matching_rule() {
+        let mut store = test_store();
+        store.rules.push(EntitlementRule {
+            id: "rule-eng-ecs".into(),
+            group: "eng".into(),
+            features: FeatureFlags {
+                can_view_ecs: true,
+                can_use_ecs_exec: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111".into(),
+                account_name: "prod".into(),
+                role_arn: "arn:aws:iam::111:role/EcsExec".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec!["app".into()],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        });
+
+        let svc = EntitlementService::new(Arc::new(RwLock::new(store)));
+        let claims = test_claims("alice", "alice@example.com");
+        let scopes = svc
+            .ecs_rule_scopes_for_feature(&claims, |f| f.can_use_ecs_exec)
+            .await;
+
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(
+            scopes[0].accounts[0].role_arn,
+            "arn:aws:iam::111:role/EcsExec"
+        );
+        assert!(scopes[0]
+            .cluster_patterns
+            .contains(&"arn:aws:ecs:us-east-1:111:cluster/app".to_string()));
     }
 }

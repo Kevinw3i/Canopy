@@ -174,7 +174,9 @@ AWS account `<AWS_ACCOUNT_ID>` 需要有一個給 GitHub Actions 使用的 IAM r
 }
 ```
 
-該 role 需要最小 ECR push 權限：
+該 role 需要最小 ECR push 權限。`<aws_region>` 和 `<project>` 必須和
+`infra/terraform.tfvars` 內的 `aws_region` / `project` 一致，因為 workflow
+會用同一份 tfvars 決定推送目標：
 
 ```json
 {
@@ -198,7 +200,7 @@ AWS account `<AWS_ACCOUNT_ID>` 需要有一個給 GitHub Actions 使用的 IAM r
         "ecr:PutImage",
         "ecr:UploadLayerPart"
       ],
-      "Resource": "arn:aws:ecr:ap-northeast-1:<AWS_ACCOUNT_ID>:repository/canopy/control-plane"
+      "Resource": "arn:aws:ecr:<aws_region>:<AWS_ACCOUNT_ID>:repository/<project>/control-plane"
     }
   ]
 }
@@ -210,7 +212,7 @@ GitHub repo secrets：
 |--------|------|
 | `AWS_GHA_ECR_PUSH_ROLE_ARN` | GitHub Actions 要 assume 的 AWS role ARN |
 | `CONTROL_PLANE_ENTITLEMENTS_TOML_B64` | `entitlements.toml` 的 base64 內容，build image 時寫回檔案 |
-| `CONTROL_PLANE_TFVARS_B64` | 可選，`infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 entitlements |
+| `CONTROL_PLANE_TFVARS_B64` | `infra/terraform.tfvars` 的 base64 內容，用來在 CI 驗證 Terraform 部署 preconditions 與 entitlements，並依 `aws_region` 決定 ECR region、依 `cpu_architecture` 決定 Docker platform、依 `project` 決定 ECR repository |
 
 設定 secrets：
 
@@ -238,19 +240,46 @@ git push origin cp-v0.1.0
 Workflow 完成後會推送 image：
 
 ```text
-<AWS_ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:cp-v0.1.0
+<AWS_ACCOUNT_ID>.dkr.ecr.<aws_region>.amazonaws.com/<project>/control-plane:cp-v0.1.0
 ```
 
-ECR repository 是 immutable，同一個 tag 不能重複推送。需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
+ECR repository 是 immutable，同一個 tag 不能重複推送，且不可使用 `latest`。
+需要重新發版時請建立新 tag，例如 `cp-v0.1.1`。
+Workflow 會從 `CONTROL_PLANE_TFVARS_B64` 還原 `infra/terraform.tfvars`，先以
+`scripts/validate-terraform-tfvars.sh infra -var="create_service=true" -var="image_tag=<release-tag>"`
+驗證 Phase 2 部署 preconditions，再驗證 entitlements，最後推送到
+`aws_region` 的 `<project>/control-plane`。請確認 GitHub Actions ECR push role
+的 repository ARN 與允許區域也使用同一組 `aws_region` / `project`。
+entitlements 檢查會拒絕 active sample placeholder、格式錯誤或含 wildcard
+的 IAM Role ARN、部署用 `profile:*`、ECS Exec 使用 direct/profile
+credentials、ECS Exec 未同時授權 ECS view、授予 ECS 存取但缺少
+`allowed_clusters` 的 rule、未明確 opt-in 的寬鬆 cluster wildcard，以及缺少
+`allowed_os_users` 的 SSM rule。
 
 ### 部署到 ECS
 
 GitHub Actions 只負責 build/push image，不會自動修改 ECS。image 推送完成後，再手動執行 Terraform Phase 2：
 
 ```bash
-AWS_PROFILE=your-aws-profile terraform -chdir=infra plan \
-  -var="image_tag=cp-v0.1.0" \
+# 若需要指定 profile，先 export AWS_PROFILE=<write-profile>；未設定時使用 default credential chain。
+VERSION=cp-v0.1.0
+AWS_REGION=$(awk -F= '/^[[:space:]]*aws_region[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+AWS_REGION=${AWS_REGION:-ap-northeast-1}
+
+scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+terraform -chdir=infra plan \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION" \
   -out=tfplan.phase2
 
-AWS_PROFILE=your-aws-profile terraform -chdir=infra apply tfplan.phase2
+terraform -chdir=infra apply tfplan.phase2
+
+aws ecs wait services-stable \
+  --cluster $(terraform -chdir=infra output -raw ecs_cluster_name) \
+  --services $(terraform -chdir=infra output -raw ecs_service_name) \
+  --region "$AWS_REGION"
 ```

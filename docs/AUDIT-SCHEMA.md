@@ -1,7 +1,8 @@
 # Audit Log Schema
 
 Canopy audit events are JSON-lines records emitted through tracing and, when
-configured, the durable `audit_log` file.
+configured, the durable `audit_log` file plus optional CloudWatch Logs / S3
+export sinks.
 
 All values in this document are illustrative placeholders.
 
@@ -43,6 +44,8 @@ Current actions:
 - `ec2_list`
 - `ec2_connect`
 - `ec2_power`
+- `ecs_task_list`
+- `ecs_exec`
 - `cloudwatch_search`
 - `cloudwatch_insights_query`
 - `cloudwatch_live_tail_start`
@@ -57,11 +60,41 @@ Current actions:
 - `mcp_cloudwatch_insights`
 - `mcp_database_scope_list`
 - `mcp_database_query`
+- `mfa_totp_enroll`
+- `mfa_totp_verify`
+- `mfa_recovery_codes_generate`
+- `mfa_recovery_code_verify`
+- `mfa_webauthn_enroll`
 
-<!-- PHASE2-REMOVE-START -->
-`ec2_power` is schema-reserved for EC2 power actions. The server does not emit
-this action until the Phase 2 control-plane route ships.
-<!-- PHASE2-REMOVE-END -->
+`ec2_power` is emitted by the control-plane when an authorized operator requests
+an EC2 start, stop, or reboot action.
+
+`mfa_totp_enroll` is emitted when a local TOTP enrollment starts or confirms.
+Metadata includes `stage`, `factor_id`, and `kind`; it must not include the
+TOTP secret or verification code.
+
+`mfa_totp_verify` is emitted when a local TOTP factor is verified for step-up.
+Metadata includes `factor_id` and `kind`; it must not include the verification
+code.
+
+`mfa_recovery_codes_generate` is emitted when local MFA recovery codes are
+generated or rotated. Metadata includes `count`; it must not include plaintext
+recovery codes.
+
+`mfa_recovery_code_verify` is emitted when a local MFA recovery code is consumed
+for step-up. Metadata includes `remaining_codes`; it must not include the
+plaintext recovery code.
+
+`mfa_webauthn_enroll` is emitted when local WebAuthn registration starts or
+finishes. Metadata includes `stage`, `factor_id`, `kind`, and the localhost
+`origin` for start events; it must not include challenge bytes, browser
+credential payloads, credential IDs, or public-key material.
+
+`mfa_webauthn_verify` is emitted when local WebAuthn/passkey verification starts
+or finishes for step-up. Metadata includes `stage`, `challenge_id` on start or
+failure, `factor_id` on finish, `kind`, and the localhost `origin` for start
+events; it must not include challenge bytes, browser assertion payloads,
+credential IDs, or public-key material.
 
 ## Common Metadata Fields
 
@@ -104,6 +137,21 @@ EC2 metadata can include:
 - `failed_scopes`
 - `method`
 - `os_user`
+
+ECS metadata can include:
+
+- `clusters_filter`
+- `clusters_returned`
+- `tasks_returned`
+- `truncated`
+- `failed_scopes`
+- `cluster_name`
+- `cluster_arn`
+- `task_arn`
+- `container_name`
+- `launch_type`
+- `broad_discovery`
+- `error_kind`
 
 EC2 power metadata (`action: "ec2_power"`) can include:
 
@@ -309,6 +357,18 @@ Denied EC2 power action (entitlement / scope rejection):
 
 ```json
 {"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e5555","timestamp":"2026-05-08T02:19:30Z","actor":"example-cognito-sub","action":"ec2_power","account_id":"123456789012","region":"ap-northeast-1","target_resource":"i-0123456789abcdef0","outcome":"denied","error_message":"instance excluded by tag policy","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","power_action":"stop","confirmation_present":true}}
+```
+
+Successful ECS task listing:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e8888","timestamp":"2026-05-08T02:22:30Z","actor":"example-cognito-sub","action":"ecs_task_list","account_id":"123456789012","region":"ap-northeast-1","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","page_size":50,"clusters_returned":1,"tasks_returned":4,"truncated":false,"failed_scopes":[],"broad_discovery":false}}
+```
+
+Successful ECS Exec:
+
+```json
+{"event_id":"018b7a5d-6e0b-7d1b-9e2c-9c4b4f8e9999","timestamp":"2026-05-08T02:23:30Z","actor":"example-cognito-sub","action":"ecs_exec","account_id":"123456789012","region":"ap-northeast-1","target_resource":"arn:aws:ecs:ap-northeast-1:123456789012:task/prod-app/abc123","outcome":"success","metadata":{"actor_email":"user@example.com","actor_email_verified":true,"client_ip":"10.0.0.10","user_agent":"canopy-tui/0.1.0","tui_version":"0.1.0","cluster_name":"prod-app","cluster_arn":"arn:aws:ecs:ap-northeast-1:123456789012:cluster/prod-app","task_arn":"arn:aws:ecs:ap-northeast-1:123456789012:task/prod-app/abc123","container_name":"app","launch_type":"FARGATE","broad_discovery":false}}
 ```
 
 State-machine conflict (e.g. `start` while pending):

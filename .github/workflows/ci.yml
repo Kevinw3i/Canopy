@@ -26,6 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -42,6 +47,28 @@ jobs:
 
       - name: Validate entitlements script syntax
         run: bash -n scripts/validate-entitlements.sh
+
+      - name: Validate Terraform
+        run: scripts/test-terraform-module.sh
+
+      - name: Validate deployment scripts
+        run: |
+          bash -n scripts/test-terraform-module.sh
+          bash -n scripts/validate-entitlements.sh
+          bash -n scripts/test-validate-entitlements.sh
+          scripts/test-validate-entitlements.sh
+          bash -n scripts/validate-terraform-tfvars.sh
+          bash -n scripts/test-validate-terraform-tfvars.sh
+          scripts/test-validate-terraform-tfvars.sh
+          bash -n scripts/deploy-control-plane-local.sh
+          bash -n scripts/test-deploy-control-plane-local.sh
+          scripts/test-deploy-control-plane-local.sh
+          bash -n scripts/package.sh
+          bash -n scripts/test-package.sh
+          scripts/test-package.sh
+          sh -n scripts/docker-entrypoint.sh
+          bash -n scripts/test-docker-entrypoint.sh
+          scripts/test-docker-entrypoint.sh
 
   # Heavyweight MySQL E2E test (tests/database_e2e_test.rs) tagged
   # `#[ignore]`. Split into its own job so the main `test` job stays

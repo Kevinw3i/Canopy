@@ -160,6 +160,30 @@ else
   printf '# change_password_url = "https://<cognito-domain>/forgotPassword?client_id=<app-client-id>&response_type=code&scope=openid+profile+email&redirect_uri=http://localhost:9876/callback"\n' >> "$CONFIG_PATH"
 fi
 
+cat >> "$CONFIG_PATH" <<'TOML'
+
+[theme]
+preset = "default"
+# accent = "cyan"
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
+TOML
+
 chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 
 echo "TUI config written:"

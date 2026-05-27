@@ -20,7 +20,7 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Project   = "canopy"
+      Project   = var.project
       Component = "control-plane"
       ManagedBy = "terraform"
     }

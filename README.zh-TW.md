@@ -5,11 +5,11 @@
 內部營運終端機操作介面，用於管理 AWS 基礎設施。
 
 ```
-┌──────────────┐         ┌──────────────────┐         ┌─────────┐
-│  TUI 客戶端  │──HTTP──▶│   Control Plane  │──STS───▶│   AWS   │
-│  (ratatui)   │         │   (axum)         │         │ EC2/CWL │
-│              │◀─JSON───│                  │◀────────│ SSM/STS │
-└──────────────┘         │  - 認證 (OIDC)   │         └─────────┘
+┌──────────────┐         ┌──────────────────┐         ┌──────────────┐
+│  TUI 客戶端  │──HTTP──▶│   Control Plane  │──STS───▶│   AWS APIs   │
+│  (ratatui)   │         │   (axum)         │         │ EC2/ECS/CWL  │
+│              │◀─JSON───│                  │◀────────│ SSM/STS/Exec │
+└──────────────┘         │  - 認證 (OIDC)   │         └──────────────┘
                          │  - 授權 (權限)    │
                          │  - 稽核日誌       │
                          │  - 伺服器端過濾   │
@@ -31,25 +31,24 @@
 - Rust 1.75+
 - 兩個終端機視窗
 
-> AWS CLI 和 Session Manager plugin 只有「連線」功能（SSM/EIC）需要，其他功能不需要。
+> AWS CLI 和 Session Manager plugin 只有連線功能（SSM/EIC/ECS Exec）需要；清查與搜尋流程不需要。
 
 ### 第一步：建置
 
 ```bash
 cd ~/Desktop/Canopy
 cargo build
-cargo test        # 39 個測試，應全部通過
+cargo test        # workspace 測試應全部通過
 ```
 
 ### 第二步：啟動 Control Plane（終端機 1）
 
 ```bash
-CONFIG_PATH=config.dev.toml cargo run -p control-plane
+DEV_MODE=1 cargo run -p control-plane
 ```
 
 看到以下訊息就是成功：
 ```
-Loaded entitlements from "entitlements.dev.toml": 2 rules, 2 memberships
 Control-plane listening on 127.0.0.1:8443
 ```
 
@@ -66,7 +65,7 @@ DEV_MODE=1 cargo run -p tui-client
 | 畫面 | 怎麼進去 | 顯示什麼 |
 |------|----------|----------|
 | 儀表板 | 登入後自動進入 | 歡迎訊息、導航選單 |
-| EC2 清查 | 按 `1` | 5 台 mock 執行個體，`/` 搜尋，`Enter` 看詳細 |
+| EC2 / ECS 清查 | 按 `1` | EC2 mock 執行個體；有權限時按 `Ctrl+E` 切到 ECS tasks。若 task 可 exec 且有 ECS Exec 權限，`Enter` 開啟 container 選擇 |
 | CloudWatch 搜尋 | 按 `2` | 查詢輸入框，mock 日誌事件 |
 | 存取/身分 | 按 `4` | 使用者、群組、功能旗標、允許的帳號 |
 | 設定 | 按 `5` | 目前的設定值；按 `p` 開啟 Change Password |
@@ -75,11 +74,11 @@ DEV_MODE=1 cargo run -p tui-client
 
 ### 開發用帳號
 
-`entitlements.dev.toml` 預設了兩個使用者：
+內建 dev defaults 預設了兩個使用者：
 
 | 使用者名稱 | 群組 | 可以做什麼 |
 |-----------|------|-----------|
-| `dev-admin` | platform-engineering | 全部功能：EC2、CloudWatch、SSM、EIC，跨 2 個帳號 |
+| `dev-admin` | platform-engineering | 全部功能：EC2、ECS、CloudWatch、SSM、EIC，跨 2 個帳號 |
 | `dev-readonly` | readonly-ops | 唯讀：只能看 staging 帳號的 EC2 和 CloudWatch，不能連線 |
 
 試試用 `dev-readonly` 登入，觀察介面如何隱藏該使用者沒有權限的功能。
@@ -90,9 +89,8 @@ DEV_MODE=1 cargo run -p tui-client
 
 ```
 Canopy/
-├── config.dev.toml            ← Control Plane 設定（本機開發用）
 ├── config.sample.toml         ← Control Plane 設定（生產環境範本）
-├── entitlements.dev.toml      ← 權限規則（本機開發用）
+├── entitlements.sample.toml   ← 權限規則範本
 ├── .env.example               ← 環境變數參考
 ├── Cargo.toml                 ← Workspace 根設定
 │
@@ -122,7 +120,7 @@ Canopy/
 
 ## 設定參考
 
-### Control Plane 設定（`config.dev.toml` / `config.toml`）
+### Control Plane 設定（`DEV_MODE=1` / `config.toml`）
 
 ```toml
 # ── 伺服器 ──────────────────────────────────────────
@@ -140,12 +138,26 @@ dev_mode = true                    # true = 啟用 dev-login
 # 權限規則檔案路徑（TOML 格式）
 # dev_mode = false 時必填
 # dev_mode = true 時可選（沒填就用內建預設值）
-entitlements_file = "entitlements.dev.toml"
+entitlements_file = "entitlements.toml"
 
 # ── 稽核日誌 ────────────────────────────────────────
 # 可選。設定後每個操作會以 JSON-lines 格式寫入此檔案。
 # 沒設定的話只會透過 structured tracing 輸出到 stdout。
 # audit_log = "/var/log/canopy/audit.jsonl"
+
+# 可選的遠端稽核匯出。local tracing / file audit 接受 event 後，
+# 會把同一筆 JSON audit event enqueue 到遠端 sink。
+# [audit_export]
+# queue_size = 1024
+#
+# [audit_export.cloudwatch_logs]
+# log_group_name = "/aws/canopy/audit"
+# log_stream_name = "control-plane"
+# create_log_stream = true
+#
+# [audit_export.s3]
+# bucket = "canopy-audit"
+# prefix = "prod/"
 
 # ── CORS ────────────────────────────────────────────
 # 允許的來源清單。空值 + dev_mode = 允許全部。
@@ -186,7 +198,7 @@ session_duration_seconds = 3600   # AssumeRole 會話時長
 3. 否則如果 `DEV_MODE=1` → 用內建預設值（不需要檔案）
 4. 以上都沒有 → 報錯
 
-### 權限規則檔（`entitlements.dev.toml`）
+### 權限規則檔（`entitlements.sample.toml` / `entitlements.toml`）
 
 定義「誰可以存取什麼」。結構：
 
@@ -200,10 +212,15 @@ allowed_regions = ["us-east-1", "us-west-2"]
 allowed_log_group_arns = [
     "arn:aws:logs:*:123456789012:log-group:/app/*",   # 支援萬用字元
 ]
+allowed_clusters = [
+    "arn:aws:ecs:us-east-1:123456789012:cluster/prod-*",
+]
 allowed_os_users = ["ec2-user", "ubuntu"]              # 用於 SSM/EIC 連線
 
 [rules.features]
 can_view_ec2 = true               # 可以看 EC2 執行個體
+can_view_ecs = true               # 可以看授權 cluster 裡的 ECS tasks
+can_use_ecs_exec = true           # 可以開啟 ECS Exec session
 can_use_cloudwatch_search = true  # 可以搜尋 CloudWatch 日誌
 can_use_cloudwatch_tail = true    # 可以使用 Live Tail
 can_use_ssm = true                # 可以透過 SSM Session Manager 連線
@@ -238,11 +255,11 @@ account_id = "123456789012"
 account_name = "production"
 # role_arn 支援三種模式：
 #   "direct"              → 直接用本機預設 AWS 憑證（不走 AssumeRole）
-#                           不支援 SSM/EIC 連線（僅 SSH）
+#                           不支援 SSM/EIC/ECS Exec 連線（僅 SSH）
 #   "profile:NAME"        → 用 ~/.aws/credentials 裡指定的 profile
-#                           不支援 SSM/EIC 連線（僅 SSH）
+#                           不支援 SSM/EIC/ECS Exec 連線（僅 SSH）
 #   "arn:aws:iam::...:role/..." → AssumeRole 到該 IAM Role（生產環境）
-#                           支援 SSM、EIC、SSH，使用範圍限定憑證
+#                           支援 SSM、EIC、SSH、ECS Exec，使用範圍限定憑證
 role_arn = "arn:aws:iam::123456789012:role/CanopyRole"
 
 [[rules.allowed_accounts]]
@@ -253,6 +270,10 @@ role_arn = "arn:aws:iam::234567890123:role/CanopyRole"
 [[rules.instance_tag_selectors]]        # 執行個體必須匹配至少一個 selector
 [rules.instance_tag_selectors.tags]
 Environment = ["production", "staging"]  # 標籤鍵 = 允許的值
+
+[[rules.task_tag_selectors]]             # ECS task 必須匹配至少一個 selector
+[rules.task_tag_selectors.tags]
+Environment = ["production"]
 
 # max_session_seconds = 3600             # 可選：連線 60 分鐘後自動斷開
                                          # 非 SSH 連線最低 900 秒（AWS STS 限制）
@@ -270,6 +291,7 @@ group = "platform-engineering"
 - 功能旗標、帳號、區域、OS users — 加法式合併（任一群組授予即擁有）
 - `max_session_seconds` — 取最嚴格（最小非零值）
 - `excluded_tag_selectors` — 聯集（任一群組排除即排除）
+- ECS 的 account、region、cluster、task tag、sidecar denylist 由 control-plane 以 rule-local scope 評估，避免跨群組 scope 被拼接成未授權組合
 
 ### TUI 客戶端設定
 
@@ -305,6 +327,27 @@ enable_live_tail = true        # 選單中顯示 Live Tail（beta 功能）
 auto_update = false            # true = 啟動時檢查並套用更新
 # update_repo_owner = "Kevinw3i"  # GitHub owner（預設值）
 # update_repo_name = "Canopy"     # GitHub repo（預設值）
+
+[theme]
+preset = "default"              # default | mono | high_contrast
+# accent = "cyan"               # 色名、indexed:N、ansi:N 或 #RRGGBB
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
 ```
 
 當 `auto_update = true` 時，TUI 啟動時會檢查 GitHub 上是否有更新的 `tui-v*` release（每 10 分鐘最多檢查一次）。如果找到新版本：
@@ -312,6 +355,8 @@ auto_update = false            # true = 啟動時檢查並套用更新
 - **唯讀安裝**：顯示 banner 提示手動下載更新。
 
 按 `Ctrl+D` 關閉更新 banner。
+
+主題 preset 與覆寫會套用在整個 TUI workflow chrome：登入、Dashboard、Settings、Access、EC2/ECS inventory、CloudWatch search、Live Tail、modal，以及連線 session 的狀態列、help、copy 畫面。連線 session 內的遠端 terminal 輸出仍保留遠端程序送出的 VT100 顏色。
 
 **載入順序：**
 1. `DEV_MODE=1` → 用內建預設值，並忽略作業系統 config 路徑的設定檔
@@ -373,10 +418,10 @@ session_duration_seconds = 3600
 
 ### 第三步：建立 `entitlements.toml`
 
-以開發檔為起點：
+以範本檔為起點：
 
 ```bash
-cp entitlements.dev.toml entitlements.toml
+cp entitlements.sample.toml entitlements.toml
 ```
 
 修改以下欄位：
@@ -428,7 +473,10 @@ Control Plane 支援任何 OpenID Connect 提供者：
     "Principal": {
       "AWS": "arn:aws:iam::CONTROL_PLANE_ACCOUNT:role/CanopyBase"
     },
-    "Action": "sts:AssumeRole",
+    "Action": [
+      "sts:AssumeRole",
+      "sts:TagSession"
+    ],
     "Condition": {
       "StringEquals": {
         "sts:ExternalId": "canopy"
@@ -438,6 +486,10 @@ Control Plane 支援任何 OpenID Connect 提供者：
 }
 ```
 
+Control Plane 本身的 AWS 身分也需要在這些目標 role ARN 上具備
+`sts:AssumeRole`、`sts:TagSession` 和 `iam:SimulatePrincipalPolicy`，
+才能挑選可用 role，並替連線流程簽發範圍限縮的 STS 憑證。
+
 **Permission Policy**（這個 Role 可以做什麼）：
 ```json
 {
@@ -446,6 +498,7 @@ Control Plane 支援任何 OpenID Connect 提供者：
     "Effect": "Allow",
     "Action": [
       "ec2:DescribeInstances",
+      "ec2:DescribeInstanceConnectEndpoints",
       "logs:DescribeLogGroups",
       "logs:FilterLogEvents",
       "logs:StartQuery",
@@ -454,7 +507,16 @@ Control Plane 支援任何 OpenID Connect 提供者：
       "ssm:StartSession",
       "ssm:DescribeInstanceInformation",
       "ec2-instance-connect:SendSSHPublicKey",
-      "ec2-instance-connect:OpenTunnel"
+      "ec2-instance-connect:OpenTunnel",
+      "ecs:DescribeClusters",
+      "ecs:DescribeTasks",
+      "ecs:ListClusters",
+      "ecs:ListTasks",
+      "ecs:ExecuteCommand",
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel"
     ],
     "Resource": "*"
   }]
@@ -519,10 +581,10 @@ dist/
 ```
 
 腳本會自動：
-1. 安裝 `canopy` 二進位檔到 `/usr/local/bin/`
+1. 預設安裝 `canopy` 二進位檔到 `~/.local/bin/`（可用 `CANOPY_BIN_DIR` 覆寫）
 2. 建立 TUI 設定檔（URL 已預填，路徑依作業系統決定）
-3. 偵測並安裝 AWS CLI v2（如果沒有）
-4. 偵測並安裝 Session Manager Plugin（如果沒有）
+3. 偵測 AWS CLI v2；可完成 installer 驗證時自動安裝，否則提示手動安裝（SSM/EIC/ECS Exec 連線需要）
+4. macOS 會偵測並安裝 Session Manager Plugin；Linux 在可信簽章驗證支援完成前會提示手動安裝（SSM/ECS Exec 需要）
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
 6. 跑完整驗證檢查
 
@@ -560,6 +622,7 @@ TUI                     Control Plane              OIDC 提供者
 記錄的操作包括：
 - 登入/登出
 - EC2 列表請求
+- ECS task list / exec 請求
 - CloudWatch 搜尋
 - Live Tail 啟動/停止
 - 連線動作
@@ -576,13 +639,14 @@ TUI                     Control Plane              OIDC 提供者
 |------|------|------|
 | `j/k` | 表格 | 上下移動 |
 | `Enter` | 表格 | 展開詳細/執行 |
-| `/` | EC2、CW | 啟動搜尋/過濾 |
+| `/` | EC2、ECS、CW | 啟動搜尋/過濾 |
+| `Ctrl+E` | 清查 | 有權限時切換 EC2/ECS 視圖 |
 | `s` | EC2 | SSM Session Manager 連線 |
 | `e` | EC2 | EC2 Instance Connect SSH |
 | `c` | EC2 | 直接 SSH（使用你自己的金鑰） |
-| `r` | EC2 | 重新整理 |
-| `[`/`]` | CW 搜尋 | 切換帳號（上一個/下一個） |
-| `{`/`}` | CW 搜尋 | 切換區域（上一個/下一個） |
+| `r` | EC2、ECS | 重新整理 |
+| `[`/`]` | 清查、CW 搜尋 | 切換帳號（上一個/下一個） |
+| `{`/`}` | 清查、CW 搜尋 | 切換區域（上一個/下一個） |
 | `x` | CW 搜尋 | 匯出結果 |
 | `Tab` | CW 搜尋 | 切換 Quick/Insights 模式 |
 | `Esc` | 任何 | 返回/取消焦點 |
@@ -593,9 +657,9 @@ TUI                     Control Plane              OIDC 提供者
 
 ## 安全模型
 
-- **伺服器端過濾**：EC2 和 CloudWatch 資料在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
+- **伺服器端過濾**：EC2、ECS tasks 和 CloudWatch 資料在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **範圍隔離**：功能授權與資源範圍依規則逐一驗證，防止跨群組權限拼接。一個群組的功能不能套用到另一個群組的資源上
-- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 限縮到特定執行個體，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）
+- **短期憑證**：STS AssumeRole 附帶 session tags；連線操作使用 inline session policy 將主要動作限縮到特定執行個體或 ECS task，並透過 IAM 條件綁定 OS 使用者（`ssm:SessionDocumentAccessCheck`、`ec2:osuser`）或 ECS cluster（`ecs:ExecuteCommand`）；ECS Exec 憑證另只包含必要的 `ecs:DescribeTasks` 與 `ssmmessages` 輔助動作，並限縮到請求的 AWS region
 - **帳號身份驗證**：`direct`/`profile:` 和 AssumeRole 憑證透過 `GetCallerIdentity` 驗證，確保與設定的 `account_id` 一致
 - **TUI 無 AWS 長期金鑰**：所有 AWS 存取都經由 Control Plane
 - **稽核失敗則拒絕**：持久化稽核日誌寫入失敗時，所有受保護的 API（包含登入、刷新、權限查詢）回傳 503。暫時性 I/O 錯誤可自行恢復，無需重啟

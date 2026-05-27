@@ -11,7 +11,6 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
-  ECR_REPOSITORY: canopy/control-plane
 
 jobs:
   build-and-push:
@@ -24,6 +23,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
 
       - name: Resolve image tag
         id: meta
@@ -38,7 +42,38 @@ jobs:
             exit 1
           fi
 
+          if [ "${image_tag,,}" = "latest" ]; then
+            echo "::error::Using 'latest' is not allowed. Specify an explicit version tag or git SHA for deterministic deployments."
+            exit 1
+          fi
+
           echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Terraform
+        shell: bash
+        run: scripts/test-terraform-module.sh
+
+      - name: Validate deployment scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bash -n scripts/test-terraform-module.sh
+          bash -n scripts/validate-entitlements.sh
+          bash -n scripts/test-validate-entitlements.sh
+          scripts/test-validate-entitlements.sh
+          bash -n scripts/validate-terraform-tfvars.sh
+          bash -n scripts/test-validate-terraform-tfvars.sh
+          scripts/test-validate-terraform-tfvars.sh
+          bash -n scripts/deploy-control-plane-local.sh
+          bash -n scripts/test-deploy-control-plane-local.sh
+          scripts/test-deploy-control-plane-local.sh
+          bash -n scripts/package.sh
+          bash -n scripts/test-package.sh
+          scripts/test-package.sh
+          sh -n scripts/docker-entrypoint.sh
+          bash -n scripts/test-docker-entrypoint.sh
+          scripts/test-docker-entrypoint.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -73,7 +108,7 @@ jobs:
           set -euo pipefail
           echo "sha=$(sha256sum entitlements.toml | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
-      - name: Validate entitlements against Terraform variables
+      - name: Validate Terraform variables and entitlements
         shell: bash
         env:
           TERRAFORM_TFVARS_B64: ${{ secrets.CONTROL_PLANE_TFVARS_B64 }}
@@ -81,18 +116,90 @@ jobs:
           set -euo pipefail
 
           if [ -z "${TERRAFORM_TFVARS_B64}" ]; then
-            echo "::warning::Skipping entitlements validation because CONTROL_PLANE_TFVARS_B64 is not set"
-            exit 0
+            echo "::error::Missing GitHub secret CONTROL_PLANE_TFVARS_B64"
+            exit 1
           fi
 
           printf '%s' "${TERRAFORM_TFVARS_B64}" | base64 -d > infra/terraform.tfvars
+          ./scripts/validate-terraform-tfvars.sh infra \
+            -var="create_service=true" \
+            -var="image_tag=${{ steps.meta.outputs.image_tag }}"
           ./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+      - name: Resolve Terraform deployment settings
+        id: platform
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cpu_architecture=""
+          aws_region=""
+          project=""
+          if [ ! -s infra/terraform.tfvars ]; then
+            echo "::error::infra/terraform.tfvars was not written from CONTROL_PLANE_TFVARS_B64"
+            exit 1
+          fi
+
+          aws_region="$(
+            awk -F= '
+              /^[[:space:]]*#/ { next }
+              /^[[:space:]]*aws_region[[:space:]]*=/ {
+                value = $2
+                sub(/#.*/, "", value)
+                gsub(/[[:space:]"]/, "", value)
+                print value
+                exit
+              }
+            ' infra/terraform.tfvars
+          )"
+          cpu_architecture="$(
+            awk -F= '
+              /^[[:space:]]*#/ { next }
+              /^[[:space:]]*cpu_architecture[[:space:]]*=/ {
+                value = $2
+                sub(/#.*/, "", value)
+                gsub(/[[:space:]"]/, "", value)
+                print value
+                exit
+              }
+            ' infra/terraform.tfvars
+          )"
+          project="$(
+            awk -F= '
+              /^[[:space:]]*#/ { next }
+              /^[[:space:]]*project[[:space:]]*=/ {
+                value = $2
+                sub(/#.*/, "", value)
+                gsub(/[[:space:]"]/, "", value)
+                print value
+                exit
+              }
+            ' infra/terraform.tfvars
+          )"
+          aws_region="${aws_region:-$AWS_REGION}"
+          cpu_architecture="${cpu_architecture:-X86_64}"
+          project="${project:-canopy}"
+
+          case "$cpu_architecture" in
+            X86_64) platform="linux/amd64" ;;
+            ARM64) platform="linux/arm64" ;;
+            *)
+              echo "::error::Unsupported cpu_architecture: $cpu_architecture"
+              exit 1
+              ;;
+          esac
+
+          echo "aws_region=$aws_region" >> "$GITHUB_OUTPUT"
+          echo "cpu_architecture=$cpu_architecture" >> "$GITHUB_OUTPUT"
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "project=$project" >> "$GITHUB_OUTPUT"
+          echo "ecr_repository=$project/control-plane" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_GHA_ECR_PUSH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: ${{ steps.platform.outputs.aws_region }}
 
       - name: Login to Amazon ECR
         id: ecr
@@ -105,9 +212,9 @@ jobs:
 
           set +e
           output=$(aws ecr describe-images \
-            --repository-name "${ECR_REPOSITORY}" \
+            --repository-name "${{ steps.platform.outputs.ecr_repository }}" \
             --image-ids "imageTag=${{ steps.meta.outputs.image_tag }}" \
-            --region "${AWS_REGION}" 2>&1)
+            --region "${{ steps.platform.outputs.aws_region }}" 2>&1)
           status=$?
           set -e
 
@@ -129,21 +236,23 @@ jobs:
         with:
           context: .
           file: apps/control-plane/Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ steps.platform.outputs.platform }}
           push: true
           build-args: |
             ENTITLEMENTS_SHA=${{ steps.entitlements.outputs.sha }}
           secret-files: |
             entitlements_toml=entitlements.toml
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.ecr.outputs.registry }}/${{ steps.platform.outputs.ecr_repository }}:${{ steps.meta.outputs.image_tag }}
 
       - name: Write deployment summary
         shell: bash
         run: |
           set -euo pipefail
 
-          image_uri="${{ steps.ecr.outputs.registry }}/${ECR_REPOSITORY}:${{ steps.meta.outputs.image_tag }}"
+          image_uri="${{ steps.ecr.outputs.registry }}/${{ steps.platform.outputs.ecr_repository }}:${{ steps.meta.outputs.image_tag }}"
+          image_tag="${{ steps.meta.outputs.image_tag }}"
+          aws_region="${{ steps.platform.outputs.aws_region }}"
 
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## Control-plane image pushed
@@ -154,10 +263,33 @@ jobs:
           ${image_uri}
           \`\`\`
 
+          Platform: \`${{ steps.platform.outputs.platform }}\` (${{ steps.platform.outputs.cpu_architecture }})
+
+          AWS region: \`${{ steps.platform.outputs.aws_region }}\`
+
+          Terraform project: \`${{ steps.platform.outputs.project }}\`
+
           Next manual Terraform step:
 
           \`\`\`bash
-          AWS_PROFILE=your-aws-profile terraform -chdir=infra plan -var="image_tag=${{ steps.meta.outputs.image_tag }}" -out=tfplan.phase2
-          AWS_PROFILE=your-aws-profile terraform -chdir=infra apply tfplan.phase2
+          # If needed, export AWS_PROFILE=<write-profile>; otherwise Terraform uses the default credential chain.
+          VERSION=${image_tag}
+          AWS_REGION=${aws_region}
+
+          scripts/validate-terraform-tfvars.sh infra \\
+            -var="create_service=true" \\
+            -var="image_tag=\$VERSION"
+          scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+          terraform -chdir=infra plan \\
+            -var="create_service=true" \\
+            -var="image_tag=\$VERSION" \\
+            -out=tfplan.phase2
+          terraform -chdir=infra apply tfplan.phase2
+
+          aws ecs wait services-stable \\
+            --cluster \$(terraform -chdir=infra output -raw ecs_cluster_name) \\
+            --services \$(terraform -chdir=infra output -raw ecs_service_name) \\
+            --region "\$AWS_REGION"
           \`\`\`
           EOF

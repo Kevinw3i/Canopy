@@ -4,19 +4,19 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Row, Table, TableState},
 };
 
+use crate::theme::Theme;
+
 pub(crate) const SELECTED_ROW_SYMBOL: &str = "> ";
 
-pub(crate) fn selected_row_style() -> Style {
-    Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+pub(crate) fn selected_row_style(theme: Theme) -> Style {
+    theme.selected_style()
 }
 
-pub(crate) fn table_border_style(focused: bool) -> Style {
+pub(crate) fn table_border_style(focused: bool, theme: Theme) -> Style {
     if focused {
-        Style::default().fg(Color::Yellow).bold()
+        theme.focused_border_style()
     } else {
-        Style::default().fg(Color::Cyan)
+        theme.accent_style()
     }
 }
 
@@ -26,6 +26,7 @@ pub struct SelectableTable {
     pub row_count: usize,
     pub column_widths: Vec<Constraint>,
     pub headers: Vec<String>,
+    theme: Theme,
 }
 
 impl SelectableTable {
@@ -35,7 +36,13 @@ impl SelectableTable {
             row_count: 0,
             column_widths,
             headers,
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn set_row_count(&mut self, count: usize) {
@@ -121,7 +128,7 @@ impl SelectableTable {
         let header = Row::new(
             self.headers
                 .iter()
-                .map(|h| Cell::from(h.as_str()).style(Style::default().bold().fg(Color::Cyan))),
+                .map(|h| Cell::from(h.as_str()).style(self.theme.accent_style().bold())),
         )
         .height(1);
 
@@ -131,9 +138,9 @@ impl SelectableTable {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {} ", title))
-                    .border_style(table_border_style(focused)),
+                    .border_style(table_border_style(focused, self.theme)),
             )
-            .highlight_style(selected_row_style())
+            .highlight_style(selected_row_style(self.theme))
             .highlight_symbol(SELECTED_ROW_SYMBOL);
 
         StatefulWidget::render(table, area, buf, &mut self.state);
@@ -242,5 +249,36 @@ mod tests {
         let mut t = make_table(0);
         assert!(!t.handle_key(key(KeyCode::Char('j'))));
         assert!(!t.handle_key(key(KeyCode::Char('k'))));
+    }
+
+    #[test]
+    fn render_uses_configured_theme() {
+        let theme = Theme {
+            accent: Color::Magenta,
+            warning: Color::Red,
+            selected_bg: Color::Blue,
+            selected_fg: Color::LightYellow,
+            ..Theme::default()
+        };
+        let mut table = SelectableTable::new(
+            vec!["A".into(), "B".into()],
+            vec![Constraint::Length(8), Constraint::Length(8)],
+        )
+        .with_theme(theme);
+        table.set_row_count(1);
+
+        let rows = vec![Row::new(vec![Cell::from("one"), Cell::from("two")])];
+        let area = Rect::new(0, 0, 24, 5);
+        let mut buf = Buffer::empty(area);
+        table.render_with_rows_focused(rows.into_iter(), "Demo", area, &mut buf, true);
+
+        assert_eq!(buf[(0, 0)].fg, Color::Red);
+        assert!(buf
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "A" && cell.fg == Color::Magenta));
+        assert!(buf.content.iter().any(|cell| {
+            cell.symbol() != " " && cell.bg == Color::Blue && cell.fg == Color::LightYellow
+        }));
     }
 }

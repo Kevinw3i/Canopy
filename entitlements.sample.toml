@@ -14,6 +14,7 @@
 #   "direct"              直接用本機/Task Role 的 AWS 憑證（不走 AssumeRole）
 #   "profile:NAME"        用 ~/.aws/credentials 裡指定的 profile（本機開發用）
 #   "arn:aws:iam::...:role/..."  AssumeRole 到該 IAM Role（生產環境用）
+#   "arn:aws:iam::{account_id}:role/..." AWS Organizations discovery template
 # ============================================================
 
 # ── 群組 1：平台工程（完整權限）───────────────────────
@@ -67,6 +68,11 @@ can_use_mcp_database = false
 # can_start_ec2 = false
 # can_stop_ec2 = false
 # can_reboot_ec2 = false
+# ── ECS task inventory / exec（預設 false）────────────
+# 建議用下方獨立 ECS rule 授權，避免和 EC2 / CloudWatch
+# rule 的範圍混在一起。
+# can_view_ecs = false
+# can_use_ecs_exec = false
 
 [[rules.allowed_accounts]]
 account_id = "<ACCOUNT_ID>"                    # ← 改成你的 AWS 帳號 ID
@@ -143,6 +149,14 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # # find scopes that took the opt-in.
 # allow_views = false
 
+# AWS Organizations 自動帳號發現（取消註解後會在啟動時展開 ACTIVE accounts）：
+# Terraform 也需設定：
+# assumable_role_arn_patterns = ["arn:aws:iam::*:role/CanopyRole"]
+# [[rules.allowed_accounts]]
+# account_id = "*"
+# account_name = "organization"
+# role_arn = "arn:aws:iam::{account_id}:role/CanopyRole"
+
 # 只顯示特定 tag 的機器（取消註解啟用）：
 # [[rules.instance_tag_selectors]]
 # [rules.instance_tag_selectors.tags]
@@ -167,8 +181,8 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # previous_state / requested_state / power_action / confirmation_present
 # （詳見 docs/AUDIT-SCHEMA.md）。
 #
-# ⚠ 此 rule 寫好之後，要等 Phase 2 control-plane `/api/ec2/power`
-#   endpoint 上線才會真正生效（在那之前只是準備權限資料）。
+# control-plane `/api/ec2/power` 會用這個獨立 rule 的 account / region /
+# tag selector scope 做二次授權，通過後才會呼叫 AWS power API。
 
 # [[rules]]
 # id = "rule-platform-eng-power"
@@ -189,6 +203,46 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # [[rules.instance_tag_selectors]]
 # [rules.instance_tag_selectors.tags]
 # Environment = ["staging"]
+
+
+# ── 群組 1C：平台工程 ECS task / exec（獨立 scope）────────
+#
+# `can_view_ecs` 只允許在 TUI 的 ECS view 看到授權 cluster/task。
+# `can_use_ecs_exec` 允許進入 task container，必須同時有
+# `can_view_ecs = true`，而且必須設定 allowed_clusters。
+#
+# ECS Exec 會固定執行 `/bin/sh`，不接受使用者自訂 command；
+# control-plane 會先檢查 task/container scope、sidecar denylist、
+# 可用時做 IAM simulation，並透過 STS inline policy 與 audit fail-closed
+# 作為最終執行邊界。
+#
+# [[rules]]
+# id = "rule-platform-eng-ecs"
+# group = "platform-engineering"
+# allowed_regions = ["ap-northeast-1"]
+# allowed_clusters = [
+#     "arn:aws:ecs:ap-northeast-1:<ACCOUNT_ID>:cluster/prod-app",
+# ]
+# excluded_container_names = ["envoy", "xray-daemon", "log-router"]
+#
+# [rules.features]
+# can_view_ecs = true
+# can_use_ecs_exec = true
+#
+# [[rules.allowed_accounts]]
+# account_id = "<ACCOUNT_ID>"
+# account_name = "production"
+# role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyEcsExecRole"
+#
+# # 強烈建議：用 task tag 限縮可看到 / 可 exec 的 task。
+# [[rules.task_tag_selectors]]
+# [rules.task_tag_selectors.tags]
+# Environment = ["production"]
+#
+# # 可選：排除敏感 task。
+# [[rules.excluded_task_tag_selectors]]
+# [rules.excluded_task_tag_selectors.tags]
+# Sensitivity = ["high"]
 
 
 # ── 群組 2：唯讀維運 ────────────────────────────────

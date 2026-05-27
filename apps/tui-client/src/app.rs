@@ -1,7 +1,9 @@
 use anyhow::Result;
 use shared::dto::cloudwatch::FilterLogEventsRequest;
-use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest};
+use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest, Ec2PowerRequest};
+use shared::dto::ecs::{EcsExecRequest, EcsTasksRequest};
 use shared::dto::entitlements::UserEntitlements;
+use shared::dto::pty_spawn::PtySpawnSpec;
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
@@ -25,6 +27,7 @@ use crate::config::ClientConfig;
 use crate::event::{Action, Event, EventReader, Screen};
 use crate::local_deps::{self, DependencyIssue, LocalDependency, SystemCommandRunner};
 use crate::mcp::McpRuntime;
+use crate::theme::Theme;
 use crate::tui::Tui;
 
 const FILTER_EMPTY_PAGE_AUTO_SCAN_LIMIT: usize = 50;
@@ -46,9 +49,9 @@ pub(crate) enum SessionTokenOutcome {
     /// on-disk token. Caller MUST refuse to enter the dashboard.
     StaleTokenSurvivesOnDisk,
 }
-
 pub struct App {
     config: ClientConfig,
+    theme: Theme,
     api: ApiClient,
     current_screen: Screen,
     screen_stack: Vec<Screen>,
@@ -227,6 +230,32 @@ fn wrapper_session_limit(max_session_seconds: Option<u64>) -> Option<u64> {
     max_session_seconds.filter(|secs| *secs > 0)
 }
 
+fn ecs_tasks_warning_messages(
+    failed_scopes: &[String],
+    task_count: usize,
+    total_count: usize,
+    truncated: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if !failed_scopes.is_empty() {
+        warnings.push(format!(
+            "Some ECS scopes failed to respond:\n{}",
+            failed_scopes.join("\n")
+        ));
+    }
+    if truncated {
+        let count_text = if total_count > task_count {
+            format!("showing {task_count} of at least {total_count}")
+        } else {
+            format!("showing {task_count}; additional results may exist")
+        };
+        warnings.push(format!(
+            "ECS task results were truncated: {count_text}. Narrow the account or region filter."
+        ));
+    }
+    warnings
+}
+
 struct ConnectTarget<'a> {
     instance_id: &'a str,
     instance_name: Option<&'a str>,
@@ -269,6 +298,14 @@ struct AppBundleInfo {
 struct McpAiLaunchResult {
     client_label: &'static str,
     terminal_label: String,
+}
+
+fn connect_method_label(method: &ConnectMethod) -> &'static str {
+    match method {
+        ConnectMethod::Ssm => "SSM",
+        ConnectMethod::Ec2InstanceConnect => "EIC",
+        ConnectMethod::Ssh => "SSH",
+    }
 }
 
 fn prompt_yes_no(prompt: &str) -> bool {
@@ -818,19 +855,26 @@ impl App {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
         let scrollback = config.live_tail_scrollback;
+        let theme = config.theme.resolve()?;
 
         Ok(Self {
-            login: LoginScreen::new(config.dev_mode),
-            dashboard: DashboardScreen::new(config.enable_live_tail, config.show_public_ip),
-            ec2: Ec2Screen::new(),
-            cloudwatch_search: CloudWatchSearchScreen::new(),
-            live_tail: LiveTailScreen::new(scrollback),
-            access: AccessScreen::new(),
-            settings: SettingsScreen::new(config.clone()),
+            login: LoginScreen::with_theme(config.dev_mode, theme),
+            dashboard: DashboardScreen::new(
+                config.enable_live_tail,
+                config.show_public_ip,
+                config.keybindings.clone(),
+                theme,
+            ),
+            ec2: Ec2Screen::with_theme(theme),
+            cloudwatch_search: CloudWatchSearchScreen::with_theme(theme),
+            live_tail: LiveTailScreen::with_theme(scrollback, theme),
+            access: AccessScreen::with_theme(theme),
+            settings: SettingsScreen::new(config.clone(), theme),
             mcp: McpScreen::new(),
             connect_session: None,
-            error_modal: ErrorModal::new(),
+            error_modal: ErrorModal::new().with_theme(theme),
             config,
+            theme,
             api,
             current_screen: Screen::Login,
             screen_stack: Vec::new(),
@@ -952,14 +996,14 @@ impl App {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green));
+                    .border_style(self.theme.success_style());
                 let inner = block.inner(banner_area);
                 block.render(banner_area, buf);
 
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" ↑ ", Style::default().fg(Color::Green).bold()),
-                    Span::styled(msg.as_str(), Style::default().fg(Color::Green).bold()),
-                    Span::styled("  (Ctrl+D: dismiss)", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" ↑ ", self.theme.success_style().bold()),
+                    Span::styled(msg.as_str(), self.theme.success_style().bold()),
+                    Span::styled("  (Ctrl+D: dismiss)", self.theme.muted_style()),
                 ]))
                 .render(inner, buf);
                 connect_cursor = None;
@@ -1183,6 +1227,78 @@ impl App {
             Action::SelectInstance(_idx) => {
                 // handled in component
             }
+            Action::PowerEc2 {
+                instance_id,
+                account_id,
+                region,
+                action,
+                confirmation_instance_id,
+            } => {
+                self.do_power_ec2(Ec2PowerRequest {
+                    instance_id,
+                    account_id,
+                    region,
+                    action,
+                    confirmation_instance_id,
+                })
+                .await;
+            }
+            Action::ToggleEcsView => {
+                let follow_up = self.ec2.toggle_inventory_view();
+                let _ = self.action_tx.send(follow_up);
+            }
+            Action::RefreshEcsTasks => {
+                self.spawn_ecs_tasks_fetch();
+            }
+            Action::EcsTasksLoaded {
+                tasks,
+                failed_scopes,
+                total_count,
+                truncated,
+                generation,
+            } => {
+                if generation != self.ec2.fetch_generation {
+                    return;
+                }
+                let task_count = tasks.len();
+                let failed_scope_count = failed_scopes.len();
+                let warnings =
+                    ecs_tasks_warning_messages(&failed_scopes, task_count, total_count, truncated);
+                if !warnings.is_empty() {
+                    self.error_modal.show(warnings.join("\n\n"));
+                }
+                self.ec2.set_ecs_task_results(
+                    tasks,
+                    Some(total_count),
+                    truncated,
+                    failed_scope_count,
+                );
+            }
+            Action::EcsTasksFetchFailed(err, generation) => {
+                if generation != self.ec2.fetch_generation {
+                    return;
+                }
+                self.ec2.set_error(err);
+            }
+            Action::ConnectEcsExec {
+                account_id,
+                region,
+                cluster_arn,
+                task_arn,
+                container_name,
+            } => {
+                self.do_ecs_exec(
+                    EcsExecRequest {
+                        account_id,
+                        region,
+                        cluster_arn,
+                        task_arn,
+                        container_name,
+                    },
+                    terminal,
+                )
+                .await;
+            }
             Action::ConnectSsm {
                 instance_id,
                 instance_name,
@@ -1357,38 +1473,30 @@ impl App {
 
             // Live Tail
             Action::StartLiveTail => {
-                if self.config.dev_mode {
-                    // Dev mode: connect to the control-plane's WebSocket
-                    // and stream simulated events into the live tail screen.
-                    if let Some((cancel, generation)) = self.try_arm_live_tail_stream() {
-                        let tx = self.action_tx.clone();
-                        let base_url = self.config.control_plane_url.clone();
-                        let token = self.api.get_token();
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::live_tail_ws::stream_simulated_live_tail(
-                                &base_url,
-                                token.as_deref(),
-                                tx,
-                                cancel,
-                                generation,
-                            )
-                            .await
-                            {
-                                tracing::warn!("Live tail stream ended: {}", e);
-                            }
-                        });
-                    }
-                    // else: a stream is already in flight; ignore the
-                    // duplicate StartLiveTail (Codex round 3: a queued
-                    // double-Start would otherwise overwrite the
-                    // cancel token, leaking the old stream and making
-                    // the old stream's StopLiveTail cancel the new one).
-                } else {
+                let Some(request) = self.live_tail.start_request() else {
                     self.error_modal.show(
-                        "Live tail WebSocket client is not yet available. \
-                         This feature is in beta."
-                            .into(),
+                        "No Live Tail log group is available with your current entitlements".into(),
                     );
+                    return;
+                };
+                if let Some((cancel, generation)) = self.try_arm_live_tail_stream() {
+                    let tx = self.action_tx.clone();
+                    let base_url = self.config.control_plane_url.clone();
+                    let token = self.api.get_token();
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::live_tail_ws::stream_live_tail(
+                            &base_url,
+                            token.as_deref(),
+                            request,
+                            tx,
+                            cancel,
+                            generation,
+                        )
+                        .await
+                        {
+                            tracing::warn!("Live tail stream ended: {}", e);
+                        }
+                    });
                 }
             }
             // Live-tail actions are dispatched through a single
@@ -1422,6 +1530,34 @@ impl App {
             }
             Action::TestMcp => {
                 self.test_mcp_runtime().await;
+            }
+            Action::LiveTailConnected => {
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.set_connected();
+                }
+            }
+            Action::LiveTailReconnecting => {
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.set_reconnecting();
+                }
+            }
+            Action::LiveTailSessionUpdate { events_per_second } => {
+                if self.live_tail_cancel.is_some() {
+                    self.live_tail.set_events_per_second(events_per_second);
+                }
+            }
+            Action::RefreshLiveTailLogGroups => {
+                self.spawn_live_tail_log_groups_fetch();
+            }
+            Action::LiveTailLogGroupsLoaded { groups, generation } => {
+                if generation == self.live_tail.fetch_generation {
+                    self.live_tail.set_log_groups(groups);
+                }
+            }
+            Action::LiveTailLogGroupsFailed { error, generation } => {
+                if generation == self.live_tail.fetch_generation {
+                    self.live_tail.set_log_groups_error(error);
+                }
             }
             Action::McpStarted(status) => {
                 self.mcp.set_running(&status);
@@ -1464,6 +1600,94 @@ impl App {
                 if generation == self.dashboard.ip_fetch_generation {
                     self.dashboard.public_ip = Some(ip);
                 }
+            }
+
+            // MFA
+            Action::RefreshMfaStatus => {
+                self.settings.set_mfa_loading();
+                self.spawn_mfa_status_fetch();
+            }
+            Action::MfaStatusLoaded(status) => {
+                self.settings.set_mfa_status(status);
+            }
+            Action::MfaStatusFailed(error) => {
+                self.settings.set_mfa_error(error);
+            }
+            Action::StartTotpEnrollment => {
+                self.settings.set_totp_starting();
+                self.spawn_totp_enrollment_start();
+            }
+            Action::TotpEnrollmentStarted(response) => {
+                self.settings.set_totp_started(response);
+            }
+            Action::TotpEnrollmentStartFailed(error) => {
+                self.settings.set_totp_start_error(error);
+            }
+            Action::ConfirmTotpEnrollment { factor_id, code } => {
+                self.settings.set_totp_confirming();
+                self.spawn_totp_enrollment_confirm(factor_id, code);
+            }
+            Action::TotpEnrollmentConfirmed(response) => {
+                self.settings.set_totp_confirmed(response.status);
+            }
+            Action::TotpEnrollmentConfirmFailed(error) => {
+                self.settings.set_totp_confirm_error(error);
+            }
+            Action::StartTotpStepUpVerification => {
+                self.settings.start_totp_step_up_verification();
+            }
+            Action::VerifyTotpStepUp { code } => {
+                self.settings.set_totp_step_up_verifying();
+                self.spawn_totp_step_up_verify(code);
+            }
+            Action::TotpStepUpVerified(response) => {
+                self.settings.set_totp_step_up_verified(response);
+            }
+            Action::TotpStepUpVerifyFailed(error) => {
+                self.settings.set_totp_step_up_verify_error(error);
+            }
+            Action::GenerateRecoveryCodes => {
+                self.settings.set_recovery_codes_generating();
+                self.spawn_recovery_codes_generate();
+            }
+            Action::RecoveryCodesGenerated(response) => {
+                self.settings.set_recovery_codes_generated(response);
+            }
+            Action::RecoveryCodesGenerateFailed(error) => {
+                self.settings.set_recovery_codes_generate_error(error);
+            }
+            Action::StartRecoveryCodeStepUpVerification => {
+                self.settings.start_recovery_code_step_up_verification();
+            }
+            Action::VerifyRecoveryCodeStepUp { code } => {
+                self.settings.set_recovery_code_step_up_verifying();
+                self.spawn_recovery_code_step_up_verify(code);
+            }
+            Action::RecoveryCodeStepUpVerified(response) => {
+                self.settings.set_recovery_code_step_up_verified(response);
+            }
+            Action::RecoveryCodeStepUpVerifyFailed(error) => {
+                self.settings.set_recovery_code_step_up_verify_error(error);
+            }
+            Action::StartWebAuthnEnrollment => {
+                self.settings.set_webauthn_starting();
+                self.spawn_webauthn_enrollment();
+            }
+            Action::WebAuthnEnrollmentSucceeded(response) => {
+                self.settings.set_webauthn_enrolled(response);
+            }
+            Action::WebAuthnEnrollmentFailed(error) => {
+                self.settings.set_webauthn_error(error);
+            }
+            Action::StartWebAuthnStepUpVerification => {
+                self.settings.set_webauthn_verifying();
+                self.spawn_webauthn_step_up_verification();
+            }
+            Action::WebAuthnStepUpVerified(response) => {
+                self.settings.set_webauthn_step_up_verified(response);
+            }
+            Action::WebAuthnStepUpVerifyFailed(error) => {
+                self.settings.set_webauthn_step_up_error(error);
             }
 
             // Auto-update
@@ -1665,9 +1889,9 @@ impl App {
         // results from the prior session are rejected.
         let ec2_gen = self.ec2.fetch_generation + 1;
         let cw_gen = self.cloudwatch_search.fetch_generation + 1;
-        self.ec2 = Ec2Screen::new();
+        self.ec2 = Ec2Screen::with_theme(self.theme);
         self.ec2.fetch_generation = ec2_gen;
-        self.cloudwatch_search = CloudWatchSearchScreen::new();
+        self.cloudwatch_search = CloudWatchSearchScreen::with_theme(self.theme);
         self.cloudwatch_search.fetch_generation = cw_gen;
         self.dashboard.public_ip = None;
         self.dashboard.ip_fetch_generation += 1;
@@ -1868,6 +2092,7 @@ impl App {
         self.dashboard.set_entitlements(ent.clone());
         self.ec2.set_entitlements(ent.clone());
         self.cloudwatch_search.set_entitlements(ent.clone());
+        self.live_tail.set_entitlements(ent.clone());
         self.access.set_entitlements(ent.clone());
         self.mcp.set_entitlements(ent.clone());
         self.entitlements = Some(ent);
@@ -2201,6 +2426,145 @@ exit "$rc"
         }
     }
 
+    fn spawn_mfa_status_fetch(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match api.mfa_status().await {
+                Ok(status) => {
+                    let _ = tx.send(Action::MfaStatusLoaded(status));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(err, Action::MfaStatusFailed));
+                }
+            }
+        });
+    }
+
+    fn spawn_totp_enrollment_start(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::TotpEnrollStartRequest { label: None };
+            match api.start_totp_enrollment(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TotpEnrollmentStarted(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::TotpEnrollmentStartFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_totp_enrollment_confirm(&self, factor_id: String, code: String) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::TotpEnrollConfirmRequest { factor_id, code };
+            match api.confirm_totp_enrollment(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TotpEnrollmentConfirmed(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::TotpEnrollmentConfirmFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_totp_step_up_verify(&self, code: String) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::TotpVerifyRequest { code };
+            match api.verify_totp_step_up(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TotpStepUpVerified(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::TotpStepUpVerifyFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_recovery_codes_generate(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match api.generate_recovery_codes().await {
+                Ok(response) => {
+                    let _ = tx.send(Action::RecoveryCodesGenerated(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::RecoveryCodesGenerateFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_recovery_code_step_up_verify(&self, code: String) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::RecoveryCodeVerifyRequest { code };
+            match api.verify_recovery_code_step_up(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::RecoveryCodeStepUpVerified(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::RecoveryCodeStepUpVerifyFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_webauthn_enrollment(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match crate::auth::webauthn::start_webauthn_registration_flow(&api).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::WebAuthnEnrollmentSucceeded(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Action::WebAuthnEnrollmentFailed(err.to_string()));
+                }
+            }
+        });
+    }
+
+    fn spawn_webauthn_step_up_verification(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match crate::auth::webauthn::start_webauthn_verification_flow(&api).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::WebAuthnStepUpVerified(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Action::WebAuthnStepUpVerifyFailed(err.to_string()));
+                }
+            }
+        });
+    }
+
     fn spawn_ec2_fetch(&mut self, name_filter: Option<String>) {
         // Cancel any in-flight EC2 fetch
         if let Some(token) = self.ec2_fetch_cancel.take() {
@@ -2266,6 +2630,72 @@ exit "$rc"
 
             let _ = tx.send(Action::Ec2Loaded(all_instances, failed_scopes, generation));
         });
+    }
+
+    fn spawn_ecs_tasks_fetch(&mut self) {
+        if let Some(token) = self.ec2_fetch_cancel.take() {
+            token.cancel();
+        }
+
+        self.ec2.set_loading();
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        let generation = self.ec2.fetch_generation;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.ec2_fetch_cancel = Some(cancel.clone());
+
+        let req = EcsTasksRequest {
+            account_id: self.ec2.selected_account_id.clone(),
+            region: self.ec2.selected_region.clone(),
+            cluster: None,
+            page_size: 200,
+        };
+
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return,
+                r = api.list_ecs_tasks(&req) => r,
+            };
+
+            match result {
+                Ok(resp) => {
+                    let _ = tx.send(Action::EcsTasksLoaded {
+                        tasks: resp.tasks,
+                        failed_scopes: resp.failed_scopes,
+                        total_count: resp.total_count,
+                        truncated: resp.truncated,
+                        generation,
+                    });
+                }
+                Err(e) => {
+                    let action = Self::route_error_to_action(e, |msg| {
+                        Action::EcsTasksFetchFailed(
+                            format!("Failed to fetch ECS tasks: {msg}"),
+                            generation,
+                        )
+                    });
+                    let _ = tx.send(action);
+                }
+            }
+        });
+    }
+
+    async fn do_power_ec2(&mut self, req: Ec2PowerRequest) {
+        match self.api.power_ec2(&req).await {
+            Ok(resp) => {
+                self.error_modal.show(format!(
+                    "{}\nPrevious: {} → Requested: {}",
+                    resp.message, resp.previous_state, resp.requested_state
+                ));
+                self.spawn_ec2_fetch(None);
+            }
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| {
+                    app.error_modal
+                        .show(format!("EC2 power action failed: {}", msg));
+                });
+            }
+        }
     }
 
     fn suspend_for_external_command(&mut self) {
@@ -2345,14 +2775,15 @@ exit "$rc"
         match self.api.connect(&req).await {
             Ok(resp) => {
                 if resp.authorized {
+                    let spawn_spec: PtySpawnSpec = resp.into();
                     tracing::info!(
-                        command = %resp.command,
-                        args = ?resp.args,
+                        command = %spawn_spec.command,
+                        args = ?spawn_spec.args,
                         "Spawning connect command"
                     );
 
                     let runner = SystemCommandRunner;
-                    let required_deps = local_deps::required_dependencies_for_connect(&resp);
+                    let required_deps = local_deps::required_dependencies_for_connect(&spawn_spec);
                     let dependency_issues =
                         local_deps::check_required_dependencies(&required_deps, &runner);
                     let mut terminal_suspended = false;
@@ -2377,7 +2808,7 @@ exit "$rc"
                     }
 
                     if let Some(max_session_seconds) =
-                        wrapper_session_limit(resp.max_session_seconds)
+                        wrapper_session_limit(spawn_spec.max_session_seconds)
                     {
                         if terminal_suspended {
                             self.resume_after_external_command(terminal);
@@ -2386,21 +2817,20 @@ exit "$rc"
                         let size = terminal
                             .size()
                             .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
-                        match ConnectSessionScreen::spawn(
+                        match ConnectSessionScreen::spawn_with_theme(
                             ConnectSessionLaunch {
                                 instance_id: target.instance_id.to_string(),
                                 instance_name: target.instance_name.map(String::from),
                                 account_id: target.account_id.to_string(),
                                 region: target.region.to_string(),
-                                method: target.method,
-                                command: resp.command,
-                                args: resp.args,
-                                env_vars: resp.env_vars,
+                                method_label: connect_method_label(&target.method).to_string(),
+                                spawn: spawn_spec,
                                 max_session_seconds,
                                 cols: size.width,
                                 rows: size.height,
                             },
                             self.action_tx.clone(),
+                            self.theme,
                         ) {
                             Ok(session) => {
                                 self.connect_session = Some(session);
@@ -2420,15 +2850,15 @@ exit "$rc"
                     }
 
                     // Run the command
-                    let mut cmd = std::process::Command::new(&resp.command);
-                    cmd.args(&resp.args);
-                    for (k, v) in &resp.env_vars {
+                    let mut cmd = std::process::Command::new(&spawn_spec.command);
+                    cmd.args(&spawn_spec.args);
+                    for (k, v) in &spawn_spec.env_vars {
                         cmd.env(k, v);
                     }
 
                     // Pre-flight: TCP connectivity check for SSH with countdown
-                    if resp.command == "ssh" {
-                        if let Some(target) = resp.args.last() {
+                    if spawn_spec.command == "ssh" {
+                        if let Some(target) = spawn_spec.args.last() {
                             // Extract IP from "user@ip"
                             if let Some(ip) = target.split('@').nth(1) {
                                 let addr = format!("{}:22", ip);
@@ -2472,11 +2902,11 @@ exit "$rc"
                         }
                     }
 
-                    if let Some(secs) = resp.max_session_seconds {
+                    if let Some(secs) = spawn_spec.max_session_seconds {
                         println!(
                             "--- Connecting to {} via {} (max {} min) ---\n",
                             target.instance_id,
-                            resp.command,
+                            spawn_spec.command,
                             secs / 60
                         );
                         println!("Session countdown: {}", render_session_countdown(secs, 0));
@@ -2485,7 +2915,7 @@ exit "$rc"
                     } else {
                         println!(
                             "--- Connecting to {} via {} ---\n",
-                            target.instance_id, resp.command
+                            target.instance_id, spawn_spec.command
                         );
                     }
 
@@ -2495,7 +2925,7 @@ exit "$rc"
 
                     match cmd.spawn() {
                         Ok(mut child) => {
-                            let session_limit = resp.max_session_seconds.filter(|&s| s > 0);
+                            let session_limit = spawn_spec.max_session_seconds.filter(|&s| s > 0);
                             let start = std::time::Instant::now();
                             let mut connected = false;
 
@@ -2589,10 +3019,10 @@ exit "$rc"
                         Err(e) => {
                             let msg = match e.kind() {
                                 std::io::ErrorKind::NotFound => {
-                                    if resp.command == "aws" {
+                                    if spawn_spec.command == "aws" {
                                         "AWS CLI not found. Install it from https://aws.amazon.com/cli/".to_string()
                                     } else {
-                                        format!("Command '{}' not found", resp.command)
+                                        format!("Command '{}' not found", spawn_spec.command)
                                     }
                                 }
                                 _ => format!("Failed to execute command: {}", e),
@@ -2601,7 +3031,7 @@ exit "$rc"
                         }
                     }
 
-                    if resp.max_session_seconds.is_some() {
+                    if spawn_spec.max_session_seconds.is_some() {
                         set_terminal_title("Canopy");
                     }
 
@@ -2628,6 +3058,126 @@ exit "$rc"
             Err(e) => {
                 self.handle_route_error(e, |app, msg| {
                     app.error_modal.show(format!("Connect failed: {}", msg));
+                });
+            }
+        }
+    }
+
+    async fn do_ecs_exec(&mut self, req: EcsExecRequest, terminal: &mut Tui) {
+        match self.api.ecs_exec(&req).await {
+            Ok(resp) => {
+                let spawn_spec: PtySpawnSpec = resp.into();
+                tracing::info!(
+                    command = %spawn_spec.command,
+                    args = ?spawn_spec.args,
+                    "Spawning ECS exec command"
+                );
+
+                let runner = SystemCommandRunner;
+                let required_deps = local_deps::required_dependencies_for_connect(&spawn_spec);
+                let dependency_issues =
+                    local_deps::check_required_dependencies(&required_deps, &runner);
+                let mut terminal_suspended = false;
+
+                if !dependency_issues.is_empty() {
+                    self.suspend_for_external_command();
+                    terminal_suspended = true;
+
+                    if let Err(msg) = self.resolve_connect_dependencies(
+                        &required_deps,
+                        dependency_issues,
+                        &runner,
+                    ) {
+                        eprintln!("\nError: {}\n", msg);
+                        println!("Press Enter to return to the console...");
+                        let _ = std::io::stdin().read_line(&mut String::new());
+
+                        self.resume_after_external_command(terminal);
+                        self.error_modal.show(msg);
+                        return;
+                    }
+                }
+
+                let task_label = req
+                    .task_arn
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(req.task_arn.as_str())
+                    .to_string();
+
+                if let Some(max_session_seconds) =
+                    wrapper_session_limit(spawn_spec.max_session_seconds)
+                {
+                    if terminal_suspended {
+                        self.resume_after_external_command(terminal);
+                    }
+
+                    let size = terminal
+                        .size()
+                        .unwrap_or_else(|_| ratatui::prelude::Size::new(80, 24));
+                    match ConnectSessionScreen::spawn_with_theme(
+                        ConnectSessionLaunch {
+                            instance_id: task_label,
+                            instance_name: Some(req.container_name),
+                            account_id: req.account_id,
+                            region: req.region,
+                            method_label: "ECS".into(),
+                            spawn: spawn_spec,
+                            max_session_seconds,
+                            cols: size.width,
+                            rows: size.height,
+                        },
+                        self.action_tx.clone(),
+                        self.theme,
+                    ) {
+                        Ok(session) => {
+                            self.connect_session = Some(session);
+                            self.current_screen = Screen::ConnectSession;
+                        }
+                        Err(e) => {
+                            self.error_modal
+                                .show(format!("Failed to start ECS exec wrapper: {e}"));
+                        }
+                    }
+                    return;
+                }
+
+                if !terminal_suspended {
+                    self.suspend_for_external_command();
+                }
+
+                let mut cmd = std::process::Command::new(&spawn_spec.command);
+                cmd.args(&spawn_spec.args);
+                for (k, v) in &spawn_spec.env_vars {
+                    cmd.env(k, v);
+                }
+
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        let _ = child.wait();
+                    }
+                    Err(e) => {
+                        let msg = match e.kind() {
+                            std::io::ErrorKind::NotFound if spawn_spec.command == "aws" => {
+                                "AWS CLI not found. Install it from https://aws.amazon.com/cli/"
+                                    .to_string()
+                            }
+                            std::io::ErrorKind::NotFound => {
+                                format!("Command '{}' not found", spawn_spec.command)
+                            }
+                            _ => format!("Failed to execute command: {}", e),
+                        };
+                        eprintln!("\nError: {}\n", msg);
+                    }
+                }
+
+                println!("\nPress Enter to return to the console...");
+                let _ = std::io::stdin().read_line(&mut String::new());
+                self.resume_after_external_command(terminal);
+            }
+            Err(e) => {
+                self.handle_route_error(e, |app, msg| {
+                    app.error_modal.show(format!("ECS exec failed: {}", msg));
                 });
             }
         }
@@ -2901,6 +3451,48 @@ exit "$rc"
         }
     }
 
+    fn spawn_live_tail_log_groups_fetch(&mut self) {
+        let account_id = self.live_tail.selected_account_id.clone();
+        let region = self.live_tail.selected_region.clone();
+
+        if account_id.is_empty() || region.is_empty() {
+            self.live_tail
+                .set_log_groups_error("No Live Tail account or region is available".into());
+            return;
+        }
+
+        self.live_tail.set_log_groups_loading();
+        self.live_tail.advance_fetch_generation();
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        let generation = self.live_tail.fetch_generation;
+
+        tokio::spawn(async move {
+            let req = shared::dto::cloudwatch::LogGroupsRequest {
+                account_id,
+                region,
+                prefix: None,
+            };
+
+            match api.list_log_groups(&req).await {
+                Ok(resp) => {
+                    let _ = tx.send(Action::LiveTailLogGroupsLoaded {
+                        groups: resp.log_groups,
+                        generation,
+                    });
+                }
+                Err(e) => {
+                    let action =
+                        Self::route_error_to_action(e, |msg| Action::LiveTailLogGroupsFailed {
+                            error: format!("Failed to fetch Live Tail log groups: {}", msg),
+                            generation,
+                        });
+                    let _ = tx.send(action);
+                }
+            }
+        });
+    }
+
     fn spawn_filter_search(&mut self, append: bool) {
         if self.cloudwatch_search.selected_log_group.is_empty() {
             self.cloudwatch_search
@@ -3124,6 +3716,8 @@ exit "$rc"
             update_repo_owner: "test".into(),
             update_repo_name: "test".into(),
             change_password_url: None,
+            keybindings: crate::keybindings::KeyBindings::default(),
+            theme: crate::theme::ThemeConfig::default(),
         }
     }
 
@@ -3248,6 +3842,11 @@ mod tests {
             max_session_seconds: None,
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             database_scopes: vec![],
         }
@@ -3958,10 +4557,13 @@ mod tests {
             instance_name: Some("test".into()),
             account_id: "111111111111".into(),
             region: "us-east-1".into(),
-            method: shared::dto::ec2::ConnectMethod::Ssh,
-            command: "/bin/sh".into(),
-            args: vec!["-c".into(), "sleep 30".into()],
-            env_vars: std::collections::HashMap::new(),
+            method_label: "SSH".into(),
+            spawn: PtySpawnSpec {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30".into()],
+                env_vars: std::collections::HashMap::new(),
+                max_session_seconds: Some(60),
+            },
             max_session_seconds: 60,
             cols: 80,
             rows: 24,
@@ -4115,6 +4717,24 @@ mod tests {
         assert_eq!(wrapper_session_limit(None), None);
     }
 
+    #[test]
+    fn ecs_tasks_warning_messages_reports_partial_and_truncated_results() {
+        let warnings =
+            ecs_tasks_warning_messages(&["account-a us-east-1 failed".into()], 200, 250, true);
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("Some ECS scopes failed"));
+        assert!(warnings[1].contains("showing 200 of at least 250"));
+    }
+
+    #[test]
+    fn ecs_tasks_warning_messages_handles_aws_side_truncation_without_exact_total() {
+        let warnings = ecs_tasks_warning_messages(&[], 50, 50, true);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("additional results may exist"));
+    }
+
     // ── Logout resets state ─────────────────────────────────
 
     #[tokio::test]
@@ -4129,9 +4749,9 @@ mod tests {
         // because it needs a Tui, so we replicate the key state changes)
         let ec2_gen = app.ec2.fetch_generation + 1;
         let cw_gen = app.cloudwatch_search.fetch_generation + 1;
-        app.ec2 = Ec2Screen::new();
+        app.ec2 = Ec2Screen::with_theme(app.theme);
         app.ec2.fetch_generation = ec2_gen;
-        app.cloudwatch_search = CloudWatchSearchScreen::new();
+        app.cloudwatch_search = CloudWatchSearchScreen::with_theme(app.theme);
         app.cloudwatch_search.fetch_generation = cw_gen;
         app.entitlements = None;
         app.current_screen = Screen::Login;

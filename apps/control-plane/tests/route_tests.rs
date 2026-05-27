@@ -11,14 +11,20 @@ use axum::{
     response::IntoResponse,
     Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
+use passkey_auth::{CosePublicKey, CredentialId, PasskeyCredential};
+use rusqlite::params;
 use serde_json::{json, Value};
+use shared::dto::cloudwatch::LiveTailMessage;
+use shared::dto::entitlements::{AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, LazyLock,
 };
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
 // ── Re-use crate internals via the library-style paths ──────────────────
@@ -37,6 +43,8 @@ use control_plane::services::oidc::OidcClient;
 use control_plane::services::AppState;
 use shared::dto::database::{ExplainSummary, ExplainTableSummary};
 
+const TEST_MFA_SECRET_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn dev_config() -> AppConfig {
@@ -47,6 +55,11 @@ fn dev_config() -> AppConfig {
             client_id: "test-client".into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            acr_values: vec![],
+            prompt: None,
+            max_age_seconds: None,
+            required_acr_values: vec![],
+            required_amr_values: vec![],
             authorization_endpoint: None,
             token_endpoint: None,
             device_authorization_endpoint: None,
@@ -66,7 +79,11 @@ fn dev_config() -> AppConfig {
         dev_mode: true,
         mock_aws_data: None,
         entitlements_file: None,
+        entitlements_database_url: None,
+        mfa_database_url: None,
+        mfa_secret_key: None,
         audit_log: None,
+        audit_export: Default::default(),
         cors_allowed_origins: vec![],
     }
 }
@@ -78,6 +95,11 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
 fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
+        config.mfa_database_url.as_deref(),
+        config.mfa_secret_key.as_deref(),
+    )
+    .unwrap();
 
     // Build a minimal SdkConfig without hitting real AWS
     let base_aws_config = aws_config::SdkConfig::builder()
@@ -98,6 +120,8 @@ fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService
         entitlement_store: Arc::new(tokio::sync::RwLock::new(entitlement_store)),
         audit_service,
         oidc_client,
+        mfa_store,
+        step_up_sessions: control_plane::services::step_up::StepUpSessionStore::default(),
         base_aws_config,
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),
@@ -143,6 +167,11 @@ fn build_state_with_database_and_allow_views(
         }
     }
     let oidc_client = OidcClient::new(config.oidc.clone());
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
+        config.mfa_database_url.as_deref(),
+        config.mfa_secret_key.as_deref(),
+    )
+    .unwrap();
     let base_aws_config = aws_config::SdkConfig::builder()
         .region(aws_types::region::Region::new("us-east-1"))
         .build();
@@ -156,6 +185,8 @@ fn build_state_with_database_and_allow_views(
         entitlement_store: Arc::new(tokio::sync::RwLock::new(entitlement_store)),
         audit_service,
         oidc_client,
+        mfa_store,
+        step_up_sessions: control_plane::services::step_up::StepUpSessionStore::default(),
         base_aws_config,
         database_secret_provider: secret_provider,
         database_executor: executor,
@@ -466,13 +497,37 @@ fn read_audit_events(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn seed_webauthn_factor(db_path: &Path, user_id: &str) -> String {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let factor_id = "webauthn-factor-1".to_string();
+    let credential = PasskeyCredential {
+        id: CredentialId(vec![1, 2, 3, 4]),
+        public_key_cose: CosePublicKey(vec![0xAA, 0xBB, 0xCC]),
+        counter: 0,
+        transports: vec!["internal".into()],
+        aaguid: [0; 16],
+    };
+    let credential_id = credential.id.as_bytes().to_vec();
+    let credential_json = serde_json::to_string(&credential).unwrap();
+    conn.execute(
+        "INSERT INTO mfa_factors
+             (id, user_id, kind, label, credential_id, credential_json, enrolled_at)
+         VALUES (?1, ?2, 'web_authn', 'Security key', ?3, ?4, CURRENT_TIMESTAMP)",
+        params![factor_id, user_id, credential_id, credential_json],
+    )
+    .unwrap();
+    credential.id.to_b64url()
+}
+
 /// Build the full app router (public + protected) exactly like main.rs.
 fn build_app(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .merge(routes::ec2::router())
+        .merge(routes::ecs::router())
         .merge(routes::cloudwatch::router())
         .merge(routes::entitlements::router())
         .merge(routes::mcp::router())
+        .merge(routes::mfa::router())
         .route_layer(axum_mw::from_fn_with_state(
             state.clone(),
             middleware::auth::require_auth,
@@ -480,8 +535,33 @@ fn build_app(state: Arc<AppState>) -> Router {
 
     Router::new()
         .merge(routes::auth::router())
+        .merge(routes::live_tail::router())
         .merge(protected)
         .with_state(state)
+}
+
+async fn start_route_server(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("ws://{addr}/api/cloudwatch/live-tail")
+}
+
+async fn recv_live_tail_message<S>(
+    ws: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> LiveTailMessage
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("timed out waiting for live-tail message")
+        .expect("websocket stream ended")
+        .expect("websocket message failed");
+    let text = msg.into_text().expect("expected text websocket message");
+    serde_json::from_str(&text).expect("live-tail message should parse")
 }
 
 /// Issue a valid JWT for the dev-admin user (matches dev_defaults memberships).
@@ -559,6 +639,90 @@ async fn body_json(body: Body) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+async fn authed_post_json(
+    app: Router,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::post(path)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json = body_json(resp.into_body()).await;
+    (status, json)
+}
+
+async fn authed_get_json(app: Router, path: &str, token: &str) -> (StatusCode, Value) {
+    let resp = app
+        .oneshot(
+            Request::get(path)
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json = body_json(resp.into_body()).await;
+    (status, json)
+}
+
+async fn enroll_test_totp(app: Router, token: &str) -> String {
+    let (start_status, start_json) =
+        authed_post_json(app.clone(), "/api/auth/mfa/totp/start", token, json!({})).await;
+    assert_eq!(start_status, StatusCode::OK);
+    let factor_id = start_json["factor_id"].as_str().unwrap().to_string();
+    let secret_base32 = start_json["secret_base32"].as_str().unwrap().to_string();
+    let secret = totp_rs::Secret::Encoded(secret_base32).to_bytes().unwrap();
+    let code = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Canopy".into()),
+        "dev-admin@dev.local".into(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap();
+
+    let (confirm_status, _) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/confirm",
+        token,
+        json!({
+            "factor_id": factor_id,
+            "code": code.clone()
+        }),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+    code
+}
+
+async fn verify_test_totp_step_up(app: Router, token: &str, code: &str) {
+    let (verify_status, verify_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/verify",
+        token,
+        json!({
+            "code": code
+        }),
+    )
+    .await;
+    assert_eq!(verify_status, StatusCode::OK);
+    assert_eq!(verify_json["verified"], true);
+}
+
 struct RouteTestOidcKey {
     pem: Vec<u8>,
     n: String,
@@ -634,6 +798,23 @@ async fn mock_oidc_token(
     Form(form): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
     match form.get("grant_type").map(String::as_str) {
+        Some("authorization_code")
+            if form.get("code").map(String::as_str) == Some("valid-code")
+                && form.get("code_verifier").map(String::as_str)
+                    == Some("valid-verifier-abcdefghijklmnopqrstuvwxyz0123456789")
+                && form.get("redirect_uri").map(String::as_str)
+                    == Some("http://localhost:9876/callback")
+                && form.get("client_id").map(String::as_str) == Some("test-client") =>
+        {
+            return axum::Json(json!({
+                "access_token": "oidc-code-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": state.id_token,
+                "refresh_token": "auth-code-refresh"
+            }))
+            .into_response();
+        }
         Some("refresh_token")
             if form.get("refresh_token").map(String::as_str) == Some("valid-refresh") =>
         {
@@ -1937,6 +2118,562 @@ async fn protected_route_rejects_invalid_token() {
 }
 
 #[tokio::test]
+async fn mfa_status_returns_provider_and_local_factor_readiness() {
+    let mut config = dev_config();
+    config.oidc.required_amr_values = vec!["mfa".into()];
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_get_json(app, "/api/auth/mfa/status", &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["user_id"], "dev-admin");
+    assert_eq!(json["provider_step_up_configured"], true);
+    assert_eq!(json["local_step_up_available"], false);
+    assert_eq!(json["factors"][0]["kind"], "totp");
+    assert_eq!(json["factors"][1]["kind"], "web_authn");
+}
+
+#[tokio::test]
+async fn mfa_status_reports_configured_local_factor_store() {
+    let db = AuditFile::new("mfa-store");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_get_json(app, "/api/auth/mfa/status", &token).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["local_step_up_available"], false);
+    assert_eq!(json["factors"][0]["available"], true);
+    assert_eq!(json["factors"][0]["enrolled"], false);
+    assert_eq!(json["factors"][1]["available"], true);
+    assert_eq!(json["factors"][1]["enrolled"], false);
+}
+
+#[tokio::test]
+async fn totp_enrollment_start_and_confirm_enrolls_factor() {
+    let db = AuditFile::new("mfa-totp");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (start_status, start_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/totp/start",
+        &token,
+        json!({"label": "Phone"}),
+    )
+    .await;
+
+    assert_eq!(start_status, StatusCode::OK);
+    let factor_id = start_json["factor_id"].as_str().unwrap().to_string();
+    let secret_base32 = start_json["secret_base32"].as_str().unwrap().to_string();
+    assert!(start_json["otpauth_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("otpauth://totp/"));
+
+    let secret = totp_rs::Secret::Encoded(secret_base32).to_bytes().unwrap();
+    let code = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Canopy".into()),
+        "dev-admin@dev.local".into(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap();
+
+    let (confirm_status, confirm_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/totp/confirm",
+        &token,
+        json!({
+            "factor_id": factor_id,
+            "code": code.clone()
+        }),
+    )
+    .await;
+
+    assert_eq!(confirm_status, StatusCode::OK);
+    assert_eq!(confirm_json["enrolled"], true);
+    assert_eq!(confirm_json["status"]["local_step_up_available"], true);
+    assert_eq!(confirm_json["status"]["factors"][0]["enrolled"], true);
+
+    let (verify_status, verify_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/verify",
+        &token,
+        json!({
+            "code": code
+        }),
+    )
+    .await;
+
+    assert_eq!(verify_status, StatusCode::OK);
+    assert_eq!(verify_json["verified"], true);
+    assert!(verify_json["step_up_expires_at"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn totp_enrollment_audit_does_not_log_secret_or_code() {
+    let db = AuditFile::new("mfa-audit-db");
+    let audit = AuditFile::new("mfa-audit-log");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (start_status, start_json) =
+        authed_post_json(app.clone(), "/api/auth/mfa/totp/start", &token, json!({})).await;
+    assert_eq!(start_status, StatusCode::OK);
+    let factor_id = start_json["factor_id"].as_str().unwrap().to_string();
+    let secret_base32 = start_json["secret_base32"].as_str().unwrap().to_string();
+    let secret = totp_rs::Secret::Encoded(secret_base32.clone())
+        .to_bytes()
+        .unwrap();
+    let code = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Canopy".into()),
+        "dev-admin@dev.local".into(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap();
+
+    let (confirm_status, _) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/totp/confirm",
+        &token,
+        json!({
+            "factor_id": factor_id,
+            "code": code.clone()
+        }),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+
+    let (verify_status, _) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/verify",
+        &token,
+        json!({
+            "code": code.clone()
+        }),
+    )
+    .await;
+    assert_eq!(verify_status, StatusCode::OK);
+
+    let events = read_audit_events(&audit.path);
+    assert_eq!(events.len(), 3);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_totp_enroll"));
+    assert!(serialized.contains("mfa_totp_verify"));
+    assert!(!serialized.contains(&secret_base32));
+    assert!(!serialized.contains(&code));
+}
+
+#[tokio::test]
+async fn webauthn_register_start_returns_localhost_challenge_and_audits_without_challenge() {
+    let db = AuditFile::new("mfa-webauthn-db");
+    let audit = AuditFile::new("mfa-webauthn-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/webauthn/register/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876",
+            "label": "Touch ID"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let factor_id = json["factor_id"].as_str().unwrap();
+    let challenge = json["public_key"]["challenge"].as_str().unwrap();
+    assert!(!factor_id.is_empty());
+    assert!(!challenge.is_empty());
+    assert_eq!(json["public_key"]["rp"]["id"], "localhost");
+    assert_eq!(json["public_key"]["rp"]["name"], "Canopy");
+    assert_eq!(
+        json["public_key"]["authenticatorSelection"]["userVerification"],
+        "required"
+    );
+
+    let (finish_status, finish_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/webauthn/register/finish",
+        &token,
+        json!({
+            "factor_id": factor_id,
+            "credential": {
+                "id": "not-a-valid-credential"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(finish_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        finish_json["message"],
+        "WebAuthn registration response is invalid"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_webauthn_enroll"));
+    assert!(serialized.contains("\"stage\":\"start\""));
+    assert!(serialized.contains("\"stage\":\"finish\""));
+    assert!(!serialized.contains(challenge));
+}
+
+#[tokio::test]
+async fn webauthn_register_requires_totp_step_up_when_local_totp_enrolled() {
+    let db = AuditFile::new("mfa-webauthn-step-up-db");
+    let audit = AuditFile::new("mfa-webauthn-step-up-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let code = enroll_test_totp(app.clone(), &token).await;
+
+    let (blocked_status, blocked_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/webauthn/register/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876"
+        }),
+    )
+    .await;
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
+
+    verify_test_totp_step_up(app.clone(), &token, &code).await;
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/auth/mfa/webauthn/register/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["public_key"]["challenge"].as_str().is_some());
+
+    let events = read_audit_events(&audit.path);
+    events
+        .iter()
+        .find(|event| {
+            event["action"] == "mfa_webauthn_enroll"
+                && event["outcome"] == "denied"
+                && event["error_message"] == "step_up_required"
+                && event["metadata"]["stage"] == "start"
+        })
+        .expect("WebAuthn step-up denied audit event");
+}
+
+#[tokio::test]
+async fn webauthn_verify_start_returns_localhost_challenge_and_audits_without_challenge() {
+    let db = AuditFile::new("mfa-webauthn-verify-db");
+    let audit = AuditFile::new("mfa-webauthn-verify-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let credential_id = seed_webauthn_factor(&db.path, "dev-admin");
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/webauthn/verify/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let challenge_id = json["challenge_id"].as_str().unwrap();
+    let challenge = json["public_key"]["challenge"].as_str().unwrap();
+    assert!(!challenge_id.is_empty());
+    assert!(!challenge.is_empty());
+    assert_eq!(json["public_key"]["rpId"], "localhost");
+    assert_eq!(
+        json["public_key"]["allowCredentials"][0]["id"],
+        credential_id
+    );
+    assert_eq!(json["public_key"]["userVerification"], "required");
+
+    let (finish_status, finish_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/webauthn/verify/finish",
+        &token,
+        json!({
+            "challenge_id": challenge_id,
+            "credential": {
+                "id": credential_id
+            }
+        }),
+    )
+    .await;
+    assert_eq!(finish_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        finish_json["message"],
+        "WebAuthn verification response is invalid"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_webauthn_verify"));
+    assert!(serialized.contains("\"stage\":\"start\""));
+    assert!(serialized.contains("\"stage\":\"finish\""));
+    assert!(!serialized.contains(challenge));
+}
+
+#[tokio::test]
+async fn recovery_codes_generate_requires_enrolled_totp() {
+    let db = AuditFile::new("mfa-recovery-require-db");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/recovery-codes/generate",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        json["message"],
+        "local recovery codes require an active TOTP factor"
+    );
+}
+
+#[tokio::test]
+async fn recovery_codes_generate_rotates_and_does_not_log_plaintext() {
+    let db = AuditFile::new("mfa-recovery-db");
+    let audit = AuditFile::new("mfa-recovery-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let recovery_token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let code = enroll_test_totp(app.clone(), &token).await;
+
+    let (blocked_status, blocked_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/recovery-codes/generate",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
+
+    verify_test_totp_step_up(app.clone(), &token, &code).await;
+
+    let (status, json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/recovery-codes/generate",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let codes = json["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 10);
+    assert!(codes.iter().all(|code| {
+        let code = code.as_str().unwrap();
+        code.len() == 24 && code.matches('-').count() == 4
+    }));
+    assert_eq!(json["remaining_codes"], 10);
+    assert_eq!(json["status"]["recovery_codes_remaining"], 10);
+
+    let first_code = codes[0].as_str().unwrap().to_string();
+    let normalized_variant = first_code.to_ascii_lowercase().replace('-', " ");
+    let (verify_status, verify_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/recovery-codes/verify",
+        &recovery_token,
+        json!({
+            "code": normalized_variant
+        }),
+    )
+    .await;
+
+    assert_eq!(verify_status, StatusCode::OK);
+    assert_eq!(verify_json["verified"], true);
+    assert_eq!(verify_json["remaining_codes"], 9);
+    assert_eq!(verify_json["status"]["recovery_codes_remaining"], 9);
+
+    let (replay_status, replay_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/recovery-codes/verify",
+        &recovery_token,
+        json!({
+            "code": first_code
+        }),
+    )
+    .await;
+
+    assert_eq!(replay_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        replay_json["message"],
+        "recovery code is invalid or already used"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_recovery_codes_generate"));
+    assert!(serialized.contains("mfa_recovery_code_verify"));
+    for code in codes {
+        assert!(!serialized.contains(code.as_str().unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn ec2_power_requires_and_accepts_totp_step_up_when_local_factor_enrolled() {
+    let db = AuditFile::new("mfa-ec2-power-db");
+    let audit = AuditFile::new("mfa-ec2-power-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let second_token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let code = enroll_test_totp(app.clone(), &token).await;
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "i-0123456789abcdef0"
+    });
+
+    let (blocked_status, blocked_json) =
+        authed_post_json(app.clone(), "/api/ec2/power", &token, body.clone()).await;
+
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
+    assert_eq!(blocked_json["details"], "local_mfa");
+
+    verify_test_totp_step_up(app.clone(), &token, &code).await;
+
+    let (status, json) =
+        authed_post_json(app.clone(), "/api/ec2/power", &token, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["instance_id"], "i-0123456789abcdef0");
+
+    let (second_status, second_json) =
+        authed_post_json(app.clone(), "/api/ec2/power", &second_token, body).await;
+    assert_eq!(second_status, StatusCode::FORBIDDEN);
+    assert_eq!(second_json["code"], "STEP_UP_REQUIRED");
+
+    let events = read_audit_events(&audit.path);
+    assert!(events.iter().any(|event| {
+        event["action"] == "ec2_power"
+            && event["outcome"] == "denied"
+            && event["error_message"] == "step_up_required"
+    }));
+    assert!(events
+        .iter()
+        .any(|event| event["action"] == "ec2_power" && event["outcome"] == "success"));
+}
+
+#[tokio::test]
+async fn ecs_exec_requires_totp_step_up_when_local_factor_enrolled() {
+    let db = AuditFile::new("mfa-ecs-exec-db");
+    let audit = AuditFile::new("mfa-ecs-exec-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    enroll_test_totp(app.clone(), &token).await;
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "STEP_UP_REQUIRED");
+    assert_eq!(json["details"], "local_mfa");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "ecs_exec" && event["metadata"]["error_kind"] == "step_up_required"
+        })
+        .expect("ecs exec step-up denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
 async fn ec2_list_returns_mock_instances() {
     let config = dev_config();
     let token = issue_test_token(&config);
@@ -2293,6 +3030,414 @@ async fn ec2_connect_audit_metadata_includes_request_context_and_method() {
     assert_eq!(metadata["tui_version"], "0.9.9-test");
     assert_eq!(metadata["actor_email"], "dev-admin@dev.local");
     assert_eq!(metadata["actor_email_verified"], true);
+}
+
+#[tokio::test]
+async fn ecs_tasks_returns_mock_tasks_and_audits() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-success");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(app, "/api/ecs/tasks", &token, json!({})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let tasks = json["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(json["total_count"], 2);
+    assert_eq!(json["truncated"], false);
+    assert!(json.get("next_cursor").is_none());
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["metadata"]["tasks_returned"], 2);
+    assert_eq!(event["metadata"]["truncated"], false);
+}
+
+#[tokio::test]
+async fn ecs_tasks_denied_for_no_perms_user() {
+    let config = dev_config();
+    let token = issue_no_perms_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(app, "/api/ecs/tasks", &token, json!({})).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn ecs_tasks_denied_for_unauthorized_account_filter() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-unauthorized-account");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/ecs/tasks",
+        &token,
+        json!({"account_id": "999999999999"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_tasks_denied_for_unauthorized_cluster_filter() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-unauthorized-cluster");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/ecs/tasks",
+        &token,
+        json!({"account_id": "111111111111", "region": "us-east-1", "cluster": "other-cluster"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_tasks_rejects_bare_star_cluster_filter() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-task-list-star");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) =
+        authed_post_json(app, "/api/ecs/tasks", &token, json!({"cluster": "*"})).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BAD_REQUEST");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_task_list")
+        .expect("ecs task list denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_tasks_page_size_one_truncates_without_cursor() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) =
+        authed_post_json(app, "/api/ecs/tasks", &token, json!({"page_size": 1})).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tasks"].as_array().unwrap().len(), 1);
+    assert_eq!(json["total_count"], 2);
+    assert_eq!(json["truncated"], true);
+    assert!(json.get("next_cursor").is_none());
+}
+
+#[tokio::test]
+async fn ecs_exec_succeeds_in_mock_mode_and_audits() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-exec-success");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["command"], "aws");
+    let args = json["args"].as_array().unwrap();
+    assert!(args.iter().any(|arg| arg == "execute-command"));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == "--command" && pair[1] == "/bin/sh"));
+    assert_eq!(
+        json["env_vars"]["AWS_ACCESS_KEY_ID"],
+        "ASIADEVMOCK000000001"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ecs_exec")
+        .expect("ecs exec audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["target_resource"], task["task_arn"]);
+    assert_eq!(event["metadata"]["container_name"], "app");
+    assert_eq!(event["metadata"]["broad_discovery"], false);
+    assert!(event["metadata"].get("task_id").is_none());
+}
+
+#[tokio::test]
+async fn ecs_exec_denies_sidecar_container() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-exec-sidecar");
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "xray-daemon"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "ecs_exec"
+                && event["metadata"]["error_kind"] == "container_in_sidecar_denylist"
+        })
+        .expect("ecs exec sidecar denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_exec_rejects_cross_account_task_arn_before_authorization() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": "222222222222",
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BAD_REQUEST");
+}
+
+#[tokio::test]
+async fn ecs_exec_returns_forbidden_for_missing_task_to_avoid_existence_oracle() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+    let cluster_arn = format!(
+        "arn:aws:ecs:us-east-1:111111111111:cluster/{}",
+        shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+    );
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "cluster_arn": cluster_arn,
+        "task_arn": format!(
+            "arn:aws:ecs:us-east-1:111111111111:task/{}/missing-task",
+            shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+        ),
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(json["message"], "ECS exec not authorized");
+}
+
+#[tokio::test]
+async fn ecs_exec_execute_command_disabled_returns_422() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][1];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "worker"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json["code"], "execute_command_disabled");
+}
+
+#[tokio::test]
+async fn ecs_exec_checks_sidecar_denylist_before_task_or_container_state() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let audit = AuditFile::new("ecs-exec-sidecar-before-state");
+    let state = build_state_with_audit_file(config, &audit.path);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform ECS rule");
+        rule.excluded_container_names = vec!["worker".into()];
+    }
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][1];
+    assert_eq!(task["enable_execute_command"], false);
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "worker"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(
+        json["message"],
+        "Container is excluded by ECS sidecar denylist"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "ecs_exec"
+                && event["metadata"]["error_kind"] == "container_in_sidecar_denylist"
+        })
+        .expect("ecs exec sidecar denied audit event");
+    assert_eq!(event["outcome"], "denied");
+}
+
+#[tokio::test]
+async fn ecs_exec_checks_task_scope_before_task_state_or_container_state() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform ECS rule");
+        rule.task_tag_selectors = vec![shared::dto::entitlements::TagSelector {
+            tags: HashMap::from([("Service".into(), vec!["web".into()])]),
+        }];
+    }
+    let app = build_app(state);
+    let cluster_arn = format!(
+        "arn:aws:ecs:us-east-1:111111111111:cluster/{}",
+        shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+    );
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "cluster_arn": cluster_arn,
+        "task_arn": format!(
+            "arn:aws:ecs:us-east-1:111111111111:task/{}/5555666677778888",
+            shared::dto::ecs::DEV_MOCK_CLUSTER_NAME
+        ),
+        "container_name": "worker"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+    assert_eq!(json["message"], "ECS exec not authorized");
+}
+
+#[tokio::test]
+async fn ecs_exec_denied_for_no_perms_user() {
+    let config = dev_config();
+    let admin_token = issue_test_token(&config);
+    let no_perms_token = issue_no_perms_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &admin_token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &no_perms_token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
 }
 
 #[tokio::test]
@@ -3838,6 +4983,86 @@ async fn cloudwatch_log_groups_returns_mock_data() {
 }
 
 #[tokio::test]
+async fn cloudwatch_log_groups_allows_tail_only_scope_for_picker() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform rule");
+        rule.features.can_use_cloudwatch_search = false;
+        assert!(rule.features.can_use_cloudwatch_tail);
+    }
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "prefix": "/app/"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/log-groups")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let groups = json["log_groups"].as_array().unwrap();
+    assert!(!groups.is_empty());
+    for group in groups {
+        assert!(group["name"].as_str().unwrap().starts_with("/app/"));
+    }
+}
+
+#[tokio::test]
+async fn cloudwatch_filter_events_still_requires_search_scope_when_tail_only() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        let rule = store
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "rule-platform-eng")
+            .expect("platform rule");
+        rule.features.can_use_cloudwatch_search = false;
+        assert!(rule.features.can_use_cloudwatch_tail);
+    }
+    let app = build_app(state);
+
+    let body = json!({
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "start_time": 0,
+        "end_time": 9999999999999_i64
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/cloudwatch/filter-events")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn cloudwatch_filter_events_returns_mock_data() {
     let config = dev_config();
     let token = issue_test_token(&config);
@@ -4342,6 +5567,168 @@ async fn cloudwatch_insights_results_with_account_outside_entitlements_is_denied
     );
 }
 
+#[tokio::test]
+async fn live_tail_ws_streams_mock_session_start_and_event() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let app = build_app(build_state(config));
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": token,
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"
+            ],
+            "filter_pattern": "ERROR"
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let first = recv_live_tail_message(&mut ws).await;
+    let session_id = match first {
+        LiveTailMessage::SessionStart { session_id } => session_id,
+        _ => panic!("expected session_start, got {first:?}"),
+    };
+    assert!(!session_id.is_empty());
+
+    let second = recv_live_tail_message(&mut ws).await;
+    match second {
+        LiveTailMessage::Event(event) => {
+            assert_eq!(event.log_group_name, "/app/web-service");
+            assert_eq!(event.log_stream_name, "web-prod-01/application");
+            assert!(event.message.contains("Simulated log event #1"));
+        }
+        _ => panic!("expected event, got {second:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn live_tail_ws_streams_mock_session_when_dev_mode_disabled() {
+    let mut config = dev_config();
+    config.dev_mode = false;
+    config.mock_aws_data = Some(true);
+    let token = issue_test_token(&config);
+    let app = build_app(build_state(config));
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": token,
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"
+            ]
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let first = recv_live_tail_message(&mut ws).await;
+    match first {
+        LiveTailMessage::SessionStart { session_id } => assert!(!session_id.is_empty()),
+        _ => panic!("expected session_start, got {first:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn live_tail_ws_rejects_log_group_from_non_tail_rule() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    {
+        let mut store = state.entitlement_store.write().await;
+        store.rules.push(EntitlementRule {
+            id: "rule-log-pattern-no-tail".into(),
+            group: "log-pattern-no-tail".into(),
+            features: FeatureFlags {
+                can_use_cloudwatch_search: true,
+                can_use_cloudwatch_tail: false,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111111111111".into(),
+                account_name: "production".into(),
+                role_arn: "arn:aws:iam::111111111111:role/CanopyReadOnly".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec!["arn:aws:logs:*:111111111111:log-group:/secret/*".into()],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        });
+        store.memberships.push(GroupMembership {
+            user_id: "dev-admin".into(),
+            group: "log-pattern-no-tail".into(),
+        });
+    }
+    let app = build_app(state);
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": token,
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/secret/api"
+            ]
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let first = recv_live_tail_message(&mut ws).await;
+    match first {
+        LiveTailMessage::Error { message } => {
+            assert_eq!(message, "Live tail not authorized for requested scope");
+        }
+        _ => panic!("expected error, got {first:?}"),
+    }
+
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn live_tail_ws_rejects_invalid_token_with_error_message() {
+    let app = build_app(build_state(dev_config()));
+    let ws_url = start_route_server(app).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+    let start = json!({
+        "token": "not-a-valid-token",
+        "request": {
+            "account_id": "111111111111",
+            "region": "us-east-1",
+            "log_group_arns": [
+                "arn:aws:logs:us-east-1:111111111111:log-group:/app/web-service"
+            ]
+        }
+    });
+    ws.send(WsMessage::Text(start.to_string())).await.unwrap();
+
+    let msg = recv_live_tail_message(&mut ws).await;
+    match msg {
+        LiveTailMessage::Error { message } => assert_eq!(message, "Authentication failed"),
+        _ => panic!("expected error, got {msg:?}"),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Authorization / entitlement enforcement
 // ═══════════════════════════════════════════════════════════════════════
@@ -4436,7 +5823,10 @@ async fn cloudwatch_log_group_denied_is_audited_with_client_metadata() {
     let event = events.last().unwrap();
     assert_eq!(event["action"], "log_group_list");
     assert_eq!(event["outcome"], "denied");
-    assert_eq!(event["error_message"], "CloudWatch search not authorized");
+    assert_eq!(
+        event["error_message"],
+        "CloudWatch log groups not authorized"
+    );
     assert_eq!(event["metadata"]["actor_email"], "dev-admin@dev.local");
     assert_eq!(event["metadata"]["client_ip"], "203.0.113.20");
     assert_eq!(event["metadata"]["prefix"], "/ecs/");
@@ -4729,6 +6119,102 @@ async fn pkce_start_returns_503_when_oidc_discovery_unavailable_and_no_explicit_
 }
 
 #[tokio::test]
+async fn pkce_exchange_prod_mode_uses_mock_oidc_and_audits_without_secrets() {
+    let issuer = start_mock_oidc().await;
+    let config = prod_config_with_mock_oidc(&issuer);
+    let audit = AuditFile::new("pkce-success");
+    let state = build_state_with_audit_file(config.clone(), &audit.path);
+    let app = build_app(state);
+    let redirect_uri = "http://localhost:9876/callback";
+    let code_verifier = "valid-verifier-abcdefghijklmnopqrstuvwxyz0123456789";
+
+    let start_body = json!({
+        "code_verifier": code_verifier,
+        "redirect_uri": redirect_uri
+    });
+    let start_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/auth/pkce/start")
+                .header("Content-Type", "application/json")
+                .body(Body::from(start_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(start_resp.status(), StatusCode::OK);
+    let start_json = body_json(start_resp.into_body()).await;
+    let authorize_url = start_json["authorize_url"].as_str().unwrap();
+    let pkce_state = start_json["state"].as_str().unwrap();
+    let auth = AuthService::new(config.clone());
+    assert!(auth.verify_pkce_state(pkce_state));
+
+    let authorize_url = reqwest::Url::parse(authorize_url).unwrap();
+    assert_eq!(authorize_url.origin().ascii_serialization(), issuer);
+    assert_eq!(authorize_url.path(), "/authorize");
+    let authorize_params: HashMap<_, _> = authorize_url.query_pairs().into_owned().collect();
+    let expected_challenge = {
+        use base64::Engine;
+        use sha2::Digest;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(code_verifier.as_bytes()))
+    };
+    assert_eq!(authorize_params.get("client_id").unwrap(), "test-client");
+    assert_eq!(authorize_params.get("redirect_uri").unwrap(), redirect_uri);
+    assert_eq!(authorize_params.get("state").unwrap(), pkce_state);
+    assert_eq!(
+        authorize_params.get("code_challenge").unwrap(),
+        &expected_challenge
+    );
+    assert_eq!(
+        authorize_params.get("code_challenge_method").unwrap(),
+        "S256"
+    );
+
+    let exchange_body = json!({
+        "code": "valid-code",
+        "code_verifier": code_verifier,
+        "state": pkce_state,
+        "redirect_uri": redirect_uri
+    });
+    let exchange_resp = app
+        .oneshot(
+            Request::post("/auth/pkce/exchange")
+                .header("Content-Type", "application/json")
+                .body(Body::from(exchange_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(exchange_resp.status(), StatusCode::OK);
+    let json = body_json(exchange_resp.into_body()).await;
+    assert!(json["access_token"].is_string());
+    assert_eq!(json["token_type"], "Bearer");
+    assert_eq!(json["refresh_token"], "auth-code-refresh");
+
+    let auth = AuthService::new(config);
+    let claims = auth
+        .validate_token(json["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.sub, "dev-admin");
+    assert_eq!(claims.email, "dev-admin@dev.local");
+    assert_eq!(claims.groups, vec!["platform-engineering"]);
+
+    let audit_contents = std::fs::read_to_string(&audit.path).unwrap();
+    assert!(audit_contents.contains(r#""actor":"dev-admin""#));
+    assert!(audit_contents.contains(r#""action":"login""#));
+    assert!(audit_contents.contains(r#""error_message":"pkce""#));
+    assert!(
+        !audit_contents.contains("valid-code")
+            && !audit_contents.contains(code_verifier)
+            && !audit_contents.contains("auth-code-refresh"),
+        "PKCE secrets must not be written to audit log: {audit_contents}"
+    );
+}
+
+#[tokio::test]
 async fn malformed_json_body_returns_error() {
     let state = build_state(dev_config());
     let app = build_app(state);
@@ -4841,6 +6327,134 @@ async fn ec2_connect_audit_includes_target_resource_name() {
         .expect("ec2 connect audit event");
     assert_eq!(event["target_resource"], "i-0123456789abcdef0");
     assert_eq!(event["target_resource_name"], "web-prod-01");
+}
+
+#[tokio::test]
+async fn ec2_power_stop_succeeds_in_mock_mode_and_audits() {
+    let audit = AuditFile::new("ec2-power-stop");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "i-0123456789abcdef0"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["instance_id"], "i-0123456789abcdef0");
+    assert_eq!(json["action"], "stop");
+    assert_eq!(json["previous_state"], "running");
+    assert_eq!(json["requested_state"], "stopping");
+    assert!(json["message"].as_str().unwrap().contains("stop requested"));
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_power")
+        .expect("ec2 power audit event");
+    assert_eq!(event["outcome"], "success");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["target_resource_name"], "web-prod-01");
+    assert_eq!(event["metadata"]["power_action"], "stop");
+    assert_eq!(event["metadata"]["previous_state"], "running");
+    assert_eq!(event["metadata"]["requested_state"], "stopping");
+    assert_eq!(event["metadata"]["confirmation_present"], true);
+}
+
+#[tokio::test]
+async fn ec2_power_rejects_confirmation_mismatch_and_audits() {
+    let audit = AuditFile::new("ec2-power-confirmation-mismatch");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "wrong-instance"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json["code"], "BAD_REQUEST");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_power")
+        .expect("ec2 power denied audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["error_message"], "confirmation_mismatch");
+    assert_eq!(event["metadata"]["power_action"], "stop");
+    assert_eq!(event["metadata"]["confirmation_present"], true);
+}
+
+#[tokio::test]
+async fn ec2_power_denied_for_readonly_user() {
+    let config = dev_config();
+    let token = issue_readonly_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0cde3456fgh78901c",
+        "account_id": "222222222222",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "i-0cde3456fgh78901c"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn ec2_power_rejects_invalid_state_transition_and_audits() {
+    let audit = AuditFile::new("ec2-power-state-conflict");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "start",
+        "confirmation_instance_id": "i-0123456789abcdef0"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ec2/power", &token, body).await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(json["code"], "CONFLICT");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| event["action"] == "ec2_power")
+        .expect("ec2 power conflict audit event");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(event["target_resource"], "i-0123456789abcdef0");
+    assert_eq!(event["target_resource_name"], "web-prod-01");
+    assert_eq!(event["error_message"], "already_in_target_or_transition");
+    assert_eq!(event["metadata"]["power_action"], "start");
+    assert_eq!(event["metadata"]["previous_state"], "running");
+    assert!(event["metadata"]["requested_state"].is_null());
 }
 
 #[tokio::test]
@@ -6010,6 +7624,11 @@ async fn entitlements_for_readonly_user_has_limited_features() {
 fn build_state_not_ready(config: AppConfig) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
+        config.mfa_database_url.as_deref(),
+        config.mfa_secret_key.as_deref(),
+    )
+    .unwrap();
     let base_aws_config = aws_config::SdkConfig::builder()
         .region(aws_types::region::Region::new("us-east-1"))
         .build();
@@ -6018,6 +7637,8 @@ fn build_state_not_ready(config: AppConfig) -> Arc<AppState> {
         entitlement_store: Arc::new(tokio::sync::RwLock::new(entitlement_store)),
         audit_service: AuditService::new(),
         oidc_client,
+        mfa_store,
+        step_up_sessions: control_plane::services::step_up::StepUpSessionStore::default(),
         base_aws_config,
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),

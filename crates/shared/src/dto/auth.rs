@@ -78,6 +78,154 @@ pub struct TokenResponse {
     pub refresh_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MfaFactorKind {
+    Totp,
+    WebAuthn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MfaFactorStatus {
+    pub kind: MfaFactorKind,
+    pub available: bool,
+    pub enrolled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MfaStatusResponse {
+    pub user_id: String,
+    pub provider_step_up_configured: bool,
+    pub local_step_up_available: bool,
+    pub step_up_required: bool,
+    pub factors: Vec<MfaFactorStatus>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_codes_remaining: Option<usize>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollStartRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollStartResponse {
+    pub factor_id: String,
+    pub secret_base32: String,
+    pub otpauth_url: String,
+    pub issuer: String,
+    pub account_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollConfirmRequest {
+    pub factor_id: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollConfirmResponse {
+    pub factor_id: String,
+    pub enrolled: bool,
+    pub status: MfaStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpVerifyRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpVerifyResponse {
+    pub factor_id: String,
+    pub verified: bool,
+    pub verified_at: String,
+    pub step_up_expires_at: String,
+    pub status: MfaStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCodesGenerateResponse {
+    pub codes: Vec<String>,
+    pub generated_at: String,
+    pub remaining_codes: usize,
+    pub status: MfaStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCodeVerifyRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCodeVerifyResponse {
+    pub verified: bool,
+    pub verified_at: String,
+    pub step_up_expires_at: String,
+    pub remaining_codes: usize,
+    pub status: MfaStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterStartRequest {
+    pub origin: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterStartResponse {
+    pub factor_id: String,
+    pub public_key: serde_json::Value,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterFinishRequest {
+    pub factor_id: String,
+    pub credential: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterFinishResponse {
+    pub factor_id: String,
+    pub credential_id: String,
+    pub enrolled: bool,
+    pub status: MfaStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyStartRequest {
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyStartResponse {
+    pub challenge_id: String,
+    pub public_key: serde_json::Value,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyFinishRequest {
+    pub challenge_id: String,
+    pub credential: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyResponse {
+    pub factor_id: String,
+    pub credential_id: String,
+    pub verified: bool,
+    pub verified_at: String,
+    pub step_up_expires_at: String,
+    pub status: MfaStatusResponse,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -154,6 +302,203 @@ mod tests {
 
         assert_eq!(resp.access_token, "tok");
         assert_eq!(resp.refresh_token, None);
+    }
+
+    #[test]
+    fn mfa_status_roundtrip() {
+        let resp = MfaStatusResponse {
+            user_id: "u1".into(),
+            provider_step_up_configured: true,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            recovery_codes_remaining: Some(3),
+            message: "OIDC provider MFA/re-auth controls are configured.".into(),
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["factors"][0]["kind"], "totp");
+        assert_eq!(json["factors"][1]["kind"], "web_authn");
+        assert_eq!(json["recovery_codes_remaining"], 3);
+
+        let back: MfaStatusResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn totp_enroll_start_roundtrip() {
+        let resp = TotpEnrollStartResponse {
+            factor_id: "factor-1".into(),
+            secret_base32: "ABCDEF234567".into(),
+            otpauth_url: "otpauth://totp/Canopy:alice".into(),
+            issuer: "Canopy".into(),
+            account_name: "alice@example.com".into(),
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["issuer"], "Canopy");
+        assert_eq!(json["account_name"], "alice@example.com");
+
+        let back: TotpEnrollStartResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn totp_enroll_confirm_roundtrip() {
+        let req = TotpEnrollConfirmRequest {
+            factor_id: "factor-1".into(),
+            code: "123456".into(),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["code"], "123456");
+
+        let back: TotpEnrollConfirmRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn totp_verify_roundtrip() {
+        let req = TotpVerifyRequest {
+            code: "123456".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["code"], "123456");
+        let back: TotpVerifyRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn recovery_codes_generate_roundtrip() {
+        let resp = RecoveryCodesGenerateResponse {
+            codes: vec!["ABCD-EFGH-IJKL-MNOP".into()],
+            generated_at: "2026-05-27T00:00:00Z".into(),
+            remaining_codes: 1,
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(1),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["codes"][0], "ABCD-EFGH-IJKL-MNOP");
+        let back: RecoveryCodesGenerateResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn recovery_code_verify_roundtrip() {
+        let resp = RecoveryCodeVerifyResponse {
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            remaining_codes: 0,
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(0),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["remaining_codes"], 0);
+        let back: RecoveryCodeVerifyResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn webauthn_register_roundtrip() {
+        let start = WebAuthnRegisterStartResponse {
+            factor_id: "factor-1".into(),
+            public_key: serde_json::json!({
+                "challenge": "abc",
+                "rp": {"id": "localhost", "name": "Canopy"}
+            }),
+            expires_at: "2026-05-27T00:10:00Z".into(),
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["factor_id"], "factor-1");
+        let back: WebAuthnRegisterStartResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, start);
+
+        let finish = WebAuthnRegisterFinishResponse {
+            factor_id: "factor-1".into(),
+            credential_id: "credential-1".into(),
+            enrolled: true,
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(0),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&finish).unwrap();
+        assert_eq!(json["credential_id"], "credential-1");
+        let back: WebAuthnRegisterFinishResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, finish);
+    }
+
+    #[test]
+    fn webauthn_verify_roundtrip() {
+        let start = WebAuthnVerifyStartResponse {
+            challenge_id: "challenge-1".into(),
+            public_key: serde_json::json!({
+                "challenge": "abc",
+                "rpId": "localhost",
+                "allowCredentials": [{"type": "public-key", "id": "credential-1"}]
+            }),
+            expires_at: "2026-05-27T00:10:00Z".into(),
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["challenge_id"], "challenge-1");
+        let back: WebAuthnVerifyStartResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, start);
+
+        let finish = WebAuthnVerifyResponse {
+            factor_id: "factor-1".into(),
+            credential_id: "credential-1".into(),
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(0),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&finish).unwrap();
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["credential_id"], "credential-1");
+        let back: WebAuthnVerifyResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, finish);
     }
 
     #[test]

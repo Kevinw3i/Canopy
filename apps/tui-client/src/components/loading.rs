@@ -3,10 +3,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::theme::Theme;
+
 /// Loading spinner animation
 pub struct LoadingIndicator {
     message: String,
     frame: usize,
+    theme: Theme,
 }
 
 const SPINNER_FRAMES: &[&str] = &[
@@ -18,7 +21,13 @@ impl LoadingIndicator {
         Self {
             message: message.into(),
             frame: 0,
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn tick(&mut self) {
@@ -33,7 +42,7 @@ impl LoadingIndicator {
         let spinner = SPINNER_FRAMES[self.frame];
         let text = format!("{} {}", spinner, self.message);
         Paragraph::new(text)
-            .style(Style::default().fg(Color::Yellow))
+            .style(self.theme.warning_style())
             .render(area, buf);
     }
 
@@ -51,7 +60,7 @@ impl LoadingIndicator {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         let inner = block.inner(popup);
         block.render(popup, buf);
 

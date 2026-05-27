@@ -220,6 +220,11 @@ fn config_with_testcontainers(port: u16, audit_log_path: &std::path::Path) -> Ap
             client_id: "test".into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            acr_values: vec![],
+            prompt: None,
+            max_age_seconds: None,
+            required_acr_values: vec![],
+            required_amr_values: vec![],
             authorization_endpoint: None,
             token_endpoint: None,
             device_authorization_endpoint: None,
@@ -239,7 +244,11 @@ fn config_with_testcontainers(port: u16, audit_log_path: &std::path::Path) -> Ap
         dev_mode: true,
         mock_aws_data: None,
         entitlements_file: None,
+        entitlements_database_url: None,
+        mfa_database_url: None,
+        mfa_secret_key: None,
         audit_log: Some(audit_log_path.to_string_lossy().into_owned()),
+        audit_export: Default::default(),
         cors_allowed_origins: vec![],
     };
     cfg.database_connections.insert(
@@ -295,6 +304,11 @@ fn build_state(
         }
     }
     let oidc_client = OidcClient::new(config.oidc.clone());
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
+        config.mfa_database_url.as_deref(),
+        config.mfa_secret_key.as_deref(),
+    )
+    .unwrap();
     let base_aws_config = aws_config::SdkConfig::builder()
         .region(aws_types::region::Region::new("us-east-1"))
         .build();
@@ -303,6 +317,8 @@ fn build_state(
         entitlement_store: Arc::new(tokio::sync::RwLock::new(entitlement_store)),
         audit_service,
         oidc_client,
+        mfa_store,
+        step_up_sessions: control_plane::services::step_up::StepUpSessionStore::default(),
         base_aws_config,
         // Codex round 20 (MED): use the dedicated read-only MySQL user
         // (created in spawn_mysql_with_seed) so the executor only has

@@ -11,8 +11,9 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 1. 瀏覽與搜尋跨帳號的 EC2 執行個體
 2. 執行 CloudWatch Logs 快速搜尋與 Logs Insights 查詢
 3. 即時串流 CloudWatch Logs（Live Tail）
-4. 透過 SSM Session Manager 或 EC2 Instance Connect 連線至執行個體
-5. 檢視自身的身分、群組與存取權限
+4. 檢視授權 ECS cluster/task，並在符合條件時開啟 ECS Exec
+5. 透過 SSM Session Manager 或 EC2 Instance Connect 連線至執行個體
+6. 檢視自身的身分、群組與存取權限
 
 本系統**不是**單機直連 AWS 的工具——它採用 Client/Server 架構，由後端控制面 (Control Plane) 統一處理認證、授權、權限評估與 AWS 存取，確保：
 
@@ -26,9 +27,9 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 
 | 角色 | 說明 |
 |------|------|
-| Platform Engineer | 擁有完整存取權限：EC2 瀏覽、CloudWatch 搜尋/Live Tail、SSM/EIC 連線 |
-| On-Call Engineer | 有限的 CloudWatch 搜尋與 EC2 唯讀瀏覽，無連線權限 |
-| Read-Only Observer | 僅 staging 環境的 EC2 瀏覽與 CloudWatch 搜尋 |
+| Platform Engineer | 擁有完整存取權限：EC2/ECS 瀏覽、CloudWatch 搜尋/Live Tail、SSM/EIC/ECS Exec 連線 |
+| On-Call Engineer | 有限的 CloudWatch 搜尋與 EC2/ECS 唯讀瀏覽，無連線權限 |
+| Read-Only Observer | 僅 staging 環境的 EC2 瀏覽與 CloudWatch 搜尋；ECS 視覺化需另授權 |
 
 權限透過**群組 → 權限規則**映射，支援多群組加法式合併。
 
@@ -40,7 +41,7 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 ┌──────────────────┐      HTTPS/JSON       ┌──────────────────────┐      STS AssumeRole
 │   TUI Client     │◀────────────────────▶│   Control Plane       │◀──────────────────▶ AWS
 │   (ratatui)      │                       │   (axum)              │
-│                  │      WebSocket        │                       │    EC2 / CloudWatch
+│                  │      WebSocket        │                       │    EC2 / ECS / CloudWatch
 │  - 7 個畫面      │◀────────────────────▶│  - 認證 (OIDC)        │    Logs / STS / SSM
 │  - 鍵盤操作      │                       │  - 授權 (Entitlements)│
 │  - async 事件迴圈│                       │  - 稽核日誌           │
@@ -66,7 +67,7 @@ Canopy 是一套**內部營運終端機介面 (TUI)**，讓受授權的維運人
 | HTTP 客戶端 | reqwest 0.12 |
 | 序列化 | serde + serde_json |
 | 認證 | jsonwebtoken (JWT)、OIDC Discovery、PKCE |
-| AWS SDK | aws-sdk-ec2、aws-sdk-cloudwatchlogs、aws-sdk-sts |
+| AWS SDK | aws-sdk-ec2、aws-sdk-ecs、aws-sdk-cloudwatchlogs、aws-sdk-sts、aws-sdk-iam |
 | 日誌 | tracing + tracing-subscriber (JSON 格式) |
 | 設定 | toml |
 
@@ -112,12 +113,19 @@ TUI                     Control Plane              OIDC Provider
 | `can_use_cloudwatch_tail` | 是否可使用 Live Tail |
 | `can_use_ssm` | 是否可透過 SSM 連線 |
 | `can_use_ec2_instance_connect` | 是否可透過 EC2 Instance Connect 連線 |
+| `can_view_ecs` | 是否可檢視授權 ECS tasks |
+| `can_use_ecs_exec` | 是否可對授權 task/container 開啟 ECS Exec |
 | `allowed_accounts` | 允許存取的 AWS 帳號 + 對應的 IAM Role ARN |
 | `allowed_regions` | 允許的 AWS 區域 |
 | `allowed_log_group_arns` | 允許的 CloudWatch Log Group ARN 樣式（支援萬用字元） |
 | `instance_tag_selectors` | EC2 標籤過濾條件（執行個體必須匹配至少一個 selector） |
 | `allowed_os_users` | 允許的作業系統使用者（用於 SSM/EIC/SSH 連線）。設定 2+ 個時連線時會彈出選擇介面 |
 | `excluded_tag_selectors` | 排除規則：匹配的機器即使通過 allow 也會被隱藏 |
+| `allowed_clusters` | ECS cluster ARN / pattern allow-list |
+| `task_tag_selectors` | ECS task 標籤 allow-list |
+| `excluded_task_tag_selectors` | ECS task 標籤 deny-list |
+| `excluded_container_names` | ECS Exec container deny-list（例如 sidecar） |
+| `allow_broad_cluster_discovery` | 明確允許 `cluster/*` 這類廣泛 cluster discovery |
 | `max_session_seconds` | 連線時間上限（秒）。省略或 0 = 不限時 |
 
 **合併策略**：
@@ -128,13 +136,16 @@ TUI                     Control Plane              OIDC Provider
 | 帳號/區域/OS users | 加法（聯集去重） |
 | `instance_tag_selectors` | 聯集（匹配任一即可見） |
 | `excluded_tag_selectors` | 聯集（匹配任一即排除） |
+| ECS cluster / task / container scope | 後端以 rule-local scope 評估，不允許把不同群組的 account、region、cluster、task selector 或 container denylist 拼接使用 |
 | `max_session_seconds` | **取最嚴格（最小非零值）** |
 
 ### 4.4 安全規則
 
-- **伺服器端過濾**：EC2 列表在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
+- **伺服器端過濾**：EC2、ECS tasks、CloudWatch data 在後端依權限過濾後才回傳，客戶端永遠看不到未授權的資源
 - **短期憑證**：透過 STS AssumeRole 取得暫時性憑證，附帶 Session Tags 供稽核
-- **連線範圍限縮**：連線操作使用 inline session policy 限制憑證僅能對目標執行個體執行 SSM/EIC
+- **連線範圍限縮**：連線操作使用 inline session policy 將主要動作限縮到目標執行個體或 ECS task；ECS Exec 只額外授予同區域必要的 task 描述與 `ssmmessages` channel 動作
+- **ECS scope 不跨規則拼接**：ECS task list / exec 的 account、role、region、cluster、task tag、container denylist 必須來自同一授權規則
+- **MFA 支援交由 OIDC Provider**：可透過 `acr_values`、`prompt`、`max_age_seconds` 要求 Provider 進行 MFA / re-auth，並可用 `required_acr_values`、`required_amr_values` 對 id_token claim 做 fail-closed 驗證
 - **稽核失敗則拒絕 (fail-closed)**：當稽核日誌寫入失敗時，後端拒絕處理請求
 - **開發模式防護**：禁止在非 loopback 位址啟用 dev_mode（除非明確覆寫）
 
@@ -158,7 +169,7 @@ TUI                     Control Plane              OIDC Provider
 - Live Tail 受 feature flag 控制（beta 功能）
 - 快捷鍵：`1`-`5` 直接跳轉、`j`/`k` 上下選擇、`Enter` 進入、`q` 離開
 
-### 5.3 EC2 清查畫面 (EC2 Inventory)
+### 5.3 EC2 / ECS 清查畫面 (Inventory)
 
 **列表區**：
 
@@ -183,6 +194,7 @@ TUI                     Control Plane              OIDC Provider
 - 重新整理（`r`）
 - 分頁支援
 - 載入中/錯誤狀態顯示
+- 若使用者有 `can_view_ecs`，`Ctrl+E` 可在 EC2 與 ECS 清查視圖切換
 
 **三種連線方式**：
 
@@ -209,6 +221,28 @@ TUI                     Control Plane              OIDC Provider
 5. SSM/EIC：產生範圍限縮的 STS 憑證 + 回傳指令
 6. SSH：回傳 `ssh user@IP` 指令（不需要 AWS 憑證）
 7. TUI 暫停 alternate screen → 執行指令 → 結束後恢復 TUI
+
+**ECS Task 視圖**：
+
+| 欄位 | 說明 |
+|------|------|
+| Cluster | Cluster 名稱 |
+| Family | Task definition family |
+| Task ID | Task ARN 尾段 |
+| Launch | Launch type |
+| Status | Task 狀態 |
+| Containers | 可見 container 與 exec-ready 狀態 |
+| Account | AWS 帳號 |
+| Region | AWS 區域 |
+
+**ECS 功能**：
+
+- 帳號/區域 scope selector 只列出目前 ECS grant 可證明的選項，避免 EC2-only grant 出現在 ECS 視圖
+- `r` 重新整理 task list；`/` 搜尋 cluster、family、task id、container name
+- `Enter` 只在 task running、`enable_execute_command = true`，且至少一個 container running 並啟動 execute-command agent 時開啟 container picker
+- ECS Exec 固定執行 `/bin/sh`，不接受使用者自訂 command
+- 後端會重新驗證 task/container scope、task tag selectors、container denylist，並為 AWS CLI 回傳短期範圍限縮憑證
+- `role_arn = "direct"` / `profile:NAME` 可用於 ECS task inventory，但 ECS Exec 需要可 AssumeRole 的 IAM role ARN
 
 **錯誤處理**：
 
@@ -253,10 +287,10 @@ TUI                     Control Plane              OIDC Provider
 - 依嚴重等級上色：ERROR=紅、WARN=黃、INFO=綠、DEBUG=藍
 - 顯示連線狀態、每秒事件數、緩衝事件數
 - 透過 WebSocket 連線至 Control Plane
-- 斷線時以指數退避重新連線
+- 斷線時停止串流並顯示錯誤（自動重連仍待補）
 - 清除緩衝區（`c`）
 
-**目前狀態**：Beta 功能，受 `enable_live_tail` feature flag 控制。生產模式下 WebSocket 端點回傳 404，開發模式使用模擬事件。
+**目前狀態**：Beta 功能，受 `enable_live_tail` feature flag 控制。TUI 已可在開發模式連到 Control Plane WebSocket 並串流 mock 事件；生產模式下 WebSocket 端點仍回傳 404。
 
 ### 5.6 存取/身分畫面 (Access)
 
@@ -266,11 +300,16 @@ TUI                     Control Plane              OIDC Provider
 - 顯示允許的帳號（含 Role ARN）
 - 顯示允許的區域
 - 顯示允許的 Log Group ARN 樣式
+- 顯示 ECS scope：allowed clusters、task tag selectors、excluded task selectors、excluded container names、broad discovery opt-in
 
 ### 5.7 設定畫面 (Settings)
 
 - 顯示目前設定：Control Plane URL、開發模式、刷新間隔、Live Tail scrollback
-- 提示設定檔路徑
+- 顯示目前 theme preset 與 resolved semantic colors
+- 顯示 MFA / step-up readiness：OIDC Provider MFA / re-auth controls、本機 TOTP / WebAuthn 因子狀態、step-up 是否可用
+- 顯示目前 keybindings：dashboard 導航、quick nav、logout、settings back / change password
+- 提示設定檔路徑；自訂主題與快捷鍵透過 TUI config 的 `[theme]` / `[keybindings]` table 設定
+- 主題 token 套用到登入、Dashboard、Settings、Access、EC2/ECS inventory、CloudWatch search、Live Tail、modal 與 connect-session chrome；connect-session 內的遠端 terminal 輸出保留 VT100 色彩
 
 ---
 
@@ -292,8 +331,19 @@ TUI                     Control Plane              OIDC Provider
 | 方法 | 路徑 | 說明 |
 |------|------|------|
 | GET | `/api/entitlements` | 取得目前使用者的完整權限 |
+| GET | `/api/auth/mfa/status` | 取得 OIDC provider / 本機 MFA readiness |
+| POST | `/api/auth/mfa/totp/start` | 開始本機 TOTP 註冊，回傳 secret/otpauth URL |
+| POST | `/api/auth/mfa/totp/confirm` | 驗證 TOTP code 並啟用 factor |
+| POST | `/api/auth/mfa/totp/verify` | 驗證已註冊 TOTP factor，建立 step-up primitive |
+| POST | `/api/auth/mfa/webauthn/register/start` | 產生本機 WebAuthn 註冊 challenge（browser ceremony foundation；已有 active TOTP 時需先完成本機 step-up） |
+| POST | `/api/auth/mfa/webauthn/register/finish` | 驗證 browser WebAuthn registration response 並保存 credential（已有 active TOTP 時需先完成本機 step-up） |
+| POST | `/api/auth/mfa/recovery-codes/generate` | 完成 TOTP step-up 後產生或輪替本機 MFA recovery codes，明文只回傳一次 |
+| POST | `/api/auth/mfa/recovery-codes/verify` | 消耗一組 unused recovery code，建立 step-up primitive |
 | POST | `/api/ec2/list` | 列出 EC2 執行個體（伺服器端過濾） |
 | POST | `/api/ec2/connect` | 取得連線指令與憑證 |
+| POST | `/api/ec2/power` | 對單一 EC2 執行 start / stop / reboot（需 typed confirmation） |
+| POST | `/api/ecs/tasks` | 列出授權 ECS tasks（伺服器端過濾、支援 account/region/cluster scope） |
+| POST | `/api/ecs/exec` | 取得 ECS Exec 指令與範圍限縮憑證 |
 | POST | `/api/cloudwatch/log-groups` | 列出允許的 Log Groups |
 | POST | `/api/cloudwatch/filter-events` | 執行 FilterLogEvents 搜尋 |
 | POST | `/api/cloudwatch/insights/start` | 啟動 Logs Insights 查詢 |
@@ -316,7 +366,7 @@ TUI                     Control Plane              OIDC Provider
 | `event_id` | UUID |
 | `timestamp` | RFC 3339 時間戳記 |
 | `actor` | 使用者 ID |
-| `action` | 操作類型（login、ec2_list、cloudwatch_search 等） |
+| `action` | 操作類型（login、ec2_list、ecs_task_list、ecs_exec、cloudwatch_search 等） |
 | `account_id` | 目標 AWS 帳號 |
 | `region` | 目標 AWS 區域 |
 | `target_resource` | 目標資源（instance_id、log_group 等） |
@@ -327,8 +377,9 @@ TUI                     Control Plane              OIDC Provider
 
 1. 結構化 tracing 日誌（stdout/stderr，JSON 格式）
 2. 可選的持久化 JSON-lines 檔案（`audit_log` 設定）
+3. 可選的遠端匯出 sink：CloudWatch Logs `PutLogEvents`、S3 `PutObject`
 
-**稽核失敗策略**：fail-closed — 當持久化稽核日誌寫入失敗時，受保護的 API 端點回傳 503 Service Unavailable。
+**稽核失敗策略**：fail-closed — 當持久化稽核日誌寫入失敗，或遠端匯出 queue 無法接受 event 時，受保護的 API 端點回傳 503 Service Unavailable。遠端 AWS 寫入錯誤會記錄在 control-plane log，後續 event 仍會繼續嘗試遠端送出。
 
 ---
 
@@ -339,6 +390,11 @@ TUI                     Control Plane              OIDC Provider
 | 服務 | API | 用途 |
 |------|-----|------|
 | EC2 | `DescribeInstances` | 列出執行個體 |
+| SSM | `DescribeInstanceInformation` | 精確判斷 EC2 instance 是否為 SSM managed |
+| EC2 | `StartInstances` / `StopInstances` / `RebootInstances` | 高風險 power actions |
+| ECS | `ListClusters` / `DescribeClusters` / `ListTasks` / `DescribeTasks` | 列出與驗證授權 tasks |
+| ECS | `ExecuteCommand` | 由 TUI 透過 control-plane 回傳的短期憑證啟動 ECS Exec |
+| IAM | `SimulatePrincipalPolicy` | EC2 查詢/power/connect 與 ECS Exec 前檢查候選 role 是否具備必要動作 |
 | CloudWatch Logs | `DescribeLogGroups` | 列出 Log Groups |
 | CloudWatch Logs | `FilterLogEvents` | 快速搜尋 |
 | CloudWatch Logs | `StartQuery` | 啟動 Insights 查詢 |
@@ -351,7 +407,7 @@ TUI                     Control Plane              OIDC Provider
 - 每個允許的帳號對應一個 IAM Role ARN
 - Control Plane 使用 base AWS 憑證（環境變數、instance profile 等）呼叫 STS AssumeRole
 - 附帶 Session Tags：`canopy-user`、`canopy-team`、`canopy-environment`
-- EC2 查詢使用扇出 (fan-out) 模式：對每個 (帳號, role, 區域) 組合並行查詢
+- EC2 查詢使用扇出 (fan-out) 模式：對每個 (帳號, role, 區域) 組合並行查詢 `DescribeInstances`，並用同 scope 的 SSM `DescribeInstanceInformation` 標示 managed 狀態
 - 結果以 instance_id 去重
 
 ### 8.3 連線憑證範圍限縮
@@ -359,9 +415,10 @@ TUI                     Control Plane              OIDC Provider
 連線操作產生的 STS 憑證附帶 inline session policy：
 
 - SSM：僅允許 `ssm:StartSession` 對目標執行個體
-- EIC：僅允許 `ec2-instance-connect:SendSSHPublicKey` 和 `ec2-instance-connect:OpenTunnel`
-- 憑證有效期：900 秒（15 分鐘）
-- 不授予 `ec2:Describe*` 以防止客戶端繞過伺服器端過濾
+- EIC：允許同區域 `ec2:DescribeInstances` 作為 AWS CLI preflight，並僅允許 `ec2-instance-connect:SendSSHPublicKey` 和 `ec2-instance-connect:OpenTunnel` 對目標 instance / EIC endpoint
+- ECS Exec：僅允許 `ecs:ExecuteCommand` 對目標 task，並以 `ecs:cluster` 條件限制目標 cluster；另允許同區域 `ecs:DescribeTasks` 與必要的同區域 `ssmmessages:*Channel`
+- 範圍限縮 STS 憑證預設 900 秒；若 entitlement 設定 `max_session_seconds`，使用最嚴格的非零上限，低於 STS 最小值 900 秒的非 SSH 連線會被拒絕
+- 除 EIC 必要的同區域 `ec2:DescribeInstances` 與 ECS Exec 必要的同區域 `ecs:DescribeTasks` 外，不授予額外 Describe 權限，以避免客戶端繞過伺服器端過濾
 
 ---
 
@@ -373,13 +430,32 @@ TUI                     Control Plane              OIDC Provider
 bind_address = "127.0.0.1:8443"
 dev_mode = false
 entitlements_file = "entitlements.toml"
+# 或使用 SQLite 權限後端：
+# entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
+# 啟用本機 TOTP/WebAuthn factor store；TOTP secret 需 mfa_secret_key 加密：
+# mfa_database_url = "sqlite:///var/lib/canopy/mfa.db"
+# mfa_secret_key = "<openssl-rand-base64-32>"
 audit_log = "/var/log/canopy/audit.jsonl"
 cors_allowed_origins = ["http://localhost:9876"]
+
+[audit_export]
+queue_size = 1024
+
+[audit_export.cloudwatch_logs]
+log_group_name = "/aws/canopy/audit"
+log_stream_name = "control-plane"
+create_log_stream = true
+
+[audit_export.s3]
+bucket = "canopy-audit"
+prefix = "prod/"
 
 [oidc]
 issuer_url = "https://accounts.google.com"
 client_id = "your-client-id"
 scopes = ["openid", "profile", "email"]
+# 若要使用長效登入，需依 OIDC provider 設定 refresh token 發放
+# （例如 offline access scope / provider policy），且 refresh grant 需回傳 id_token。
 
 [jwt]
 secret = "<generated-jwt-secret>"
@@ -407,6 +483,27 @@ enable_live_tail = false
 auto_update = false              # 啟動時自動檢查 GitHub Releases 更新
 # update_repo_owner = "Kevinw3i" # GitHub owner（預設值）
 # update_repo_name = "Canopy"    # GitHub repo（預設值）
+
+[theme]
+preset = "default"              # default | mono | high_contrast
+# accent = "cyan"               # 色名、indexed:N、ansi:N 或 #RRGGBB
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
 ```
 
 ### 9.3 權限規則 (`entitlements.toml`)
@@ -420,42 +517,83 @@ allowed_accounts = [
 ]
 allowed_regions = ["us-east-1", "us-west-2"]
 allowed_log_group_arns = ["arn:aws:logs:*:123456789012:log-group:/app/*"]
+allowed_clusters = ["arn:aws:ecs:us-east-1:123456789012:cluster/prod-*"]
 allowed_os_users = ["ec2-user", "ubuntu"]
 
 [rules.features]
 can_view_ec2 = true
+can_view_ecs = true
+can_use_ecs_exec = true
 can_use_cloudwatch_search = true
 can_use_cloudwatch_tail = true
 can_use_ssm = true
 can_use_ec2_instance_connect = true
+
+[[rules.task_tag_selectors]]
+[rules.task_tag_selectors.tags]
+Environment = ["production"]
 
 [[memberships]]
 user_id = "alice@example.com"
 group = "platform-engineering"
 ```
 
+AWS Organizations 帳號自動發現可用 `account_id = "*"` 明確 opt-in；`role_arn`
+必須是包含 `{account_id}` 的 IAM role ARN template。Control Plane 啟動時會
+呼叫 `organizations:ListAccounts`，只展開 `ACTIVE` 帳號，並在路由使用前把
+placeholder 移除：
+
+```toml
+[[rules.allowed_accounts]]
+account_id = "*"
+account_name = "organization"
+role_arn = "arn:aws:iam::{account_id}:role/CanopyRole"
+```
+
+Terraform 需同時設定對應 pattern，例如
+`assumable_role_arn_patterns = ["arn:aws:iam::*:role/CanopyRole"]`。
+
+### 9.4 SQLite 權限後端
+
+Control Plane 可改用 `entitlements_database_url = "sqlite:///path/to/entitlements.db"` 從 SQLite 載入權限。`entitlements_file` 與 `entitlements_database_url` 互斥；兩者同時設定時啟動失敗。SQLite schema 由 control-plane 內建，核心資料表如下：
+
+| 資料表 | 用途 |
+|--------|------|
+| `entitlement_rules` | rule id、group、feature flags、broad discovery opt-in、session limit |
+| `entitlement_memberships` | user id/email 到 group 的對應 |
+| `entitlement_allowed_accounts` | 每條 rule 的 AWS account / display name / role ARN；可用 `account_id="*"` + `{account_id}` role template 啟用 Organizations discovery |
+| `entitlement_allowed_regions` | 每條 rule 的 region allow-list |
+| `entitlement_allowed_log_group_arns` | 每條 rule 的 CloudWatch log group ARN patterns |
+| `entitlement_allowed_clusters` | 每條 rule 的 ECS cluster allow-list |
+| `entitlement_allowed_os_users` | 每條 rule 的 OS user allow-list |
+| `entitlement_*_tag_selectors` | EC2/ECS allow/deny tag selectors，`selector_json` 可用 `{"tags": {...}}` 或 `{...}` |
+
+Control Plane 啟動時會一次載入 SQLite 內容並套用與 TOML 相同的 validation（例如 SSM 必須明確設定 OS users、ECS exec 必須同 rule 啟用 ECS view）。常用 lookup 欄位已建立 index：`group_name`、`user_id`、各 child table 的 `(rule_id, position)`。
+
+### 9.5 本機 MFA factor store
+
+`mfa_database_url = "sqlite:///path/to/mfa.db"` 啟用本機 MFA factor store。Control Plane 啟動時會建立 `mfa_factors`、`mfa_recovery_codes` 與 `mfa_webauthn_challenges` schema；status endpoint 會回報 TOTP / WebAuthn factor store 是否可用、使用者是否已有 active enrolled factor，以及可用 recovery code 數量。TOTP enrollment / verify 需要 `mfa_secret_key`（base64 32 bytes，例：`openssl rand -base64 32`），secret 以 XChaCha20-Poly1305 加密後才寫入 SQLite。WebAuthn registration / verification 接受 `http://localhost[:port]` browser ceremony origin；TUI 會以 `w` 開啟 localhost browser ceremony 完成 passkey 註冊，並以 `x` 開啟 localhost browser ceremony 完成 passkey step-up。WebAuthn registration 會產生 challenge、驗證 registration response，並將 credential id/public key/counter 存入既有 `mfa_factors` 欄位；WebAuthn verification 會用 `mfa_webauthn_challenges` 保存 10 分鐘 challenge state，finish 時 scoped lookup 使用者的 active credential、驗證 assertion、更新 credential counter / `last_used_at`，並建立 5 分鐘 per-JWT in-memory step-up session。若使用者已有 active local factor，WebAuthn 註冊 start/finish 需先完成本機 step-up。查詢使用 `(user_id, kind)` partial index，只掃描 `enrolled_at IS NOT NULL AND disabled_at IS NULL` 的 active factors；pending TOTP / WebAuthn setup 使用 `(user_id, kind, created_at)` partial index 並在 confirm/finish 時套用 10 分鐘 TTL；WebAuthn verification challenge 使用 `(user_id, created_at)` index 清理與查找。TOTP verify 會更新 `last_used_at` 與 `last_totp_step`，避免同一 time-step code 被重放，並建立同一個 step-up session。Recovery codes 只能在 active TOTP factor 存在且目前 JWT 已完成本機 step-up 時產生或輪替；每次產生 10 組 80-bit code，SQLite 只保存 salted SHA-256 hash 與 used/disabled 狀態，明文只在 generate response 與 TUI 畫面中顯示一次。Recovery-code verify 會接受大小寫與空白/連字號變體，成功後以 transaction 標記 `used_at` 並建立同一個 step-up session；已使用或 disabled code 不能重放。`mfa_recovery_codes` 的 active unused lookup 使用 `user_id` partial index。當使用者已註冊本機 TOTP 或 WebAuthn factor 時，EC2 power 與 ECS Exec 會要求有效 step-up session，否則回傳 `403 STEP_UP_REQUIRED`。
+
 ---
 
 ## 10. 測試策略
 
-### 10.1 單元測試（目前 39 個）
+### 10.1 單元測試與整合測試
 
-| 模組 | 測試數量 | 覆蓋範圍 |
-|------|----------|----------|
-| `shared::dto::entitlements` | 4 | TagSelector 匹配邏輯 |
-| `control-plane::models::entitlements` | 13 | 權限評估、多群組合併、邊界案例 |
-| `control-plane::services::ec2` | 14 | 伺服器端過濾、使用者過濾、連線授權、排除標籤 |
-| `control-plane::services::entitlements` | 4 | ARN 萬用字元匹配 |
-| `control-plane::services::cloudwatch` | 2 | 查詢狀態機、mock 資料 |
-| `tui-client::auth::device_code` | 2 | 指數退避 |
+| 模組 | 覆蓋範圍 |
+|------|----------|
+| `shared::dto::*` | EC2 / ECS / CloudWatch / entitlement DTO 序列化與預設值 |
+| `control-plane::models::entitlements` | 權限評估、多群組合併、ECS cluster allow-list 驗證、broad wildcard opt-in |
+| `control-plane::services::{ec2,ecs,entitlements,cloudwatch}` | 伺服器端過濾、rule-local ECS scope、exec command 建構、ARN 萬用字元匹配、mock 資料 |
+| `control-plane::routes::*` | 受保護 API route、audit fail-closed、pagination、scope denied / partial failure 行為 |
+| `tui-client` components | EC2/ECS inventory rendering、scope cycling、container picker、connect session、CloudWatch search、device-code backoff |
 
 ### 10.2 待補強的測試
 
-- API 路由整合測試（使用 axum test utilities）
-- OIDC 流程測試（mock HTTP server）
-- WebSocket Live Tail 連線測試
-- TUI 元件渲染快照測試
-- 端到端測試（mock AWS 回應）
+- 更多 OIDC 流程測試（目前已涵蓋 device-code、refresh 與 PKCE authorization-code mock HTTP server）
+- 更多 WebSocket Live Tail 連線測試（目前已涵蓋 dev/mock session start、mock event、invalid token error 與 TUI WebSocket event action E2E）
+- 更多 TUI 元件渲染快照測試（目前已涵蓋 ECS inventory table 與 ECS Exec container picker）
+- 更多端到端測試（目前已涵蓋 TUI ApiClient → control-plane → mock AWS 的 auth、entitlements、EC2、ECS、CloudWatch log groups/filter events）
 
 ---
 
@@ -464,18 +602,25 @@ group = "platform-engineering"
 ### 11.1 先決條件
 
 - Rust 1.75+
-- AWS CLI v2（用於 SSM/EIC 連線）
-- Session Manager plugin（用於 SSM）
+- AWS CLI v2（用於 SSM/EIC/ECS Exec 連線）
+- Session Manager plugin（用於 SSM/ECS Exec）
 - OIDC Provider（Google、Okta、Azure AD 等）
 
 ### 11.2 生產部署步驟
 
-1. 設定 `config.toml`（OIDC、JWT、AWS）
-2. 建立 `entitlements.toml`（權限規則）
-3. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
-4. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
-5. 分發 `dist/` 資料夾給維運人員
-6. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔、AWS CLI、SSM Plugin）
+1. 建立 OIDC client 與 Secrets Manager secret（JWT secret，必要時也包含 OIDC client secret）
+2. 填寫 `infra/terraform.tfvars`（VPC/subnet/ACM、OIDC、secret ARN/version、AWS region、CPU architecture、Phase 2 image tag）
+3. 建立 `entitlements.toml`（權限規則）
+4. 執行 `scripts/validate-terraform-tfvars.sh infra` 驗證 ALB/DNS/subnet/service preconditions（Phase 1 帶 `-var="create_service=false"`；Phase 2 帶 `-var="create_service=true"` 與 `-var="image_tag=<tag>"`）
+5. 執行 `scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars` 驗證權限規則與 Terraform 變數一致，並在部署前攔截本機 profile、ECS access / SSM shell scope 缺漏、未 opt-in 的寬鬆 cluster wildcard
+6. 部署 Control Plane 至 ECS Fargate（推薦使用 `infra/` 的 Terraform，詳見 `infra/README.md`）
+7. 打包 TUI 客戶端：`scripts/package.sh https://canopy.internal`
+8. 分發 `dist/` 資料夾給維運人員
+9. 維運人員執行 `./install.sh` 完成安裝（自動處理設定檔；可驗證時自動安裝 AWS CLI；macOS 自動安裝 SSM Plugin，Linux 提示手動安裝）
+
+ECS 部署不需要 commit 或掛載生產 `config.toml`。Terraform task definition
+會設定 `GENERATE_CONFIG=1`，container entrypoint 會從環境變數與
+ECS-native secrets 在啟動時產生 control-plane 設定。
 
 > 詳細操作見 `docs/OPERATOR-SETUP.md`
 
@@ -502,20 +647,23 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 
 ### 目前限制
 
-- Live Tail 為 beta 功能，WebSocket 客戶端尚未完整實作
-- OIDC 刷新 Token 流程未完整
-- SSM 受管理狀態為啟發式判斷（有 IAM Role 且 Running）
+- Live Tail 為 beta 功能，支援 dev/mock 串流、production CloudWatch Logs StartLiveTail 串流、log group picker 與自動重連；production session 仍受 AWS 服務端 timeout、sampling 與配額限制
+- ECS 目前支援 task inventory 與 ECS Exec，不支援 ECS service/deployment 管理
+- ECS broad cluster discovery 需要明確 opt-in，且 response 仍受服務端上限保護
+- OIDC refresh token 流程已支援 PKCE/device-code 取得、TUI 401 refresh/retry 與 rotated token 持久化；仍要求 provider 發放 refresh token 並在 refresh grant 回傳 id_token
+- EC2 inventory 會用 SSM `DescribeInstanceInformation` 精確標示 SSM 受管理狀態；需目標 role 具備 `ssm:DescribeInstanceInformation`
 - EC2 Instance Connect 支援判斷為近似值
-- 未支援 AWS Organizations 自動帳號發現
-- 權限規則僅支援 TOML 檔案，無資料庫後端
+- AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
+- 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
+- MFA 目前仍以 OIDC Provider-driven enforcement 為主；TUI 已顯示本機 MFA / step-up readiness，且在 `mfa_database_url` + `mfa_secret_key` 設定後可註冊並驗證本機 TOTP step-up、產生/輪替與使用 recovery codes；`mfa_database_url` 設定後可註冊並驗證本機 WebAuthn/passkey step-up；EC2 power / ECS Exec 已支援本機 TOTP 或 WebAuthn route-level step-up gate
 
 ### 未來規劃
 
-- [ ] 完整的 WebSocket Live Tail 實作
-- [ ] 資料庫後端的權限管理
-- [ ] AWS Organizations 帳號自動發現
-- [ ] SSM DescribeInstanceInformation 精確判斷受管理狀態
-- [ ] Multi-factor Authentication 支援
-- [ ] 自訂快捷鍵設定
-- [ ] 主題與配色自訂
-- [ ] 匯出稽核日誌至 CloudWatch Logs / S3
+- [x] AWS Organizations 帳號自動發現
+- [x] SSM DescribeInstanceInformation 精確判斷受管理狀態
+- [x] OIDC Provider-driven Multi-factor Authentication 支援
+- [x] 本機 TOTP/WebAuthn 註冊與 step-up UI
+- [x] 自訂快捷鍵設定（dashboard / settings）
+- [x] 主題與配色自訂（dashboard / settings shell）
+- [x] 全工作流配色 token 化
+- [x] 匯出稽核日誌至 CloudWatch Logs / S3

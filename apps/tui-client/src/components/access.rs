@@ -7,15 +7,49 @@ use shared::dto::entitlements::UserEntitlements;
 
 use super::Component;
 use crate::event::Action;
+use crate::theme::Theme;
 
-#[derive(Default)]
+fn selector_summary(selectors: &[shared::dto::entitlements::TagSelector]) -> String {
+    if selectors.is_empty() {
+        return "-".into();
+    }
+
+    selectors
+        .iter()
+        .map(|selector| {
+            let mut tags = selector
+                .tags
+                .iter()
+                .map(|(key, values)| format!("{}=[{}]", key, values.join("|")))
+                .collect::<Vec<_>>();
+            tags.sort();
+            tags.join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub struct AccessScreen {
     pub entitlements: Option<UserEntitlements>,
+    theme: Theme,
+}
+
+impl Default for AccessScreen {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AccessScreen {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_theme(Theme::default())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
+        Self {
+            entitlements: None,
+            theme,
+        }
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {
@@ -38,13 +72,13 @@ impl Component for AccessScreen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" Access / Current Identity ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
         let Some(ref ent) = self.entitlements else {
             Paragraph::new("Loading entitlements...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(self.theme.warning_style())
                 .render(inner, buf);
             return;
         };
@@ -53,37 +87,53 @@ impl Component for AccessScreen {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(6), // Identity
-                Constraint::Length(8), // Features
-                Constraint::Length(6), // Accounts
-                Constraint::Length(3), // Regions
-                Constraint::Min(4),    // Log groups
-                Constraint::Length(2), // Help
+                Constraint::Min(8),    // Feature and scope columns
+                Constraint::Length(1), // Help
             ])
             .split(inner);
+        let body_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(chunks[1]);
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(10), // Features
+                Constraint::Min(4),     // Log groups
+            ])
+            .split(body_chunks[0]);
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4), // Accounts
+                Constraint::Length(3), // Regions
+                Constraint::Min(8),    // ECS scopes
+            ])
+            .split(body_chunks[1]);
 
         // Identity section
         let identity_lines = vec![
             Line::from(vec![
                 Span::styled("User ID:      ", Style::default().bold()),
-                Span::raw(&ent.user_id),
+                Span::styled(&ent.user_id, self.theme.text_style()),
             ]),
             Line::from(vec![
                 Span::styled("Email:        ", Style::default().bold()),
-                Span::raw(&ent.email),
+                Span::styled(&ent.email, self.theme.text_style()),
             ]),
             Line::from(vec![
                 Span::styled("Display Name: ", Style::default().bold()),
-                Span::raw(&ent.display_name),
+                Span::styled(&ent.display_name, self.theme.text_style()),
             ]),
             Line::from(vec![
                 Span::styled("Groups:       ", Style::default().bold()),
-                Span::raw(ent.groups.join(", ")),
+                Span::styled(ent.groups.join(", "), self.theme.text_style()),
             ]),
         ];
         let identity_block = Block::default()
             .borders(Borders::ALL)
             .title(" Identity ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(identity_lines)
             .block(identity_block)
             .render(chunks[0], buf);
@@ -93,9 +143,9 @@ impl Component for AccessScreen {
         let check = |b: bool| if b { "Yes" } else { "No " };
         let feat_style = |b: bool| {
             if b {
-                Style::default().fg(Color::Green)
+                self.theme.success_style()
             } else {
-                Style::default().fg(Color::Red)
+                self.theme.danger_style()
             }
         };
 
@@ -129,14 +179,25 @@ impl Component for AccessScreen {
                     feat_style(feat.can_use_ec2_instance_connect),
                 ),
             ]),
+            Line::from(vec![
+                Span::styled("ECS Task View:         ", Style::default().bold()),
+                Span::styled(check(feat.can_view_ecs), feat_style(feat.can_view_ecs)),
+            ]),
+            Line::from(vec![
+                Span::styled("ECS Exec:              ", Style::default().bold()),
+                Span::styled(
+                    check(feat.can_use_ecs_exec),
+                    feat_style(feat.can_use_ecs_exec),
+                ),
+            ]),
         ];
         let feature_block = Block::default()
             .borders(Borders::ALL)
             .title(" Feature Flags ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(feature_lines)
             .block(feature_block)
-            .render(chunks[1], buf);
+            .render(left_chunks[0], buf);
 
         // Accounts
         let account_lines: Vec<Line> = ent
@@ -155,20 +216,64 @@ impl Component for AccessScreen {
                 " Allowed Accounts ({}) ",
                 ent.allowed_accounts.len()
             ))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(account_lines)
             .block(accounts_block)
             .wrap(Wrap { trim: true })
-            .render(chunks[2], buf);
+            .render(right_chunks[0], buf);
 
         // Regions
         let regions_block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" Allowed Regions ({}) ", ent.allowed_regions.len()))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(ent.allowed_regions.join(", "))
             .block(regions_block)
-            .render(chunks[3], buf);
+            .render(right_chunks[1], buf);
+
+        // ECS scopes
+        let ecs_lines = vec![
+            Line::from(format!(
+                "  clusters: {}",
+                if ent.allowed_clusters.is_empty() {
+                    "-".into()
+                } else {
+                    ent.allowed_clusters.join(", ")
+                }
+            )),
+            Line::from(format!(
+                "  task_tags: {}",
+                selector_summary(&ent.task_tag_selectors)
+            )),
+            Line::from(format!(
+                "  excluded_task_tags: {}",
+                selector_summary(&ent.excluded_task_tag_selectors)
+            )),
+            Line::from(format!(
+                "  excluded_containers: {}",
+                if ent.excluded_container_names.is_empty() {
+                    "-".into()
+                } else {
+                    ent.excluded_container_names.join(", ")
+                }
+            )),
+            Line::from(format!(
+                "  broad_discovery: {}",
+                if ent.allow_broad_cluster_discovery {
+                    "true"
+                } else {
+                    "false"
+                }
+            )),
+        ];
+        let ecs_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" ECS Scope ")
+            .border_style(self.theme.accent_style());
+        Paragraph::new(ecs_lines)
+            .block(ecs_block)
+            .wrap(Wrap { trim: true })
+            .render(right_chunks[2], buf);
 
         // Log groups
         let lg_lines: Vec<Line> = ent
@@ -182,16 +287,100 @@ impl Component for AccessScreen {
                 " Allowed Log Group Patterns ({}) ",
                 ent.allowed_log_group_arns.len()
             ))
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         Paragraph::new(lg_lines)
             .block(lg_block)
             .wrap(Wrap { trim: true })
-            .render(chunks[4], buf);
+            .render(left_chunks[1], buf);
 
         // Help
         Paragraph::new("Esc/q: back")
-            .style(Style::default().fg(Color::Gray))
-            .render(chunks[5], buf);
+            .style(self.theme.muted_style())
+            .render(chunks[2], buf);
+    }
+}
+
+#[cfg(test)]
+mod ecs_scope_tests {
+    use super::*;
+    use shared::dto::entitlements::{AllowedAccount, FeatureFlags, TagSelector};
+    use std::collections::HashMap;
+
+    fn rendered_text_at(screen: &mut AccessScreen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut out = String::new();
+        for cell in &buf.content {
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
+    fn sample_screen() -> AccessScreen {
+        let mut screen = AccessScreen::new();
+        screen.set_entitlements(UserEntitlements {
+            user_id: "u1".into(),
+            email: "u1@example.com".into(),
+            display_name: "User".into(),
+            groups: vec!["platform".into()],
+            features: FeatureFlags {
+                can_view_ecs: true,
+                can_use_ecs_exec: false,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111".into(),
+                account_name: "prod".into(),
+                role_arn: "arn:aws:iam::111:role/CanopyRole".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec!["arn:aws:ecs:us-east-1:111:cluster/prod-*".into()],
+            task_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("Environment".into(), vec!["production".into()])]),
+            }],
+            excluded_task_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("CanopyDeny".into(), vec!["true".into()])]),
+            }],
+            excluded_container_names: vec!["envoy".into()],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        });
+        screen
+    }
+
+    #[test]
+    fn render_includes_ecs_permissions_and_scope() {
+        let mut screen = sample_screen();
+
+        let text = rendered_text_at(&mut screen, 140, 40);
+
+        assert!(text.contains("ECS Task View"));
+        assert!(text.contains("ECS Exec"));
+        assert!(text.contains("arn:aws:ecs:us-east-1:111:cluster/prod-*"));
+        assert!(text.contains("Environment=[production]"));
+        assert!(text.contains("CanopyDeny=[true]"));
+        assert!(text.contains("excluded_containers"));
+        assert!(text.contains("envoy"));
+        assert!(text.contains("broad_discovery: false"));
+    }
+
+    #[test]
+    fn render_keeps_ecs_scope_visible_at_standard_terminal_size() {
+        let mut screen = sample_screen();
+
+        let text = rendered_text_at(&mut screen, 80, 24);
+
+        assert!(text.contains("ECS Scope"));
+        assert!(text.contains("excluded_containers"));
+        assert!(text.contains("broad_discovery: false"));
+        assert!(text.contains("Esc/q: back"));
     }
 }
 
@@ -243,6 +432,11 @@ mod tests {
             max_session_seconds: None,
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             database_scopes: vec![],
         }

@@ -17,6 +17,25 @@ pub struct UserEntitlements {
     /// even if they passed the allow checks above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excluded_tag_selectors: Vec<TagSelector>,
+    /// ECS clusters visible to this user. Values may be short cluster names or
+    /// ARN patterns; control-plane route checks normalize them per rule before
+    /// authorization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_clusters: Vec<String>,
+    /// Allow-list selectors for ECS task tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_tag_selectors: Vec<TagSelector>,
+    /// Deny-list selectors for ECS task tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_task_tag_selectors: Vec<TagSelector>,
+    /// ECS container names users may not exec into even when the task is in
+    /// scope, typically sidecars such as Envoy or telemetry agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_container_names: Vec<String>,
+    /// Explicit opt-in for broad ECS cluster discovery patterns such as
+    /// `cluster/*`. This never relaxes server-side list caps.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_broad_cluster_discovery: bool,
     pub allowed_os_users: Vec<String>,
     /// Maximum SSH/SSM session duration in seconds.
     /// 0 or None = no limit. Enforced by the TUI client via TMOUT or
@@ -29,10 +48,15 @@ pub struct UserEntitlements {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FeatureFlags {
+    #[serde(default)]
     pub can_view_ec2: bool,
+    #[serde(default)]
     pub can_use_cloudwatch_search: bool,
+    #[serde(default)]
     pub can_use_cloudwatch_tail: bool,
+    #[serde(default)]
     pub can_use_ssm: bool,
+    #[serde(default)]
     pub can_use_ec2_instance_connect: bool,
     /// Power-action flags. `#[serde(default)]` keeps existing
     /// entitlements.toml files (and any persisted JSON) backward-compatible:
@@ -61,6 +85,14 @@ pub struct FeatureFlags {
     /// database_scopes, SQL validation, EXPLAIN gates, and DB credentials.
     #[serde(default)]
     pub can_use_mcp_database: bool,
+    #[serde(default)]
+    pub can_view_ecs: bool,
+    #[serde(default)]
+    pub can_use_ecs_exec: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +146,19 @@ pub struct EntitlementRule {
     /// Deny-list: instances matching ANY excluded selector are hidden.
     #[serde(default)]
     pub excluded_tag_selectors: Vec<TagSelector>,
+    /// ECS cluster allow-list. Entries may be short cluster names or ARN
+    /// patterns; route authorization normalizes short names with the rule's
+    /// account and region scope.
+    #[serde(default)]
+    pub allowed_clusters: Vec<String>,
+    #[serde(default)]
+    pub task_tag_selectors: Vec<TagSelector>,
+    #[serde(default)]
+    pub excluded_task_tag_selectors: Vec<TagSelector>,
+    #[serde(default)]
+    pub excluded_container_names: Vec<String>,
+    #[serde(default)]
+    pub allow_broad_cluster_discovery: bool,
     #[serde(default)]
     pub allowed_os_users: Vec<String>,
     /// Maximum session duration in seconds. 0 or omitted = no limit.
@@ -237,6 +282,8 @@ mod tests {
         assert!(!flags.can_view_mcp_raw_audit_plaintext);
         assert!(!flags.can_use_mcp_ec2);
         assert!(!flags.can_use_mcp_database);
+        assert!(!flags.can_view_ecs);
+        assert!(!flags.can_use_ecs_exec);
     }
 
     #[test]
@@ -255,6 +302,8 @@ mod tests {
             can_view_mcp_raw_audit_plaintext: true,
             can_use_mcp_ec2: false,
             can_use_mcp_database: true,
+            can_view_ecs: true,
+            can_use_ecs_exec: true,
         };
         let json = serde_json::to_value(&flags).unwrap();
         assert_eq!(json["can_view_ec2"], true);
@@ -267,6 +316,8 @@ mod tests {
         assert_eq!(json["can_view_mcp_raw_audit_plaintext"], true);
         assert_eq!(json["can_use_mcp_ec2"], false);
         assert_eq!(json["can_use_mcp_database"], true);
+        assert_eq!(json["can_view_ecs"], true);
+        assert_eq!(json["can_use_ecs_exec"], true);
         let back: FeatureFlags = serde_json::from_value(json).unwrap();
         assert!(back.can_view_ec2);
         assert!(!back.can_use_ec2_instance_connect);
@@ -278,6 +329,8 @@ mod tests {
         assert!(back.can_view_mcp_raw_audit_plaintext);
         assert!(!back.can_use_mcp_ec2);
         assert!(back.can_use_mcp_database);
+        assert!(back.can_view_ecs);
+        assert!(back.can_use_ecs_exec);
     }
 
     /// Existing entitlements.toml / persisted JSON without the new
@@ -303,10 +356,12 @@ mod tests {
         assert!(!flags.can_view_mcp_raw_audit_plaintext);
         assert!(!flags.can_use_mcp_ec2);
         assert!(!flags.can_use_mcp_database);
+        assert!(!flags.can_view_ecs);
+        assert!(!flags.can_use_ecs_exec);
     }
 
     #[test]
-    fn feature_flags_backward_compat_without_mcp_keys() {
+    fn feature_flags_backward_compat_without_mcp_or_ecs_keys() {
         let json = serde_json::json!({
             "can_view_ec2": true,
             "can_use_cloudwatch_search": true,
@@ -325,6 +380,8 @@ mod tests {
         assert!(!flags.can_view_mcp_raw_audit_plaintext);
         assert!(!flags.can_use_mcp_ec2);
         assert!(!flags.can_use_mcp_database);
+        assert!(!flags.can_view_ecs);
+        assert!(!flags.can_use_ecs_exec);
     }
 
     #[test]
@@ -341,6 +398,11 @@ mod tests {
         assert!(rule.allowed_log_group_arns.is_empty());
         assert!(rule.instance_tag_selectors.is_empty());
         assert!(rule.excluded_tag_selectors.is_empty());
+        assert!(rule.allowed_clusters.is_empty());
+        assert!(rule.task_tag_selectors.is_empty());
+        assert!(rule.excluded_task_tag_selectors.is_empty());
+        assert!(rule.excluded_container_names.is_empty());
+        assert!(!rule.allow_broad_cluster_discovery);
         assert!(rule.allowed_os_users.is_empty());
         assert!(rule.max_session_seconds.is_none());
         assert!(rule.database_scopes.is_empty());
@@ -361,6 +423,11 @@ mod tests {
             allowed_log_group_arns: vec![],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
@@ -398,6 +465,15 @@ mod tests {
             excluded_tag_selectors: vec![TagSelector {
                 tags: HashMap::from([("temp".into(), vec!["true".into()])]),
             }],
+            allowed_clusters: vec!["arn:aws:ecs:us-east-1:111:cluster/prod-*".into()],
+            task_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("Environment".into(), vec!["production".into()])]),
+            }],
+            excluded_task_tag_selectors: vec![TagSelector {
+                tags: HashMap::from([("CanopyDeny".into(), vec!["true".into()])]),
+            }],
+            excluded_container_names: vec!["envoy".into()],
+            allow_broad_cluster_discovery: true,
             allowed_os_users: vec!["ec2-user".into()],
             max_session_seconds: Some(3600),
             database_scopes: vec![DatabaseScope {
@@ -422,6 +498,11 @@ mod tests {
         assert!(back.features.can_use_ssm);
         assert_eq!(back.allowed_accounts[0].account_id, "111");
         assert_eq!(back.excluded_tag_selectors.len(), 1);
+        assert_eq!(back.allowed_clusters.len(), 1);
+        assert_eq!(back.task_tag_selectors.len(), 1);
+        assert_eq!(back.excluded_task_tag_selectors.len(), 1);
+        assert_eq!(back.excluded_container_names, vec!["envoy"]);
+        assert!(back.allow_broad_cluster_discovery);
         assert_eq!(back.max_session_seconds, Some(3600));
         assert_eq!(back.database_scopes.len(), 1);
     }
@@ -446,6 +527,26 @@ mod tests {
         assert_eq!(scope.connection, "orders_prod");
         assert!(scope.require_explain);
         assert!(!scope.allow_full_table_scan);
+    }
+
+    #[test]
+    fn ecs_entitlement_fields_default_empty() {
+        let json = serde_json::json!({
+            "id": "ecs",
+            "group": "ops",
+            "features": {
+                "can_view_ecs": true,
+                "can_use_ecs_exec": true
+            }
+        });
+        let rule: EntitlementRule = serde_json::from_value(json).unwrap();
+        assert!(rule.features.can_view_ecs);
+        assert!(rule.features.can_use_ecs_exec);
+        assert!(rule.allowed_clusters.is_empty());
+        assert!(rule.task_tag_selectors.is_empty());
+        assert!(rule.excluded_task_tag_selectors.is_empty());
+        assert!(rule.excluded_container_names.is_empty());
+        assert!(!rule.allow_broad_cluster_discovery);
     }
 
     #[test]

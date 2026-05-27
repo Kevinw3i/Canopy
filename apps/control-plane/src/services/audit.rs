@@ -6,9 +6,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::config::{AuditExportConfig, AuditS3ExportConfig};
 use crate::services::auth::Claims;
+use aws_config::SdkConfig;
 use axum::http::{header::USER_AGENT, HeaderMap};
+use chrono::Datelike;
 use shared::headers;
+use tokio::sync::mpsc;
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
 
@@ -17,6 +21,7 @@ const X_FORWARDED_FOR: &str = "x-forwarded-for";
 /// failure so callers can fail-closed on privileged operations.
 pub struct AuditService {
     writer: Option<Mutex<std::io::BufWriter<std::fs::File>>>,
+    exporter: Option<AuditExporter>,
     sink_failed: std::sync::atomic::AtomicBool,
 }
 
@@ -30,6 +35,7 @@ impl AuditService {
     pub fn new() -> Self {
         Self {
             writer: None,
+            exporter: None,
             sink_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -49,8 +55,32 @@ impl AuditService {
         tracing::info!(path = %path.display(), "Audit log file opened");
         Ok(Self {
             writer: Some(Mutex::new(std::io::BufWriter::new(file))),
+            exporter: None,
             sink_failed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    pub fn from_config(
+        audit_log: Option<&str>,
+        export_config: &AuditExportConfig,
+        aws_config: &SdkConfig,
+    ) -> anyhow::Result<Self> {
+        export_config.validate()?;
+
+        let mut service = if let Some(log_path) = audit_log {
+            Self::with_file(log_path)?
+        } else {
+            Self::new()
+        };
+
+        if export_config.is_enabled() {
+            service.exporter = Some(AuditExporter::spawn(
+                export_config.clone(),
+                aws_config.clone(),
+            ));
+        }
+
+        Ok(service)
     }
 
     pub fn event(
@@ -72,7 +102,7 @@ impl AuditService {
             "audit"
         );
 
-        // Persist to durable log file if configured
+        // Persist to durable log file if configured.
         if let Some(ref writer) = self.writer {
             match writer.lock() {
                 Ok(mut w) => {
@@ -101,6 +131,11 @@ impl AuditService {
                 }
             }
         }
+
+        if let Some(exporter) = &self.exporter {
+            exporter.enqueue(event)?;
+        }
+
         Ok(())
     }
 
@@ -111,10 +146,223 @@ impl AuditService {
     /// is still fail-closed — callers must propagate its errors.
     pub fn is_healthy(&self) -> bool {
         match &self.writer {
-            None => true,
-            Some(mutex) => !mutex.is_poisoned(),
+            None => self
+                .exporter
+                .as_ref()
+                .map(|exporter| exporter.is_healthy())
+                .unwrap_or(true),
+            Some(mutex) => {
+                !mutex.is_poisoned()
+                    && self
+                        .exporter
+                        .as_ref()
+                        .map(|exporter| exporter.is_healthy())
+                        .unwrap_or(true)
+            }
         }
     }
+}
+
+#[derive(Clone)]
+struct AuditExporter {
+    sender: mpsc::Sender<AuditEvent>,
+}
+
+impl AuditExporter {
+    fn spawn(config: AuditExportConfig, aws_config: SdkConfig) -> Self {
+        let queue_size = config.queue_size.max(1);
+        let (sender, receiver) = mpsc::channel(queue_size);
+        tokio::spawn(async move {
+            AuditExportWorker::new(config, aws_config)
+                .run(receiver)
+                .await;
+        });
+        Self { sender }
+    }
+
+    fn enqueue(&self, event: AuditEvent) -> Result<(), &'static str> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err("Audit export queue full"),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err("Audit export worker stopped"),
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        !self.sender.is_closed()
+    }
+}
+
+struct AuditExportWorker {
+    cloudwatch_logs: Option<AuditCloudWatchLogsSink>,
+    s3: Option<AuditS3Sink>,
+}
+
+impl AuditExportWorker {
+    fn new(config: AuditExportConfig, aws_config: SdkConfig) -> Self {
+        let cloudwatch_logs = config
+            .cloudwatch_logs
+            .map(|sink| AuditCloudWatchLogsSink::new(sink, &aws_config));
+        let s3 = config.s3.map(|sink| AuditS3Sink::new(sink, &aws_config));
+        Self {
+            cloudwatch_logs,
+            s3,
+        }
+    }
+
+    async fn run(self, mut receiver: mpsc::Receiver<AuditEvent>) {
+        if let Some(sink) = &self.cloudwatch_logs {
+            if let Err(error) = sink.ensure_log_stream().await {
+                tracing::error!(error = %error, "audit CloudWatch Logs stream setup failed");
+            }
+        }
+
+        while let Some(event) = receiver.recv().await {
+            let json = match serde_json::to_string(&event) {
+                Ok(json) => json,
+                Err(error) => {
+                    tracing::error!(error = %error, "audit export serialization failed");
+                    continue;
+                }
+            };
+
+            if let Some(sink) = &self.cloudwatch_logs {
+                if let Err(error) = sink.export(&event, json.clone()).await {
+                    tracing::error!(error = %error, "audit CloudWatch Logs export failed");
+                }
+            }
+
+            if let Some(sink) = &self.s3 {
+                if let Err(error) = sink.export(&event, json.clone()).await {
+                    tracing::error!(error = %error, "audit S3 export failed");
+                }
+            }
+        }
+    }
+}
+
+struct AuditCloudWatchLogsSink {
+    client: aws_sdk_cloudwatchlogs::Client,
+    log_group_name: String,
+    log_stream_name: String,
+    create_log_stream: bool,
+}
+
+impl AuditCloudWatchLogsSink {
+    fn new(config: crate::config::AuditCloudWatchLogsExportConfig, aws_config: &SdkConfig) -> Self {
+        Self {
+            client: aws_sdk_cloudwatchlogs::Client::new(aws_config),
+            log_group_name: config.log_group_name,
+            log_stream_name: config.log_stream_name,
+            create_log_stream: config.create_log_stream,
+        }
+    }
+
+    async fn ensure_log_stream(&self) -> anyhow::Result<()> {
+        if !self.create_log_stream {
+            return Ok(());
+        }
+
+        let output = self
+            .client
+            .describe_log_streams()
+            .log_group_name(&self.log_group_name)
+            .log_stream_name_prefix(&self.log_stream_name)
+            .limit(1)
+            .send()
+            .await?;
+
+        let exists = output
+            .log_streams()
+            .iter()
+            .any(|stream| stream.log_stream_name() == Some(self.log_stream_name.as_str()));
+        if exists {
+            return Ok(());
+        }
+
+        self.client
+            .create_log_stream()
+            .log_group_name(&self.log_group_name)
+            .log_stream_name(&self.log_stream_name)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    async fn export(&self, event: &AuditEvent, json: String) -> anyhow::Result<()> {
+        let input = aws_sdk_cloudwatchlogs::types::InputLogEvent::builder()
+            .timestamp(audit_timestamp_millis(event))
+            .message(json)
+            .build()?;
+
+        self.client
+            .put_log_events()
+            .log_group_name(&self.log_group_name)
+            .log_stream_name(&self.log_stream_name)
+            .log_events(input)
+            .send()
+            .await?;
+        Ok(())
+    }
+}
+
+struct AuditS3Sink {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    prefix: String,
+}
+
+impl AuditS3Sink {
+    fn new(config: AuditS3ExportConfig, aws_config: &SdkConfig) -> Self {
+        Self {
+            client: aws_sdk_s3::Client::new(aws_config),
+            bucket: config.bucket,
+            prefix: normalized_s3_prefix(&config.prefix),
+        }
+    }
+
+    async fn export(&self, event: &AuditEvent, json: String) -> anyhow::Result<()> {
+        let key = audit_s3_key(&self.prefix, event);
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type("application/json")
+            .body(aws_sdk_s3::primitives::ByteStream::from(json.into_bytes()))
+            .send()
+            .await?;
+        Ok(())
+    }
+}
+
+fn audit_timestamp_millis(event: &AuditEvent) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+        .map(|timestamp| timestamp.timestamp_millis())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis())
+}
+
+fn normalized_s3_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+fn audit_s3_key(prefix: &str, event: &AuditEvent) -> String {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+    format!(
+        "{}{:04}/{:02}/{:02}/{}-{}.json",
+        prefix,
+        timestamp.year(),
+        timestamp.month(),
+        timestamp.day(),
+        timestamp.format("%Y%m%dT%H%M%S%.3fZ"),
+        event.event_id
+    )
 }
 
 pub struct AuditEventBuilder<'a> {
@@ -659,6 +907,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         };
 
@@ -691,6 +940,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         };
 
@@ -714,6 +964,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         };
 
@@ -732,6 +983,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: false,
         };
 
@@ -753,6 +1005,30 @@ mod tests {
     fn test_is_healthy_true_without_writer() {
         let svc = AuditService::new();
         assert!(svc.is_healthy());
+    }
+
+    #[test]
+    fn audit_s3_key_partitions_by_utc_date_and_normalizes_prefix() {
+        let event = AuditEvent {
+            event_id: "evt-123".into(),
+            timestamp: "2026-05-27T03:04:05.678Z".into(),
+            actor: "alice".into(),
+            action: AuditAction::Login,
+            account_id: None,
+            region: None,
+            target_resource: None,
+            target_resource_name: None,
+            outcome: AuditOutcome::Success,
+            error_message: None,
+            metadata: None,
+        };
+
+        let prefix = normalized_s3_prefix("/prod/audit/");
+        assert_eq!(prefix, "prod/audit/");
+        assert_eq!(
+            audit_s3_key(&prefix, &event),
+            "prod/audit/2026/05/27/20260527T030405.678Z-evt-123.json"
+        );
     }
 
     #[test]

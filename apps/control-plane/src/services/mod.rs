@@ -3,11 +3,14 @@ pub mod auth;
 pub mod cloudwatch;
 pub mod database;
 pub mod ec2;
+pub mod ecs;
 pub mod entitlements;
 pub mod oidc;
+pub mod step_up;
 
 use crate::config::AppConfig;
 use crate::models::entitlements::EntitlementStore;
+use crate::models::mfa::MfaStore;
 use aws_config::SdkConfig;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -103,6 +106,8 @@ pub struct AppState {
     pub entitlement_store: Arc<RwLock<EntitlementStore>>,
     pub audit_service: audit::AuditService,
     pub oidc_client: oidc::OidcClient,
+    pub mfa_store: MfaStore,
+    pub step_up_sessions: step_up::StepUpSessionStore,
     pub base_aws_config: SdkConfig,
     pub database_secret_provider: Arc<dyn DatabaseSecretProvider>,
     pub database_executor: Arc<dyn DatabaseExecutor>,
@@ -133,19 +138,32 @@ pub struct AppState {
 
 impl AppState {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
-        let entitlement_store = if let Some(ref path) = config.entitlements_file {
-            // Explicit entitlements file always takes priority (dev or production)
-            EntitlementStore::load_from_file(std::path::Path::new(path))?
+        if config.entitlements_file.is_some() && config.entitlements_database_url.is_some() {
+            anyhow::bail!("entitlements_file and entitlements_database_url are mutually exclusive");
+        }
+
+        let mut entitlement_store = if let Some(ref url) = config.entitlements_database_url {
+            EntitlementStore::load_from_database_url_allowing_organization_account_placeholders(
+                url,
+            )?
+        } else if let Some(ref path) = config.entitlements_file {
+            EntitlementStore::load_from_file_allowing_organization_account_placeholders(
+                std::path::Path::new(path),
+            )?
         } else if config.dev_mode {
             EntitlementStore::dev_defaults()
         } else {
             anyhow::bail!(
-                "entitlements_file is required in production mode. \
-                 Set dev_mode = true or provide an entitlements config path."
+                "entitlements_file or entitlements_database_url is required in production mode. \
+                 Set dev_mode = true or provide an entitlement backend."
             );
         };
 
         let oidc_client = oidc::OidcClient::new(config.oidc.clone());
+        let mfa_store = MfaStore::from_optional_config(
+            config.mfa_database_url.as_deref(),
+            config.mfa_secret_key.as_deref(),
+        )?;
 
         // Load the base AWS SDK config (uses ambient credentials: env vars,
         // instance profile, ~/.aws/credentials, etc.).
@@ -161,17 +179,39 @@ impl AppState {
             .await;
         let secrets_client = aws_sdk_secretsmanager::Client::new(&base_aws_config);
 
-        let audit_service = if let Some(ref log_path) = config.audit_log {
-            audit::AuditService::with_file(log_path)?
-        } else {
-            audit::AuditService::new()
-        };
+        if entitlement_store.has_organization_account_placeholders() {
+            tracing::info!("Discovering AWS Organizations accounts for entitlement expansion");
+            let accounts =
+                crate::aws::organizations::discover_active_accounts(&base_aws_config).await?;
+            let discovered_count = accounts.len();
+            if discovered_count == 0 {
+                anyhow::bail!(
+                    "AWS Organizations account discovery returned no ACTIVE accounts for entitlement expansion"
+                );
+            }
+            let expanded_count =
+                entitlement_store.expand_organization_account_placeholders(&accounts)?;
+            tracing::info!(
+                discovered_accounts = discovered_count,
+                expanded_accounts = expanded_count,
+                "Expanded AWS Organizations entitlement accounts"
+            );
+        }
+        entitlement_store.validate()?;
+
+        let audit_service = audit::AuditService::from_config(
+            config.audit_log.as_deref(),
+            &config.audit_export,
+            &base_aws_config,
+        )?;
 
         Ok(Self {
             config,
             entitlement_store: Arc::new(RwLock::new(entitlement_store)),
             audit_service,
             oidc_client,
+            mfa_store,
+            step_up_sessions: step_up::StepUpSessionStore::default(),
             base_aws_config,
             database_secret_provider: Arc::new(AwsSecretsDatabaseSecretProvider::new(
                 secrets_client,
@@ -670,6 +710,11 @@ mod tests {
                 client_id: "test".into(),
                 client_secret: None,
                 scopes: vec![],
+                acr_values: vec![],
+                prompt: None,
+                max_age_seconds: None,
+                required_acr_values: vec![],
+                required_amr_values: vec![],
                 authorization_endpoint: None,
                 token_endpoint: None,
                 device_authorization_endpoint: None,
@@ -689,7 +734,11 @@ mod tests {
             dev_mode: true,
             mock_aws_data: None,
             entitlements_file: None,
+            entitlements_database_url: None,
+            mfa_database_url: None,
+            mfa_secret_key: None,
             audit_log: None,
+            audit_export: crate::config::AuditExportConfig::default(),
             cors_allowed_origins: vec![],
         };
         config.database_connections.insert(
@@ -722,12 +771,19 @@ mod tests {
                 client_id: "test".into(),
                 client_secret: None,
                 scopes: vec![],
+                acr_values: vec![],
+                prompt: None,
+                max_age_seconds: None,
+                required_acr_values: vec![],
+                required_amr_values: vec![],
                 authorization_endpoint: None,
                 token_endpoint: None,
                 device_authorization_endpoint: None,
                 userinfo_endpoint: None,
                 jwks_uri: None,
             }),
+            mfa_store: crate::models::mfa::MfaStore::disabled(),
+            step_up_sessions: step_up::StepUpSessionStore::default(),
             base_aws_config,
             database_secret_provider: provider,
             database_executor: Arc::new(UnreachableExecutor),

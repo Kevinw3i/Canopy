@@ -33,6 +33,11 @@ output "ecs_service_name" {
   value       = var.create_service ? aws_ecs_service.control_plane[0].name : ""
 }
 
+output "target_group_arn" {
+  description = "ALB target group ARN for ECS service health checks"
+  value       = aws_lb_target_group.control_plane.arn
+}
+
 output "jwt_secret_arn" {
   description = "Secrets Manager ARN for JWT secret"
   value       = data.aws_secretsmanager_secret.jwt_secret.arn

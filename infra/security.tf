@@ -4,6 +4,22 @@ resource "aws_security_group" "alb" {
   name        = "${var.project}-alb-sg"
   description = "ALB for ${var.project} control-plane"
   vpc_id      = local.network_vpc_id
+
+  lifecycle {
+    precondition {
+      condition     = var.create_vpc || var.vpc_id != ""
+      error_message = "vpc_id is required when create_vpc = false."
+    }
+
+    precondition {
+      condition = (
+        var.alb_internal ||
+        var.allow_public_alb_world_cidr ||
+        !contains(var.alb_allowed_cidrs, "0.0.0.0/0")
+      )
+      error_message = "Public ALB cannot allow 0.0.0.0/0 unless allow_public_alb_world_cidr = true."
+    }
+  }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_https" {

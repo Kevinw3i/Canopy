@@ -17,6 +17,8 @@ pub struct Claims {
     pub groups: Vec<String>,
     pub exp: usize,
     pub iat: usize,
+    #[serde(default)]
+    pub jti: String,
     /// Whether the email was verified by the IdP. Only verified emails
     /// are used for entitlement membership matching.
     #[serde(default)]
@@ -53,6 +55,7 @@ impl AuthService {
             groups: identity.groups.clone(),
             exp,
             iat: now,
+            jti: uuid::Uuid::new_v4().to_string(),
             email_verified: identity.email_verified,
         };
 
@@ -145,14 +148,27 @@ impl AuthService {
 
         let mut url = reqwest::Url::parse(&endpoints.authorization_endpoint)
             .expect("authorization_endpoint must be a valid URL");
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &self.config.oidc.client_id)
-            .append_pair("redirect_uri", &req.redirect_uri)
-            .append_pair("scope", &self.config.oidc.scopes.join(" "))
-            .append_pair("state", &state)
-            .append_pair("code_challenge", &code_challenge)
-            .append_pair("code_challenge_method", "S256");
+        {
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("response_type", "code")
+                .append_pair("client_id", &self.config.oidc.client_id)
+                .append_pair("redirect_uri", &req.redirect_uri)
+                .append_pair("scope", &self.config.oidc.scopes.join(" "))
+                .append_pair("state", &state)
+                .append_pair("code_challenge", &code_challenge)
+                .append_pair("code_challenge_method", "S256");
+
+            if !self.config.oidc.acr_values.is_empty() {
+                query.append_pair("acr_values", &self.config.oidc.acr_values.join(" "));
+            }
+            if let Some(prompt) = self.config.oidc.prompt.as_deref() {
+                query.append_pair("prompt", prompt);
+            }
+            if let Some(max_age) = self.config.oidc.max_age_seconds {
+                query.append_pair("max_age", &max_age.to_string());
+            }
+        }
         let authorize_url = url.to_string();
 
         PkceAuthResponse {
@@ -236,6 +252,11 @@ mod tests {
                 client_id: "test-client".into(),
                 client_secret: None,
                 scopes: vec!["openid".into()],
+                acr_values: vec![],
+                prompt: None,
+                max_age_seconds: None,
+                required_acr_values: vec![],
+                required_amr_values: vec![],
                 authorization_endpoint: None,
                 token_endpoint: None,
                 device_authorization_endpoint: None,
@@ -255,7 +276,11 @@ mod tests {
             dev_mode,
             mock_aws_data: None,
             entitlements_file: None,
+            entitlements_database_url: None,
+            mfa_database_url: None,
+            mfa_secret_key: None,
             audit_log: None,
+            audit_export: Default::default(),
             cors_allowed_origins: vec![],
         }
     }
@@ -313,6 +338,7 @@ mod tests {
             groups: vec![],
             exp: 0, // epoch — definitely expired
             iat: 0,
+            jti: "expired-token".into(),
             email_verified: false,
         };
         let token = jsonwebtoken::encode(
@@ -379,6 +405,37 @@ mod tests {
     }
 
     #[test]
+    fn test_pkce_authorize_url_includes_mfa_controls() {
+        let mut config = test_config(false);
+        config.oidc.acr_values = vec!["urn:mfa".into(), "urn:webauthn".into()];
+        config.oidc.prompt = Some("login".into());
+        config.oidc.max_age_seconds = Some(300);
+        let svc = AuthService::new(config);
+        let endpoints = OidcEndpoints {
+            authorization_endpoint: "https://example.com/auth".into(),
+            token_endpoint: "https://example.com/token".into(),
+            device_authorization_endpoint: None,
+            userinfo_endpoint: None,
+            jwks_uri: Some("https://example.com/jwks".into()),
+        };
+        let req = PkceAuthRequest {
+            code_verifier: "test-verifier".into(),
+            redirect_uri: "http://localhost:9876/callback".into(),
+        };
+
+        let resp = svc.build_pkce_auth_url(&req, &endpoints);
+        let url = reqwest::Url::parse(&resp.authorize_url).unwrap();
+        let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+        assert_eq!(
+            query.get("acr_values").map(String::as_str),
+            Some("urn:mfa urn:webauthn")
+        );
+        assert_eq!(query.get("prompt").map(String::as_str), Some("login"));
+        assert_eq!(query.get("max_age").map(String::as_str), Some("300"));
+    }
+
+    #[test]
     fn test_pkce_state_rejects_tampered() {
         let svc = AuthService::new(test_config(false));
         assert!(!svc.verify_pkce_state("fake-nonce.0000bad0000"));
@@ -397,6 +454,9 @@ mod tests {
             iss: None,
             aud: None,
             exp: None,
+            acr: None,
+            amr: vec![],
+            auth_time: None,
         };
         let id = AuthService::identity_from_oidc_claims(&claims, vec!["ops".into()]);
         assert_eq!(id.user_id, "sub-123");
@@ -416,6 +476,9 @@ mod tests {
             iss: None,
             aud: None,
             exp: None,
+            acr: None,
+            amr: vec![],
+            auth_time: None,
         };
         let id = AuthService::identity_from_oidc_claims(&claims, vec![]);
         assert_eq!(id.email, "sub-456@unknown");

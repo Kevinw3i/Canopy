@@ -5,11 +5,11 @@
 Internal terminal operations console for AWS infrastructure management.
 
 ```
-┌──────────────┐         ┌──────────────────┐         ┌─────────┐
-│  TUI Client  │──HTTP──▶│  Control Plane   │──STS───▶│   AWS   │
-│  (ratatui)   │         │  (axum)          │         │ EC2/CWL │
-│              │◀─JSON───│                  │◀────────│ SSM/STS │
-└──────────────┘         │  - Auth (OIDC)   │         └─────────┘
+┌──────────────┐         ┌──────────────────┐         ┌──────────────┐
+│  TUI Client  │──HTTP──▶│  Control Plane   │──STS───▶│   AWS APIs   │
+│  (ratatui)   │         │  (axum)          │         │ EC2/ECS/CWL  │
+│              │◀─JSON───│                  │◀────────│ SSM/STS/Exec │
+└──────────────┘         │  - Auth (OIDC)   │         └──────────────┘
                          │  - Entitlements  │
                          │  - Audit logging │
                          │  - Server-side   │
@@ -32,25 +32,24 @@ Internal terminal operations console for AWS infrastructure management.
 - Rust 1.75+
 - Two terminal windows
 
-> AWS CLI and Session Manager plugin are only needed for the `connect` feature (SSM/EIC). All other features work without them.
+> AWS CLI and Session Manager plugin are only needed for connection features (SSM/EIC/ECS Exec). Inventory and search flows work without them.
 
 ### Step 1: Build
 
 ```bash
 cd ~/Desktop/Canopy
 cargo build
-cargo test        # 39 tests, should all pass
+cargo test        # workspace tests should all pass
 ```
 
 ### Step 2: Start the control-plane (Terminal 1)
 
 ```bash
-CONFIG_PATH=config.dev.toml cargo run -p control-plane
+DEV_MODE=1 cargo run -p control-plane
 ```
 
 You should see:
 ```
-Loaded entitlements from "entitlements.dev.toml": 2 rules, 2 memberships
 Control-plane listening on 127.0.0.1:8443
 ```
 
@@ -67,7 +66,7 @@ The TUI opens on the login screen. Type `dev-admin` and press Enter.
 | Screen | How to get there | What it shows |
 |--------|-----------------|---------------|
 | Dashboard | Automatic after login | Welcome message, navigation menu |
-| EC2 Inventory | Press `1` | 5 mock instances, search with `/`, detail with `Enter` |
+| EC2 / ECS Inventory | Press `1` | EC2 mock instances; press `Ctrl+E` when entitled to switch to ECS tasks. `Enter` opens container selection for exec-ready tasks when ECS Exec is granted |
 | CloudWatch Search | Press `2` | Query input, mock log events |
 | Access / Identity | Press `4` | Your user, groups, feature flags, allowed accounts |
 | Settings | Press `5` | Current config values; press `p` to open Change Password |
@@ -76,11 +75,11 @@ Press `Esc` to go back, `Ctrl+x` on Dashboard to log out, `q` to quit.
 
 ### Dev users
 
-Two users are pre-configured in `entitlements.dev.toml`:
+Two users are pre-configured in the built-in dev defaults:
 
 | Username | Group | What they can do |
 |----------|-------|-----------------|
-| `dev-admin` | platform-engineering | Everything: EC2, CloudWatch, SSM, EIC across 2 accounts |
+| `dev-admin` | platform-engineering | Everything: EC2, ECS, CloudWatch, SSM, EIC across 2 accounts |
 | `dev-readonly` | readonly-ops | Read-only: EC2 view + CloudWatch search on staging only, no connect |
 
 Try logging in as `dev-readonly` to see how the UI hides features the user doesn't have.
@@ -91,9 +90,8 @@ Try logging in as `dev-readonly` to see how the UI hides features the user doesn
 
 ```
 Canopy/
-├── config.dev.toml            ← Control-plane config (local dev)
 ├── config.sample.toml         ← Control-plane config (production template)
-├── entitlements.dev.toml      ← Permission rules (local dev)
+├── entitlements.sample.toml   ← Permission rules template
 ├── .env.example               ← Environment variables reference
 ├── Cargo.toml                 ← Workspace root
 │
@@ -123,7 +121,7 @@ Canopy/
 
 ## Configuration reference
 
-### Control-plane config (`config.dev.toml` / `config.toml`)
+### Control-plane config (`DEV_MODE=1` / `config.toml`)
 
 ```toml
 # ── Server ──────────────────────────────────────────
@@ -141,12 +139,26 @@ dev_mode = true                    # true = enables dev-login
 # Path to the permission rules file (TOML).
 # Required when dev_mode = false.
 # Optional when dev_mode = true (falls back to built-in dev defaults).
-entitlements_file = "entitlements.dev.toml"
+entitlements_file = "entitlements.toml"
 
 # ── Audit ───────────────────────────────────────────
 # Optional. When set, every action is appended to this file as JSON-lines.
 # If not set, audit events are only emitted via structured tracing (stdout).
 # audit_log = "/var/log/canopy/audit.jsonl"
+
+# Optional remote audit exports. These enqueue JSON audit events after the
+# local tracing/file audit write has accepted the event.
+# [audit_export]
+# queue_size = 1024
+#
+# [audit_export.cloudwatch_logs]
+# log_group_name = "/aws/canopy/audit"
+# log_stream_name = "control-plane"
+# create_log_stream = true
+#
+# [audit_export.s3]
+# bucket = "canopy-audit"
+# prefix = "prod/"
 
 # ── CORS ────────────────────────────────────────────
 # List of allowed origins. Empty + dev_mode = allow all.
@@ -187,7 +199,7 @@ session_duration_seconds = 3600   # AssumeRole session duration
 3. Else if `DEV_MODE=1` → use built-in defaults (no file needed)
 4. Else → error
 
-### Entitlements file (`entitlements.dev.toml`)
+### Entitlements file (`entitlements.sample.toml` / `entitlements.toml`)
 
 Defines who can access what. Structure:
 
@@ -201,10 +213,15 @@ allowed_regions = ["us-east-1", "us-west-2"]
 allowed_log_group_arns = [
     "arn:aws:logs:*:123456789012:log-group:/app/*",   # Wildcards supported
 ]
+allowed_clusters = [
+    "arn:aws:ecs:us-east-1:123456789012:cluster/prod-*",
+]
 allowed_os_users = ["ec2-user", "ubuntu"]              # For SSM/EIC connect
 
 [rules.features]
 can_view_ec2 = true               # Can see EC2 instances
+can_view_ecs = true               # Can see ECS tasks in allowed clusters
+can_use_ecs_exec = true           # Can open ECS Exec sessions
 can_use_cloudwatch_search = true  # Can search CloudWatch logs
 can_use_cloudwatch_tail = true    # Can use Live Tail
 can_use_ssm = true                # Can connect via SSM Session Manager
@@ -240,11 +257,11 @@ account_id = "123456789012"
 account_name = "production"
 # role_arn supports three modes:
 #   "direct"              → use ambient AWS credentials (no AssumeRole)
-#                           SSM/EIC connect not supported (SSH only)
+#                           SSM/EIC/ECS Exec not supported (SSH only)
 #   "profile:NAME"        → use a specific AWS profile from ~/.aws/credentials
-#                           SSM/EIC connect not supported (SSH only)
+#                           SSM/EIC/ECS Exec not supported (SSH only)
 #   "arn:aws:iam::...:role/..." → AssumeRole into that IAM role (production)
-#                           Supports SSM, EIC, and SSH with scoped credentials
+#                           Supports SSM, EIC, SSH, and ECS Exec with scoped credentials
 role_arn = "arn:aws:iam::123456789012:role/CanopyRole"
 
 [[rules.allowed_accounts]]
@@ -255,6 +272,10 @@ role_arn = "arn:aws:iam::234567890123:role/CanopyRole"
 [[rules.instance_tag_selectors]]        # Instance must match at least one selector
 [rules.instance_tag_selectors.tags]
 Environment = ["production", "staging"]  # Tag key = allowed values
+
+[[rules.task_tag_selectors]]             # ECS task must match at least one selector
+[rules.task_tag_selectors.tags]
+Environment = ["production"]
 
 # max_session_seconds = 3600             # Optional: auto-disconnect after 60 min
                                          # Minimum 900 seconds for non-SSH connects (AWS STS limit)
@@ -272,7 +293,7 @@ user_id = "bob@example.com"
 group = "readonly-ops"
 ```
 
-**Merge rule**: If a user belongs to multiple groups, permissions are merged additively — if *any* group grants a feature, the user has it.
+**Merge rule**: If a user belongs to multiple groups, feature flags are merged additively — if *any* group grants a feature, the user has it. ECS account, region, cluster, task tag, and sidecar denylist checks are evaluated rule-locally by the control-plane to avoid cross-group scope splicing.
 
 ### TUI client config
 
@@ -309,6 +330,27 @@ enable_live_tail = true        # Show live-tail in menu (beta feature)
 auto_update = false            # true = check & apply updates on startup
 # update_repo_owner = "Kevinw3i"  # GitHub owner (default)
 # update_repo_name = "Canopy"     # GitHub repo  (default)
+
+[theme]
+preset = "default"              # default | mono | high_contrast
+# accent = "cyan"               # color name, indexed:N, ansi:N, or #RRGGBB
+# selected_bg = "indexed:24"
+# selected_fg = "white"
+
+[keybindings]
+quit = ["ctrl+c"]
+logout = ["ctrl+x"]
+dashboard_up = ["up", "k"]
+dashboard_down = ["down", "j"]
+dashboard_select = ["enter"]
+dashboard_quit = ["q"]
+dashboard_inventory = ["1"]
+dashboard_cloudwatch = ["2"]
+dashboard_live_tail = ["3"]
+dashboard_access = ["4"]
+dashboard_settings = ["5"]
+settings_back = ["esc", "q"]
+settings_change_password = ["p"]
 ```
 
 When `auto_update = true`, the TUI checks for new `tui-v*` releases on GitHub at startup (throttled to once per 10 minutes). If a newer version is found:
@@ -316,6 +358,8 @@ When `auto_update = true`, the TUI checks for new `tui-v*` releases on GitHub at
 - **Read-only install**: shows a banner suggesting a manual download.
 
 Press `Ctrl+D` to dismiss the update banner.
+
+Theme presets and overrides apply across the TUI workflow chrome: login, dashboard, settings, access, EC2/ECS inventory, CloudWatch search, live tail, modals, and connect-session status/help/copy surfaces. Remote terminal output in connect sessions keeps the VT100 colors sent by the remote process.
 
 **How it's loaded:**
 1. If `DEV_MODE=1` → use built-in defaults and ignore the OS config file
@@ -377,10 +421,10 @@ session_duration_seconds = 3600
 
 ### Step 3: Create `entitlements.toml`
 
-Copy and edit the dev file as a starting point:
+Copy and edit the sample file as a starting point:
 
 ```bash
-cp entitlements.dev.toml entitlements.toml
+cp entitlements.sample.toml entitlements.toml
 ```
 
 Change:
@@ -432,7 +476,10 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
     "Principal": {
       "AWS": "arn:aws:iam::CONTROL_PLANE_ACCOUNT:role/CanopyBase"
     },
-    "Action": "sts:AssumeRole",
+    "Action": [
+      "sts:AssumeRole",
+      "sts:TagSession"
+    ],
     "Condition": {
       "StringEquals": {
         "sts:ExternalId": "canopy"
@@ -442,7 +489,12 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
 }
 ```
 
-**Permission policy** (what the role can do):
+The control-plane's own AWS identity also needs `sts:AssumeRole`, `sts:TagSession`,
+and `iam:SimulatePrincipalPolicy` on these target role ARNs so it can choose a
+role and then mint scoped STS credentials for connect flows.
+
+**Permission policy** (what the target role can do before Canopy applies its
+per-request inline session policy):
 ```json
 {
   "Version": "2012-10-17",
@@ -451,6 +503,7 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceConnectEndpoints",
         "logs:DescribeLogGroups",
         "logs:FilterLogEvents",
         "logs:StartQuery",
@@ -459,7 +512,16 @@ Each AWS account in `entitlements.toml` needs an IAM role that the control-plane
         "ssm:StartSession",
         "ssm:DescribeInstanceInformation",
         "ec2-instance-connect:SendSSHPublicKey",
-        "ec2-instance-connect:OpenTunnel"
+        "ec2-instance-connect:OpenTunnel",
+        "ecs:DescribeClusters",
+        "ecs:DescribeTasks",
+        "ecs:ListClusters",
+        "ecs:ListTasks",
+        "ecs:ExecuteCommand",
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
       ],
       "Resource": "*"
     }
@@ -525,10 +587,10 @@ Each operator runs one command:
 ```
 
 The script automatically:
-1. Installs the `canopy` binary to `/usr/local/bin/`
+1. Installs the `canopy` binary to `~/.local/bin/` by default (`CANOPY_BIN_DIR` can override it)
 2. Creates the TUI config file (URL already filled in, OS-specific path)
-3. Installs AWS CLI v2 if missing
-4. Installs Session Manager Plugin if missing
+3. Installs AWS CLI v2 if missing when installer verification is available; otherwise prompts for manual install (needed for SSM/EIC/ECS Exec connection flows)
+4. Installs Session Manager Plugin if missing on macOS; Linux operators get a manual install prompt until verified installer signature support is configured (needed for SSM/ECS Exec)
 5. Removes macOS Gatekeeper quarantine flag if needed
 6. Runs a full verification check
 
@@ -563,6 +625,7 @@ Every action is logged with structured tracing **and** to a durable JSON-lines f
 
 - Login / logout
 - EC2 list requests
+- ECS task list / exec requests
 - CloudWatch searches
 - Live tail start/stop
 - Connect actions
@@ -580,13 +643,14 @@ When the durable audit file is configured and a write fails, the API returns 503
 |-----|---------|--------|
 | `j/k` | Tables | Navigate rows |
 | `Enter` | Tables | Toggle detail / execute |
-| `/` | EC2, CW | Focus search/filter |
+| `/` | EC2, ECS, CW | Focus search/filter |
+| `Ctrl+E` | Inventory | Toggle EC2/ECS view when entitled |
 | `s` | EC2 | SSM Session Manager connect |
 | `e` | EC2 | EC2 Instance Connect SSH |
 | `c` | EC2 | Direct SSH (your own key) |
-| `r` | EC2 | Refresh |
-| `[`/`]` | CW Search | Cycle accounts (prev/next) |
-| `{`/`}` | CW Search | Cycle regions (prev/next) |
+| `r` | EC2, ECS | Refresh |
+| `[`/`]` | Inventory, CW Search | Cycle accounts (prev/next) |
+| `{`/`}` | Inventory, CW Search | Cycle regions (prev/next) |
 | `x` | CW Search | Export results |
 | `Tab` | CW Search | Toggle quick/insights mode |
 | `Esc` | Any | Go back / unfocus |
@@ -597,9 +661,9 @@ When the durable audit file is configured and a write fails, the API returns 503
 
 ## Security model
 
-- **Server-side filtering**: EC2 instances and CloudWatch data are filtered by entitlements on the backend before returning to the TUI. The client never sees unauthorized resources.
+- **Server-side filtering**: EC2 instances, ECS tasks, and CloudWatch data are filtered by entitlements on the backend before returning to the TUI. The client never sees unauthorized resources.
 - **Scope isolation**: Feature grants and resource scopes are evaluated per-rule to prevent cross-group privilege escalation. A feature from one group cannot be applied to resources from another group.
-- **Short-lived credentials**: STS AssumeRole with session tags. Connect operations use inline session policies scoped to the specific instance, including OS-user binding via IAM conditions (`ssm:SessionDocumentAccessCheck`, `ec2:osuser`).
+- **Short-lived credentials**: STS AssumeRole with session tags. Connect operations use inline session policies that scope the primary action to the specific instance or ECS task, including OS-user binding via IAM conditions (`ssm:SessionDocumentAccessCheck`, `ec2:osuser`) and ECS cluster binding for `ecs:ExecuteCommand`; ECS Exec credentials also include only the required `ecs:DescribeTasks` and `ssmmessages` helper actions, limited to the requested AWS region.
 - **Account identity verification**: `direct`/`profile:` and AssumeRole credentials are verified via `GetCallerIdentity` to ensure they match the configured `account_id`.
 - **No long-lived AWS keys in the TUI**: All AWS access goes through the control-plane.
 - **Audit fail-closed**: If the durable audit log cannot be written, all protected APIs (including login, refresh, entitlements) return 503. Transient I/O failures self-recover without restart.

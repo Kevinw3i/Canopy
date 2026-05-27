@@ -3,11 +3,13 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Paragraph, Row, Wrap},
 };
-use shared::dto::ec2::Ec2Instance;
+use shared::dto::ec2::{Ec2Instance, Ec2PowerAction, InstanceState};
+use shared::dto::ecs::{EcsContainer, EcsTask};
 use shared::dto::entitlements::UserEntitlements;
 
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
 use crate::event::Action;
+use crate::theme::Theme;
 use crate::widgets::input::TextInput;
 use crate::widgets::table::SelectableTable;
 
@@ -17,6 +19,10 @@ enum Ec2Focus {
     DetailPanel,
     /// OS user selection popup before connecting
     OsUserSelect,
+    /// ECS container picker before execute-command
+    ContainerPicker,
+    /// EC2 start/stop/reboot confirmation popup
+    PowerConfirm,
 }
 
 /// Pending connect action waiting for OS user selection
@@ -39,6 +45,40 @@ struct ConnectDispatchTarget {
     account_id: String,
     region: String,
     os_user: Option<String>,
+}
+
+struct PendingEcsExec {
+    account_id: String,
+    region: String,
+    cluster_arn: String,
+    task_arn: String,
+    containers: Vec<String>,
+    selected: usize,
+}
+
+struct PendingPowerAction {
+    instance_id: String,
+    instance_name: Option<String>,
+    account_id: String,
+    region: String,
+    current_state: InstanceState,
+    action: Ec2PowerAction,
+    confirmation: TextInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InventoryView {
+    Ec2,
+    Ecs,
+}
+
+impl InventoryView {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ec2 => "EC2",
+            Self::Ecs => "ECS",
+        }
+    }
 }
 
 /// Which instances to show based on state
@@ -77,14 +117,22 @@ impl StateFilter {
 
 pub struct Ec2Screen {
     pub instances: Vec<Ec2Instance>,
+    pub tasks: Vec<EcsTask>,
+    ecs_total_count: usize,
+    ecs_results_truncated: bool,
+    ecs_failed_scope_count: usize,
     pub loading: bool,
     pub error: Option<String>,
     entitlements: Option<UserEntitlements>,
     pub search_input: TextInput,
     table: SelectableTable,
+    ecs_table: SelectableTable,
+    view: InventoryView,
     focus: Ec2Focus,
     show_detail: bool,
     pending_connect: Option<PendingConnect>,
+    pending_ecs_exec: Option<PendingEcsExec>,
+    pending_power: Option<PendingPowerAction>,
     state_filter: StateFilter,
 
     // Scope selection for account/region cycling
@@ -96,6 +144,7 @@ pub struct Ec2Screen {
     loading_spinner: LoadingIndicator,
     /// Monotonically increasing counter to detect stale async responses
     pub fetch_generation: u64,
+    theme: Theme,
 }
 
 impl Default for Ec2Screen {
@@ -106,12 +155,20 @@ impl Default for Ec2Screen {
 
 impl Ec2Screen {
     pub fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
         Self {
             instances: Vec::new(),
+            tasks: Vec::new(),
+            ecs_total_count: 0,
+            ecs_results_truncated: false,
+            ecs_failed_scope_count: 0,
             loading: false,
             error: None,
             entitlements: None,
-            search_input: TextInput::new("Search (name, id, ip)"),
+            search_input: TextInput::new("Search (name, id, ip)").with_theme(theme),
             table: SelectableTable::new(
                 vec![
                     "Instance ID".into(),
@@ -121,7 +178,7 @@ impl Ec2Screen {
                     "State".into(),
                     "Type".into(),
                     "SSM".into(),
-                    "SSH".into(),
+                    "EIC".into(),
                     "Env".into(),
                 ],
                 vec![
@@ -135,24 +192,73 @@ impl Ec2Screen {
                     Constraint::Length(5),
                     Constraint::Length(12),
                 ],
-            ),
+            )
+            .with_theme(theme),
+            ecs_table: SelectableTable::new(
+                vec![
+                    "Cluster".into(),
+                    "Family".into(),
+                    "Task ID".into(),
+                    "Launch".into(),
+                    "Status".into(),
+                    "Containers".into(),
+                    "Account".into(),
+                    "Region".into(),
+                ],
+                vec![
+                    Constraint::Length(20),
+                    Constraint::Min(14),
+                    Constraint::Length(18),
+                    Constraint::Length(8),
+                    Constraint::Length(10),
+                    Constraint::Length(24),
+                    Constraint::Length(14),
+                    Constraint::Length(14),
+                ],
+            )
+            .with_theme(theme),
+            view: InventoryView::Ec2,
             focus: Ec2Focus::Table,
             show_detail: false,
             pending_connect: None,
+            pending_ecs_exec: None,
+            pending_power: None,
             state_filter: StateFilter::All,
             selected_account_id: None,
             selected_region: None,
             available_accounts: Vec::new(),
             available_regions: Vec::new(),
             scope_transition: None,
-            loading_spinner: LoadingIndicator::new("Loading EC2 instances..."),
+            loading_spinner: LoadingIndicator::new("Loading EC2 instances...").with_theme(theme),
             fetch_generation: 0,
+            theme,
         }
     }
 
     pub fn set_instances(&mut self, instances: Vec<Ec2Instance>) {
         self.instances = instances;
         self.apply_state_filter();
+        self.loading = false;
+        self.error = None;
+    }
+
+    pub fn set_tasks(&mut self, tasks: Vec<EcsTask>) {
+        self.set_ecs_task_results(tasks, None, false, 0);
+    }
+
+    pub fn set_ecs_task_results(
+        &mut self,
+        tasks: Vec<EcsTask>,
+        total_count: Option<usize>,
+        truncated: bool,
+        failed_scope_count: usize,
+    ) {
+        let task_count = tasks.len();
+        self.tasks = tasks;
+        self.ecs_total_count = total_count.unwrap_or(task_count).max(task_count);
+        self.ecs_results_truncated = truncated;
+        self.ecs_failed_scope_count = failed_scope_count;
+        self.apply_ecs_filter();
         self.loading = false;
         self.error = None;
     }
@@ -175,6 +281,10 @@ impl Ec2Screen {
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {
+        if !ent.features.can_view_ec2 && ent.features.can_view_ecs {
+            self.view = InventoryView::Ecs;
+        }
+
         // Populate available accounts (deduplicated, sorted)
         self.available_accounts = ent
             .allowed_accounts
@@ -209,31 +319,164 @@ impl Ec2Screen {
         self.table.selected().and_then(|i| filtered.get(i).copied())
     }
 
+    fn selected_task(&self) -> Option<&EcsTask> {
+        let filtered = self.filtered_tasks();
+        self.ecs_table
+            .selected()
+            .and_then(|i| filtered.get(i).copied())
+    }
+
+    fn filtered_tasks(&self) -> Vec<&EcsTask> {
+        let query = self.search_input.value.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return self.tasks.iter().collect();
+        }
+
+        self.tasks
+            .iter()
+            .filter(|task| {
+                task.cluster_name.to_ascii_lowercase().contains(&query)
+                    || task
+                        .family
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                    || task
+                        .task_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase()
+                        .contains(&query)
+                    || task
+                        .containers
+                        .iter()
+                        .any(|container| container.name.to_ascii_lowercase().contains(&query))
+            })
+            .collect()
+    }
+
+    fn ecs_task_count_display(&self) -> String {
+        let loaded_count = self.tasks.len();
+        let known_total = self.ecs_total_count.max(loaded_count);
+        let filtered_count = self.filtered_tasks().len();
+        let suffix = if self.ecs_results_truncated { "+" } else { "" };
+        let base = if self.search_input.value.trim().is_empty() {
+            if known_total > loaded_count {
+                format!("{loaded_count}/{known_total}{suffix} tasks")
+            } else {
+                format!("{loaded_count}{suffix} tasks")
+            }
+        } else if known_total > loaded_count {
+            format!("{filtered_count}/{loaded_count}/{known_total}{suffix} tasks")
+        } else {
+            format!("{filtered_count}/{loaded_count}{suffix} tasks")
+        };
+
+        let mut parts = vec![base];
+        if self.ecs_results_truncated {
+            parts.push("truncated".into());
+        }
+        if self.ecs_failed_scope_count > 0 {
+            let noun = if self.ecs_failed_scope_count == 1 {
+                "scope"
+            } else {
+                "scopes"
+            };
+            parts.push(format!(
+                "partial: {} {} failed",
+                self.ecs_failed_scope_count, noun
+            ));
+        }
+        parts.join(" | ")
+    }
+
+    fn has_ecs_result_warning(&self) -> bool {
+        self.view == InventoryView::Ecs
+            && (self.ecs_results_truncated || self.ecs_failed_scope_count > 0)
+    }
+
+    fn apply_ecs_filter(&mut self) {
+        let count = self.filtered_tasks().len();
+        self.ecs_table.set_row_count(count);
+    }
+
+    fn refresh_current_view_action(&self) -> Action {
+        match self.view {
+            InventoryView::Ec2 => Action::RefreshEc2,
+            InventoryView::Ecs => Action::RefreshEcsTasks,
+        }
+    }
+
+    fn search_label(&self) -> &'static str {
+        match self.view {
+            InventoryView::Ec2 => "Search (name, id, ip)",
+            InventoryView::Ecs => "Search (cluster, family, task, container)",
+        }
+    }
+
+    fn can_view_inventory(&self, view: InventoryView) -> bool {
+        match self.entitlements.as_ref() {
+            Some(ent) => match view {
+                InventoryView::Ec2 => ent.features.can_view_ec2,
+                InventoryView::Ecs => ent.features.can_view_ecs,
+            },
+            None => true,
+        }
+    }
+
+    fn toggle_target(&self) -> InventoryView {
+        match self.view {
+            InventoryView::Ec2 => InventoryView::Ecs,
+            InventoryView::Ecs => InventoryView::Ec2,
+        }
+    }
+
+    fn toggle_hint(&self) -> Option<&'static str> {
+        let target = self.toggle_target();
+        self.can_view_inventory(target).then_some(target.label())
+    }
+
+    pub fn toggle_inventory_view(&mut self) -> Action {
+        let target = self.toggle_target();
+        if !self.can_view_inventory(target) {
+            return Action::ShowError(format!("{} inventory is not authorized", target.label()));
+        }
+
+        self.view = target;
+        self.sanitize_scope_for_current_view();
+        self.clear_instances();
+        match self.view {
+            InventoryView::Ec2 => Action::RefreshEc2,
+            InventoryView::Ecs => Action::RefreshEcsTasks,
+        }
+    }
+
     fn render_detail(&self, area: Rect, buf: &mut Buffer) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Instance Detail ")
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(self.theme.focused_border_style());
         let inner = block.inner(area);
         block.render(area, buf);
 
         if let Some(inst) = self.selected_instance() {
             let state_style = match inst.state {
-                shared::dto::ec2::InstanceState::Running => Style::default().fg(Color::Green),
-                shared::dto::ec2::InstanceState::Stopped => Style::default().fg(Color::Red),
-                _ => Style::default().fg(Color::Yellow),
+                shared::dto::ec2::InstanceState::Running => self.theme.success_style(),
+                shared::dto::ec2::InstanceState::Stopped => self.theme.danger_style(),
+                _ => self.theme.warning_style(),
             };
 
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("Instance ID: ", Style::default().bold()),
-                    Span::styled(&inst.instance_id, Style::default().fg(Color::Yellow)),
+                    Span::styled(&inst.instance_id, self.theme.warning_style()),
                 ]),
                 Line::from(vec![
                     Span::styled("Name:        ", Style::default().bold()),
                     Span::styled(
                         inst.name.as_deref().unwrap_or("-"),
-                        Style::default().fg(Color::White).bold(),
+                        self.theme.text_style().bold(),
                     ),
                 ]),
                 Line::from(vec![
@@ -311,64 +554,61 @@ impl Ec2Screen {
                 .as_ref()
                 .map(|e| e.features.can_use_ec2_instance_connect)
                 .unwrap_or(false);
+            let has_start = self.has_power_entitlement(Ec2PowerAction::Start);
+            let has_stop = self.has_power_entitlement(Ec2PowerAction::Stop);
+            let has_reboot = self.has_power_entitlement(Ec2PowerAction::Reboot);
 
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Connect:",
-                Style::default().bold().fg(Color::Cyan),
+                self.theme.accent_style().bold(),
             )));
 
             if !is_running {
                 lines.push(Line::from(Span::styled(
                     "  Instance is not running",
-                    Style::default().fg(Color::Red),
+                    self.theme.danger_style(),
                 )));
             } else {
                 // SSM
                 if inst.ssm_managed && has_ssm {
                     lines.push(Line::from(vec![
-                        Span::styled("  [s] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled("SSM Session Manager", Style::default().fg(Color::White)),
-                        Span::styled(" - ready", Style::default().fg(Color::Green)),
+                        Span::styled("  [s] ", self.theme.success_style().bold()),
+                        Span::styled("SSM Session Manager", self.theme.text_style()),
+                        Span::styled(" - ready", self.theme.success_style()),
                     ]));
                 } else if inst.ssm_managed && !has_ssm {
                     lines.push(Line::from(vec![
-                        Span::styled("  [s] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSM Session Manager", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                        Span::styled("  [s] ", self.theme.muted_style()),
+                        Span::styled("SSM Session Manager", self.theme.muted_style()),
+                        Span::styled(" - not authorized", self.theme.danger_style()),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("  [s] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSM Session Manager", Style::default().fg(Color::Gray)),
-                        Span::styled(
-                            " - not available (no SSM agent)",
-                            Style::default().fg(Color::Gray),
-                        ),
+                        Span::styled("  [s] ", self.theme.muted_style()),
+                        Span::styled("SSM Session Manager", self.theme.muted_style()),
+                        Span::styled(" - not available (no SSM agent)", self.theme.muted_style()),
                     ]));
                 }
 
                 // EC2 Instance Connect
                 if inst.instance_connect_capable && has_eic {
                     lines.push(Line::from(vec![
-                        Span::styled("  [e] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled(
-                            "EC2 Instance Connect SSH",
-                            Style::default().fg(Color::White),
-                        ),
-                        Span::styled(" - ready", Style::default().fg(Color::Green)),
+                        Span::styled("  [e] ", self.theme.success_style().bold()),
+                        Span::styled("EC2 Instance Connect SSH", self.theme.text_style()),
+                        Span::styled(" - ready", self.theme.success_style()),
                     ]));
                 } else if inst.instance_connect_capable && !has_eic {
                     lines.push(Line::from(vec![
-                        Span::styled("  [e] ", Style::default().fg(Color::Gray)),
-                        Span::styled("EC2 Instance Connect SSH", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                        Span::styled("  [e] ", self.theme.muted_style()),
+                        Span::styled("EC2 Instance Connect SSH", self.theme.muted_style()),
+                        Span::styled(" - not authorized", self.theme.danger_style()),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("  [e] ", Style::default().fg(Color::Gray)),
-                        Span::styled("EC2 Instance Connect SSH", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not available", Style::default().fg(Color::Gray)),
+                        Span::styled("  [e] ", self.theme.muted_style()),
+                        Span::styled("EC2 Instance Connect SSH", self.theme.muted_style()),
+                        Span::styled(" - not available", self.theme.muted_style()),
                     ]));
                 }
 
@@ -381,24 +621,21 @@ impl Ec2Screen {
                         .or(inst.private_ip.as_deref())
                         .unwrap_or("?");
                     lines.push(Line::from(vec![
-                        Span::styled("  [c] ", Style::default().fg(Color::Green).bold()),
-                        Span::styled("SSH (your key)", Style::default().fg(Color::White)),
-                        Span::styled(
-                            format!(" - {}", ip_display),
-                            Style::default().fg(Color::Green),
-                        ),
+                        Span::styled("  [c] ", self.theme.success_style().bold()),
+                        Span::styled("SSH (your key)", self.theme.text_style()),
+                        Span::styled(format!(" - {}", ip_display), self.theme.success_style()),
                     ]));
                 } else if has_ip && !has_ssm {
                     lines.push(Line::from(vec![
-                        Span::styled("  [c] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSH (your key)", Style::default().fg(Color::Gray)),
-                        Span::styled(" - not authorized", Style::default().fg(Color::Red)),
+                        Span::styled("  [c] ", self.theme.muted_style()),
+                        Span::styled("SSH (your key)", self.theme.muted_style()),
+                        Span::styled(" - not authorized", self.theme.danger_style()),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled("  [c] ", Style::default().fg(Color::Gray)),
-                        Span::styled("SSH (your key)", Style::default().fg(Color::Gray)),
-                        Span::styled(" - no IP address", Style::default().fg(Color::Gray)),
+                        Span::styled("  [c] ", self.theme.muted_style()),
+                        Span::styled("SSH (your key)", self.theme.muted_style()),
+                        Span::styled(" - no IP address", self.theme.muted_style()),
                     ]));
                 }
 
@@ -406,9 +643,71 @@ impl Ec2Screen {
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         "  No connect method available for this instance",
-                        Style::default().fg(Color::Yellow),
+                        self.theme.warning_style(),
                     )));
                 }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Power:",
+                self.theme.danger_style().bold(),
+            )));
+            if has_start {
+                let (label, style) = if inst.state == InstanceState::Stopped {
+                    (" - ready", self.theme.success_style())
+                } else {
+                    (" - requires stopped", self.theme.muted_style())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  [S] ", self.theme.success_style().bold()),
+                    Span::styled("Start", self.theme.text_style()),
+                    Span::styled(label, style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  [S] ", self.theme.muted_style()),
+                    Span::styled("Start", self.theme.muted_style()),
+                    Span::styled(" - not authorized", self.theme.danger_style()),
+                ]));
+            }
+
+            if has_stop {
+                let (label, style) = if inst.state == InstanceState::Running {
+                    (" - ready", self.theme.success_style())
+                } else {
+                    (" - requires running", self.theme.muted_style())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  [X] ", self.theme.danger_style().bold()),
+                    Span::styled("Stop", self.theme.text_style()),
+                    Span::styled(label, style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  [X] ", self.theme.muted_style()),
+                    Span::styled("Stop", self.theme.muted_style()),
+                    Span::styled(" - not authorized", self.theme.danger_style()),
+                ]));
+            }
+
+            if has_reboot {
+                let (label, style) = if inst.state == InstanceState::Running {
+                    (" - ready", self.theme.success_style())
+                } else {
+                    (" - requires running", self.theme.muted_style())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  [B] ", self.theme.warning_style().bold()),
+                    Span::styled("Reboot", self.theme.text_style()),
+                    Span::styled(label, style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  [B] ", self.theme.muted_style()),
+                    Span::styled("Reboot", self.theme.muted_style()),
+                    Span::styled(" - not authorized", self.theme.danger_style()),
+                ]));
             }
 
             Paragraph::new(lines)
@@ -416,7 +715,7 @@ impl Ec2Screen {
                 .render(inner, buf);
         } else {
             Paragraph::new("No instance selected")
-                .style(Style::default().fg(Color::Gray))
+                .style(self.theme.muted_style())
                 .render(inner, buf);
         }
     }
@@ -511,69 +810,208 @@ impl Ec2Screen {
         Action::Noop
     }
 
+    fn has_power_entitlement(&self, action: Ec2PowerAction) -> bool {
+        self.entitlements
+            .as_ref()
+            .map(|entitlements| match action {
+                Ec2PowerAction::Start => entitlements.features.can_start_ec2,
+                Ec2PowerAction::Stop => entitlements.features.can_stop_ec2,
+                Ec2PowerAction::Reboot => entitlements.features.can_reboot_ec2,
+            })
+            .unwrap_or(false)
+    }
+
+    fn start_power_action(&mut self, action: Ec2PowerAction) -> Action {
+        if self.loading {
+            return Action::Noop;
+        }
+        let Some(inst) = self.selected_instance() else {
+            return Action::Noop;
+        };
+        if !self.has_power_entitlement(action) {
+            return Action::ShowError(format!("EC2 {} is not authorized for this user", action));
+        }
+
+        match action {
+            Ec2PowerAction::Start if inst.state != InstanceState::Stopped => {
+                return Action::ShowError("Start is only available for stopped instances".into());
+            }
+            Ec2PowerAction::Stop | Ec2PowerAction::Reboot
+                if inst.state != InstanceState::Running =>
+            {
+                return Action::ShowError(format!(
+                    "{} is only available for running instances",
+                    action
+                ));
+            }
+            _ => {}
+        }
+
+        let mut confirmation = TextInput::new("Type instance id to confirm");
+        confirmation.focused = true;
+
+        self.pending_power = Some(PendingPowerAction {
+            instance_id: inst.instance_id.clone(),
+            instance_name: inst.name.clone(),
+            account_id: inst.account_id.clone(),
+            region: inst.region.clone(),
+            current_state: inst.state.clone(),
+            action,
+            confirmation,
+        });
+        self.focus = Ec2Focus::PowerConfirm;
+        Action::Noop
+    }
+
     /// Clear instance list and selection to prevent stale cross-scope actions.
     fn clear_instances(&mut self) {
         // Advance generation first so any in-flight response is rejected
         self.fetch_generation += 1;
         self.instances.clear();
+        self.tasks.clear();
+        self.ecs_total_count = 0;
+        self.ecs_results_truncated = false;
+        self.ecs_failed_scope_count = 0;
         self.table.set_row_count(0);
+        self.ecs_table.set_row_count(0);
+        self.loading = false;
         self.error = None;
         self.show_detail = false;
         self.focus = Ec2Focus::Table;
         self.pending_connect = None;
+        self.pending_ecs_exec = None;
+        self.pending_power = None;
         self.search_input.clear();
+    }
+
+    fn account_scope_options(&self) -> Vec<String> {
+        match self.view {
+            InventoryView::Ec2 => self.available_accounts.clone(),
+            InventoryView::Ecs => self.entitlements.as_ref().map_or_else(Vec::new, |ent| {
+                ecs_account_scope_options(ent, self.selected_region.as_deref())
+            }),
+        }
+    }
+
+    fn region_scope_options(&self) -> Vec<String> {
+        match self.view {
+            InventoryView::Ec2 => self.available_regions.clone(),
+            InventoryView::Ecs => self.entitlements.as_ref().map_or_else(Vec::new, |ent| {
+                ecs_region_scope_options(ent, self.selected_account_id.as_deref())
+            }),
+        }
+    }
+
+    fn sanitize_scope_for_current_view(&mut self) {
+        match self.view {
+            InventoryView::Ec2 => {
+                if self
+                    .selected_account_id
+                    .as_ref()
+                    .is_some_and(|account| !self.available_accounts.contains(account))
+                {
+                    self.selected_account_id = None;
+                }
+                if self
+                    .selected_region
+                    .as_ref()
+                    .is_some_and(|region| !self.available_regions.contains(region))
+                {
+                    self.selected_region = None;
+                }
+            }
+            InventoryView::Ecs => {
+                let Some(entitlements) = self.entitlements.as_ref() else {
+                    self.selected_account_id = None;
+                    self.selected_region = None;
+                    return;
+                };
+
+                let accounts = ecs_account_scope_options(entitlements, None);
+                if self
+                    .selected_account_id
+                    .as_ref()
+                    .is_some_and(|account| !accounts.contains(account))
+                {
+                    self.selected_account_id = None;
+                }
+
+                let regions = ecs_region_scope_options(entitlements, None);
+                if self.selected_region.as_ref().is_some_and(|region| {
+                    !regions.contains(region)
+                        && !ecs_region_selection_matches(
+                            entitlements,
+                            self.selected_account_id.as_deref(),
+                            region,
+                        )
+                }) {
+                    self.selected_region = None;
+                }
+
+                if let (Some(account), Some(region)) = (
+                    self.selected_account_id.as_deref(),
+                    self.selected_region.as_deref(),
+                ) {
+                    if !ecs_scope_pair_matches(entitlements, account, region) {
+                        self.selected_region = None;
+                    }
+                }
+            }
+        }
     }
 
     /// Cycle account: None (All) → first → second → … → None (All)
     fn cycle_account(&mut self, forward: bool) -> bool {
-        if self.available_accounts.is_empty() {
+        let accounts = self.account_scope_options();
+        if accounts.is_empty() {
             return false;
         }
         let cur_idx = self
             .selected_account_id
             .as_ref()
-            .and_then(|id| self.available_accounts.iter().position(|a| a == id));
+            .and_then(|id| accounts.iter().position(|a| a == id));
         let next = if forward {
             match cur_idx {
                 None => Some(0),
-                Some(i) if i + 1 < self.available_accounts.len() => Some(i + 1),
+                Some(i) if i + 1 < accounts.len() => Some(i + 1),
                 Some(_) => None,
             }
         } else {
             match cur_idx {
-                None => Some(self.available_accounts.len() - 1),
+                None => Some(accounts.len() - 1),
                 Some(0) => None,
                 Some(i) => Some(i - 1),
             }
         };
-        self.selected_account_id = next.map(|i| self.available_accounts[i].clone());
+        self.selected_account_id = next.map(|i| accounts[i].clone());
         self.clear_instances();
         true
     }
 
     /// Cycle region: None (All) → first → second → … → None (All)
     fn cycle_region(&mut self, forward: bool) -> bool {
-        if self.available_regions.is_empty() {
+        let regions = self.region_scope_options();
+        if regions.is_empty() {
             return false;
         }
         let cur_idx = self
             .selected_region
             .as_ref()
-            .and_then(|id| self.available_regions.iter().position(|r| r == id));
+            .and_then(|id| regions.iter().position(|r| r == id));
         let next = if forward {
             match cur_idx {
                 None => Some(0),
-                Some(i) if i + 1 < self.available_regions.len() => Some(i + 1),
+                Some(i) if i + 1 < regions.len() => Some(i + 1),
                 Some(_) => None,
             }
         } else {
             match cur_idx {
-                None => Some(self.available_regions.len() - 1),
+                None => Some(regions.len() - 1),
                 Some(0) => None,
                 Some(i) => Some(i - 1),
             }
         };
-        self.selected_region = next.map(|i| self.available_regions[i].clone());
+        self.selected_region = next.map(|i| regions[i].clone());
         self.clear_instances();
         true
     }
@@ -607,6 +1045,154 @@ impl Ec2Screen {
             },
         }
     }
+
+    fn start_ecs_exec(&mut self) -> Action {
+        if self.loading {
+            return Action::Noop;
+        }
+        let Some(task) = self.selected_task() else {
+            return Action::Noop;
+        };
+        if !ecs_status_is_running(&task.last_status) {
+            return Action::ShowError("Task is not running".into());
+        }
+        if !task.enable_execute_command {
+            return Action::ShowError("ECS Exec is not enabled for this task".into());
+        }
+        let containers = ecs_exec_ready_container_names(task);
+        if containers.is_empty() {
+            return Action::ShowError("No containers are ready for ECS Exec".into());
+        }
+
+        self.pending_ecs_exec = Some(PendingEcsExec {
+            account_id: task.account_id.clone(),
+            region: task.region.clone(),
+            cluster_arn: task.cluster_arn.clone(),
+            task_arn: task.task_arn.clone(),
+            containers,
+            selected: 0,
+        });
+        self.focus = Ec2Focus::ContainerPicker;
+        Action::Noop
+    }
+}
+
+fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
+    task.containers
+        .iter()
+        .filter(|container| {
+            ecs_status_is_running(&container.last_status) && container.execute_command_agent_running
+        })
+        .map(|container| container.name.clone())
+        .collect()
+}
+
+fn ecs_status_is_running(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("RUNNING")
+}
+
+fn ecs_container_readiness_label(task_exec_enabled: bool, container: &EcsContainer) -> String {
+    if !task_exec_enabled {
+        return format!("{}:disabled", container.name);
+    }
+    let last_status = container.last_status.trim();
+    if !ecs_status_is_running(last_status) {
+        let status_label = if last_status.is_empty() {
+            "unknown".to_string()
+        } else {
+            last_status.to_ascii_lowercase()
+        };
+        return format!("{}:{}", container.name, status_label);
+    }
+    if container.execute_command_agent_running {
+        format!("{}:ready", container.name)
+    } else {
+        format!("{}:no-agent", container.name)
+    }
+}
+
+fn ecs_account_scope_options(
+    entitlements: &UserEntitlements,
+    selected_region: Option<&str>,
+) -> Vec<String> {
+    let mut accounts = std::collections::BTreeSet::new();
+    for pattern in &entitlements.allowed_clusters {
+        let Some((region, account)) = ecs_cluster_pattern_scope(pattern) else {
+            continue;
+        };
+        if !ecs_region_part_matches_selection(region, selected_region) {
+            continue;
+        }
+        if account != "*" && !account.is_empty() {
+            accounts.insert(account.to_string());
+        }
+    }
+    accounts.into_iter().collect()
+}
+
+fn ecs_region_scope_options(
+    entitlements: &UserEntitlements,
+    selected_account: Option<&str>,
+) -> Vec<String> {
+    let mut regions = std::collections::BTreeSet::new();
+    for pattern in &entitlements.allowed_clusters {
+        let Some((region, account)) = ecs_cluster_pattern_scope(pattern) else {
+            continue;
+        };
+        if !ecs_account_part_matches_selection(account, selected_account) {
+            continue;
+        }
+        if region != "*" && !region.is_empty() {
+            regions.insert(region.to_string());
+        }
+    }
+    regions.into_iter().collect()
+}
+
+fn ecs_scope_pair_matches(entitlements: &UserEntitlements, account: &str, region: &str) -> bool {
+    entitlements.allowed_clusters.iter().any(|pattern| {
+        ecs_cluster_pattern_scope(pattern).is_some_and(|(cluster_region, cluster_account)| {
+            ecs_account_part_matches_selection(cluster_account, Some(account))
+                && ecs_region_part_matches_selection(cluster_region, Some(region))
+        })
+    })
+}
+
+fn ecs_region_selection_matches(
+    entitlements: &UserEntitlements,
+    selected_account: Option<&str>,
+    region: &str,
+) -> bool {
+    entitlements.allowed_clusters.iter().any(|pattern| {
+        ecs_cluster_pattern_scope(pattern).is_some_and(|(cluster_region, cluster_account)| {
+            ecs_region_part_matches_selection(cluster_region, Some(region))
+                && ecs_account_part_matches_selection(cluster_account, selected_account)
+        })
+    })
+}
+
+fn ecs_cluster_pattern_scope(pattern: &str) -> Option<(&str, &str)> {
+    let mut parts = pattern.split(':');
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("arn"), Some(_partition), Some("ecs"), Some(region), Some(account)) => {
+            Some((region, account))
+        }
+        _ => None,
+    }
+}
+
+fn ecs_region_part_matches_selection(part: &str, selected: Option<&str>) -> bool {
+    selected.is_none_or(|selected| part == "*" || part == selected)
+}
+
+fn ecs_account_part_matches_selection(part: &str, selected: Option<&str>) -> bool {
+    selected.is_none_or(|selected| part != "*" && part == selected)
 }
 
 impl Component for Ec2Screen {
@@ -669,7 +1255,102 @@ impl Component for Ec2Screen {
             }
         }
 
+        if matches!(self.focus, Ec2Focus::ContainerPicker) {
+            if let Some(ref mut pending) = self.pending_ecs_exec {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.pending_ecs_exec = None;
+                        self.focus = Ec2Focus::Table;
+                        return Action::Noop;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if pending.selected > 0 {
+                            pending.selected -= 1;
+                        }
+                        return Action::Noop;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if pending.selected < pending.containers.len().saturating_sub(1) {
+                            pending.selected += 1;
+                        }
+                        return Action::Noop;
+                    }
+                    KeyCode::Enter => {
+                        let can_exec = self
+                            .entitlements
+                            .as_ref()
+                            .map(|e| e.features.can_use_ecs_exec)
+                            .unwrap_or(false);
+                        if !can_exec {
+                            return Action::ShowError(
+                                "ECS exec requires can_use_ecs_exec entitlement".into(),
+                            );
+                        }
+                        let container_name = pending.containers[pending.selected].clone();
+                        let account_id = pending.account_id.clone();
+                        let region = pending.region.clone();
+                        let cluster_arn = pending.cluster_arn.clone();
+                        let task_arn = pending.task_arn.clone();
+                        self.pending_ecs_exec = None;
+                        self.focus = Ec2Focus::Table;
+                        return Action::ConnectEcsExec {
+                            account_id,
+                            region,
+                            cluster_arn,
+                            task_arn,
+                            container_name,
+                        };
+                    }
+                    _ => return Action::Noop,
+                }
+            }
+        }
+
+        if matches!(self.focus, Ec2Focus::PowerConfirm) {
+            if let Some(ref mut pending) = self.pending_power {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.pending_power = None;
+                        self.focus = Ec2Focus::DetailPanel;
+                        return Action::Noop;
+                    }
+                    KeyCode::Enter => {
+                        if pending.confirmation.value != pending.instance_id {
+                            pending.confirmation.clear();
+                            return Action::ShowError(
+                                "Confirmation must exactly match the instance id".into(),
+                            );
+                        }
+                        let instance_id = pending.instance_id.clone();
+                        let account_id = pending.account_id.clone();
+                        let region = pending.region.clone();
+                        let action = pending.action;
+                        let confirmation_instance_id = pending.confirmation.value.clone();
+                        self.pending_power = None;
+                        self.focus = Ec2Focus::DetailPanel;
+                        return Action::PowerEc2 {
+                            instance_id,
+                            account_id,
+                            region,
+                            action,
+                            confirmation_instance_id,
+                        };
+                    }
+                    _ => {
+                        pending.confirmation.handle_key(key);
+                        return Action::Noop;
+                    }
+                }
+            }
+        }
+
         match key.code {
+            KeyCode::Char('e')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !matches!(self.focus, Ec2Focus::SearchBox) =>
+            {
+                self.toggle_inventory_view()
+            }
             KeyCode::Esc => {
                 match self.focus {
                     Ec2Focus::SearchBox => {
@@ -681,7 +1362,8 @@ impl Component for Ec2Screen {
                         self.focus = Ec2Focus::Table;
                     }
                     Ec2Focus::Table => return Action::GoBack,
-                    Ec2Focus::OsUserSelect => {} // handled above
+                    Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker | Ec2Focus::PowerConfirm => {
+                    } // handled above
                 }
                 Action::Noop
             }
@@ -695,8 +1377,15 @@ impl Component for Ec2Screen {
                     let query = self.search_input.value.clone();
                     self.focus = Ec2Focus::Table;
                     self.search_input.focused = false;
-                    Action::SearchEc2(query)
+                    match self.view {
+                        InventoryView::Ec2 => Action::SearchEc2(query),
+                        InventoryView::Ecs => {
+                            self.apply_ecs_filter();
+                            Action::Noop
+                        }
+                    }
                 }
+                Ec2Focus::Table if self.view == InventoryView::Ecs => self.start_ecs_exec(),
                 Ec2Focus::Table => {
                     self.show_detail = !self.show_detail;
                     if self.show_detail {
@@ -704,7 +1393,10 @@ impl Component for Ec2Screen {
                     }
                     Action::Noop
                 }
-                Ec2Focus::DetailPanel | Ec2Focus::OsUserSelect => Action::Noop,
+                Ec2Focus::DetailPanel
+                | Ec2Focus::OsUserSelect
+                | Ec2Focus::ContainerPicker
+                | Ec2Focus::PowerConfirm => Action::Noop,
             },
             // `[` / `]` → cycle account
             KeyCode::Char('[') if !matches!(self.focus, Ec2Focus::SearchBox) => {
@@ -717,7 +1409,7 @@ impl Component for Ec2Screen {
                         self.selected_account_id.as_deref().unwrap_or("All")
                     );
                     self.scope_transition = Some(ScopeTransition::new(label));
-                    return Action::RefreshEc2;
+                    return self.refresh_current_view_action();
                 }
                 Action::Noop
             }
@@ -731,7 +1423,7 @@ impl Component for Ec2Screen {
                         self.selected_account_id.as_deref().unwrap_or("All")
                     );
                     self.scope_transition = Some(ScopeTransition::new(label));
-                    return Action::RefreshEc2;
+                    return self.refresh_current_view_action();
                 }
                 Action::Noop
             }
@@ -746,7 +1438,7 @@ impl Component for Ec2Screen {
                         self.selected_region.as_deref().unwrap_or("All")
                     );
                     self.scope_transition = Some(ScopeTransition::new(label));
-                    return Action::RefreshEc2;
+                    return self.refresh_current_view_action();
                 }
                 Action::Noop
             }
@@ -760,24 +1452,56 @@ impl Component for Ec2Screen {
                         self.selected_region.as_deref().unwrap_or("All")
                     );
                     self.scope_transition = Some(ScopeTransition::new(label));
-                    return Action::RefreshEc2;
+                    return self.refresh_current_view_action();
                 }
                 Action::Noop
             }
-            KeyCode::Char('r') if !matches!(self.focus, Ec2Focus::SearchBox) => Action::RefreshEc2,
-            KeyCode::Char('f') if !matches!(self.focus, Ec2Focus::SearchBox) => {
+            KeyCode::Char('r') if !matches!(self.focus, Ec2Focus::SearchBox) => {
+                self.refresh_current_view_action()
+            }
+            KeyCode::Char('f')
+                if self.view == InventoryView::Ec2
+                    && !matches!(self.focus, Ec2Focus::SearchBox) =>
+            {
                 self.state_filter = self.state_filter.next();
                 self.apply_state_filter();
                 Action::Noop
             }
-            KeyCode::Char('s') if !matches!(self.focus, Ec2Focus::SearchBox) => {
+            KeyCode::Char('s')
+                if self.view == InventoryView::Ec2
+                    && !matches!(self.focus, Ec2Focus::SearchBox) =>
+            {
                 self.start_connect(shared::dto::ec2::ConnectMethod::Ssm)
             }
-            KeyCode::Char('e') if !matches!(self.focus, Ec2Focus::SearchBox) => {
+            KeyCode::Char('e')
+                if self.view == InventoryView::Ec2
+                    && !matches!(self.focus, Ec2Focus::SearchBox) =>
+            {
                 self.start_connect(shared::dto::ec2::ConnectMethod::Ec2InstanceConnect)
             }
-            KeyCode::Char('c') if !matches!(self.focus, Ec2Focus::SearchBox) => {
+            KeyCode::Char('c')
+                if self.view == InventoryView::Ec2
+                    && !matches!(self.focus, Ec2Focus::SearchBox) =>
+            {
                 self.start_connect(shared::dto::ec2::ConnectMethod::Ssh)
+            }
+            KeyCode::Char('S')
+                if self.view == InventoryView::Ec2
+                    && matches!(self.focus, Ec2Focus::DetailPanel) =>
+            {
+                self.start_power_action(Ec2PowerAction::Start)
+            }
+            KeyCode::Char('X')
+                if self.view == InventoryView::Ec2
+                    && matches!(self.focus, Ec2Focus::DetailPanel) =>
+            {
+                self.start_power_action(Ec2PowerAction::Stop)
+            }
+            KeyCode::Char('B')
+                if self.view == InventoryView::Ec2
+                    && matches!(self.focus, Ec2Focus::DetailPanel) =>
+            {
+                self.start_power_action(Ec2PowerAction::Reboot)
             }
             _ => {
                 match self.focus {
@@ -785,9 +1509,14 @@ impl Component for Ec2Screen {
                         self.search_input.handle_key(key);
                     }
                     Ec2Focus::Table | Ec2Focus::DetailPanel => {
-                        self.table.handle_key(key);
+                        if self.view == InventoryView::Ecs {
+                            self.ecs_table.handle_key(key);
+                        } else {
+                            self.table.handle_key(key);
+                        }
                     }
-                    Ec2Focus::OsUserSelect => {} // handled above
+                    Ec2Focus::OsUserSelect | Ec2Focus::ContainerPicker | Ec2Focus::PowerConfirm => {
+                    } // handled above
                 }
                 Action::Noop
             }
@@ -798,6 +1527,12 @@ impl Component for Ec2Screen {
         if matches!(self.focus, Ec2Focus::SearchBox) {
             self.search_input
                 .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+        } else if matches!(self.focus, Ec2Focus::PowerConfirm) {
+            if let Some(ref mut pending) = self.pending_power {
+                pending
+                    .confirmation
+                    .insert_str(&text.replace("\r\n", "\n").replace(['\r', '\n'], " "));
+            }
         }
         Action::Noop
     }
@@ -805,8 +1540,8 @@ impl Component for Ec2Screen {
     fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let outer = Block::default()
             .borders(Borders::ALL)
-            .title(" EC2 Inventory ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .title(format!(" {} Inventory ", self.view.label()))
+            .border_style(self.theme.accent_style());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -821,31 +1556,34 @@ impl Component for Ec2Screen {
             .split(inner);
 
         // Search bar
+        self.search_input.label = self.search_label().to_string();
         self.search_input.render(main_chunks[0], buf);
 
         // Account/Region scope header
+        let account_options = self.account_scope_options();
+        let region_options = self.region_scope_options();
         let acct_display = self.selected_account_id.as_deref().unwrap_or("All");
         let region_display = self.selected_region.as_deref().unwrap_or("All");
-        let acct_label = if self.available_accounts.len() > 1 {
-            format!("Account [/]: {}", acct_display)
+        let acct_label = if account_options.len() > 1 {
+            format!("Account [ / ]: {}", acct_display)
         } else {
             format!("Account: {}", acct_display)
         };
-        let region_label = if self.available_regions.len() > 1 {
-            format!("Region {{/}}: {}", region_display)
+        let region_label = if region_options.len() > 1 {
+            format!("Region {{ / }}: {}", region_display)
         } else {
             format!("Region: {}", region_display)
         };
         let scope_line = Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled(acct_label, Style::default().fg(Color::Yellow)),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(region_label, Style::default().fg(Color::Cyan)),
+            Span::styled(acct_label, self.theme.warning_style()),
+            Span::styled(" │ ", self.theme.muted_style()),
+            Span::styled(region_label, self.theme.accent_style()),
         ]);
         Paragraph::new(scope_line).render(main_chunks[1], buf);
 
         // Table + optional detail panel
-        if self.show_detail {
+        if self.show_detail && self.view == InventoryView::Ec2 {
             let h_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -859,23 +1597,53 @@ impl Component for Ec2Screen {
 
         // Status bar
         let filtered_count = self.filtered_instances().len();
-        let total_count = self.instances.len();
+        let total_count = match self.view {
+            InventoryView::Ec2 => self.instances.len(),
+            InventoryView::Ecs => self.tasks.len(),
+        };
         let filter_label = self.state_filter.label();
 
-        let count_display = if self.state_filter == StateFilter::All {
+        let count_display = if self.view == InventoryView::Ecs {
+            self.ecs_task_count_display()
+        } else if self.state_filter == StateFilter::All {
             format!("{} instances", total_count)
         } else {
             format!("{}/{} [{}]", filtered_count, total_count, filter_label)
         };
 
+        let toggle_hint = self.toggle_hint();
         let status = if self.loading {
-            "Loading instances...".to_string()
+            format!("Loading {}...", self.view.label())
         } else if let Some(ref err) = self.error {
             format!("Error: {}", err)
+        } else if self.view == InventoryView::Ecs {
+            if let Some(target) = toggle_hint {
+                format!(
+                    "{} | Ctrl+E: {} | /: search | r: refresh | Enter: containers | Esc: back",
+                    count_display, target
+                )
+            } else {
+                format!(
+                    "{} | /: search | r: refresh | Enter: containers | Esc: back",
+                    count_display
+                )
+            }
         } else if self.show_detail {
+            if let Some(target) = toggle_hint {
+                format!(
+                    "{} | Ctrl+E: {} | s/e/c: connect | S/X/B: power | r: refresh | Esc: close",
+                    count_display, target
+                )
+            } else {
+                format!(
+                    "{} | s/e/c: connect | S/X/B: power | r: refresh | Esc: close",
+                    count_display
+                )
+            }
+        } else if let Some(target) = toggle_hint {
             format!(
-                "{} | f: filter | s: SSM | e: EIC | c: SSH | r: refresh | Esc: close",
-                count_display
+                "{} | Ctrl+E: {} | f: filter | /: search | r: refresh | Enter: detail | Esc: back",
+                count_display, target
             )
         } else {
             format!(
@@ -885,11 +1653,11 @@ impl Component for Ec2Screen {
         };
 
         let status_style = if self.error.is_some() {
-            Style::default().fg(Color::Red)
-        } else if self.loading {
-            Style::default().fg(Color::Yellow)
+            self.theme.danger_style()
+        } else if self.loading || self.has_ecs_result_warning() {
+            self.theme.warning_style()
         } else {
-            Style::default().fg(Color::Gray)
+            self.theme.muted_style()
         };
 
         Paragraph::new(status)
@@ -897,7 +1665,12 @@ impl Component for Ec2Screen {
             .render(main_chunks[3], buf);
 
         // Loading overlay
-        if self.loading && self.instances.is_empty() {
+        if self.loading
+            && match self.view {
+                InventoryView::Ec2 => self.instances.is_empty(),
+                InventoryView::Ecs => self.tasks.is_empty(),
+            }
+        {
             self.loading_spinner.render_overlay(inner, buf);
         }
 
@@ -906,9 +1679,17 @@ impl Component for Ec2Screen {
             self.render_os_user_popup(inner, buf, pending);
         }
 
+        if let Some(ref pending) = self.pending_ecs_exec {
+            self.render_container_picker(inner, buf, pending);
+        }
+
+        if let Some(ref pending) = self.pending_power {
+            self.render_power_confirmation(inner, buf, pending);
+        }
+
         // Scope transition overlay
         if let Some(ref t) = self.scope_transition {
-            t.render(inner, buf);
+            t.render_with_theme(inner, buf, self.theme);
         }
     }
 
@@ -924,7 +1705,7 @@ impl Component for Ec2Screen {
     }
 
     fn on_enter(&mut self) -> Vec<Action> {
-        vec![Action::RefreshEc2]
+        vec![self.refresh_current_view_action()]
     }
 }
 
@@ -952,22 +1733,16 @@ impl Ec2Screen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {} — Select User ", method_name))
-            .border_style(Style::default().fg(Color::Cyan).bold());
+            .border_style(self.theme.accent_style().bold());
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
         let mut lines = Vec::new();
         for (i, user) in pending.users.iter().enumerate() {
             let (prefix, style) = if i == pending.selected {
-                (
-                    ">> ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Indexed(24))
-                        .bold(),
-                )
+                (">> ", self.theme.selected_plain_style())
             } else {
-                ("   ", Style::default().fg(Color::White))
+                ("   ", self.theme.text_style())
             };
             lines.push(Line::from(Span::styled(
                 format!("{}{}", prefix, user),
@@ -977,10 +1752,141 @@ impl Ec2Screen {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "j/k: select | Enter: connect | Esc: cancel",
-            Style::default().fg(Color::Gray),
+            self.theme.muted_style(),
         )));
 
         Paragraph::new(lines).render(inner, buf);
+    }
+
+    fn render_container_picker(&self, area: Rect, buf: &mut Buffer, pending: &PendingEcsExec) {
+        use ratatui::widgets::Clear;
+
+        let popup_height = (pending.containers.len() as u16 + 6).min(area.height.saturating_sub(4));
+        let popup_width = 96u16.min(area.width);
+        let popup_area = Rect {
+            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        Clear.render(popup_area, buf);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" ECS Exec — Select Container ")
+            .border_style(self.theme.accent_style().bold());
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let mut lines = Vec::with_capacity(pending.containers.len() + 4);
+        let task_label = pending
+            .task_arn
+            .rsplit('/')
+            .next()
+            .unwrap_or(pending.task_arn.as_str());
+        lines.push(Line::from(vec![
+            Span::styled("Task: ", self.theme.muted_style()),
+            Span::styled(task_label, self.theme.warning_style()),
+        ]));
+        lines.push(Line::from(""));
+
+        for (i, container) in pending.containers.iter().enumerate() {
+            let (prefix, style) = if i == pending.selected {
+                (">> ", self.theme.selected_plain_style())
+            } else {
+                ("   ", self.theme.text_style())
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", prefix, container),
+                style,
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "j/k: select | Enter: exec | Esc: cancel",
+            self.theme.muted_style(),
+        )));
+
+        Paragraph::new(lines).render(inner, buf);
+    }
+
+    fn render_power_confirmation(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        pending: &PendingPowerAction,
+    ) {
+        use ratatui::widgets::Clear;
+
+        let popup_width = 72u16.min(area.width.saturating_sub(4));
+        let popup_height = 14u16.min(area.height.saturating_sub(4));
+        let popup_area = Rect {
+            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        Clear.render(popup_area, buf);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" EC2 {} — Confirm ", pending.action))
+            .border_style(self.theme.danger_style().bold());
+        let inner = block.inner(popup_area);
+        block.render(popup_area, buf);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(8),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+
+        let action_style = match pending.action {
+            Ec2PowerAction::Start => self.theme.success_style().bold(),
+            Ec2PowerAction::Stop => self.theme.danger_style().bold(),
+            Ec2PowerAction::Reboot => self.theme.warning_style().bold(),
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Action:   ", self.theme.muted_style()),
+                Span::styled(pending.action.to_string(), action_style),
+            ]),
+            Line::from(vec![
+                Span::styled("Instance: ", self.theme.muted_style()),
+                Span::styled(&pending.instance_id, self.theme.warning_style()),
+            ]),
+            Line::from(vec![
+                Span::styled("Name:     ", self.theme.muted_style()),
+                Span::raw(pending.instance_name.as_deref().unwrap_or("-")),
+            ]),
+            Line::from(vec![
+                Span::styled("Scope:    ", self.theme.muted_style()),
+                Span::raw(format!("{} / {}", pending.account_id, pending.region)),
+            ]),
+            Line::from(vec![
+                Span::styled("State:    ", self.theme.muted_style()),
+                Span::raw(pending.current_state.to_string()),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Type the full instance id below. The typed value is never stored in audit logs.",
+                self.theme.danger_style(),
+            )),
+        ];
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(chunks[0], buf);
+        pending.confirmation.render(chunks[1], buf);
+        Paragraph::new("Enter: submit | Esc: cancel")
+            .style(self.theme.muted_style())
+            .render(chunks[2], buf);
     }
 }
 
@@ -992,12 +1898,19 @@ impl Ec2Screen {
             Ec2Focus::Table => "Table",
             Ec2Focus::DetailPanel => "DetailPanel",
             Ec2Focus::OsUserSelect => "OsUserSelect",
+            Ec2Focus::ContainerPicker => "ContainerPicker",
+            Ec2Focus::PowerConfirm => "PowerConfirm",
         }
     }
 }
 
 impl Ec2Screen {
     fn render_table(&mut self, area: Rect, buf: &mut Buffer) {
+        if self.view == InventoryView::Ecs {
+            self.render_ecs_table(area, buf);
+            return;
+        }
+
         let filter = self.state_filter;
         let rows: Vec<_> = self
             .instances
@@ -1005,26 +1918,26 @@ impl Ec2Screen {
             .filter(|i| filter.matches(&i.state))
             .map(|inst| {
                 let state_style = match inst.state {
-                    shared::dto::ec2::InstanceState::Running => Style::default().fg(Color::Green),
-                    shared::dto::ec2::InstanceState::Stopped => Style::default().fg(Color::Red),
-                    _ => Style::default().fg(Color::Yellow),
+                    shared::dto::ec2::InstanceState::Running => self.theme.success_style(),
+                    shared::dto::ec2::InstanceState::Stopped => self.theme.danger_style(),
+                    _ => self.theme.warning_style(),
                 };
 
                 Row::new(vec![
-                    Cell::from(inst.instance_id.as_str()).style(Style::default().fg(Color::Yellow)),
+                    Cell::from(inst.instance_id.as_str()).style(self.theme.warning_style()),
                     Cell::from(inst.name.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::White).bold()),
+                        .style(self.theme.text_style().bold()),
                     Cell::from(inst.private_ip.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::White)),
+                        .style(self.theme.text_style()),
                     Cell::from(inst.public_ip.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::White)),
+                        .style(self.theme.text_style()),
                     Cell::from(inst.state.to_string()).style(state_style),
-                    Cell::from(inst.instance_type.as_str()).style(Style::default().fg(Color::Gray)),
+                    Cell::from(inst.instance_type.as_str()).style(self.theme.muted_style()),
                     Cell::from(if inst.ssm_managed { "Yes" } else { "No" }).style(
                         if inst.ssm_managed {
-                            Style::default().fg(Color::Green)
+                            self.theme.success_style()
                         } else {
-                            Style::default().fg(Color::Gray)
+                            self.theme.muted_style()
                         },
                     ),
                     Cell::from(if inst.instance_connect_capable {
@@ -1033,12 +1946,12 @@ impl Ec2Screen {
                         "No"
                     })
                     .style(if inst.instance_connect_capable {
-                        Style::default().fg(Color::Green)
+                        self.theme.success_style()
                     } else {
-                        Style::default().fg(Color::Gray)
+                        self.theme.muted_style()
                     }),
                     Cell::from(inst.environment.as_deref().unwrap_or("-"))
-                        .style(Style::default().fg(Color::Cyan)),
+                        .style(self.theme.accent_style()),
                 ])
             })
             .collect();
@@ -1051,6 +1964,49 @@ impl Ec2Screen {
         self.table.render_with_rows_focused(
             rows.into_iter(),
             &title,
+            area,
+            buf,
+            matches!(self.focus, Ec2Focus::Table),
+        );
+    }
+
+    fn render_ecs_table(&mut self, area: Rect, buf: &mut Buffer) {
+        let tasks = self.filtered_tasks();
+        let rows: Vec<_> = tasks
+            .into_iter()
+            .map(|task| {
+                let status_style = if ecs_status_is_running(&task.last_status) {
+                    self.theme.success_style()
+                } else {
+                    self.theme.warning_style()
+                };
+                let containers = task
+                    .containers
+                    .iter()
+                    .map(|container| {
+                        ecs_container_readiness_label(task.enable_execute_command, container)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                Row::new(vec![
+                    Cell::from(task.cluster_name.clone()).style(self.theme.accent_style()),
+                    Cell::from(task.family.clone().unwrap_or_else(|| "-".into()))
+                        .style(self.theme.text_style().bold()),
+                    Cell::from(task.task_id.clone().unwrap_or_else(|| "-".into()))
+                        .style(self.theme.warning_style()),
+                    Cell::from(task.launch_type.clone()).style(self.theme.muted_style()),
+                    Cell::from(task.last_status.clone()).style(status_style),
+                    Cell::from(containers).style(self.theme.text_style()),
+                    Cell::from(task.account_id.clone()).style(self.theme.muted_style()),
+                    Cell::from(task.region.clone()).style(self.theme.muted_style()),
+                ])
+            })
+            .collect();
+
+        self.ecs_table.render_with_rows_focused(
+            rows.into_iter(),
+            "ECS Tasks",
             area,
             buf,
             matches!(self.focus, Ec2Focus::Table),
@@ -1072,6 +2028,43 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    fn rendered_text(screen: &mut Ec2Screen) -> String {
+        let area = Rect::new(0, 0, 140, 40);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut out = String::new();
+        for cell in &buf.content {
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
+    fn rendered_snapshot(screen: &mut Ec2Screen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut lines = buf
+            .content
+            .chunks(width as usize)
+            .take(height as usize)
+            .map(|row| {
+                let mut line = String::new();
+                for cell in row {
+                    line.push_str(cell.symbol());
+                }
+                line.trim_end().to_string()
+            })
+            .collect::<Vec<_>>();
+
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+
+        lines.join("\n")
     }
 
     fn test_entitlements() -> UserEntitlements {
@@ -1104,10 +2097,53 @@ mod tests {
             allowed_log_group_arns: vec![],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec!["ec2-user".into(), "ubuntu".into()],
             max_session_seconds: None,
             database_scopes: vec![],
         }
+    }
+
+    fn ecs_entitlements(can_exec: bool) -> UserEntitlements {
+        let mut ent = test_entitlements();
+        ent.features.can_view_ecs = true;
+        ent.features.can_use_ecs_exec = can_exec;
+        ent.allowed_clusters = vec!["arn:aws:ecs:us-east-1:111:cluster/app".into()];
+        ent
+    }
+
+    fn multi_scope_ecs_entitlements() -> UserEntitlements {
+        let mut ent = ecs_entitlements(true);
+        ent.allowed_clusters = vec![
+            "arn:aws:ecs:us-east-1:111:cluster/app".into(),
+            "arn:aws:ecs:eu-west-1:222:cluster/app".into(),
+        ];
+        ent
+    }
+
+    fn wildcard_region_ecs_entitlements() -> UserEntitlements {
+        let mut ent = ecs_entitlements(true);
+        ent.allowed_regions.clear();
+        ent.allowed_clusters = vec!["arn:aws:ecs:*:111:cluster/app".into()];
+        ent
+    }
+
+    fn wildcard_account_ecs_entitlements() -> UserEntitlements {
+        let mut ent = ecs_entitlements(true);
+        ent.allowed_clusters = vec!["arn:aws:ecs:us-east-1:*:cluster/app".into()];
+        ent
+    }
+
+    fn power_entitlements() -> UserEntitlements {
+        let mut ent = test_entitlements();
+        ent.features.can_start_ec2 = true;
+        ent.features.can_stop_ec2 = true;
+        ent.features.can_reboot_ec2 = true;
+        ent
     }
 
     fn running_instance(id: &str) -> Ec2Instance {
@@ -1138,6 +2174,42 @@ mod tests {
         inst.state = shared::dto::ec2::InstanceState::Stopped;
         inst.ssm_managed = false;
         inst
+    }
+
+    fn ecs_task(containers: Vec<&str>) -> EcsTask {
+        ecs_task_with_containers(
+            containers
+                .into_iter()
+                .map(|name| (name, "RUNNING", true))
+                .collect(),
+        )
+    }
+
+    fn ecs_task_with_containers(containers: Vec<(&str, &str, bool)>) -> EcsTask {
+        EcsTask {
+            task_arn: "arn:aws:ecs:us-east-1:111:task/app/abc123".into(),
+            cluster_arn: "arn:aws:ecs:us-east-1:111:cluster/app".into(),
+            cluster_name: "app".into(),
+            account_id: "111".into(),
+            region: "us-east-1".into(),
+            family: Some("web".into()),
+            task_id: Some("abc123".into()),
+            launch_type: "FARGATE".into(),
+            last_status: "RUNNING".into(),
+            desired_status: "RUNNING".into(),
+            enable_execute_command: true,
+            containers: containers
+                .into_iter()
+                .map(|(name, last_status, execute_command_agent_running)| {
+                    shared::dto::ecs::EcsContainer {
+                        name: name.into(),
+                        last_status: last_status.into(),
+                        execute_command_agent_running,
+                    }
+                })
+                .collect(),
+            tags: HashMap::new(),
+        }
     }
 
     // ── Initial state ──
@@ -1201,6 +2273,450 @@ mod tests {
         assert!(screen.instances.is_empty());
     }
 
+    #[test]
+    fn toggle_ecs_view_clears_state_and_refreshes_current_view() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.set_tasks(vec![ecs_task(vec!["app"])]);
+        let generation = screen.fetch_generation;
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert!(screen.instances.is_empty());
+        assert!(screen.tasks.is_empty());
+        assert_eq!(screen.fetch_generation, generation + 1);
+    }
+
+    #[test]
+    fn ecs_view_only_user_defaults_to_ecs_and_refreshes_tasks_on_enter() {
+        let mut screen = Ec2Screen::new();
+        let mut ent = ecs_entitlements(false);
+        ent.features.can_view_ec2 = false;
+        screen.set_entitlements(ent);
+
+        assert_eq!(screen.view, InventoryView::Ecs);
+        let actions = screen.on_enter();
+        assert!(actions.iter().any(|a| matches!(a, Action::RefreshEcsTasks)));
+    }
+
+    #[test]
+    fn ecs_view_only_user_cannot_toggle_to_ec2() {
+        let mut screen = Ec2Screen::new();
+        let mut ent = ecs_entitlements(false);
+        ent.features.can_view_ec2 = false;
+        screen.set_entitlements(ent);
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::ShowError(ref msg) if msg.contains("EC2")));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert!(screen.toggle_hint().is_none());
+    }
+
+    #[test]
+    fn ec2_view_only_user_cannot_toggle_to_ecs() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(test_entitlements());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::ShowError(ref msg) if msg.contains("ECS")));
+        assert_eq!(screen.view, InventoryView::Ec2);
+        assert!(screen.toggle_hint().is_none());
+    }
+
+    #[test]
+    fn status_hides_toggle_hint_without_target_entitlement() {
+        let mut screen = Ec2Screen::new();
+        let mut ent = ecs_entitlements(false);
+        ent.features.can_view_ec2 = false;
+        screen.set_entitlements(ent);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(!text.contains("Ctrl+E:"));
+        assert!(text.contains("/: search"));
+        assert!(text.contains("Enter: containers"));
+    }
+
+    #[test]
+    fn status_shows_toggle_hint_when_target_entitled() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+
+        let ec2_text = rendered_text(&mut screen);
+        assert!(ec2_text.contains("Ctrl+E: ECS"));
+
+        let action = screen.toggle_inventory_view();
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        let ecs_text = rendered_text(&mut screen);
+        assert!(ecs_text.contains("Ctrl+E: EC2"));
+    }
+
+    #[test]
+    fn scope_header_shows_literal_cycle_keys() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(test_entitlements());
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("Account [ / ]: All"));
+        assert!(text.contains("Region { / }: All"));
+        assert!(!text.contains("Account [/]"));
+        assert!(!text.contains("Region {/}"));
+    }
+
+    #[test]
+    fn ec2_table_labels_instance_connect_column_as_eic() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(test_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("EIC"));
+        assert!(!text.contains("SSH"));
+    }
+
+    #[test]
+    fn ecs_view_search_label_describes_task_fields() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("Search (cluster, family, task, container)"));
+        assert!(!text.contains("Search (name, id, ip)"));
+    }
+
+    #[test]
+    fn ecs_view_status_counts_filtered_search_results() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut worker = ecs_task(vec!["worker"]);
+        worker.cluster_name = "jobs".into();
+        worker.family = Some("worker".into());
+        worker.task_id = Some("def456".into());
+        screen.set_tasks(vec![ecs_task(vec!["app"]), worker]);
+        screen.search_input.value = "worker".into();
+        screen.apply_ecs_filter();
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1/2 tasks"));
+    }
+
+    #[test]
+    fn ecs_view_status_persists_truncated_result_state() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_ecs_task_results(vec![ecs_task(vec!["app"])], Some(5), true, 0);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1/5+ tasks"));
+        assert!(text.contains("truncated"));
+    }
+
+    #[test]
+    fn ecs_view_status_persists_partial_scope_state() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_ecs_task_results(vec![ecs_task(vec!["app"])], Some(1), false, 1);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1 tasks"));
+        assert!(text.contains("partial: 1 scope failed"));
+    }
+
+    #[test]
+    fn ecs_view_set_tasks_clears_result_warning_state() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_ecs_task_results(vec![ecs_task(vec!["app"])], Some(5), true, 1);
+        screen.set_tasks(vec![ecs_task(vec!["app"])]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("1 tasks"));
+        assert!(!text.contains("truncated"));
+        assert!(!text.contains("partial:"));
+    }
+
+    #[test]
+    fn ecs_container_readiness_label_includes_exec_state() {
+        let task = ecs_task_with_containers(vec![
+            ("app", "RUNNING", true),
+            ("api", "running", false),
+            ("job", "STOPPED", true),
+            ("init", "", false),
+        ]);
+
+        let labels = task
+            .containers
+            .iter()
+            .map(|container| ecs_container_readiness_label(true, container))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            labels,
+            vec!["app:ready", "api:no-agent", "job:stopped", "init:unknown"]
+        );
+        assert_eq!(
+            ecs_container_readiness_label(false, &task.containers[0]),
+            "app:disabled"
+        );
+    }
+
+    #[test]
+    fn ecs_running_status_normalizes_case_and_whitespace() {
+        assert!(ecs_status_is_running("RUNNING"));
+        assert!(ecs_status_is_running(" running "));
+        assert!(ecs_status_is_running("Running"));
+        assert!(!ecs_status_is_running(""));
+        assert!(!ecs_status_is_running("STOPPED"));
+    }
+
+    #[test]
+    fn ecs_table_renders_container_readiness_labels() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("app", "RUNNING", true),
+            ("api", "RUNNING", false),
+        ])]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("app:ready,api:no-agent"));
+        assert!(!text.contains("api*"));
+    }
+
+    #[test]
+    fn ecs_table_marks_containers_disabled_when_task_exec_is_disabled() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task = ecs_task_with_containers(vec![("app", "RUNNING", true)]);
+        task.enable_execute_command = false;
+        screen.set_tasks(vec![task]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("app:disabled"));
+        assert!(!text.contains("app:ready"));
+    }
+
+    #[test]
+    fn ecs_inventory_render_snapshot_keeps_scan_layout() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task =
+            ecs_task_with_containers(vec![("app", "RUNNING", true), ("api", "RUNNING", false)]);
+        task.cluster_name = "prod-api".into();
+        task.family = Some("payments".into());
+        task.task_id = Some("task-abcdef123456".into());
+        task.launch_type = "FARGATE".into();
+        screen.set_tasks(vec![task]);
+
+        let snapshot = rendered_snapshot(&mut screen, 140, 18);
+
+        let expected = r#"┌ ECS Inventory ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ Search (cluster, family, task, container) ─────────────────────────────────────────────────────────────────────────────────────────────┐│
+││                                                                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ Account: All │ Region: All                                                                                                               │
+│┌ ECS Tasks ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+││  Cluster              Family              Task ID            Launch   Status     Containers               Account        Region        ││
+││> prod-api             payments            task-abcdef123456  FARGATE  RUNNING    app:ready,api:no-agent   111            us-east-1     ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+││                                                                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│1 tasks | Ctrl+E: EC2 | /: search | r: refresh | Enter: containers | Esc: back                                                            │
+│                                                                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"#;
+        assert_eq!(snapshot, expected);
+    }
+
+    #[test]
+    fn ecs_container_picker_render_snapshot_keeps_exec_context() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task =
+            ecs_task_with_containers(vec![("app", "RUNNING", true), ("worker", "RUNNING", true)]);
+        task.task_arn = "arn:aws:ecs:us-east-1:111:task/app/task-abcdef123456".into();
+        screen.set_tasks(vec![task]);
+
+        assert!(matches!(screen.start_ecs_exec(), Action::Noop));
+        let snapshot = rendered_snapshot(&mut screen, 92, 20);
+
+        let expected = r#"┌ ECS Inventory ───────────────────────────────────────────────────────────────────────────┐
+│┌ Search (cluster, family, task, container) ─────────────────────────────────────────────┐│
+││                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────┘│
+│ Account: All │ Region: All                                                               │
+│┌ ECS Tasks ─────────────────────────────────────────────────────────────────────────────┐│
+│┌ ECS Exec — Select Container ───────────────────────────────────────────────────────────┐│
+││Task: task-abcdef123456                                                                 ││
+││                                                                                        ││
+││>> app                                                                                  ││
+││   worker                                                                               ││
+││                                                                                        ││
+││j/k: select | Enter: exec | Esc: cancel                                                 ││
+│└────────────────────────────────────────────────────────────────────────────────────────┘│
+││                                                                                        ││
+││                                                                                        ││
+│└────────────────────────────────────────────────────────────────────────────────────────┘│
+│1 tasks | Ctrl+E: EC2 | /: search | r: refresh | Enter: containers | Esc: back            │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘"#;
+        assert_eq!(snapshot, expected);
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_uses_ecs_cluster_accounts_only() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+
+        assert!(screen.cycle_account(true));
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+        assert!(screen.cycle_account(true));
+        assert!(screen.selected_account_id.is_none());
+    }
+
+    #[test]
+    fn ecs_view_region_cycle_uses_ecs_cluster_regions_only() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+
+        assert!(screen.cycle_region(true));
+        assert_eq!(screen.selected_region.as_deref(), Some("us-east-1"));
+        assert!(screen.cycle_region(true));
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_respects_selected_region_pair() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(multi_scope_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_region = Some("eu-west-1".into());
+
+        assert!(screen.cycle_account(true));
+        assert_eq!(screen.selected_account_id.as_deref(), Some("222"));
+        assert!(screen.cycle_account(true));
+        assert!(screen.selected_account_id.is_none());
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_accepts_wildcard_region_pattern() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(wildcard_region_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_region = Some("ap-northeast-1".into());
+
+        assert!(screen.cycle_account(true));
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+    }
+
+    #[test]
+    fn ecs_view_account_cycle_does_not_expand_wildcard_account_pattern() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(wildcard_account_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_region = Some("us-east-1".into());
+
+        assert!(!screen.cycle_account(true));
+        assert!(screen.selected_account_id.is_none());
+    }
+
+    #[test]
+    fn ecs_view_region_cycle_respects_selected_account_pair() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(multi_scope_ecs_entitlements());
+        screen.view = InventoryView::Ecs;
+        screen.selected_account_id = Some("111".into());
+
+        assert!(screen.cycle_region(true));
+        assert_eq!(screen.selected_region.as_deref(), Some("us-east-1"));
+        assert!(screen.cycle_region(true));
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn toggling_to_ecs_resets_ec2_only_scope_selection() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.selected_account_id = Some("222".into());
+        screen.selected_region = Some("eu-west-1".into());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert!(screen.selected_account_id.is_none());
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn toggling_to_ecs_resets_cross_pair_scope_selection() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(multi_scope_ecs_entitlements());
+        screen.selected_account_id = Some("111".into());
+        screen.selected_region = Some("eu-west-1".into());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+        assert!(screen.selected_region.is_none());
+    }
+
+    #[test]
+    fn toggling_to_ecs_keeps_region_selected_when_wildcard_region_authorizes_it() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(wildcard_region_ecs_entitlements());
+        screen.selected_account_id = Some("111".into());
+        screen.selected_region = Some("ap-northeast-1".into());
+
+        let action = screen.toggle_inventory_view();
+
+        assert!(matches!(action, Action::RefreshEcsTasks));
+        assert_eq!(screen.view, InventoryView::Ecs);
+        assert_eq!(screen.selected_account_id.as_deref(), Some("111"));
+        assert_eq!(screen.selected_region.as_deref(), Some("ap-northeast-1"));
+    }
+
+    #[test]
+    fn ecs_scope_pair_matches_wildcard_region_pattern() {
+        let entitlements = wildcard_region_ecs_entitlements();
+
+        assert!(ecs_scope_pair_matches(
+            &entitlements,
+            "111",
+            "ap-northeast-1"
+        ));
+    }
+
     // ── State filter ──
 
     #[test]
@@ -1259,6 +2775,205 @@ mod tests {
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, Action::SearchEc2(ref q) if q == "web-server"));
         assert_eq!(screen.test_focus(), "Table");
+    }
+
+    #[test]
+    fn container_picker_always_shown_even_for_one_container() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task(vec!["app"])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::Noop));
+        assert_eq!(screen.test_focus(), "ContainerPicker");
+        assert!(screen.pending_ecs_exec.is_some());
+    }
+
+    #[test]
+    fn container_picker_escape_returns_to_ecs_table_without_dispatch() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task(vec!["app"])]);
+        screen.handle_key(key(KeyCode::Enter));
+
+        let action = screen.handle_key(key(KeyCode::Esc));
+
+        assert!(matches!(action, Action::Noop));
+        assert_eq!(screen.test_focus(), "Table");
+        assert!(screen.pending_ecs_exec.is_none());
+    }
+
+    #[test]
+    fn container_picker_connect_disabled_without_exec_entitlement() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(false));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task(vec!["app"])]);
+        screen.handle_key(key(KeyCode::Enter));
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::ShowError(ref msg) if msg.contains("can_use_ecs_exec")));
+        assert!(screen.pending_ecs_exec.is_some());
+    }
+
+    #[test]
+    fn container_picker_skips_containers_without_exec_agent() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("app", "RUNNING", true),
+            ("sidecar", "RUNNING", false),
+            ("worker", "STOPPED", true),
+        ])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::Noop));
+        let pending = screen.pending_ecs_exec.as_ref().unwrap();
+        assert_eq!(pending.containers, vec!["app"]);
+    }
+
+    #[test]
+    fn container_picker_uses_normalized_running_statuses() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        let mut task = ecs_task_with_containers(vec![
+            ("app", " running ", true),
+            ("sidecar", "Running", true),
+            ("worker", "STOPPED", true),
+        ]);
+        task.last_status = "running".into();
+        screen.set_tasks(vec![task]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::Noop));
+        let pending = screen.pending_ecs_exec.as_ref().unwrap();
+        assert_eq!(pending.containers, vec!["app", "sidecar"]);
+        assert_eq!(screen.test_focus(), "ContainerPicker");
+    }
+
+    #[test]
+    fn container_picker_errors_when_no_container_is_exec_ready() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("sidecar", "RUNNING", false),
+            ("worker", "STOPPED", true),
+        ])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            matches!(action, Action::ShowError(ref msg) if msg.contains("No containers are ready"))
+        );
+        assert!(screen.pending_ecs_exec.is_none());
+        assert_eq!(screen.test_focus(), "Table");
+    }
+
+    #[test]
+    fn container_picker_enter_dispatches_selected_container() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(ecs_entitlements(true));
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task(vec!["app", "worker"])]);
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Down));
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ConnectEcsExec {
+                ref container_name,
+                ..
+            } if container_name == "worker"
+        ));
+        assert!(screen.pending_ecs_exec.is_none());
+        assert_eq!(screen.test_focus(), "Table");
+    }
+
+    #[test]
+    fn power_key_opens_confirmation_from_detail_panel() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.handle_key(key(KeyCode::Enter));
+
+        let action = screen.handle_key(key(KeyCode::Char('X')));
+
+        assert!(matches!(action, Action::Noop));
+        assert_eq!(screen.test_focus(), "PowerConfirm");
+        assert!(matches!(
+            screen.pending_power.as_ref().map(|pending| pending.action),
+            Some(Ec2PowerAction::Stop)
+        ));
+    }
+
+    #[test]
+    fn power_confirmation_dispatches_exact_instance_id() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Char('B')));
+        screen.handle_paste("i-1");
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::PowerEc2 {
+                ref instance_id,
+                action: Ec2PowerAction::Reboot,
+                ref confirmation_instance_id,
+                ..
+            } if instance_id == "i-1" && confirmation_instance_id == "i-1"
+        ));
+        assert!(screen.pending_power.is_none());
+        assert_eq!(screen.test_focus(), "DetailPanel");
+    }
+
+    #[test]
+    fn power_confirmation_rejects_mismatch_locally() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![stopped_instance("i-2")]);
+        screen.handle_key(key(KeyCode::Enter));
+        screen.handle_key(key(KeyCode::Char('S')));
+        screen.handle_paste("wrong");
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ShowError(ref msg) if msg.contains("exactly match")
+        ));
+        assert!(screen.pending_power.is_some());
+        assert_eq!(screen.test_focus(), "PowerConfirm");
+    }
+
+    #[test]
+    fn power_start_requires_stopped_instance() {
+        let mut screen = Ec2Screen::new();
+        screen.set_entitlements(power_entitlements());
+        screen.set_instances(vec![running_instance("i-1")]);
+        screen.handle_key(key(KeyCode::Enter));
+
+        let action = screen.handle_key(key(KeyCode::Char('S')));
+
+        assert!(matches!(
+            action,
+            Action::ShowError(ref msg) if msg.contains("stopped")
+        ));
+        assert!(screen.pending_power.is_none());
     }
 
     #[test]

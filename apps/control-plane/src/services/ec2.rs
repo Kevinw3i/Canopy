@@ -15,6 +15,45 @@ pub struct RuleScope {
     pub deny_selectors: Vec<TagSelector>,
 }
 
+pub fn power_feature_enabled(
+    action: Ec2PowerAction,
+    flags: &shared::dto::entitlements::FeatureFlags,
+) -> bool {
+    match action {
+        Ec2PowerAction::Start => flags.can_start_ec2,
+        Ec2PowerAction::Stop => flags.can_stop_ec2,
+        Ec2PowerAction::Reboot => flags.can_reboot_ec2,
+    }
+}
+
+pub fn requested_state_for_power_action(
+    action: Ec2PowerAction,
+    previous_state: &InstanceState,
+) -> Result<InstanceState, &'static str> {
+    match (action, previous_state) {
+        (Ec2PowerAction::Start, InstanceState::Stopped) => Ok(InstanceState::Pending),
+        (Ec2PowerAction::Start, InstanceState::Pending | InstanceState::Running) => {
+            Err("already_in_target_or_transition")
+        }
+        (Ec2PowerAction::Start, InstanceState::Stopping) => {
+            Err("instance_stopping_wait_before_start")
+        }
+        (Ec2PowerAction::Start, InstanceState::ShuttingDown | InstanceState::Terminated) => {
+            Err("instance_cannot_be_started_from_terminal_state")
+        }
+        (Ec2PowerAction::Stop, InstanceState::Running) => Ok(InstanceState::Stopping),
+        (Ec2PowerAction::Stop, InstanceState::Stopping | InstanceState::Stopped) => {
+            Err("already_in_target_or_transition")
+        }
+        (Ec2PowerAction::Stop, InstanceState::Pending) => Err("instance_pending_wait_before_stop"),
+        (Ec2PowerAction::Stop, InstanceState::ShuttingDown | InstanceState::Terminated) => {
+            Err("instance_cannot_be_stopped_from_terminal_state")
+        }
+        (Ec2PowerAction::Reboot, InstanceState::Running) => Ok(InstanceState::Running),
+        (Ec2PowerAction::Reboot, _) => Err("instance_must_be_running_to_reboot"),
+    }
+}
+
 /// Filter EC2 instances server-side based on per-rule entitlement scopes.
 /// An instance is visible if at least ONE rule scope grants it:
 /// the rule must cover the account, region, AND tag selectors.
@@ -578,6 +617,11 @@ mod tests {
                 )]),
             }],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec!["ec2-user".into(), "ubuntu".into()],
             max_session_seconds: None,
             database_scopes: vec![],
@@ -609,6 +653,11 @@ mod tests {
                 tags: HashMap::from([("Environment".into(), vec!["staging".into()])]),
             }],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: Some(3600),
             database_scopes: vec![],

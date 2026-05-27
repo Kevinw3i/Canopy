@@ -4,6 +4,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use crate::theme::Theme;
+
 /// Reusable text input widget with cursor.
 ///
 /// `cursor_pos` is a **character** index (not byte index) so that cursor
@@ -15,6 +17,7 @@ pub struct TextInput {
     pub label: String,
     pub focused: bool,
     pub masked: bool,
+    theme: Theme,
 }
 
 impl TextInput {
@@ -25,7 +28,13 @@ impl TextInput {
             label: label.to_string(),
             focused: false,
             masked: false,
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn masked(mut self) -> Self {
@@ -112,9 +121,9 @@ impl TextInput {
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
         let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
+            self.theme.accent_style()
         } else {
-            Style::default().fg(Color::Gray)
+            self.theme.muted_style()
         };
 
         let display_value = if self.masked {
@@ -153,7 +162,7 @@ impl TextInput {
                     } else {
                         after[..cursor_char_len].to_string()
                     },
-                    Style::default().bg(Color::White).fg(Color::Black),
+                    self.theme.cursor_style(),
                 ),
                 Span::raw(if cursor_char_len < after.len() {
                     after[cursor_char_len..].to_string()
@@ -177,6 +186,7 @@ pub struct TextAreaInput {
     pub cursor_pos: usize,
     pub label: String,
     pub focused: bool,
+    theme: Theme,
     scroll_line: usize,
 }
 
@@ -191,8 +201,14 @@ impl TextAreaInput {
             cursor_pos: value.chars().count(),
             label: label.to_string(),
             focused: false,
+            theme: Theme::default(),
             scroll_line: 0,
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     fn char_to_byte(&self, char_idx: usize) -> usize {
@@ -363,9 +379,9 @@ impl TextAreaInput {
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let border_style = if self.focused {
-            Style::default().fg(Color::Cyan)
+            self.theme.accent_style()
         } else {
-            Style::default().fg(Color::Gray)
+            self.theme.muted_style()
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -388,9 +404,9 @@ impl TextAreaInput {
 
             let line_no = format!("{:>width$} ", line_idx + 1, width = line_no_width);
             let line_style = if self.focused && line_idx == cursor_line {
-                Style::default().fg(Color::White)
+                self.theme.text_style()
             } else {
-                Style::default().fg(Color::Gray)
+                self.theme.muted_style()
             };
 
             if self.focused && line_idx == cursor_line {
@@ -403,7 +419,7 @@ impl TextAreaInput {
                 let cursor_char_len = after.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
 
                 Line::from(vec![
-                    Span::styled(line_no, Style::default().fg(Color::Blue)),
+                    Span::styled(line_no, self.theme.accent_style()),
                     Span::styled(before.to_string(), line_style),
                     Span::styled(
                         if cursor_char_len == 0 {
@@ -411,7 +427,7 @@ impl TextAreaInput {
                         } else {
                             after[..cursor_char_len].to_string()
                         },
-                        Style::default().bg(Color::White).fg(Color::Black),
+                        self.theme.cursor_style(),
                     ),
                     Span::styled(
                         if cursor_char_len < after.len() {
@@ -424,7 +440,7 @@ impl TextAreaInput {
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(line_no, Style::default().fg(Color::Blue)),
+                    Span::styled(line_no, self.theme.accent_style()),
                     Span::styled(line.to_string(), line_style),
                 ])
             }
@@ -521,6 +537,29 @@ mod tests {
         input.insert_str("b");
         assert_eq!(input.value, "abc");
         assert_eq!(input.cursor_pos, 2);
+    }
+
+    #[test]
+    fn textinput_render_uses_configured_theme() {
+        let theme = Theme {
+            accent: Color::Blue,
+            selected_bg: Color::Yellow,
+            selected_fg: Color::Black,
+            ..Theme::default()
+        };
+        let mut input = TextInput::new("Test").with_theme(theme);
+        input.value = "ab".into();
+        input.cursor_pos = 1;
+        input.focused = true;
+
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+        input.render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].fg, Color::Blue);
+        assert_eq!(buf[(2, 1)].symbol(), "b");
+        assert_eq!(buf[(2, 1)].fg, Color::Black);
+        assert_eq!(buf[(2, 1)].bg, Color::Yellow);
     }
 
     #[test]

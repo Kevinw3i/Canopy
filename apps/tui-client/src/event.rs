@@ -40,6 +40,30 @@ pub enum Action {
     Ec2Loaded(Vec<shared::dto::ec2::Ec2Instance>, Vec<String>, u64), // instances, failed_scopes, generation
     Ec2FetchFailed(String, u64),                                     // error message, generation
     SelectInstance(usize),
+    PowerEc2 {
+        instance_id: String,
+        account_id: String,
+        region: String,
+        action: shared::dto::ec2::Ec2PowerAction,
+        confirmation_instance_id: String,
+    },
+    ToggleEcsView,
+    RefreshEcsTasks,
+    EcsTasksLoaded {
+        tasks: Vec<shared::dto::ecs::EcsTask>,
+        failed_scopes: Vec<String>,
+        total_count: usize,
+        truncated: bool,
+        generation: u64,
+    },
+    EcsTasksFetchFailed(String, u64),
+    ConnectEcsExec {
+        account_id: String,
+        region: String,
+        cluster_arn: String,
+        task_arn: String,
+        container_name: String,
+    },
     ConnectSsm {
         instance_id: String,
         instance_name: Option<String>,
@@ -113,6 +137,17 @@ pub enum Action {
     StopLiveTail,
     PauseLiveTail,
     ResumeLiveTail,
+    LiveTailConnected,
+    LiveTailReconnecting,
+    RefreshLiveTailLogGroups,
+    LiveTailLogGroupsLoaded {
+        groups: Vec<shared::dto::cloudwatch::LogGroup>,
+        generation: u64,
+    },
+    LiveTailLogGroupsFailed {
+        error: String,
+        generation: u64,
+    },
     /// One event from the background stream. The `generation` field
     /// identifies which streaming run produced this event so a
     /// late-arriving event from a previously-stopped stream cannot
@@ -120,6 +155,9 @@ pub enum Action {
     LiveTailEvent {
         event: shared::dto::cloudwatch::LiveTailEvent,
         generation: u64,
+    },
+    LiveTailSessionUpdate {
+        events_per_second: Option<f64>,
     },
     /// Background stream's natural-completion signal. Carries the
     /// generation so the handler can drop it when it belongs to a
@@ -141,6 +179,41 @@ pub enum Action {
     // Dashboard
     FetchPublicIp,
     SetPublicIp(String, u64), // ip, generation
+
+    // MFA
+    RefreshMfaStatus,
+    MfaStatusLoaded(shared::dto::auth::MfaStatusResponse),
+    MfaStatusFailed(String),
+    StartTotpEnrollment,
+    TotpEnrollmentStarted(shared::dto::auth::TotpEnrollStartResponse),
+    TotpEnrollmentStartFailed(String),
+    ConfirmTotpEnrollment {
+        factor_id: String,
+        code: String,
+    },
+    TotpEnrollmentConfirmed(shared::dto::auth::TotpEnrollConfirmResponse),
+    TotpEnrollmentConfirmFailed(String),
+    StartTotpStepUpVerification,
+    VerifyTotpStepUp {
+        code: String,
+    },
+    TotpStepUpVerified(shared::dto::auth::TotpVerifyResponse),
+    TotpStepUpVerifyFailed(String),
+    GenerateRecoveryCodes,
+    RecoveryCodesGenerated(shared::dto::auth::RecoveryCodesGenerateResponse),
+    RecoveryCodesGenerateFailed(String),
+    StartRecoveryCodeStepUpVerification,
+    VerifyRecoveryCodeStepUp {
+        code: String,
+    },
+    RecoveryCodeStepUpVerified(shared::dto::auth::RecoveryCodeVerifyResponse),
+    RecoveryCodeStepUpVerifyFailed(String),
+    StartWebAuthnEnrollment,
+    WebAuthnEnrollmentSucceeded(shared::dto::auth::WebAuthnRegisterFinishResponse),
+    WebAuthnEnrollmentFailed(String),
+    StartWebAuthnStepUpVerification,
+    WebAuthnStepUpVerified(shared::dto::auth::WebAuthnVerifyResponse),
+    WebAuthnStepUpVerifyFailed(String),
 
     // Auto-update
     CheckForUpdate,

@@ -13,6 +13,7 @@ pub mod time_range;
 pub mod time_range_modal;
 
 use crate::event::Action;
+use crate::theme::Theme;
 use crossterm::event::KeyEvent;
 use ratatui::prelude::*;
 
@@ -79,6 +80,10 @@ impl ScopeTransition {
 
     /// Render a centered overlay banner.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_with_theme(area, buf, Theme::default());
+    }
+
+    pub fn render_with_theme(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
         use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
         let text_width = (self.label.len() as u16 + 6).min(area.width.saturating_sub(4));
@@ -93,19 +98,19 @@ impl ScopeTransition {
 
         // Fade effect: brighter when fresh, dimmer near end
         let fg = if self.remaining_ticks >= 2 {
-            Color::White
+            theme.text
         } else {
-            Color::Gray
+            theme.muted
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(theme.accent_style());
         let inner = block.inner(popup);
         block.render(popup, buf);
 
         Paragraph::new(Line::from(vec![
-            Span::styled("⟳ ", Style::default().fg(Color::Cyan)),
+            Span::styled("⟳ ", theme.accent_style()),
             Span::styled(&self.label, Style::default().fg(fg).bold()),
         ]))
         .alignment(Alignment::Center)

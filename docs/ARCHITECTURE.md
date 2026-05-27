@@ -1,6 +1,6 @@
 # Canopy — Complete Architecture
 
-> Version 0.1.0 | 57 Rust source files | ~12,700 lines | 380 tests
+> Version 0.1.0 | Rust workspace | TUI client + control-plane + shared DTOs
 
 ---
 
@@ -10,24 +10,24 @@
  Operator Terminal                    Control Plane                        External
  ================                    =============                        ========
 
- +-----------------+    HTTP/JSON    +--------------------+   STS/EC2/CWL  +-------+
+ +-----------------+    HTTP/JSON    +--------------------+ STS/EC2/ECS/CWL +-------+
  |   TUI Client    |--------------->|   Control Plane    |--------------->|  AWS  |
  |   (ratatui)     |<---------------|   (axum)           |<---------------|       |
  |                 |    JWT bearer   |                    |                +-------+
  |  - Login        |                 |  - Auth (OIDC)     |
- |  - EC2 Inventory|                 |  - Entitlements    |   OIDC         +-------+
+ |  - EC2/ECS Inv. |                 |  - Entitlements    |   OIDC         +-------+
  |  - CW Search    |                 |  - Audit logging   |--------------->| IdP   |
  |  - Live Tail    |                 |  - AWS integration |<---------------|       |
  |  - Access       |                 |  - Server-side     |   JWKS/token   +-------+
  |  - Settings     |                 |    filtering       |
  +-----------------+                 +--------------------+
         |
-        | ssh / aws ssm / aws ec2-instance-connect
-        v
- +-----------------+
- | Target Instance |
- | (SSM / EIC)     |
- +-----------------+
+       | ssh / aws ssm / aws ec2-instance-connect / aws ecs execute-command
+       v
+ +-----------------------+
+ | Target Instance/Task  |
+ | (SSM / EIC / ECS Exec)|
+ +-----------------------+
 ```
 
 ## Workspace Layout
@@ -36,21 +36,22 @@
 Canopy/
   Cargo.toml                    Workspace root
   config.sample.toml            Production-safe config template
-  entitlements.dev.toml         Dev entitlements sample
+  entitlements.sample.toml      Entitlements sample
   .env.example                  Environment variables reference
 
   crates/
-    shared/                     Shared DTOs + error types (~680 lines)
+    shared/                     Shared DTOs + error types
       src/dto/
         auth.rs                 PKCE, DeviceCode, Token, Refresh DTOs
         ec2.rs                  Ec2Instance, ConnectRequest/Response, AssumedRoleCredentials
+        ecs.rs                  EcsTask, EcsContainer, ECS Exec request/response DTOs
         cloudwatch.rs           LogGroup, LogEvent, Insights, LiveTail DTOs
         entitlements.rs         UserEntitlements, FeatureFlags, TagSelector, AllowedAccount
         audit.rs                AuditEvent, AuditAction, AuditOutcome
       src/errors.rs             ApiError
 
   apps/
-    control-plane/              Axum REST API (~6,100 lines)
+    control-plane/              Axum REST API
       Dockerfile                Multi-stage build for ECS Fargate
       src/
         main.rs                 Startup, CORS, dev_mode loopback guard
@@ -58,7 +59,8 @@ Canopy/
         middleware/auth.rs      JWT validation (require_auth)
         routes/
           auth.rs               /auth/* (PKCE, device-code, refresh, dev-login)
-          ec2.rs                /api/ec2/list, /api/ec2/connect
+          ec2.rs                /api/ec2/list, /api/ec2/connect, /api/ec2/power
+          ecs.rs                /api/ecs/tasks, /api/ecs/exec
           cloudwatch.rs         /api/cloudwatch/* (log-groups, filter, insights)
           live_tail.rs          /api/cloudwatch/live-tail (WebSocket, beta)
           entitlements.rs       /api/entitlements
@@ -66,18 +68,19 @@ Canopy/
           mod.rs                AppState, sign/verify_query_token (HMAC)
           auth.rs               JWT issue/validate, OIDC exchange
           oidc.rs               Discovery, JWKS cache, token exchange, device code
-          ec2.rs                build_connect_command, entitlement filtering
+          ec2.rs                build_connect_command, EC2 entitlement filtering
+          ecs.rs                ECS task filtering, rule-local scopes, exec command builder
           cloudwatch.rs         QueryPoller, mock data
           entitlements.rs       EntitlementService, arn_matches_pattern
           audit.rs              JSONL file + tracing (fail-closed)
         aws/
-          credentials.rs        AssumeRole, scoped policy, sanitize session name
+          credentials.rs        AssumeRole, scoped EC2/ECS policies, sanitize session name
           clients.rs            AwsClients factory (fresh per-request)
           ec2_convert.rs        SDK Instance -> DTO conversion
         models/
           entitlements.rs       EntitlementStore (evaluate, load TOML)
 
-    tui-client/                 Ratatui terminal UI (~5,900 lines)
+    tui-client/                 Ratatui terminal UI
       src/
         app.rs                  Event loop, action handling
         config.rs               ClientConfig (fail-closed without config)
@@ -92,13 +95,14 @@ Canopy/
         components/
           login.rs              Dev-mode aware focus order
           dashboard.rs          Live-tail beta gating
-          ec2.rs                Instance table, detail, connect
+          ec2.rs                EC2/ECS inventory table, details, connect, container picker
           cloudwatch_search.rs  Quick search + Insights (dual mode)
           live_tail.rs          Pause/resume state machine
           access.rs             User identity, groups, feature flags
-          settings.rs           Current config display
+          settings.rs           Current config and theme display
           error_modal.rs        Overlay error dialog
           loading.rs            Async loading spinner
+        theme.rs                TUI theme presets and color overrides
         widgets/
           input.rs              UTF-8 safe cursor (byte boundaries)
           table.rs              Keyboard-navigable table
@@ -225,8 +229,53 @@ Canopy/
  "arn:aws:iam::...:role/..."  STS AssumeRole into that IAM role (production)
 ```
 
-For `direct` and `profile:` modes, scoped credentials are skipped —
-the spawned CLI process uses the ambient or profile credentials directly.
+For inventory/search paths, `direct` and `profile:` modes can use local
+credentials after `GetCallerIdentity` confirms the configured account. SSM/EIC
+connect and ECS Exec require an AssumeRole ARN because the control-plane must
+return short-lived scoped credentials to the spawned CLI process. Direct SSH is
+the only connect path that does not need AWS-scoped credentials.
+
+## ECS Task Inventory and Exec Flow
+
+```
+ TUI                     Control Plane              AWS
+  |                           |                      |
+  |--POST /api/ecs/tasks---->|                      |
+  |  {account?, region?,      |                      |
+  |   cluster?, page_size?}   |                      |
+  |                           |                      |
+  |                    1. Audit health check          |
+  |                    2. Build rule-local ECS scopes |
+  |                       (account, role, region,     |
+  |                        cluster, task tags,        |
+  |                        container denylist)        |
+  |                    3. Reject unauthorized scope   |
+  |                    4. List/Describe clusters      |
+  |                       and tasks per scoped rule   |
+  |                           |--List/Describe ECS-->|
+  |                           |<--tasks + metadata---|
+  |                    5. Server-side task filtering  |
+  |                    6. Audit result + partials     |
+  |<--{tasks, failed_scopes, truncated}--------------|
+  |
+  | (Enter on running exec-ready task)
+  | show container picker for running containers
+  |
+  |--POST /api/ecs/exec----->|
+  |  {cluster_arn, task_arn, |
+  |   container_name, ...}   |
+  |                    1. Re-fetch task by ARN        |
+  |                    2. Re-check same rule-local    |
+  |                       scope and container denylist |
+  |                    3. IAM SimulatePrincipalPolicy |
+  |                       for assumable candidates    |
+  |                    4. Scoped AssumeRole policy:   |
+  |                       ExecuteCommand on task,     |
+  |                       region-limited DescribeTasks|
+  |                       and ssmmessages channels    |
+  |<--{aws ecs execute-command, env creds, timeout}--|
+  | suspend TUI -> spawn AWS CLI -> resume TUI        |
+```
 
 ## Entitlement Model
 
@@ -235,12 +284,17 @@ the spawned CLI process uses the ambient or profile credentials directly.
   |
   |-- rules[]
   |    |-- id, group
-  |    |-- features: {can_view_ec2, can_use_ssm, ...}
+  |    |-- features: {can_view_ec2, can_view_ecs, can_use_ecs_exec, can_use_ssm, ...}
   |    |-- allowed_accounts: [{account_id, account_name, role_arn}]
   |    |-- allowed_regions: ["us-east-1", ...]
   |    |-- allowed_log_group_arns: ["arn:...:log-group:/app/*"]
   |    |-- instance_tag_selectors: [{key: [values]}]
   |    |-- excluded_tag_selectors: [{key: [values]}]  (deny-list)
+  |    |-- allowed_clusters: ["arn:aws:ecs:...:cluster/prod-*"]
+  |    |-- task_tag_selectors: [{key: [values]}]
+  |    |-- excluded_task_tag_selectors: [{key: [values]}]  (deny-list)
+  |    |-- excluded_container_names: ["xray-daemon", ...]
+  |    |-- allow_broad_cluster_discovery: false
   |    |-- allowed_os_users: ["ec2-user", "ubuntu"]
   |    +-- max_session_seconds: 3600  (optional, 0 = no limit)
   |
@@ -254,6 +308,7 @@ the spawned CLI process uses the ambient or profile credentials directly.
   log_group_arns:        dedup
   tag_selectors:         concatenate (match ANY)
   excluded_tag_selectors: concatenate (match ANY → hidden)
+  ECS scopes:            displayed as merged entitlements, enforced rule-locally
   os_users:              dedup
   max_session_seconds:   MIN non-zero (strictest wins)
 ```
@@ -265,18 +320,19 @@ the spawned CLI process uses the ambient or profile credentials directly.
 | 1 | OIDC id_token | JWKS signature verification + iss/aud/exp (fail-closed) |
 | 2 | Internal JWT | HMAC-SHA256, configurable expiry, carries email_verified |
 | 3 | Entitlements | Server-side filtering with per-rule scope isolation (no cross-group splicing) |
-| 4 | Connect creds | Inline IAM session policy (per-method, per-instance, OS-user bound) |
+| 4 | Connect creds | Inline IAM session policy (per-method, per-instance or per-task, OS-user / ECS-cluster bound) |
 | 5 | SSM os_user | SSH ProxyCommand + IAM condition `ssm:SessionDocumentAccessCheck` |
 | 6 | EIC creds | Allows AWS CLI `ec2:DescribeInstances` preflight only in the target region; OS-user bound via `ec2:osuser` condition |
-| 7 | Audit | Fail-closed on all endpoints (auth, EC2, CW, entitlements). Transient recovery without restart |
-| 8 | Config | dev_mode refuses non-loopback bind; CORS restricted with real AWS; SSM requires explicit allowed_os_users |
-| 9 | Insights token | HMAC-signed query auth (survives restart), rejects empty log_group_names |
-| 10 | IAM Simulation | SimulatePrincipalPolicy with full action+resource set; inconclusive = skip candidate |
-| 11 | Session timeout | max_session_seconds per group, min 900s for STS, kill after timeout (strictest wins) |
-| 12 | Account identity | GetCallerIdentity verifies direct/profile/AssumeRole credentials match configured account_id |
-| 13 | Email verification | Entitlement email matching gated on IdP `email_verified` claim |
-| 14 | STS ExternalId | Configurable ExternalId on all AssumeRole calls (default "canopy") |
-| 15 | Token storage | Unix 0600 enforced on every write; insecure permissions rejected on load |
+| 7 | ECS scope | Task list and exec must match one rule-local account/role/region/cluster/task-tag/container scope |
+| 8 | Audit | Fail-closed on all endpoints (auth, EC2, ECS, CW, entitlements). Transient recovery without restart |
+| 9 | Config | dev_mode refuses non-loopback bind; CORS restricted with real AWS; SSM requires explicit allowed_os_users |
+| 10 | Insights token | HMAC-signed query auth (survives restart), rejects empty log_group_names |
+| 11 | IAM Simulation | SimulatePrincipalPolicy selects EC2 describe/power/connect and ECS Exec AssumeRole candidates with full action+resource sets; local direct/profile candidates are not simulated, and inconclusive AssumeRole simulations fall back only when every simulated candidate errors |
+| 12 | Session timeout | max_session_seconds per group, min 900s for STS, kill after timeout (strictest wins) |
+| 13 | Account identity | GetCallerIdentity verifies direct/profile/AssumeRole credentials match configured account_id |
+| 14 | Email verification | Entitlement email matching gated on IdP `email_verified` claim |
+| 15 | STS ExternalId | Configurable ExternalId on all AssumeRole calls (default "canopy") |
+| 16 | Token storage | Unix 0600 enforced on every write; insecure permissions rejected on load |
 
 ## Scoped Credential Policies
 
@@ -298,6 +354,32 @@ the spawned CLI process uses the ambient or profile credentials directly.
 {"Action": ["ec2-instance-connect:SendSSHPublicKey",
             "ec2-instance-connect:OpenTunnel"],
  "Resource": ["...instance/{id}", "...instance-connect-endpoint/*"]}
+```
+
+**ECS Exec**:
+```json
+[
+  {
+    "Action": ["ecs:ExecuteCommand"],
+    "Resource": ["...task/{cluster}/{task-id}"],
+    "Condition": {"ArnEquals": {"ecs:cluster": "...cluster/{cluster}"}}
+  },
+  {
+    "Action": ["ecs:DescribeTasks"],
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:RequestedRegion": "{region}"}}
+  },
+  {
+    "Action": [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel"
+    ],
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:RequestedRegion": "{region}"}}
+  }
+]
 ```
 
 ## Insights Query Authorization
@@ -326,22 +408,33 @@ No shared state -- survives restarts and multi-replica routing.
 | `bind_address` | `127.0.0.1:8443` | Server listen address |
 | `dev_mode` | `false` | Dev login + mock data |
 | `entitlements_file` | -- | Entitlements TOML (required in prod) |
+| `mfa_database_url` | -- | Optional SQLite local MFA factor store; WebAuthn registration and step-up use localhost browser ceremonies |
+| `mfa_secret_key` | -- | Optional base64 32-byte key for encrypted local TOTP secrets |
 | `audit_log` | -- | Durable JSONL audit file |
 | `cors_allowed_origins` | `[]` | CORS origins (permissive in dev) |
 | `oidc.issuer_url` | -- | OIDC provider URL |
 | `oidc.client_id` | -- | OIDC client ID |
+| `oidc.acr_values` | `[]` | Optional auth context values sent to the OIDC provider |
+| `oidc.prompt` | -- | Optional OIDC prompt parameter, e.g. `login` |
+| `oidc.max_age_seconds` | -- | Optional OIDC `max_age`; also validates `auth_time` |
+| `oidc.required_acr_values` | `[]` | Optional accepted `acr` claim values for fail-closed MFA enforcement |
+| `oidc.required_amr_values` | `[]` | Optional required `amr` claim values for fail-closed MFA enforcement |
 | `oidc.jwks_uri` | auto | JWKS endpoint |
 | `jwt.secret` | -- | HMAC secret (JWTs + query tokens) |
 | `aws.session_duration_seconds` | `3600` | STS AssumeRole duration |
+| `audit_export.cloudwatch_logs.*` | disabled | Optional direct audit export to CloudWatch Logs |
+| `audit_export.s3.*` | disabled | Optional direct audit export to S3 |
 | `control_plane_url` | -- | (TUI) Control plane URL |
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |
+| `keybindings.*` | built-in defaults | (TUI) Dashboard/settings shortcut overrides |
+| `theme.*` | `default` preset | (TUI) Dashboard/settings theme preset and color overrides |
 
 ## Tests
 
-| Crate | Unit | Integration | Areas |
-|-------|------|-------------|-------|
-| control-plane | 123 | 57 | Auth middleware (9), OIDC (22), EC2 filter/connect (14), EC2 convert (12), Entitlement merge (13+4), CloudWatch (2), Audit (3), Credentials (10), Config (5), HMAC helpers (4), Route handlers (57) |
-| shared | 43 | — | Auth DTOs (8), EC2 DTOs (7), CloudWatch DTOs (8), Entitlements DTOs (10), Errors (5), TagSelector (5) |
-| tui-client | 150 | 7 | Components (80+), Widgets (20), PKCE (11), Updater (10), Config (3), ApiClient (4+7 integration) |
-| **Total** | **316** | **64** | **380 tests** |
+| Crate | Coverage Areas |
+|-------|----------------|
+| control-plane | Auth/OIDC, entitlement loading and merge invariants, EC2 filtering/connect/power routes, ECS task list/exec scope enforcement, CloudWatch search, audit fail-closed, credential policies, config validation, HMAC helpers |
+| shared | Auth, EC2, ECS, CloudWatch, entitlements, audit, error, and PTY DTO serialization/defaults |
+| tui-client | Login/auth flows, dashboard feature gating, EC2/ECS inventory rendering and scope cycling, ECS container picker, connect session lifecycle, CloudWatch search, widgets, updater, config, API client integration |
+| workspace | `cargo test --workspace` is the source of truth for current counts |

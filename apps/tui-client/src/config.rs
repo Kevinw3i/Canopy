@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::keybindings::KeyBindings;
+use crate::theme::ThemeConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub control_plane_url: String,
@@ -31,6 +34,12 @@ pub struct ClientConfig {
     /// Optional self-service password change URL, typically the Cognito hosted UI.
     #[serde(default)]
     pub change_password_url: Option<String>,
+    /// Configurable keyboard shortcuts for high-level TUI actions.
+    #[serde(default)]
+    pub keybindings: KeyBindings,
+    /// Configurable theme preset and color overrides.
+    #[serde(default)]
+    pub theme: ThemeConfig,
 }
 
 fn default_auto_update() -> bool {
@@ -80,6 +89,7 @@ impl ClientConfig {
         if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)?;
             let config: ClientConfig = toml::from_str(&content)?;
+            config.validate()?;
             Ok(config)
         } else {
             anyhow::bail!(
@@ -91,7 +101,7 @@ impl ClientConfig {
         }
     }
 
-    fn config_path() -> PathBuf {
+    pub fn config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("canopy")
@@ -121,7 +131,14 @@ impl ClientConfig {
             update_repo_owner: default_update_repo_owner(),
             update_repo_name: default_update_repo_name(),
             change_password_url: None,
+            keybindings: KeyBindings::default(),
+            theme: ThemeConfig::default(),
         }
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        self.keybindings.validate()?;
+        self.theme.validate()
     }
 }
 
@@ -152,11 +169,13 @@ mod tests {
         assert!(!config.enable_live_tail);
         assert!(!config.auto_update);
         assert!(config.change_password_url.is_none());
+        assert_eq!(config.keybindings.dashboard_up, vec!["up", "k"]);
+        assert_eq!(config.theme.preset, "default");
     }
 
     #[test]
     fn test_parse_full_toml() {
-        let toml_str = r#"
+        let toml_str = r##"
             control_plane_url = "http://localhost:9999"
             dev_mode = true
             refresh_interval_secs = 60
@@ -168,7 +187,18 @@ mod tests {
             update_repo_owner = "MyOrg"
             update_repo_name = "MyRepo"
             change_password_url = "https://auth.example.com/forgotPassword"
-        "#;
+
+            [keybindings]
+            dashboard_up = ["w"]
+            dashboard_down = ["s"]
+            dashboard_inventory = ["i"]
+            settings_change_password = ["P"]
+
+            [theme]
+            preset = "high_contrast"
+            accent = "#336699"
+            selected_bg = "indexed:42"
+        "##;
         let config: ClientConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.control_plane_url, "http://localhost:9999");
         assert!(config.dev_mode);
@@ -184,6 +214,13 @@ mod tests {
             config.change_password_url.as_deref(),
             Some("https://auth.example.com/forgotPassword")
         );
+        assert_eq!(config.keybindings.dashboard_up, vec!["w"]);
+        assert_eq!(config.keybindings.dashboard_down, vec!["s"]);
+        assert_eq!(config.keybindings.dashboard_inventory, vec!["i"]);
+        assert_eq!(config.keybindings.settings_change_password, vec!["P"]);
+        assert_eq!(config.theme.preset, "high_contrast");
+        assert_eq!(config.theme.accent.as_deref(), Some("#336699"));
+        assert_eq!(config.theme.selected_bg.as_deref(), Some("indexed:42"));
     }
 
     #[test]
@@ -221,5 +258,65 @@ mod tests {
         let config = ClientConfig::load_from_path(true, path.clone()).unwrap();
         assert_eq!(config.control_plane_url, "http://localhost:8443");
         assert!(config.dev_mode);
+        assert_eq!(config.keybindings.dashboard_select, vec!["enter"]);
+        assert_eq!(config.theme.preset, "default");
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_keybinding() {
+        let dir = std::env::temp_dir().join(format!(
+            "canopy-tui-config-keybinding-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = RemoveDirOnDrop(dir.clone());
+        let path = dir.join("config.toml");
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"
+            control_plane_url = "https://canopy.internal"
+
+            [keybindings]
+            dashboard_up = ["cmd+k"]
+        "#,
+        )
+        .unwrap();
+
+        let err = ClientConfig::load_from_path(false, path).unwrap_err();
+        assert!(err.to_string().contains("invalid keybindings.dashboard_up"));
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_theme_color() {
+        let dir = std::env::temp_dir().join(format!(
+            "canopy-tui-config-theme-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _cleanup = RemoveDirOnDrop(dir.clone());
+        let path = dir.join("config.toml");
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            r#"
+            control_plane_url = "https://canopy.internal"
+
+            [theme]
+            accent = "not-a-color"
+        "#,
+        )
+        .unwrap();
+
+        let err = ClientConfig::load_from_path(false, path).unwrap_err();
+        assert!(err.to_string().contains("invalid theme.accent"));
     }
 }

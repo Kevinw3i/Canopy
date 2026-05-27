@@ -1,5 +1,17 @@
 # ── Cluster ──────────────────────────────────────────────
 
+locals {
+  fargate_cpu_memory_pairs = toset(concat(
+    [for memory in [512, 1024, 2048] : "256:${memory}"],
+    [for memory in [1024, 2048, 3072, 4096] : "512:${memory}"],
+    [for memory in range(2048, 8193, 1024) : "1024:${memory}"],
+    [for memory in range(4096, 16385, 1024) : "2048:${memory}"],
+    [for memory in range(8192, 30721, 1024) : "4096:${memory}"],
+    [for memory in range(16384, 61441, 4096) : "8192:${memory}"],
+    [for memory in range(32768, 122881, 8192) : "16384:${memory}"],
+  ))
+}
+
 resource "aws_ecs_cluster" "main" {
   name = var.project
 
@@ -27,6 +39,14 @@ resource "aws_ecs_task_definition" "control_plane" {
     precondition {
       condition     = var.oidc_client_secret_arn == "" || var.oidc_client_secret_version_id != ""
       error_message = "oidc_client_secret_version_id is required when oidc_client_secret_arn is set."
+    }
+    precondition {
+      condition     = var.oidc_client_secret_arn != "" || var.oidc_client_secret_version_id == ""
+      error_message = "oidc_client_secret_arn is required when oidc_client_secret_version_id is set."
+    }
+    precondition {
+      condition     = contains(local.fargate_cpu_memory_pairs, "${var.cpu}:${var.memory}")
+      error_message = "cpu and memory must be a valid AWS Fargate Linux task size combination."
     }
   }
   requires_compatibilities = ["FARGATE"]
@@ -63,6 +83,11 @@ resource "aws_ecs_task_definition" "control_plane" {
       { name = "CORS_ALLOWED_ORIGINS", value = join(",", var.cors_allowed_origins) },
       { name = "STS_EXTERNAL_ID", value = var.sts_external_id },
       { name = "DATABASE_CONNECTIONS_TOML", value = var.database_connections_toml },
+      { name = "AUDIT_CLOUDWATCH_LOG_GROUP", value = var.audit_export_cloudwatch_log_group_name },
+      { name = "AUDIT_CLOUDWATCH_LOG_STREAM", value = var.audit_export_cloudwatch_log_stream_name },
+      { name = "AUDIT_S3_BUCKET", value = var.audit_export_s3_bucket },
+      { name = "AUDIT_S3_PREFIX", value = var.audit_export_s3_prefix },
+      { name = "AUDIT_EXPORT_QUEUE_SIZE", value = tostring(var.audit_export_queue_size) },
     ]
 
     # Inject secrets via ECS-native secrets injection (uses execution role).

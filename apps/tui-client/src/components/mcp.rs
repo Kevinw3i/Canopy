@@ -230,6 +230,11 @@ mod tests {
             max_session_seconds: None,
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             database_scopes: vec![],
         }

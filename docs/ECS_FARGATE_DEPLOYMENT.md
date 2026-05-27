@@ -22,8 +22,8 @@ Internet
 ┌─────────────────────────┐
 │  ECS Fargate Task       │  ← control-plane container
 │  ┌───────────────────┐  │
-│  │ control-plane     │  │  ← 從 Secrets Manager 讀 JWT secret
-│  │ port 8443         │  │  ← 從 S3/EFS 讀 entitlements.toml
+│  │ control-plane     │  │  ← JWT_SECRET 由 ECS secrets 注入
+│  │ port 8443         │  │  ← entitlements.toml 已 bake 進 image
 │  └───────────────────┘  │
 └────────┬────────────────┘
          │ AWS SDK (Task Role)
@@ -56,6 +56,7 @@ Internet
 ```bash
 aws ecr create-repository \
   --repository-name canopy/control-plane \
+  --image-tag-mutability IMMUTABLE \
   --region ap-northeast-1
 
 # 登入 ECR
@@ -70,32 +71,65 @@ aws ecr get-login-password --region ap-northeast-1 | \
 
 ```bash
 # 在專案根目錄執行（因為 Dockerfile 需要 workspace context）
+# entitlements.toml 必須先準備完成；若尚未建立，先完成 Step 5。
+# Docker build 會把它 bake 進 image。
+test -s entitlements.toml
+VERSION=$(git describe --tags --always)
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+ECR_REPOSITORY=canopy/control-plane
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in
+  X86_64) PLATFORM="linux/amd64" ;;
+  ARM64) PLATFORM="linux/arm64" ;;
+  *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;;
+esac
 
-docker build \
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+if TAG_CHECK_OUTPUT=$(aws ecr describe-images \
+  --region ap-northeast-1 \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids "imageTag=$VERSION" 2>&1); then
+  echo "$TAG_CHECK_OUTPUT"
+  echo "ECR image tag already exists: $VERSION"
+  exit 1
+else
+  TAG_CHECK_STATUS=$?
+  if ! grep -q "ImageNotFoundException" <<< "$TAG_CHECK_OUTPUT"; then
+    echo "$TAG_CHECK_OUTPUT"
+    exit "$TAG_CHECK_STATUS"
+  fi
+fi
+
+DOCKER_BUILDKIT=1 docker build \
+  --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
-  -t canopy/control-plane:latest \
+  -t canopy/control-plane:${VERSION} \
   -f apps/control-plane/Dockerfile .
 
 # Tag
-docker tag canopy/control-plane:latest \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:latest
+docker tag canopy/control-plane:${VERSION} \
+  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
 
 # Push
 docker push \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:latest
-```
-
-建議用 git tag 或 commit hash 做 image tag：
-
-```bash
-VERSION=$(git describe --tags --always)
-docker tag canopy/control-plane:latest \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
-docker push \
   <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:${VERSION}
 ```
+
+若改用 SQLite 權限後端，可省略 `ENTITLEMENTS_SHA` 與
+`--secret id=entitlements_toml,...`，但 ECS task 必須設定
+`ENTITLEMENTS_DATABASE_URL`，且該 SQLite 檔案需由 volume 或 image 外部程序提供。
+
+ECR tag 應使用 git tag 或 commit hash；不要使用 `latest`，因為 Terraform
+範本將 repository 設為 immutable。
+
+`--platform` 必須和 `terraform.tfvars` 中的 `cpu_architecture`
+一致：`X86_64` 對應 `linux/amd64`，`ARM64` 對應 `linux/arm64`。
 
 ---
 
@@ -108,6 +142,16 @@ aws secretsmanager create-secret \
   --name canopy/jwt-secret \
   --secret-string "$(openssl rand -base64 32)" \
   --region ap-northeast-1
+
+JWT_SECRET_ARN=$(aws secretsmanager describe-secret \
+  --secret-id canopy/jwt-secret \
+  --query ARN --output text \
+  --region ap-northeast-1)
+JWT_SECRET_VERSION_ID=$(aws secretsmanager list-secret-version-ids \
+  --secret-id canopy/jwt-secret \
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
+  --output text \
+  --region ap-northeast-1)
 ```
 
 如果有 OIDC client secret：
@@ -117,85 +161,80 @@ aws secretsmanager create-secret \
   --name canopy/oidc-client-secret \
   --secret-string "your-oidc-client-secret" \
   --region ap-northeast-1
+
+OIDC_CLIENT_SECRET_ARN=$(aws secretsmanager describe-secret \
+  --secret-id canopy/oidc-client-secret \
+  --query ARN --output text \
+  --region ap-northeast-1)
+OIDC_CLIENT_SECRET_VERSION_ID=$(aws secretsmanager list-secret-version-ids \
+  --secret-id canopy/oidc-client-secret \
+  --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
+  --output text \
+  --region ap-northeast-1)
+```
+
+Task definition 的 ECS secret `valueFrom` 建議 pin 到明確 version ID：
+`<SECRET_ARN>:::<VERSION_ID>`。這能避免 rolling update 期間新舊 task
+讀到不同 secret version。
+
+---
+
+## Step 4: 準備啟動設定值
+
+正式 ECS 部署不需要預先產生 `config.toml`，也不要把 secret 寫進 repo、
+Terraform state、或 baked config file。Task definition 設定 `GENERATE_CONFIG=1`
+後，entrypoint 會從環境變數和 ECS-native `secrets` 在
+`/tmp/canopy-config.toml` 產生啟動設定。
+
+> **注意**：正式 ECS 部署建議使用 repo 內建的
+> [`scripts/docker-entrypoint.sh`](../scripts/docker-entrypoint.sh)。Dockerfile
+> 會把這個 entrypoint 放進 image；Terraform task definition 會用
+> ECS-native `secrets` 注入 `JWT_SECRET` / `OIDC_CLIENT_SECRET`，並設定
+> `GENERATE_CONFIG=1` 讓 entrypoint 在 `/tmp/canopy-config.toml` 產生啟動設定。
+> 這樣 secret 不需要寫進 repo、Terraform state、或 baked config file。
+
+entrypoint 的行為摘要：
+
+```bash
+GENERATE_CONFIG=1
+JWT_SECRET=<injected by ECS secrets>
+OIDC_ISSUER_URL=https://accounts.google.com
+OIDC_CLIENT_ID=<client id>
+ENTITLEMENTS_FILE=/etc/canopy/entitlements.toml
+# 或改用 SQLite 權限後端（不可同時設定 ENTITLEMENTS_FILE）：
+# ENTITLEMENTS_DATABASE_URL=sqlite:///var/lib/canopy/entitlements.db
 ```
 
 ---
 
-## Step 4: 準備設定檔
+## Step 5: 準備 entitlements build secret
 
-建立生產用的 `config.toml`（不含 secret，secret 從環境變數注入）：
+這一步必須在 Step 2 build image 之前完成。
 
-```toml
-# config.production.toml
-
-bind_address = "0.0.0.0:8443"    # Fargate 容器內必須綁 0.0.0.0
-dev_mode = false
-
-entitlements_file = "/etc/canopy/entitlements.toml"
-
-# 不設 audit_log — audit 事件透過 tracing 輸出到 stdout
-# ECS 會自動把 stdout 送到 CloudWatch Logs
-
-cors_allowed_origins = ["https://your-domain.com"]
-
-[oidc]
-issuer_url = "https://accounts.google.com"
-client_id = "your-client-id"
-# client_secret 從環境變數注入（見 Step 6 task definition）
-
-[jwt]
-secret = "placeholder"           # 會被環境變數覆寫（見下方說明）
-expiry_seconds = 3600
-
-[aws]
-default_region = "ap-northeast-1"
-session_duration_seconds = 3600
-```
-
-> **注意**：目前 config 從 TOML 檔讀取，JWT secret 寫在檔案裡。
-> 若要從 Secrets Manager 注入，有兩種做法：
->
-> 1. **Container entrypoint script**：啟動時用 `aws secretsmanager get-secret-value` 取值，
->    用 `sed` 寫入 config.toml，再啟動 control-plane
-> 2. **改程式碼**：讓 `AppConfig` 支援從環境變數覆寫個別欄位（推薦，未來再做）
->
-> 以下用做法 1 的 wrapper script。
-
-建立 entrypoint wrapper：
+`entitlements.toml` 不 commit 到 repo，也不要放進 Terraform state。正式 image
+build 時透過 BuildKit secret 注入，Dockerfile 會把檔案 bake 到
+`/etc/canopy/entitlements.toml` 並設為唯讀。
 
 ```bash
-# scripts/docker-entrypoint.sh
-#!/bin/sh
-set -e
+cp entitlements.sample.toml entitlements.toml
+vi entitlements.toml
 
-CONFIG_PATH="${CONFIG_PATH:-/etc/canopy/config.toml}"
-
-# 從 Secrets Manager 注入 JWT secret（如果環境變數有設定 ARN）
-if [ -n "$JWT_SECRET_ARN" ]; then
-  JWT_SECRET=$(aws secretsmanager get-secret-value \
-    --secret-id "$JWT_SECRET_ARN" \
-    --query SecretString --output text)
-  sed -i "s|^secret = .*|secret = \"${JWT_SECRET}\"|" "$CONFIG_PATH"
-fi
-
-exec control-plane "$@"
+VERSION=${VERSION:-$(git describe --tags --always)}
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
 ```
 
----
-
-## Step 5: 上傳設定檔到 S3
-
-```bash
-# 建立 S3 bucket（或用現有的）
-aws s3 mb s3://canopy-config-<ACCOUNT_ID> --region ap-northeast-1
-
-# 上傳設定檔
-aws s3 cp config.production.toml s3://canopy-config-<ACCOUNT_ID>/config.toml
-aws s3 cp entitlements.production.toml s3://canopy-config-<ACCOUNT_ID>/entitlements.toml
-```
-
-> 或者直接把設定檔 bake 進 Docker image：在 Dockerfile 加 `COPY config.production.toml /etc/canopy/config.toml`。
-> S3 方式的優點是更新設定不需要重新 build image。
+第一個檢查會用 backendless Terraform mock plan 驗證 `terraform.tfvars` 的
+ALB/DNS/subnet/service preconditions。第二個檢查會確認 active entitlements
+沒有 sample placeholder、AssumeRole ARN 已列在 `assumable_role_arns`、
+Organizations role template 已列在 `assumable_role_arn_patterns`、
+`role_arn` 格式有效且 IAM Role ARN 不含 wildcard、使用 `direct` 時已啟用
+`enable_direct_access`、`profile:*` 未被部署到 ECS、ECS Exec rule 不使用
+direct/profile credentials 且同時授權 ECS view、授予 ECS 存取的 rule 有明確
+`allowed_clusters` 且寬鬆 wildcard 已設定 `allow_broad_cluster_discovery=true`，
+以及 SSM rule 有明確 `allowed_os_users`。
 
 ---
 
@@ -236,18 +275,8 @@ aws iam put-role-policy \
     }]
   }'
 
-# 加上 S3 設定檔讀取權限（如果用 S3 存設定）
-aws iam put-role-policy \
-  --role-name canopy-task-execution \
-  --policy-name config-s3-access \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::canopy-config-<ACCOUNT_ID>/*"
-    }]
-  }'
+# config 由 entrypoint 產生，entitlements 已 bake 進 image；
+# 目前不需要給 execution role 讀 S3 設定檔的權限。
 ```
 
 ### 6b. Task Role（control-plane 用來呼叫 AWS API）
@@ -266,8 +295,13 @@ aws iam create-role \
 
 # control-plane 需要的權限：
 # - STS AssumeRole（跨帳號存取）
+# - STS GetCallerIdentity（startup preflight）
+# - IAM SimulatePrincipalPolicy（connect/ECS Exec 前檢查候選 AssumeRole）
+# - Organizations ListAccounts（使用 account_id="*" discovery 時）
 # - CloudWatch Logs（自身 log + 查詢）
 # - EC2 DescribeInstances, DescribeInstanceConnectEndpoints
+# - SSM DescribeInstanceInformation（EC2 inventory 精確標示 SSM managed 狀態）
+# - ECS task inventory（使用 `role_arn = "direct"` 查看部署帳號 ECS tasks 時）
 aws iam put-role-policy \
   --role-name canopy-task-role \
   --policy-name canopy-permissions \
@@ -277,10 +311,33 @@ aws iam put-role-policy \
       {
         "Sid": "AssumeTargetRoles",
         "Effect": "Allow",
-        "Action": "sts:AssumeRole",
+        "Action": [
+          "sts:AssumeRole",
+          "sts:TagSession"
+        ],
         "Resource": [
           "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"
         ]
+      },
+      {
+        "Sid": "SimulatePolicy",
+        "Effect": "Allow",
+        "Action": "iam:SimulatePrincipalPolicy",
+        "Resource": [
+          "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"
+        ]
+      },
+      {
+        "Sid": "OrganizationsAccountDiscovery",
+        "Effect": "Allow",
+        "Action": "organizations:ListAccounts",
+        "Resource": "*"
+      },
+      {
+        "Sid": "StsIdentity",
+        "Effect": "Allow",
+        "Action": "sts:GetCallerIdentity",
+        "Resource": "*"
       },
       {
         "Sid": "DirectAccessFallback",
@@ -288,6 +345,11 @@ aws iam put-role-policy \
         "Action": [
           "ec2:DescribeInstances",
           "ec2:DescribeInstanceConnectEndpoints",
+          "ssm:DescribeInstanceInformation",
+          "ecs:DescribeClusters",
+          "ecs:DescribeTasks",
+          "ecs:ListClusters",
+          "ecs:ListTasks",
           "logs:DescribeLogGroups",
           "logs:FilterLogEvents",
           "logs:StartQuery",
@@ -301,11 +363,28 @@ aws iam put-role-policy \
 ```
 
 > **`role_arn = "direct"` 模式**：如果 entitlements 裡用 `"direct"`，
-> control-plane 會直接用 Task Role 的權限存取 AWS API，不走 AssumeRole。
-> 確保 Task Role 有足夠權限。
+> control-plane 會直接用 Task Role 的權限存取 inventory/logs 相關 AWS API，
+> 不走 AssumeRole。確保 Task Role 有足夠權限。
+>
+> ECS Exec 在非 mock deployment 中仍需要可 AssumeRole 的 IAM role ARN，
+> 因為 control-plane 必須回傳 scope 過的 STS credentials；不要用
+> `direct` 或 `profile:*` 開啟 ECS Exec。
+> ECS Exec 的 inline session policy 只允許目標 task 的 `ecs:ExecuteCommand`，
+> 並以 `aws:RequestedRegion` 限制 `ecs:DescribeTasks` 與 `ssmmessages`
+> helper channel actions 到同一個 requested region。
+>
+> 若使用 AWS Organizations discovery，AssumeRole/SimulatePolicy 的 `Resource`
+> 可使用相同 role name 的 account wildcard，例如
+> `arn:aws:iam::*:role/CanopyRole`；Terraform 對應設定為
+> `assumable_role_arn_patterns`。
 >
 > **跨帳號模式**：如果要存取其他帳號的資源，在 `AssumeTargetRoles` 加上對應的 role ARN，
-> 並在目標帳號的 role trust policy 信任這個 Task Role。
+> 並在目標帳號的 role trust policy 信任這個 Task Role。Canopy 的 AssumeRole
+> 會帶 ExternalId 與 STS session tags，所以 trust policy 也要允許
+> `sts:TagSession` 並檢查 `sts:ExternalId`。
+> 目標帳號 role 也需允許 inventory 所需的 `ec2:DescribeInstances` 與
+> `ssm:DescribeInstanceInformation`；否則該 account/region scope 會被視為
+> fetch 失敗，而不是回傳不精確的 SSM managed 狀態。
 
 ---
 
@@ -338,6 +417,10 @@ cat > /tmp/task-def.json << 'EOF'
   "family": "canopy-control-plane",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
   "cpu": "512",
   "memory": "1024",
   "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/canopy-task-execution",
@@ -345,7 +428,7 @@ cat > /tmp/task-def.json << 'EOF'
   "containerDefinitions": [
     {
       "name": "control-plane",
-      "image": "<ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:latest",
+      "image": "<ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:<IMAGE_TAG>",
       "essential": true,
       "portMappings": [
         {
@@ -354,8 +437,19 @@ cat > /tmp/task-def.json << 'EOF'
         }
       ],
       "environment": [
-        {"name": "CONFIG_PATH", "value": "/etc/canopy/config.toml"},
-        {"name": "RUST_LOG", "value": "control_plane=info,tower_http=info"}
+        {"name": "RUST_LOG", "value": "control_plane=info,tower_http=info"},
+        {"name": "GENERATE_CONFIG", "value": "1"},
+        {"name": "OIDC_ISSUER_URL", "value": "https://accounts.google.com"},
+        {"name": "OIDC_CLIENT_ID", "value": "<OIDC_CLIENT_ID>"},
+        {"name": "JWT_EXPIRY_SECONDS", "value": "3600"},
+        {"name": "AWS_DEFAULT_REGION", "value": "ap-northeast-1"},
+        {"name": "AWS_SESSION_DURATION_SECONDS", "value": "3600"},
+        {"name": "ENTITLEMENTS_FILE", "value": "/etc/canopy/entitlements.toml"},
+        {"name": "CORS_ALLOWED_ORIGINS", "value": "https://your-domain.com"},
+        {"name": "STS_EXTERNAL_ID", "value": "canopy"}
+      ],
+      "secrets": [
+        {"name": "JWT_SECRET", "valueFrom": "<JWT_SECRET_ARN>:::<JWT_SECRET_VERSION_ID>"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
@@ -368,9 +462,9 @@ cat > /tmp/task-def.json << 'EOF'
       "healthCheck": {
         "command": ["CMD-SHELL", "curl -f http://localhost:8443/health || exit 1"],
         "interval": 15,
-        "timeout": 3,
-        "retries": 3,
-        "startPeriod": 10
+        "timeout": 5,
+        "retries": 5,
+        "startPeriod": 180
       },
       "stopTimeout": 30
     }
@@ -383,13 +477,18 @@ aws ecs register-task-definition \
   --region ap-northeast-1
 ```
 
-> **設定檔注入方式**（擇一）：
->
-> 1. **Bake 進 image** — 最簡單，但更新設定需重新 build
-> 2. **S3 + init container** — 在 task definition 加一個 init container 從 S3 下載設定
-> 3. **EFS mount** — 掛載 EFS volume 存放設定檔
->
-> 建議初期用方式 1（把 config 和 entitlements COPY 進 Dockerfile），穩定後再改用方式 2 或 3。
+若 OIDC provider 使用 confidential client，另外在 `secrets` 加入下列項目，
+並讓 execution role 可讀該 secret：
+
+```json
+{
+  "name": "OIDC_CLIENT_SECRET",
+  "valueFrom": "<OIDC_CLIENT_SECRET_ARN>:::<OIDC_CLIENT_SECRET_VERSION_ID>"
+}
+```
+
+`entitlements.toml` 由 Docker build 透過 BuildKit secret bake 進 image，
+不要放進 task definition 環境變數或 Terraform state。
 
 ---
 
@@ -407,7 +506,9 @@ ALB_SG=$(aws ec2 create-security-group \
 
 aws ec2 authorize-security-group-ingress \
   --group-id $ALB_SG \
-  --protocol tcp --port 443 --cidr 0.0.0.0/0
+  --protocol tcp --port 443 --cidr <OFFICE_OR_VPN_CIDR>
+
+# 只有明確需要公開給全網際網路時，才改用 0.0.0.0/0。
 
 # ECS Task Security Group — 只允許來自 ALB 的流量
 TASK_SG=$(aws ec2 create-security-group \
@@ -518,25 +619,46 @@ canopy.your-domain.com  CNAME  canopy-alb-xxxx.ap-northeast-1.elb.amazonaws.com
 
 ```bash
 # 1. Build & push 新 image
+VERSION=v0.2.0
+test -s entitlements.toml
 ENTITLEMENTS_SHA=$(shasum -a 256 entitlements.toml | awk '{print $1}')
+CPU_ARCH=$(awk -F= '/^[[:space:]]*cpu_architecture[[:space:]]*=/{value=$2; sub(/#.*/, "", value); gsub(/[[:space:]"]/, "", value); print value; exit}' infra/terraform.tfvars)
+CPU_ARCH=${CPU_ARCH:-X86_64}
+case "$CPU_ARCH" in
+  X86_64) PLATFORM="linux/amd64" ;;
+  ARM64) PLATFORM="linux/arm64" ;;
+  *) echo "Unsupported cpu_architecture: $CPU_ARCH"; exit 1 ;;
+esac
 
-docker build \
+./scripts/validate-terraform-tfvars.sh infra \
+  -var="create_service=true" \
+  -var="image_tag=$VERSION"
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+
+DOCKER_BUILDKIT=1 docker build \
+  --platform "$PLATFORM" \
   --build-arg "ENTITLEMENTS_SHA=$ENTITLEMENTS_SHA" \
   --secret id=entitlements_toml,src=entitlements.toml \
-  -t canopy/control-plane:v0.2.0 \
+  -t canopy/control-plane:$VERSION \
   -f apps/control-plane/Dockerfile .
-docker tag canopy/control-plane:v0.2.0 \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:v0.2.0
+docker tag canopy/control-plane:$VERSION \
+  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:$VERSION
 docker push \
-  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:v0.2.0
+  <ACCOUNT_ID>.dkr.ecr.ap-northeast-1.amazonaws.com/canopy/control-plane:$VERSION
 
-# 2. 更新 task definition 的 image tag
-#    （編輯 task-def.json 改 image tag，重新 register）
+# 2. 更新 task definition 的 image tag 並 register 新 revision
+#    （重用 Step 9 的 task-def.json，將 image 改成剛 push 的 $VERSION）
+TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+  --cli-input-json file:///tmp/task-def.json \
+  --region ap-northeast-1 \
+  --query 'taskDefinition.taskDefinitionArn' \
+  --output text)
 
-# 3. 更新 service（觸發 rolling update）
+# 3. 更新 service 到新 revision（觸發 rolling update）
 aws ecs update-service \
   --cluster canopy \
   --service control-plane \
+  --task-definition "$TASK_DEFINITION_ARN" \
   --force-new-deployment \
   --region ap-northeast-1
 
@@ -590,12 +712,16 @@ curl -s https://canopy.your-domain.com/health
 
 - [ ] `bind_address` 設為 `0.0.0.0:8443`
 - [ ] `dev_mode = false`
-- [ ] `entitlements_file` 指向容器內的路徑
+- [ ] `entitlements_file` 指向容器內路徑，或 `ENTITLEMENTS_DATABASE_URL` 指向 SQLite 權限資料庫
+- [ ] 若使用 TOML backend，`entitlements.toml` 已通過 `scripts/validate-entitlements.sh`
+- [ ] 授予 ECS 存取的 rule 有明確 `allowed_clusters`
+- [ ] 寬鬆 ECS cluster wildcard 已明確設定 `allow_broad_cluster_discovery=true`
+- [ ] SSM rule 有明確 `allowed_os_users`
 - [ ] JWT secret 從 Secrets Manager 注入（不寫死在 config）
 - [ ] OIDC `issuer_url` 和 `client_id` 設定正確
 - [ ] `cors_allowed_origins` 列出 TUI client 的 callback URL
-- [ ] Task Role 有 STS/EC2/CloudWatch 權限
+- [ ] Task Role 有 STS/IAM/EC2/SSM/ECS/CloudWatch 權限；跨帳號目標 role 也有 inventory 所需的 EC2/SSM 權限
 - [ ] ALB health check 指向 `/health`
 - [ ] CloudWatch Log Group 已建立
 - [ ] DNS 已指向 ALB
-- [ ] 目標帳號的 IAM Role trust policy 信任 Task Role（跨帳號情境）
+- [ ] 目標帳號的 IAM Role trust policy 信任 Task Role，並允許 `sts:TagSession` / 檢查 `sts:ExternalId`（跨帳號情境）

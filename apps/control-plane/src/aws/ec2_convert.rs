@@ -75,9 +75,8 @@ pub fn convert_sdk_instance(
             arn.rsplit('/').next().unwrap_or(arn).to_string()
         });
 
-    // Heuristic: SSM managed if the instance has an IAM role (SSM agent needs one).
-    // A more accurate check would call SSM DescribeInstanceInformation, but that
-    // is expensive and can be deferred to instance detail view.
+    // Fallback heuristic for callers that only have EC2 DescribeInstances data.
+    // The real AWS list route overwrites this with SSM DescribeInstanceInformation.
     let ssm_managed = iam_role.is_some() && state == InstanceState::Running;
 
     // EC2 Instance Connect is available on Amazon Linux 2/2023 and Ubuntu 20.04+

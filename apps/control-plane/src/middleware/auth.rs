@@ -169,6 +169,11 @@ mod tests {
                 client_id: "test".into(),
                 client_secret: None,
                 scopes: vec!["openid".into()],
+                acr_values: vec![],
+                prompt: None,
+                max_age_seconds: None,
+                required_acr_values: vec![],
+                required_amr_values: vec![],
                 authorization_endpoint: None,
                 token_endpoint: None,
                 device_authorization_endpoint: None,
@@ -188,7 +193,11 @@ mod tests {
             dev_mode: true,
             mock_aws_data: None,
             entitlements_file: None,
+            entitlements_database_url: None,
+            mfa_database_url: None,
+            mfa_secret_key: None,
             audit_log: None,
+            audit_export: Default::default(),
             cors_allowed_origins: vec![],
         }
     }
@@ -205,6 +214,8 @@ mod tests {
             entitlement_store: Arc::new(tokio::sync::RwLock::new(store)),
             audit_service: AuditService::new(),
             oidc_client: OidcClient::new(test_config().oidc),
+            mfa_store: crate::models::mfa::MfaStore::disabled(),
+            step_up_sessions: crate::services::step_up::StepUpSessionStore::default(),
             base_aws_config,
             database_secret_provider: Arc::new(TestDatabaseSecretProvider),
             database_executor: Arc::new(TestDatabaseExecutor),
@@ -236,6 +247,7 @@ mod tests {
             groups: vec!["eng".into()],
             exp: now + 3600,
             iat: now,
+            jti: "test-token".into(),
             email_verified: true,
         };
         jsonwebtoken::encode(
@@ -337,6 +349,7 @@ mod tests {
             groups: vec![],
             exp: 0, // epoch — expired
             iat: 0,
+            jti: "expired-token".into(),
             email_verified: false,
         };
         let token = jsonwebtoken::encode(

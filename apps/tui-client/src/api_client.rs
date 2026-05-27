@@ -12,6 +12,7 @@ use shared::dto::auth::*;
 use shared::dto::cloudwatch::*;
 use shared::dto::database::*;
 use shared::dto::ec2::*;
+use shared::dto::ecs::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
     McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse, McpGuidanceSyncRequest,
@@ -410,6 +411,135 @@ impl ApiClient {
         .await
     }
 
+    pub async fn mfa_status(&self) -> ApiResult<MfaStatusResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .get(format!("{}/api/auth/mfa/status", self.base_url))
+        })
+        .await
+    }
+
+    pub async fn start_totp_enrollment(
+        &self,
+        request: &TotpEnrollStartRequest,
+    ) -> ApiResult<TotpEnrollStartResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/auth/mfa/totp/start", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn confirm_totp_enrollment(
+        &self,
+        request: &TotpEnrollConfirmRequest,
+    ) -> ApiResult<TotpEnrollConfirmResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/auth/mfa/totp/confirm", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn verify_totp_step_up(
+        &self,
+        request: &TotpVerifyRequest,
+    ) -> ApiResult<TotpVerifyResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/auth/mfa/totp/verify", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn generate_recovery_codes(&self) -> ApiResult<RecoveryCodesGenerateResponse> {
+        self.send_authenticated(|| {
+            self.client.post(format!(
+                "{}/api/auth/mfa/recovery-codes/generate",
+                self.base_url
+            ))
+        })
+        .await
+    }
+
+    pub async fn verify_recovery_code_step_up(
+        &self,
+        request: &RecoveryCodeVerifyRequest,
+    ) -> ApiResult<RecoveryCodeVerifyResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/recovery-codes/verify",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn start_webauthn_registration(
+        &self,
+        request: &WebAuthnRegisterStartRequest,
+    ) -> ApiResult<WebAuthnRegisterStartResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/register/start",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn finish_webauthn_registration(
+        &self,
+        request: &WebAuthnRegisterFinishRequest,
+    ) -> ApiResult<WebAuthnRegisterFinishResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/register/finish",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn start_webauthn_verification(
+        &self,
+        request: &WebAuthnVerifyStartRequest,
+    ) -> ApiResult<WebAuthnVerifyStartResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/verify/start",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn finish_webauthn_verification(
+        &self,
+        request: &WebAuthnVerifyFinishRequest,
+    ) -> ApiResult<WebAuthnVerifyResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/verify/finish",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {
@@ -425,6 +555,35 @@ impl ApiClient {
         self.send_authenticated(|| {
             self.client
                 .post(format!("{}/api/ec2/connect", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn power_ec2(&self, request: &Ec2PowerRequest) -> ApiResult<Ec2PowerResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ec2/power", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    // ── ECS ─────────────────────────────────────────────
+
+    pub async fn list_ecs_tasks(&self, request: &EcsTasksRequest) -> ApiResult<EcsTasksResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ecs/tasks", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn ecs_exec(&self, request: &EcsExecRequest) -> ApiResult<EcsExecResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/ecs/exec", self.base_url))
                 .json(request)
         })
         .await

@@ -25,8 +25,12 @@ reqwest.workspace = true
 
 aws-config.workspace = true
 aws-sdk-ec2.workspace = true
+aws-sdk-ecs.workspace = true
 aws-sdk-cloudwatchlogs.workspace = true
 aws-sdk-secretsmanager.workspace = true
+aws-sdk-s3.workspace = true
+aws-sdk-organizations.workspace = true
+aws-sdk-ssm.workspace = true
 aws-sdk-sts.workspace = true
 aws-sdk-iam.workspace = true
 aws-credential-types.workspace = true
@@ -40,8 +44,13 @@ aes-gcm.workspace = true
 async-trait.workspace = true
 mysql_async.workspace = true
 sqlparser.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+totp-rs.workspace = true
+passkey-auth.workspace = true
 toml = "0.8"
 dashmap = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
@@ -63,3 +72,6 @@ tokio-tungstenite = "0.24"
 # CI runners that opt in must have Docker available.
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["mysql"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+ciborium = "0.2"
+ed25519-dalek = "2"

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -7,9 +7,11 @@ use shared::dto::entitlements::UserEntitlements;
 
 use super::Component;
 use crate::event::{Action, Screen};
+use crate::keybindings::{DashboardShortcut, KeyBindings};
+use crate::theme::Theme;
 
 struct MenuItem {
-    key: char,
+    shortcut: DashboardShortcut,
     label: &'static str,
     screen: Screen,
     enabled: bool,
@@ -26,10 +28,17 @@ pub struct DashboardScreen {
     pub public_ip: Option<String>,
     pub show_public_ip: bool,
     pub ip_fetch_generation: u64,
+    keybindings: KeyBindings,
+    theme: Theme,
 }
 
 impl DashboardScreen {
-    pub fn new(enable_live_tail: bool, show_public_ip: bool) -> Self {
+    pub fn new(
+        enable_live_tail: bool,
+        show_public_ip: bool,
+        keybindings: KeyBindings,
+        theme: Theme,
+    ) -> Self {
         Self {
             entitlements: None,
             selected: 0,
@@ -37,44 +46,46 @@ impl DashboardScreen {
             public_ip: None,
             show_public_ip,
             ip_fetch_generation: 0,
+            keybindings,
+            theme,
             items: vec![
                 MenuItem {
-                    key: '1',
-                    label: "EC2 Inventory",
+                    shortcut: DashboardShortcut::Inventory,
+                    label: "Inventory",
                     screen: Screen::Ec2Inventory,
                     enabled: false,
                     hidden: false,
                 },
                 MenuItem {
-                    key: '2',
+                    shortcut: DashboardShortcut::CloudWatch,
                     label: "CloudWatch Search",
                     screen: Screen::CloudWatchSearch,
                     enabled: false,
                     hidden: false,
                 },
                 MenuItem {
-                    key: '3',
+                    shortcut: DashboardShortcut::LiveTail,
                     label: "Live Tail",
                     screen: Screen::LiveTail,
                     enabled: false,
                     hidden: !enable_live_tail,
                 },
                 MenuItem {
-                    key: '4',
+                    shortcut: DashboardShortcut::Access,
                     label: "Access / Identity",
                     screen: Screen::Access,
                     enabled: true,
                     hidden: false,
                 },
                 MenuItem {
-                    key: '5',
+                    shortcut: DashboardShortcut::Settings,
                     label: "Settings",
                     screen: Screen::Settings,
                     enabled: true,
                     hidden: false,
                 },
                 MenuItem {
-                    key: '6',
+                    shortcut: DashboardShortcut::Mcp,
                     label: "MCP / AI Tools",
                     screen: Screen::Mcp,
                     enabled: false,
@@ -90,7 +101,7 @@ impl DashboardScreen {
     }
 
     pub fn set_entitlements(&mut self, ent: UserEntitlements) {
-        self.items[0].enabled = ent.features.can_view_ec2;
+        self.items[0].enabled = ent.features.can_view_ec2 || ent.features.can_view_ecs;
         self.items[1].enabled = ent.features.can_use_cloudwatch_search;
         // Only enable live tail when the feature flag is on AND the user has
         // the entitlement.
@@ -114,46 +125,57 @@ impl DashboardScreen {
 
 impl Component for DashboardScreen {
     fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if self.keybindings.matches_any(&self.keybindings.quit, &key) {
             return Action::Quit;
         }
-        if key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if self.keybindings.matches_any(&self.keybindings.logout, &key) {
             return Action::Logout;
         }
-        if key.code == KeyCode::Char('q') {
+        if self
+            .keybindings
+            .matches_any(&self.keybindings.dashboard_quit, &key)
+        {
             return Action::Quit;
         }
-
         let visible: Vec<&MenuItem> = self.visible_items();
 
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.selected > 0 {
-                    self.selected -= 1;
-                }
-                Action::Noop
+        if self
+            .keybindings
+            .matches_any(&self.keybindings.dashboard_up, &key)
+        {
+            if self.selected > 0 {
+                self.selected -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected < visible.len().saturating_sub(1) {
-                    self.selected += 1;
-                }
-                Action::Noop
+            return Action::Noop;
+        }
+
+        if self
+            .keybindings
+            .matches_any(&self.keybindings.dashboard_down, &key)
+        {
+            if self.selected < visible.len().saturating_sub(1) {
+                self.selected += 1;
             }
-            KeyCode::Enter => {
-                if let Some(item) = visible.get(self.selected) {
-                    self.try_navigate(item)
-                } else {
-                    Action::Noop
-                }
+            return Action::Noop;
+        }
+
+        if self
+            .keybindings
+            .matches_any(&self.keybindings.dashboard_select, &key)
+        {
+            if let Some(item) = visible.get(self.selected) {
+                return self.try_navigate(item);
             }
-            KeyCode::Char(c) => {
-                if let Some(item) = visible.iter().find(|i| i.key == c) {
-                    self.try_navigate(item)
-                } else {
-                    Action::Noop
-                }
-            }
-            _ => Action::Noop,
+            return Action::Noop;
+        }
+
+        if let Some(item) = visible.iter().find(|item| {
+            self.keybindings
+                .matches_dashboard_shortcut(item.shortcut, &key)
+        }) {
+            self.try_navigate(item)
+        } else {
+            Action::Noop
         }
     }
 
@@ -161,7 +183,7 @@ impl Component for DashboardScreen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" Canopy - Dashboard ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(self.theme.accent));
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -182,15 +204,15 @@ impl Component for DashboardScreen {
         let info_line = if self.show_public_ip {
             let ip_display = self.public_ip.as_deref().unwrap_or("fetching...");
             Line::from(vec![
-                Span::styled(" IP: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(ip_display, Style::default().fg(Color::Yellow)),
-                Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&now, Style::default().fg(Color::Cyan)),
+                Span::styled(" IP: ", Style::default().fg(self.theme.muted)),
+                Span::styled(ip_display, Style::default().fg(self.theme.warning)),
+                Span::styled("  │  ", Style::default().fg(self.theme.muted)),
+                Span::styled(&now, Style::default().fg(self.theme.accent)),
             ])
         } else {
             Line::from(vec![
                 Span::styled(" ", Style::default()),
-                Span::styled(&now, Style::default().fg(Color::Cyan)),
+                Span::styled(&now, Style::default().fg(self.theme.accent)),
             ])
         };
         Paragraph::new(info_line).render(chunks[0], buf);
@@ -209,7 +231,7 @@ impl Component for DashboardScreen {
         };
 
         Paragraph::new(welcome_text)
-            .style(Style::default().fg(Color::Cyan))
+            .style(Style::default().fg(self.theme.accent))
             .wrap(Wrap { trim: true })
             .render(chunks[2], buf);
 
@@ -231,27 +253,43 @@ impl Component for DashboardScreen {
             };
 
             let (style, prefix) = if !item.enabled {
-                (Style::default().fg(Color::Gray), "  ")
+                (Style::default().fg(self.theme.muted), "  ")
             } else if i == self.selected {
                 (
                     Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Indexed(24))
+                        .fg(self.theme.selected_fg)
+                        .bg(self.theme.selected_bg)
                         .bold(),
                     ">>",
                 )
             } else {
-                (Style::default().fg(Color::White), "  ")
+                (Style::default().fg(self.theme.text), "  ")
             };
 
+            let label = if item.screen == Screen::Ec2Inventory {
+                inventory_label(self.entitlements.as_ref(), item.label)
+            } else {
+                item.label
+            };
             let status = if item.enabled { "" } else { " (disabled)" };
-            let text = format!("{} [{}] {}{}", prefix, item.key, item.label, status);
+            let key_label = KeyBindings::first_label(
+                self.keybindings.dashboard_shortcut_bindings(item.shortcut),
+            );
+            let text = format!("{} [{}] {}{}", prefix, key_label, label, status);
             Paragraph::new(text).style(style).render(item_area, buf);
         }
 
         // Help bar
-        Paragraph::new("Ctrl+x: logout | q: quit | j/k: navigate | Enter: select | 1-6: quick nav")
-            .style(Style::default().fg(Color::Gray))
+        let help = format!(
+            "{}: logout | {}: quit | {}/{}: navigate | {}: select",
+            KeyBindings::first_label(&self.keybindings.logout),
+            KeyBindings::first_label(&self.keybindings.dashboard_quit),
+            KeyBindings::first_label(&self.keybindings.dashboard_up),
+            KeyBindings::first_label(&self.keybindings.dashboard_down),
+            KeyBindings::first_label(&self.keybindings.dashboard_select)
+        );
+        Paragraph::new(help)
+            .style(Style::default().fg(self.theme.muted))
             .render(chunks[5], buf);
     }
 
@@ -261,6 +299,18 @@ impl Component for DashboardScreen {
         } else {
             vec![]
         }
+    }
+}
+
+fn inventory_label(
+    entitlements: Option<&UserEntitlements>,
+    fallback: &'static str,
+) -> &'static str {
+    match entitlements.map(|ent| (ent.features.can_view_ec2, ent.features.can_view_ecs)) {
+        Some((true, true)) => "Inventory (EC2 + ECS)",
+        Some((true, false)) => "Inventory (EC2)",
+        Some((false, true)) => "Inventory (ECS)",
+        _ => fallback,
     }
 }
 
@@ -306,20 +356,41 @@ mod tests {
             allowed_log_group_arns: vec![],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
         }
     }
 
+    fn test_theme() -> Theme {
+        Theme::default()
+    }
+
+    fn rendered_text(screen: &mut DashboardScreen) -> String {
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+
+        let mut out = String::new();
+        for cell in &buf.content {
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
     #[test]
     fn initial_state_all_menu_items_except_access_settings_disabled() {
-        let screen = DashboardScreen::new(false, false);
+        let screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         let visible = screen.visible_items();
-        // Items: EC2(disabled), CW(disabled), Access(enabled), Settings(enabled), MCP(disabled)
+        // Items: Inventory(disabled), CW(disabled), Access(enabled), Settings(enabled), MCP(disabled)
         // Live Tail is hidden when enable_live_tail=false
         assert_eq!(visible.len(), 5);
-        assert!(!visible[0].enabled); // EC2
+        assert!(!visible[0].enabled); // Inventory
         assert!(!visible[1].enabled); // CW
         assert!(visible[2].enabled); // Access
         assert!(visible[3].enabled); // Settings
@@ -328,7 +399,7 @@ mod tests {
 
     #[test]
     fn set_entitlements_enables_ec2_and_cloudwatch() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         screen.set_entitlements(test_entitlements(true, true, false));
 
         let visible = screen.visible_items();
@@ -337,22 +408,60 @@ mod tests {
     }
 
     #[test]
+    fn set_entitlements_enables_inventory_for_ecs_view_only_user() {
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
+        let mut ent = test_entitlements(false, false, false);
+        ent.features.can_view_ecs = true;
+        screen.set_entitlements(ent);
+
+        let visible = screen.visible_items();
+        assert!(visible[0].enabled);
+        let action = screen.handle_key(key(KeyCode::Char('1')));
+        assert!(matches!(action, Action::NavigateTo(Screen::Ec2Inventory)));
+    }
+
+    #[test]
+    fn dashboard_inventory_label_is_ecs_aware() {
+        let mut both = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
+        let mut both_ent = test_entitlements(true, false, false);
+        both_ent.features.can_view_ecs = true;
+        both.set_entitlements(both_ent);
+        let both_text = rendered_text(&mut both);
+        assert!(both_text.contains("Inventory (EC2 + ECS)"));
+        assert!(!both_text.contains("EC2 Inventory"));
+
+        let mut ecs_only = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
+        let mut ecs_ent = test_entitlements(false, false, false);
+        ecs_ent.features.can_view_ecs = true;
+        ecs_only.set_entitlements(ecs_ent);
+        let ecs_text = rendered_text(&mut ecs_only);
+        assert!(ecs_text.contains("Inventory (ECS)"));
+        assert!(!ecs_text.contains("EC2 Inventory"));
+
+        let mut ec2_only = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
+        ec2_only.set_entitlements(test_entitlements(true, false, false));
+        let ec2_text = rendered_text(&mut ec2_only);
+        assert!(ec2_text.contains("Inventory (EC2)"));
+        assert!(!ec2_text.contains("EC2 Inventory"));
+    }
+
+    #[test]
     fn live_tail_hidden_when_feature_flag_off() {
-        let screen = DashboardScreen::new(false, false);
+        let screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         let visible = screen.visible_items();
         assert!(visible.iter().all(|i| i.screen != Screen::LiveTail));
     }
 
     #[test]
     fn live_tail_visible_when_feature_flag_on() {
-        let screen = DashboardScreen::new(true, false);
+        let screen = DashboardScreen::new(true, false, KeyBindings::default(), test_theme());
         let visible = screen.visible_items();
         assert!(visible.iter().any(|i| i.screen == Screen::LiveTail));
     }
 
     #[test]
     fn live_tail_enabled_only_with_entitlement_and_flag() {
-        let mut screen = DashboardScreen::new(true, false);
+        let mut screen = DashboardScreen::new(true, false, KeyBindings::default(), test_theme());
         screen.set_entitlements(test_entitlements(false, false, true));
 
         let lt = screen
@@ -365,7 +474,7 @@ mod tests {
 
     #[test]
     fn navigate_up_down_wraps_selection() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         assert_eq!(screen.selected, 0);
 
         screen.handle_key(key(KeyCode::Down));
@@ -391,7 +500,7 @@ mod tests {
 
     #[test]
     fn enter_on_disabled_item_shows_error() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         // selected=0 is EC2, disabled
         let action = screen.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, Action::ShowError(_)));
@@ -399,7 +508,7 @@ mod tests {
 
     #[test]
     fn enter_on_enabled_item_navigates() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         screen.set_entitlements(test_entitlements(true, false, false));
 
         // selected=0 is EC2, now enabled
@@ -409,7 +518,7 @@ mod tests {
 
     #[test]
     fn quick_nav_by_number() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         screen.set_entitlements(test_entitlements(true, true, false));
 
         let action = screen.handle_key(key(KeyCode::Char('2')));
@@ -420,15 +529,59 @@ mod tests {
     }
 
     #[test]
+    fn custom_quick_nav_replaces_default_key() {
+        let bindings = KeyBindings {
+            dashboard_cloudwatch: vec!["c".into()],
+            ..Default::default()
+        };
+        let mut screen = DashboardScreen::new(false, false, bindings, test_theme());
+        screen.set_entitlements(test_entitlements(true, true, false));
+
+        let default_action = screen.handle_key(key(KeyCode::Char('2')));
+        assert!(matches!(default_action, Action::Noop));
+
+        let custom_action = screen.handle_key(key(KeyCode::Char('c')));
+        assert!(matches!(
+            custom_action,
+            Action::NavigateTo(Screen::CloudWatchSearch)
+        ));
+    }
+
+    #[test]
+    fn render_applies_configured_selection_theme() {
+        let theme = Theme {
+            selected_bg: Color::Blue,
+            selected_fg: Color::LightYellow,
+            ..Theme::default()
+        };
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), theme);
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        screen.set_entitlements(test_entitlements(true, false, false));
+
+        screen.render(area, &mut buf);
+
+        let selected_cells = buf
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() != " " && cell.bg == Color::Blue)
+            .count();
+        assert!(selected_cells > 0);
+        assert!(buf.content.iter().any(|cell| {
+            cell.symbol() != " " && cell.bg == Color::Blue && cell.fg == Color::LightYellow
+        }));
+    }
+
+    #[test]
     fn q_quits() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         let action = screen.handle_key(key(KeyCode::Char('q')));
         assert!(matches!(action, Action::Quit));
     }
 
     #[test]
     fn ctrl_x_logs_out() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         let action = screen.handle_key(key_with_modifiers(
             KeyCode::Char('x'),
             KeyModifiers::CONTROL,
@@ -438,7 +591,7 @@ mod tests {
 
     #[test]
     fn plain_x_upper_x_and_tab_do_not_log_out() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
 
         let plain_x = screen.handle_key(key(KeyCode::Char('x')));
         let upper_x = screen.handle_key(key(KeyCode::Char('X')));
@@ -451,21 +604,21 @@ mod tests {
 
     #[test]
     fn on_enter_fetches_ip_when_enabled() {
-        let mut screen = DashboardScreen::new(false, true);
+        let mut screen = DashboardScreen::new(false, true, KeyBindings::default(), test_theme());
         let actions = screen.on_enter();
         assert!(actions.iter().any(|a| matches!(a, Action::FetchPublicIp)));
     }
 
     #[test]
     fn on_enter_does_not_fetch_ip_when_disabled() {
-        let mut screen = DashboardScreen::new(false, false);
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         let actions = screen.on_enter();
         assert!(actions.is_empty());
     }
 
     #[test]
     fn on_enter_does_not_refetch_ip_when_already_present() {
-        let mut screen = DashboardScreen::new(false, true);
+        let mut screen = DashboardScreen::new(false, true, KeyBindings::default(), test_theme());
         screen.public_ip = Some("1.2.3.4".into());
         let actions = screen.on_enter();
         assert!(actions.is_empty());

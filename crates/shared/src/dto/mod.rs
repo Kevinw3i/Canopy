@@ -3,5 +3,7 @@ pub mod auth;
 pub mod cloudwatch;
 pub mod database;
 pub mod ec2;
+pub mod ecs;
 pub mod entitlements;
 pub mod mcp;
+pub mod pty_spawn;

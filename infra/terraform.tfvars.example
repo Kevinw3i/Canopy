@@ -1,28 +1,44 @@
 aws_region         = "ap-northeast-1"
+# Project is used in ALB, target group, ECR, ECS, IAM, and log names.
+# project            = "canopy"
 
 # Networking:
 # Option A: use existing VPC/subnets.
 create_vpc         = false
-vpc_id             = "vpc-xxxxxxxxxxxxxxxxx"
-public_subnet_ids  = ["subnet-aaa", "subnet-bbb"]
-private_subnet_ids = ["subnet-ccc", "subnet-ddd"]
+vpc_id             = "vpc-00000000000000000"
+public_subnet_ids  = ["subnet-00000000000000001", "subnet-00000000000000002"]
+private_subnet_ids = ["subnet-00000000000000003", "subnet-00000000000000004"]
 
 # Option B: create a dedicated VPC. Set create_vpc = true and tune CIDRs.
 # create_vpc           = true
 # vpc_cidr             = "10.200.0.0/16"
 # public_subnet_cidrs  = ["10.200.0.0/24", "10.200.1.0/24"]
 # private_subnet_cidrs = ["10.200.10.0/24", "10.200.11.0/24"]
+# Set false for one NAT per private subnet/AZ; requires at least as many public CIDRs as private CIDRs.
 # single_nat_gateway   = true
 
-acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/xxxxxxxx"
+acm_certificate_arn = "arn:aws:acm:ap-northeast-1:123456789012:certificate/00000000-0000-0000-0000-000000000000"
 
 # Image tag (required — use a versioned tag or git SHA, not "latest")
 image_tag = "v0.1.0"
 
+# Fargate Linux task size. Defaults are 512 CPU units and 1024 MiB memory.
+# cpu    = 512
+# memory = 1024
+
 # JWT secret — create out-of-band, pass ARN here (never stored in Terraform state)
-# aws secretsmanager create-secret --name canopy/jwt-secret --secret-string "$(openssl rand -base64 44)"
+# AWS_REGION=${AWS_REGION:-ap-northeast-1}
+# aws secretsmanager create-secret \
+#   --name canopy/jwt-secret \
+#   --secret-string "$(openssl rand -base64 44)" \
+#   --region "$AWS_REGION"
+# aws secretsmanager list-secret-version-ids \
+#   --secret-id canopy/jwt-secret \
+#   --query 'Versions[?contains(VersionStages, `AWSCURRENT`)].VersionId | [0]' \
+#   --output text \
+#   --region "$AWS_REGION"
 jwt_secret_arn        = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/jwt-secret-XXXXXX"
-jwt_secret_version_id = ""  # Required: pin with `aws secretsmanager describe-secret --secret-id canopy/jwt-secret --query 'VersionIdsToStages' --output json`
+jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
 
 # Optional MCP database credentials. Create these secrets out-of-band; Terraform
 # stores only the secret ARNs and non-secret connection metadata.
@@ -48,14 +64,21 @@ jwt_secret_version_id = ""  # Required: pin with `aws secretsmanager describe-se
 
 # ALB defaults to internal. Provide at least one CIDR (e.g. your VPC CIDR for internal).
 alb_allowed_cidrs = ["10.0.0.0/16"]
-# alb_internal    = false  # set to false + office CIDRs for public access
+# alb_internal    = false  # set to false + office/VPN CIDRs for public access
+# allow_public_alb_world_cidr = true  # explicit opt-in only if public ALB must allow the whole internet
 
 # Optional: Route 53 DNS record
+# Set both values to create the record; leave both commented to skip DNS.
 # route53_zone_id = "Z0123456789ABCDEFGHIJ"
 # domain_name     = "canopy.example.com"
 
 oidc_issuer_url = "https://accounts.google.com"
 oidc_client_id  = "your-client-id"
+
+# Runtime defaults generated into config.toml by the ECS entrypoint.
+# jwt_expiry_seconds            = 3600
+# aws_session_duration_seconds  = 3600
+# log_retention_days            = 90
 
 # STS ExternalId for cross-account AssumeRole (must match target trust policy)
 # sts_external_id = "my-custom-external-id"
@@ -64,4 +87,10 @@ oidc_client_id  = "your-client-id"
 # assumable_role_arns = [
 #   "arn:aws:iam::111111111111:role/CanopyRole",
 #   "arn:aws:iam::222222222222:role/CanopyRole",
+# ]
+#
+# Optional: allow AWS Organizations account discovery for same-named roles.
+# Use with entitlements account_id = "*" and role_arn containing {account_id}.
+# assumable_role_arn_patterns = [
+#   "arn:aws:iam::*:role/CanopyRole",
 # ]

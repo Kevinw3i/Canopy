@@ -26,7 +26,9 @@ subtle.workspace = true
 portable-pty = "0.9"
 vt100 = "0.16"
 
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-util = "0.7"
+tokio-tungstenite = "0.24"
 toml = "0.8"
 dirs = "5"
 open = "5"
@@ -35,6 +37,11 @@ flate2 = "1"
 tar = "0.4"
 
 [dev-dependencies]
+async-trait.workspace = true
+axum = { version = "0.7", features = ["json"] }
+aws-config.workspace = true
+aws-types.workspace = true
+control-plane = { path = "../control-plane" }
 tokio = { version = "1", features = ["full"] }
 serde_json.workspace = true
 reqwest.workspace = true

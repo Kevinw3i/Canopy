@@ -93,6 +93,12 @@ pub struct IdTokenClaims {
     pub aud: Option<serde_json::Value>, // can be string or array
     #[serde(default)]
     pub exp: Option<u64>,
+    #[serde(default)]
+    pub acr: Option<String>,
+    #[serde(default)]
+    pub amr: Vec<String>,
+    #[serde(default)]
+    pub auth_time: Option<u64>,
 }
 
 /// OIDC device authorization response
@@ -414,7 +420,51 @@ impl OidcClient {
             None => anyhow::bail!("id_token missing required 'exp' claim"),
         }
 
+        self.validate_mfa_claims(&claims)?;
+
         Ok(claims)
+    }
+
+    fn validate_mfa_claims(&self, claims: &IdTokenClaims) -> anyhow::Result<()> {
+        if !self.config.required_acr_values.is_empty() {
+            match claims.acr.as_deref() {
+                Some(acr)
+                    if self
+                        .config
+                        .required_acr_values
+                        .iter()
+                        .any(|required| required == acr) => {}
+                Some(acr) => {
+                    anyhow::bail!("id_token acr '{}' does not match required values", acr);
+                }
+                None => anyhow::bail!("id_token missing required 'acr' claim"),
+            }
+        }
+
+        for required in &self.config.required_amr_values {
+            if !claims.amr.iter().any(|amr| amr == required) {
+                anyhow::bail!(
+                    "id_token amr does not contain required value '{}'",
+                    required
+                );
+            }
+        }
+
+        if let Some(max_age) = self.config.max_age_seconds {
+            let auth_time = claims
+                .auth_time
+                .ok_or_else(|| anyhow::anyhow!("id_token missing required 'auth_time' claim"))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let latest_allowed = auth_time.saturating_add(max_age).saturating_add(300);
+            if now > latest_allowed {
+                anyhow::bail!("id_token auth_time is older than configured max_age_seconds");
+            }
+        }
+
+        Ok(())
     }
 
     /// Verify an id_token using JWKS keys.
@@ -462,15 +512,21 @@ impl OidcClient {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("OIDC provider has no device_authorization_endpoint"))?;
 
-        let scope_str = self.config.scopes.join(" ");
-        let mut params = vec![
-            ("client_id", self.config.client_id.as_str()),
-            ("scope", scope_str.as_str()),
+        let mut params: Vec<(&'static str, String)> = vec![
+            ("client_id", self.config.client_id.clone()),
+            ("scope", self.config.scopes.join(" ")),
         ];
-        let secret_val;
         if let Some(ref secret) = self.config.client_secret {
-            secret_val = secret.clone();
-            params.push(("client_secret", &secret_val));
+            params.push(("client_secret", secret.clone()));
+        }
+        if !self.config.acr_values.is_empty() {
+            params.push(("acr_values", self.config.acr_values.join(" ")));
+        }
+        if let Some(prompt) = self.config.prompt.as_ref() {
+            params.push(("prompt", prompt.clone()));
+        }
+        if let Some(max_age) = self.config.max_age_seconds {
+            params.push(("max_age", max_age.to_string()));
         }
 
         let resp = self.http.post(device_ep).form(&params).send().await?;
@@ -638,6 +694,11 @@ mod tests {
             client_id: TEST_CLIENT_ID.into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            acr_values: vec![],
+            prompt: None,
+            max_age_seconds: None,
+            required_acr_values: vec![],
+            required_amr_values: vec![],
             authorization_endpoint: None,
             token_endpoint: None,
             device_authorization_endpoint: None,
@@ -651,8 +712,8 @@ mod tests {
     }
 
     /// Create a client with the test RSA key pre-populated in JWKS cache.
-    async fn client_with_cached_jwks() -> OidcClient {
-        let client = test_client();
+    async fn client_with_cached_jwks_config(config: crate::config::OidcConfig) -> OidcClient {
+        let client = OidcClient::new(config);
         let jwk = Jwk {
             kid: Some(TEST_KID.into()),
             kty: "RSA".into(),
@@ -666,6 +727,10 @@ mod tests {
         };
         client.jwks_cache.write().await.insert(TEST_KID.into(), jwk);
         client
+    }
+
+    async fn client_with_cached_jwks() -> OidcClient {
+        client_with_cached_jwks_config(test_config()).await
     }
 
     /// Sign a JWT with the test RSA key, including kid in the header.
@@ -879,6 +944,11 @@ mod tests {
             client_id: "cid".into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            acr_values: vec![],
+            prompt: None,
+            max_age_seconds: None,
+            required_acr_values: vec![],
+            required_amr_values: vec![],
             authorization_endpoint: Some("https://auth.example.com/authorize".into()),
             token_endpoint: Some("https://auth.example.com/token".into()),
             device_authorization_endpoint: Some("https://auth.example.com/device".into()),
@@ -913,6 +983,11 @@ mod tests {
             client_id: "cid".into(),
             client_secret: None,
             scopes: vec![],
+            acr_values: vec![],
+            prompt: None,
+            max_age_seconds: None,
+            required_acr_values: vec![],
+            required_amr_values: vec![],
             authorization_endpoint: Some("https://a/authorize".into()),
             token_endpoint: Some("https://a/token".into()),
             device_authorization_endpoint: None,
@@ -936,6 +1011,11 @@ mod tests {
             client_id: "cid".into(),
             client_secret: None,
             scopes: vec![],
+            acr_values: vec![],
+            prompt: None,
+            max_age_seconds: None,
+            required_acr_values: vec![],
+            required_amr_values: vec![],
             authorization_endpoint: Some("https://a/authorize".into()),
             token_endpoint: Some("https://a/token".into()),
             device_authorization_endpoint: None,
@@ -1019,6 +1099,73 @@ mod tests {
         assert!(resp.verification_uri_complete.is_none());
     }
 
+    #[tokio::test]
+    async fn device_authorize_includes_mfa_controls() {
+        use axum::{
+            extract::{Form, State},
+            routing::post,
+            Router,
+        };
+        use std::sync::{Arc, Mutex};
+
+        type CapturedForm = Arc<Mutex<Option<HashMap<String, String>>>>;
+
+        async fn capture_device_form(
+            State(captured): State<CapturedForm>,
+            Form(form): Form<HashMap<String, String>>,
+        ) -> impl axum::response::IntoResponse {
+            *captured.lock().unwrap() = Some(form);
+            axum::Json(serde_json::json!({
+                "device_code": "dc",
+                "user_code": "UC-1234",
+                "verification_uri": "https://device.example.com",
+                "expires_in": 600,
+                "interval": 5
+            }))
+        }
+
+        let captured: CapturedForm = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/device", post(capture_device_form))
+            .with_state(captured.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.authorization_endpoint = Some(format!("http://{addr}/authorize"));
+        config.token_endpoint = Some(format!("http://{addr}/token"));
+        config.device_authorization_endpoint = Some(format!("http://{addr}/device"));
+        config.jwks_uri = Some(format!("http://{addr}/jwks"));
+        config.client_secret = Some("secret".into());
+        config.acr_values = vec!["urn:mfa".into(), "urn:webauthn".into()];
+        config.prompt = Some("login".into());
+        config.max_age_seconds = Some(300);
+
+        let client = OidcClient::new(config);
+        let resp = client.device_authorize().await.unwrap();
+        assert_eq!(resp.device_code, "dc");
+
+        let form = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            form.get("client_id").map(String::as_str),
+            Some(TEST_CLIENT_ID)
+        );
+        assert_eq!(form.get("scope").map(String::as_str), Some("openid"));
+        assert_eq!(
+            form.get("client_secret").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(
+            form.get("acr_values").map(String::as_str),
+            Some("urn:mfa urn:webauthn")
+        );
+        assert_eq!(form.get("prompt").map(String::as_str), Some("login"));
+        assert_eq!(form.get("max_age").map(String::as_str), Some("300"));
+    }
+
     #[test]
     fn serde_oidc_token_error() {
         let err: OidcTokenError = serde_json::from_value(serde_json::json!({
@@ -1053,7 +1200,10 @@ mod tests {
             "preferred_username": "tuser",
             "iss": "https://issuer.com",
             "aud": "client-1",
-            "exp": 1700000000_u64
+            "exp": 1700000000_u64,
+            "acr": "urn:mfa",
+            "amr": ["pwd", "mfa"],
+            "auth_time": 1699999900_u64
         }))
         .unwrap();
         assert_eq!(claims.sub, "user-123");
@@ -1061,6 +1211,9 @@ mod tests {
         assert_eq!(claims.email_verified, Some(true));
         assert_eq!(claims.name.as_deref(), Some("Test User"));
         assert_eq!(claims.exp, Some(1700000000));
+        assert_eq!(claims.acr.as_deref(), Some("urn:mfa"));
+        assert_eq!(claims.amr, vec!["pwd", "mfa"]);
+        assert_eq!(claims.auth_time, Some(1699999900));
     }
 
     #[test]
@@ -1082,6 +1235,9 @@ mod tests {
         assert!(claims.iss.is_none());
         assert!(claims.aud.is_none());
         assert!(claims.exp.is_none());
+        assert!(claims.acr.is_none());
+        assert!(claims.amr.is_empty());
+        assert!(claims.auth_time.is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1227,6 +1383,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn validate_id_token_requires_configured_acr() {
+        let mut config = test_config();
+        config.required_acr_values = vec!["urn:mfa".into()];
+        let client = client_with_cached_jwks_config(config).await;
+        let token = sign_test_jwt(&serde_json::json!({
+            "sub": "u",
+            "iss": TEST_ISSUER,
+            "aud": TEST_CLIENT_ID,
+            "exp": now_secs() + 3600,
+            "acr": "urn:pwd",
+        }));
+        let err = client
+            .decode_and_validate_id_token(&token)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("acr"));
+
+        let token = sign_test_jwt(&serde_json::json!({
+            "sub": "u",
+            "iss": TEST_ISSUER,
+            "aud": TEST_CLIENT_ID,
+            "exp": now_secs() + 3600,
+            "acr": "urn:mfa",
+        }));
+        assert!(client.decode_and_validate_id_token(&token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_id_token_requires_configured_amr_values() {
+        let mut config = test_config();
+        config.required_amr_values = vec!["mfa".into(), "pwd".into()];
+        let client = client_with_cached_jwks_config(config).await;
+        let token = sign_test_jwt(&serde_json::json!({
+            "sub": "u",
+            "iss": TEST_ISSUER,
+            "aud": TEST_CLIENT_ID,
+            "exp": now_secs() + 3600,
+            "amr": ["pwd"],
+        }));
+        let err = client
+            .decode_and_validate_id_token(&token)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("amr"));
+
+        let token = sign_test_jwt(&serde_json::json!({
+            "sub": "u",
+            "iss": TEST_ISSUER,
+            "aud": TEST_CLIENT_ID,
+            "exp": now_secs() + 3600,
+            "amr": ["pwd", "mfa"],
+        }));
+        assert!(client.decode_and_validate_id_token(&token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_id_token_enforces_configured_max_age() {
+        let mut config = test_config();
+        config.max_age_seconds = Some(60);
+        let client = client_with_cached_jwks_config(config).await;
+        let token = sign_test_jwt(&serde_json::json!({
+            "sub": "u",
+            "iss": TEST_ISSUER,
+            "aud": TEST_CLIENT_ID,
+            "exp": now_secs() + 3600,
+            "auth_time": now_secs() - 600,
+        }));
+        let err = client
+            .decode_and_validate_id_token(&token)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("auth_time"));
+
+        let token = sign_test_jwt(&serde_json::json!({
+            "sub": "u",
+            "iss": TEST_ISSUER,
+            "aud": TEST_CLIENT_ID,
+            "exp": now_secs() + 3600,
+            "auth_time": now_secs(),
+        }));
+        assert!(client.decode_and_validate_id_token(&token).await.is_ok());
     }
 
     #[tokio::test]

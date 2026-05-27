@@ -10,6 +10,7 @@ use super::time_range::{TimeRange, TimeRangePreset};
 use super::time_range_modal::{ModalOutcome, TimeRangeModal};
 use super::{loading::LoadingIndicator, Component, ScopeTransition};
 use crate::event::{Action, ExportFormat};
+use crate::theme::Theme;
 use crate::widgets::input::{TextAreaInput, TextInput};
 use crate::widgets::table::{
     selected_row_style, table_border_style, SelectableTable, SELECTED_ROW_SYMBOL,
@@ -230,6 +231,7 @@ pub struct CloudWatchSearchScreen {
     /// Active time-range selection (preset or custom). Drives both Quick
     /// Search (FilterLogEvents) and Insights query windows.
     pub time_range: TimeRange,
+    theme: Theme,
     /// Optional custom-range modal overlay. When `Some`, all key events are
     /// routed to the modal instead of the screen.
     time_range_modal: Option<TimeRangeModal>,
@@ -250,6 +252,10 @@ impl Default for CloudWatchSearchScreen {
 
 impl CloudWatchSearchScreen {
     pub fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    pub fn with_theme(theme: Theme) -> Self {
         let mut screen = Self {
             log_groups: Vec::new(),
             events: Vec::new(),
@@ -267,18 +273,19 @@ impl CloudWatchSearchScreen {
             selected_log_group: String::new(),
             available_accounts: Vec::new(),
             available_regions: Vec::new(),
-            query_input: TextInput::new("Keyword"),
+            query_input: TextInput::new("Keyword").with_theme(theme),
             insights_query_input: TextAreaInput::with_value(
                 "Insights query",
                 DEFAULT_INSIGHTS_QUERY_TEMPLATE,
-            ),
+            )
+            .with_theme(theme),
             insights_query_customized: false,
             scope_transition: None,
-            loading_spinner: LoadingIndicator::new("Loading log groups..."),
+            loading_spinner: LoadingIndicator::new("Loading log groups...").with_theme(theme),
             fetch_generation: 0,
             search_mode: SearchMode::QuickSearch,
             focus: CwFocus::LogGroupList,
-            log_group_filter: TextInput::new("Search log groups..."),
+            log_group_filter: TextInput::new("Search log groups...").with_theme(theme),
             filtered_indices: Vec::new(),
             log_group_table: SelectableTable::new(
                 vec!["Log Group".into(), "Retention".into(), "Size".into()],
@@ -287,7 +294,8 @@ impl CloudWatchSearchScreen {
                     Constraint::Length(12),
                     Constraint::Length(12),
                 ],
-            ),
+            )
+            .with_theme(theme),
             table: SelectableTable::new(
                 vec!["Timestamp".into(), "Stream".into(), "Message".into()],
                 vec![
@@ -295,10 +303,12 @@ impl CloudWatchSearchScreen {
                     Constraint::Length(30),
                     Constraint::Min(40),
                 ],
-            ),
+            )
+            .with_theme(theme),
             selected_event: None,
             query_history: Vec::new(),
             time_range: TimeRange::default(),
+            theme,
             time_range_modal: None,
             last_next_token: None,
             has_more: false,
@@ -683,17 +693,17 @@ impl CloudWatchSearchScreen {
 
     fn render_status_footer(&self, area: Rect, buf: &mut Buffer, use_insights: bool) {
         let status_style = if self.error.is_some() {
-            Style::default().fg(Color::Red)
+            self.theme.danger_style()
         } else if self.loading.is_some() {
-            Style::default().fg(Color::Yellow)
+            self.theme.warning_style()
         } else {
-            Style::default().fg(Color::Gray)
+            self.theme.muted_style()
         };
         let lines = vec![
             Line::styled(self.footer_status_text(use_insights), status_style),
             Line::styled(
                 self.footer_hint_text(use_insights),
-                Style::default().fg(Color::DarkGray),
+                self.theme.muted_style(),
             ),
         ];
         Paragraph::new(lines).render(area, buf);
@@ -703,10 +713,10 @@ impl CloudWatchSearchScreen {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Event Detail ")
-            .border_style(table_border_style(matches!(
-                self.focus,
-                CwFocus::EventDetail
-            )));
+            .border_style(table_border_style(
+                matches!(self.focus, CwFocus::EventDetail),
+                self.theme,
+            ));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -727,11 +737,11 @@ impl CloudWatchSearchScreen {
                 let style = if message.contains("\"ERROR\"")
                     || message.contains("\"level\":\"ERROR\"")
                 {
-                    Style::default().fg(Color::Red)
+                    self.theme.danger_style()
                 } else if message.contains("\"WARN\"") || message.contains("\"level\":\"WARN\"") {
-                    Style::default().fg(Color::Yellow)
+                    self.theme.warning_style()
                 } else {
-                    Style::default().fg(Color::White)
+                    self.theme.text_style()
                 };
 
                 Paragraph::new(message)
@@ -889,7 +899,10 @@ impl Component for CloudWatchSearchScreen {
                 if !matches!(self.focus, CwFocus::QueryInput | CwFocus::LogGroupFilter)
                     && !self.is_loading() =>
             {
-                self.time_range_modal = Some(TimeRangeModal::open(&self.time_range));
+                self.time_range_modal = Some(TimeRangeModal::open_with_theme(
+                    &self.time_range,
+                    self.theme,
+                ));
                 Action::Noop
             }
             // `/` in log group list → activate log group filter
@@ -1080,7 +1093,7 @@ impl Component for CloudWatchSearchScreen {
         let outer = Block::default()
             .borders(Borders::ALL)
             .title(" CloudWatch Search ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(self.theme.accent_style());
         let inner = outer.inner(area);
         outer.render(area, buf);
 
@@ -1113,9 +1126,9 @@ impl Component for CloudWatchSearchScreen {
         };
         let scope_line = Line::from(vec![
             Span::styled(" ", Style::default()),
-            Span::styled(acct_label, Style::default().fg(Color::Yellow)),
-            Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(region_label, Style::default().fg(Color::Cyan)),
+            Span::styled(acct_label, self.theme.warning_style()),
+            Span::styled(" │ ", self.theme.muted_style()),
+            Span::styled(region_label, self.theme.accent_style()),
         ]);
         Paragraph::new(scope_line).render(left_chunks[0], buf);
 
@@ -1136,7 +1149,7 @@ impl Component for CloudWatchSearchScreen {
                 .map(Self::format_bytes)
                 .unwrap_or_else(|| "-".into());
             let style = if lg.name == selected_lg {
-                selected_row_style()
+                selected_row_style(self.theme)
             } else {
                 Style::default()
             };
@@ -1155,7 +1168,7 @@ impl Component for CloudWatchSearchScreen {
             self.log_group_table
                 .headers
                 .iter()
-                .map(|h| Cell::from(h.as_str()).style(Style::default().bold().fg(Color::Cyan))),
+                .map(|h| Cell::from(h.as_str()).style(self.theme.accent_style().bold())),
         )
         .height(1);
         let lg_table = ratatui::widgets::Table::new(lg_rows, &self.log_group_table.column_widths)
@@ -1164,9 +1177,9 @@ impl Component for CloudWatchSearchScreen {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {} ", lg_title))
-                    .border_style(table_border_style(lg_focused)),
+                    .border_style(table_border_style(lg_focused, self.theme)),
             )
-            .highlight_style(selected_row_style())
+            .highlight_style(selected_row_style(self.theme))
             .highlight_symbol(SELECTED_ROW_SYMBOL);
         ratatui::widgets::StatefulWidget::render(
             lg_table,
@@ -1198,7 +1211,7 @@ impl Component for CloudWatchSearchScreen {
             }
         };
         Paragraph::new(mode_text)
-            .style(Style::default().fg(Color::Cyan))
+            .style(self.theme.accent_style())
             .render(right_chunks[0], buf);
 
         // Query input
@@ -1239,9 +1252,9 @@ impl Component for CloudWatchSearchScreen {
                     .unwrap_or("-");
 
                 let msg_style = if raw_msg.is_some_and(|msg| msg.contains("ERROR")) {
-                    Style::default().fg(Color::Red)
+                    self.theme.danger_style()
                 } else if raw_msg.is_some_and(|msg| msg.contains("WARN")) {
-                    Style::default().fg(Color::Yellow)
+                    self.theme.warning_style()
                 } else {
                     Style::default()
                 };
@@ -1266,9 +1279,9 @@ impl Component for CloudWatchSearchScreen {
                     .unwrap_or_else(|| ev.timestamp.to_string());
 
                 let msg_style = if ev.message.contains("ERROR") {
-                    Style::default().fg(Color::Red)
+                    self.theme.danger_style()
                 } else if ev.message.contains("WARN") {
-                    Style::default().fg(Color::Yellow)
+                    self.theme.warning_style()
                 } else {
                     Style::default()
                 };
@@ -1307,7 +1320,7 @@ impl Component for CloudWatchSearchScreen {
 
         // Scope transition overlay
         if let Some(ref t) = self.scope_transition {
-            t.render(inner, buf);
+            t.render_with_theme(inner, buf, self.theme);
         }
 
         // Custom-range modal (top-most overlay)
@@ -1372,6 +1385,11 @@ mod tests {
             allowed_log_group_arns: vec!["arn:aws:logs:*:*:log-group:/app/web-service*".into()],
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
