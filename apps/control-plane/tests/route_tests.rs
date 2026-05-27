@@ -5095,10 +5095,7 @@ async fn cloudwatch_filter_events_audit_includes_query_and_client_metadata() {
     assert_eq!(event["metadata"]["client_ip"], "10.0.0.10");
     assert_eq!(event["metadata"]["user_agent"], "canopy-tui/9.9.9");
     assert_eq!(event["metadata"]["tui_version"], "9.9.9");
-    assert_eq!(
-        event["metadata"]["filter_pattern"],
-        "\"/api/orders/items\""
-    );
+    assert_eq!(event["metadata"]["filter_pattern"], "\"/api/orders/items\"");
     assert_eq!(event["metadata"]["limit"], 25);
 }
 
