@@ -335,6 +335,8 @@ TUI                     Control Plane              OIDC Provider
 | POST | `/api/auth/mfa/totp/start` | 開始本機 TOTP 註冊，回傳 secret/otpauth URL |
 | POST | `/api/auth/mfa/totp/confirm` | 驗證 TOTP code 並啟用 factor |
 | POST | `/api/auth/mfa/totp/verify` | 驗證已註冊 TOTP factor，建立 step-up primitive |
+| POST | `/api/auth/mfa/webauthn/register/start` | 產生本機 WebAuthn 註冊 challenge（browser ceremony foundation；已有 active TOTP 時需先完成本機 step-up） |
+| POST | `/api/auth/mfa/webauthn/register/finish` | 驗證 browser WebAuthn registration response 並保存 credential（已有 active TOTP 時需先完成本機 step-up） |
 | POST | `/api/auth/mfa/recovery-codes/generate` | 完成 TOTP step-up 後產生或輪替本機 MFA recovery codes，明文只回傳一次 |
 | POST | `/api/auth/mfa/recovery-codes/verify` | 消耗一組 unused recovery code，建立 step-up primitive |
 | POST | `/api/ec2/list` | 列出 EC2 執行個體（伺服器端過濾） |
@@ -570,7 +572,7 @@ Control Plane 啟動時會一次載入 SQLite 內容並套用與 TOML 相同的 
 
 ### 9.5 本機 MFA factor store
 
-`mfa_database_url = "sqlite:///path/to/mfa.db"` 啟用本機 MFA factor store。Control Plane 啟動時會建立 `mfa_factors` 與 `mfa_recovery_codes` schema；status endpoint 會回報 TOTP / WebAuthn factor store 是否可用、使用者是否已有 active enrolled factor，以及可用 recovery code 數量。TOTP enrollment / verify 需要 `mfa_secret_key`（base64 32 bytes，例：`openssl rand -base64 32`），secret 以 XChaCha20-Poly1305 加密後才寫入 SQLite。WebAuthn 欄位目前只保留在 schema 中；在 browser/WebAuthn ceremony 實作前，status 會回報 WebAuthn 不可用。查詢使用 `(user_id, kind)` partial index，只掃描 `enrolled_at IS NOT NULL AND disabled_at IS NULL` 的 active factors；pending TOTP setup 使用 `(user_id, kind, created_at)` partial index 並在 confirm 時套用 10 分鐘 TTL。TOTP verify 會更新 `last_used_at` 與 `last_totp_step`，避免同一 time-step code 被重放，並建立 5 分鐘 per-JWT in-memory step-up session。Recovery codes 只能在 active TOTP factor 存在且目前 JWT 已完成 TOTP step-up 時產生或輪替；每次產生 10 組 80-bit code，SQLite 只保存 salted SHA-256 hash 與 used/disabled 狀態，明文只在 generate response 與 TUI 畫面中顯示一次。Recovery-code verify 會接受大小寫與空白/連字號變體，成功後以 transaction 標記 `used_at` 並建立同一個 per-JWT step-up session；已使用或 disabled code 不能重放。`mfa_recovery_codes` 的 active unused lookup 使用 `user_id` partial index。當使用者已註冊本機 TOTP factor 時，EC2 power 與 ECS Exec 會要求有效 step-up session，否則回傳 `403 STEP_UP_REQUIRED`。
+`mfa_database_url = "sqlite:///path/to/mfa.db"` 啟用本機 MFA factor store。Control Plane 啟動時會建立 `mfa_factors` 與 `mfa_recovery_codes` schema；status endpoint 會回報 TOTP / WebAuthn factor store 是否可用、使用者是否已有 active enrolled factor，以及可用 recovery code 數量。TOTP enrollment / verify 需要 `mfa_secret_key`（base64 32 bytes，例：`openssl rand -base64 32`），secret 以 XChaCha20-Poly1305 加密後才寫入 SQLite。WebAuthn backend registration foundation 會接受 `http://localhost[:port]` browser ceremony origin、產生 challenge、驗證 registration response，並將 credential id/public key/counter 存入既有 `mfa_factors` 欄位；若使用者已有 active TOTP factor，WebAuthn 註冊 start/finish 需先完成本機 step-up；TUI local browser flow 與 WebAuthn step-up 尚未接上前，status 仍不宣告 WebAuthn 為可用 step-up factor。查詢使用 `(user_id, kind)` partial index，只掃描 `enrolled_at IS NOT NULL AND disabled_at IS NULL` 的 active factors；pending TOTP / WebAuthn setup 使用 `(user_id, kind, created_at)` partial index 並在 confirm/finish 時套用 10 分鐘 TTL。TOTP verify 會更新 `last_used_at` 與 `last_totp_step`，避免同一 time-step code 被重放，並建立 5 分鐘 per-JWT in-memory step-up session。Recovery codes 只能在 active TOTP factor 存在且目前 JWT 已完成 TOTP step-up 時產生或輪替；每次產生 10 組 80-bit code，SQLite 只保存 salted SHA-256 hash 與 used/disabled 狀態，明文只在 generate response 與 TUI 畫面中顯示一次。Recovery-code verify 會接受大小寫與空白/連字號變體，成功後以 transaction 標記 `used_at` 並建立同一個 per-JWT step-up session；已使用或 disabled code 不能重放。`mfa_recovery_codes` 的 active unused lookup 使用 `user_id` partial index。當使用者已註冊本機 TOTP factor 時，EC2 power 與 ECS Exec 會要求有效 step-up session，否則回傳 `403 STEP_UP_REQUIRED`。
 
 ---
 
@@ -653,7 +655,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - EC2 Instance Connect 支援判斷為近似值
 - AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
 - 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
-- MFA 目前仍以 OIDC Provider-driven enforcement 為主；TUI 已顯示本機 MFA / step-up readiness，且在 `mfa_database_url` + `mfa_secret_key` 設定後可註冊並驗證本機 TOTP step-up、產生/輪替與使用 recovery codes；EC2 power / ECS Exec 已支援本機 TOTP route-level step-up gate；本機 WebAuthn 註冊尚未實作
+- MFA 目前仍以 OIDC Provider-driven enforcement 為主；TUI 已顯示本機 MFA / step-up readiness，且在 `mfa_database_url` + `mfa_secret_key` 設定後可註冊並驗證本機 TOTP step-up、產生/輪替與使用 recovery codes；EC2 power / ECS Exec 已支援本機 TOTP route-level step-up gate；本機 WebAuthn backend 註冊 foundation 已實作，TUI local browser flow 與 WebAuthn step-up 尚未實作
 
 ### 未來規劃
 

@@ -171,6 +171,33 @@ pub struct RecoveryCodeVerifyResponse {
     pub status: MfaStatusResponse,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterStartRequest {
+    pub origin: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterStartResponse {
+    pub factor_id: String,
+    pub public_key: serde_json::Value,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterFinishRequest {
+    pub factor_id: String,
+    pub credential: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnRegisterFinishResponse {
+    pub factor_id: String,
+    pub credential_id: String,
+    pub enrolled: bool,
+    pub status: MfaStatusResponse,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -370,6 +397,41 @@ mod tests {
         assert_eq!(json["remaining_codes"], 0);
         let back: RecoveryCodeVerifyResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn webauthn_register_roundtrip() {
+        let start = WebAuthnRegisterStartResponse {
+            factor_id: "factor-1".into(),
+            public_key: serde_json::json!({
+                "challenge": "abc",
+                "rp": {"id": "localhost", "name": "Canopy"}
+            }),
+            expires_at: "2026-05-27T00:10:00Z".into(),
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["factor_id"], "factor-1");
+        let back: WebAuthnRegisterStartResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, start);
+
+        let finish = WebAuthnRegisterFinishResponse {
+            factor_id: "factor-1".into(),
+            credential_id: "credential-1".into(),
+            enrolled: true,
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(0),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&finish).unwrap();
+        assert_eq!(json["credential_id"], "credential-1");
+        let back: WebAuthnRegisterFinishResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, finish);
     }
 
     #[test]

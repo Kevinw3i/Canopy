@@ -56,6 +56,7 @@ Current actions:
 - `mfa_totp_verify`
 - `mfa_recovery_codes_generate`
 - `mfa_recovery_code_verify`
+- `mfa_webauthn_enroll`
 
 `ec2_power` is emitted by the control-plane when an authorized operator requests
 an EC2 start, stop, or reboot action.
@@ -75,6 +76,11 @@ recovery codes.
 `mfa_recovery_code_verify` is emitted when a local MFA recovery code is consumed
 for step-up. Metadata includes `remaining_codes`; it must not include the
 plaintext recovery code.
+
+`mfa_webauthn_enroll` is emitted when local WebAuthn registration starts or
+finishes. Metadata includes `stage`, `factor_id`, `kind`, and the localhost
+`origin` for start events; it must not include challenge bytes, browser
+credential payloads, credential IDs, or public-key material.
 
 ## Common Metadata Fields
 

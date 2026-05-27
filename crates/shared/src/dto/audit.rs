@@ -73,6 +73,10 @@ pub enum AuditAction {
     /// Verify and consume one local MFA recovery code for a step-up challenge.
     /// Plaintext recovery codes must never be placed in metadata.
     MfaRecoveryCodeVerify,
+    /// Enroll a local WebAuthn/passkey factor. Browser credential payloads must
+    /// never be placed in metadata.
+    #[serde(rename = "mfa_webauthn_enroll")]
+    MfaWebAuthnEnroll,
 }
 
 impl AuditAction {
@@ -95,6 +99,7 @@ impl AuditAction {
             Self::MfaTotpVerify => "mfa_totp_verify",
             Self::MfaRecoveryCodesGenerate => "mfa_recovery_codes_generate",
             Self::MfaRecoveryCodeVerify => "mfa_recovery_code_verify",
+            Self::MfaWebAuthnEnroll => "mfa_webauthn_enroll",
         }
     }
 }
@@ -132,6 +137,7 @@ mod tests {
             AuditAction::MfaTotpVerify,
             AuditAction::MfaRecoveryCodesGenerate,
             AuditAction::MfaRecoveryCodeVerify,
+            AuditAction::MfaWebAuthnEnroll,
         ] {
             let json = serde_json::to_value(&action).unwrap();
             assert_eq!(json, serde_json::Value::String(action.wire_name().into()));
@@ -221,6 +227,19 @@ mod tests {
 
         let back: AuditAction = serde_json::from_value(json).unwrap();
         assert!(matches!(back, AuditAction::MfaRecoveryCodeVerify));
+    }
+
+    #[test]
+    fn audit_action_mfa_webauthn_enroll_roundtrip() {
+        let json = serde_json::to_value(AuditAction::MfaWebAuthnEnroll).unwrap();
+        assert_eq!(json, "mfa_webauthn_enroll");
+        assert_eq!(
+            AuditAction::MfaWebAuthnEnroll.wire_name(),
+            "mfa_webauthn_enroll"
+        );
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::MfaWebAuthnEnroll));
     }
 
     #[test]

@@ -42,6 +42,7 @@ base64.workspace = true
 chacha20poly1305.workspace = true
 rand.workspace = true
 totp-rs.workspace = true
+passkey-auth.workspace = true
 toml = "0.8"
 dashmap = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -53,3 +54,5 @@ http-body-util = "0.1"
 rsa = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = "0.24"
+ciborium = "0.2"
+ed25519-dalek = "2"

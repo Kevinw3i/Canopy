@@ -883,6 +883,119 @@ async fn totp_enrollment_audit_does_not_log_secret_or_code() {
 }
 
 #[tokio::test]
+async fn webauthn_register_start_returns_localhost_challenge_and_audits_without_challenge() {
+    let db = AuditFile::new("mfa-webauthn-db");
+    let audit = AuditFile::new("mfa-webauthn-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/webauthn/register/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876",
+            "label": "Touch ID"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let factor_id = json["factor_id"].as_str().unwrap();
+    let challenge = json["public_key"]["challenge"].as_str().unwrap();
+    assert!(!factor_id.is_empty());
+    assert!(!challenge.is_empty());
+    assert_eq!(json["public_key"]["rp"]["id"], "localhost");
+    assert_eq!(json["public_key"]["rp"]["name"], "Canopy");
+    assert_eq!(
+        json["public_key"]["authenticatorSelection"]["userVerification"],
+        "required"
+    );
+
+    let (finish_status, finish_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/webauthn/register/finish",
+        &token,
+        json!({
+            "factor_id": factor_id,
+            "credential": {
+                "id": "not-a-valid-credential"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(finish_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        finish_json["message"],
+        "WebAuthn registration response is invalid"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_webauthn_enroll"));
+    assert!(serialized.contains("\"stage\":\"start\""));
+    assert!(serialized.contains("\"stage\":\"finish\""));
+    assert!(!serialized.contains(challenge));
+}
+
+#[tokio::test]
+async fn webauthn_register_requires_totp_step_up_when_local_totp_enrolled() {
+    let db = AuditFile::new("mfa-webauthn-step-up-db");
+    let audit = AuditFile::new("mfa-webauthn-step-up-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let code = enroll_test_totp(app.clone(), &token).await;
+
+    let (blocked_status, blocked_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/webauthn/register/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876"
+        }),
+    )
+    .await;
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
+
+    verify_test_totp_step_up(app.clone(), &token, &code).await;
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/auth/mfa/webauthn/register/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json["public_key"]["challenge"].as_str().is_some());
+
+    let events = read_audit_events(&audit.path);
+    events
+        .iter()
+        .find(|event| {
+            event["action"] == "mfa_webauthn_enroll"
+                && event["outcome"] == "denied"
+                && event["error_message"] == "step_up_required"
+                && event["metadata"]["stage"] == "start"
+        })
+        .expect("WebAuthn step-up denied audit event");
+}
+
+#[tokio::test]
 async fn recovery_codes_generate_requires_enrolled_totp() {
     let db = AuditFile::new("mfa-recovery-require-db");
     std::fs::create_dir_all(&db.dir).unwrap();

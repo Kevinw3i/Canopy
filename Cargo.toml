@@ -54,6 +54,7 @@ base64 = "0.22"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth", "zeroize"] }
+passkey-auth = "0.1.3"
 
 # TUI
 ratatui = "0.28"
