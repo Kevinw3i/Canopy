@@ -18,6 +18,8 @@ const TOTP_SKEW: u8 = 1;
 const TOTP_STEP_SECONDS: u64 = 30;
 const TOTP_PENDING_TTL_SQL: &str = "-10 minutes";
 const RECOVERY_CODE_COUNT: usize = 10;
+// Schema fields are reserved for WebAuthn, but no ceremony is exposed yet.
+const WEBAUTHN_ENROLLMENT_AVAILABLE: bool = false;
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mfa_factors (
@@ -196,7 +198,7 @@ impl MfaStore {
 
         Ok(default_factor_statuses(
             self.totp_enrollment_available(),
-            true,
+            WEBAUTHN_ENROLLMENT_AVAILABLE,
             &enrolled,
         ))
     }
@@ -826,7 +828,7 @@ mod tests {
             .find(|factor| factor.kind == MfaFactorKind::WebAuthn)
             .unwrap();
         assert!(!totp.available);
-        assert!(webauthn.available);
+        assert!(!webauthn.available);
         assert!(statuses.iter().all(|factor| !factor.enrolled));
     }
 
@@ -836,7 +838,16 @@ mod tests {
             MfaStore::from_database_url_and_secret_key("sqlite::memory:", Some(TEST_KEY)).unwrap();
         let statuses = store.factor_statuses("u1").unwrap();
 
-        assert!(statuses.iter().all(|factor| factor.available));
+        let totp = statuses
+            .iter()
+            .find(|factor| factor.kind == MfaFactorKind::Totp)
+            .unwrap();
+        let webauthn = statuses
+            .iter()
+            .find(|factor| factor.kind == MfaFactorKind::WebAuthn)
+            .unwrap();
+        assert!(totp.available);
+        assert!(!webauthn.available);
         assert!(statuses.iter().all(|factor| !factor.enrolled));
     }
 
@@ -891,7 +902,7 @@ mod tests {
 
         assert!(totp.available);
         assert!(totp.enrolled);
-        assert!(webauthn.available);
+        assert!(!webauthn.available);
         assert!(!webauthn.enrolled);
     }
 

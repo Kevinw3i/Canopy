@@ -33,7 +33,8 @@ pub struct AppConfig {
 
     /// SQLite local MFA factor database URL. Supported forms:
     /// `sqlite:///absolute/path.db` or `sqlite://relative/path.db`.
-    /// If omitted, local TOTP/WebAuthn enrollment remains disabled.
+    /// If omitted, local MFA enrollment remains disabled. Local WebAuthn
+    /// fields are reserved but not currently exposed as an available factor.
     #[serde(default)]
     pub mfa_database_url: Option<String>,
 

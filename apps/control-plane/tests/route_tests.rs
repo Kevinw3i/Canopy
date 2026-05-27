@@ -740,7 +740,7 @@ async fn mfa_status_reports_configured_local_factor_store() {
     assert_eq!(json["local_step_up_available"], false);
     assert_eq!(json["factors"][0]["available"], true);
     assert_eq!(json["factors"][0]["enrolled"], false);
-    assert_eq!(json["factors"][1]["available"], true);
+    assert_eq!(json["factors"][1]["available"], false);
     assert_eq!(json["factors"][1]["enrolled"], false);
 }
 

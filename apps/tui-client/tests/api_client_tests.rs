@@ -256,7 +256,7 @@ async fn totp_confirm_handler(headers: HeaderMap, Json(body): Json<Value>) -> im
                 },
                 {
                     "kind": "web_authn",
-                    "available": true,
+                    "available": false,
                     "enrolled": false,
                     "label": "Security key"
                 }
@@ -302,7 +302,7 @@ async fn totp_verify_handler(headers: HeaderMap, Json(body): Json<Value>) -> imp
                 },
                 {
                     "kind": "web_authn",
-                    "available": true,
+                    "available": false,
                     "enrolled": false,
                     "label": "Security key"
                 }
@@ -340,7 +340,7 @@ async fn recovery_codes_generate_handler(headers: HeaderMap) -> impl IntoRespons
                 },
                 {
                     "kind": "web_authn",
-                    "available": true,
+                    "available": false,
                     "enrolled": false,
                     "label": "Security key"
                 }
@@ -389,7 +389,7 @@ async fn recovery_code_verify_handler(
                 },
                 {
                     "kind": "web_authn",
-                    "available": true,
+                    "available": false,
                     "enrolled": false,
                     "label": "Security key"
                 }
