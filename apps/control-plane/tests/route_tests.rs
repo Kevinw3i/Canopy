@@ -883,6 +883,85 @@ async fn totp_enrollment_audit_does_not_log_secret_or_code() {
 }
 
 #[tokio::test]
+async fn recovery_codes_generate_requires_enrolled_totp() {
+    let db = AuditFile::new("mfa-recovery-require-db");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/auth/mfa/recovery-codes/generate",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        json["message"],
+        "local recovery codes require an active TOTP factor"
+    );
+}
+
+#[tokio::test]
+async fn recovery_codes_generate_rotates_and_does_not_log_plaintext() {
+    let db = AuditFile::new("mfa-recovery-db");
+    let audit = AuditFile::new("mfa-recovery-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let code = enroll_test_totp(app.clone(), &token).await;
+
+    let (blocked_status, blocked_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/recovery-codes/generate",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
+
+    verify_test_totp_step_up(app.clone(), &token, &code).await;
+
+    let (status, json) = authed_post_json(
+        app,
+        "/api/auth/mfa/recovery-codes/generate",
+        &token,
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let codes = json["codes"].as_array().unwrap();
+    assert_eq!(codes.len(), 10);
+    assert!(codes.iter().all(|code| {
+        let code = code.as_str().unwrap();
+        code.len() == 24 && code.matches('-').count() == 4
+    }));
+    assert_eq!(json["remaining_codes"], 10);
+    assert_eq!(json["status"]["recovery_codes_remaining"], 10);
+
+    let events = read_audit_events(&audit.path);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_recovery_codes_generate"));
+    for code in codes {
+        assert!(!serialized.contains(code.as_str().unwrap()));
+    }
+}
+
+#[tokio::test]
 async fn ec2_power_requires_and_accepts_totp_step_up_when_local_factor_enrolled() {
     let db = AuditFile::new("mfa-ec2-power-db");
     let audit = AuditFile::new("mfa-ec2-power-audit");

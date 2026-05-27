@@ -54,6 +54,7 @@ Current actions:
 - `entitlements_view`
 - `mfa_totp_enroll`
 - `mfa_totp_verify`
+- `mfa_recovery_codes_generate`
 
 `ec2_power` is emitted by the control-plane when an authorized operator requests
 an EC2 start, stop, or reboot action.
@@ -65,6 +66,10 @@ TOTP secret or verification code.
 `mfa_totp_verify` is emitted when a local TOTP factor is verified for step-up.
 Metadata includes `factor_id` and `kind`; it must not include the verification
 code.
+
+`mfa_recovery_codes_generate` is emitted when local MFA recovery codes are
+generated or rotated. Metadata includes `count`; it must not include plaintext
+recovery codes.
 
 ## Common Metadata Fields
 

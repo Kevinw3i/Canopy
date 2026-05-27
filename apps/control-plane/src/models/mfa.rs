@@ -1,10 +1,12 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng, Payload},
     XChaCha20Poly1305, XNonce,
 };
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use shared::dto::auth::{MfaFactorKind, MfaFactorStatus, TotpEnrollStartResponse};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -15,6 +17,7 @@ const TOTP_DIGITS: usize = 6;
 const TOTP_SKEW: u8 = 1;
 const TOTP_STEP_SECONDS: u64 = 30;
 const TOTP_PENDING_TTL_SQL: &str = "-10 minutes";
+const RECOVERY_CODE_COUNT: usize = 10;
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mfa_factors (
@@ -43,6 +46,20 @@ CREATE INDEX IF NOT EXISTS idx_mfa_factors_pending_user_kind
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mfa_factors_active_credential_id
     ON mfa_factors(credential_id)
     WHERE credential_id IS NOT NULL AND disabled_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    code_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    used_at TEXT,
+    disabled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_active_user
+    ON mfa_recovery_codes(user_id)
+    WHERE used_at IS NULL AND disabled_at IS NULL;
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +78,8 @@ pub enum MfaStoreError {
     NoActiveTotpFactor,
     #[error("TOTP code has already been used for this time step")]
     TotpCodeReplayed,
+    #[error("local recovery codes require an active TOTP factor")]
+    RecoveryCodesRequireTotp,
     #[error("MFA secret key must be base64-encoded 32 bytes")]
     InvalidSecretKey,
     #[error("MFA secret envelope is invalid")]
@@ -87,6 +106,12 @@ type MfaResult<T> = Result<T, MfaStoreError>;
 pub struct TotpVerifyResult {
     pub factor_id: String,
     pub matched_step: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCodesResult {
+    pub codes: Vec<String>,
+    pub remaining_codes: usize,
 }
 
 #[derive(Clone)]
@@ -345,6 +370,88 @@ impl MfaStore {
         Err(MfaStoreError::InvalidTotpCode)
     }
 
+    pub fn recovery_codes_remaining(&self, user_id: &str) -> MfaResult<Option<usize>> {
+        let Some(conn) = self.connection()? else {
+            return Ok(None);
+        };
+
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM mfa_recovery_codes
+             WHERE user_id = ?1
+               AND used_at IS NULL
+               AND disabled_at IS NULL",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(Some(remaining as usize))
+    }
+
+    pub fn generate_recovery_codes(&self, user_id: &str) -> MfaResult<RecoveryCodesResult> {
+        let Some(result) = self.generate_recovery_codes_with_precommit(user_id, |_| true)? else {
+            unreachable!("recovery code generation precommit returned false")
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn generate_recovery_codes_with_precommit<F>(
+        &self,
+        user_id: &str,
+        precommit: F,
+    ) -> MfaResult<Option<RecoveryCodesResult>>
+    where
+        F: FnOnce(&[String]) -> bool,
+    {
+        let mut conn = self.required_connection()?;
+        let active_totp_exists: i64 = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM mfa_factors
+                 WHERE user_id = ?1
+                   AND kind = 'totp'
+                   AND enrolled_at IS NOT NULL
+                   AND disabled_at IS NULL
+             )",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        if active_totp_exists == 0 {
+            return Err(MfaStoreError::RecoveryCodesRequireTotp);
+        }
+
+        let codes = (0..RECOVERY_CODE_COUNT)
+            .map(|_| generate_recovery_code())
+            .collect::<Vec<_>>();
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE mfa_recovery_codes
+             SET disabled_at = CURRENT_TIMESTAMP
+             WHERE user_id = ?1
+               AND used_at IS NULL
+               AND disabled_at IS NULL",
+            params![user_id],
+        )?;
+        for code in &codes {
+            let salt = generate_recovery_salt();
+            let code_hash = recovery_code_hash(&salt, code);
+            tx.execute(
+                "INSERT INTO mfa_recovery_codes (id, user_id, salt, code_hash)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![uuid::Uuid::new_v4().to_string(), user_id, salt, code_hash],
+            )?;
+        }
+        if !precommit(&codes) {
+            return Ok(None);
+        }
+        tx.commit()?;
+
+        Ok(Some(RecoveryCodesResult {
+            remaining_codes: codes.len(),
+            codes,
+        }))
+    }
+
     fn connection(&self) -> MfaResult<Option<MutexGuard<'_, Connection>>> {
         self.conn
             .as_ref()
@@ -446,7 +553,7 @@ fn parse_secret_key(value: Option<&str>) -> MfaResult<Option<[u8; 32]>> {
 
 fn encrypt_secret(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> MfaResult<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
     let ciphertext = cipher
         .encrypt(
             &nonce,
@@ -521,6 +628,34 @@ fn normalized_totp_code(code: &str) -> MfaResult<String> {
         return Err(MfaStoreError::InvalidTotpCode);
     }
     Ok(code)
+}
+
+fn generate_recovery_code() -> String {
+    let mut bytes = [0u8; 10];
+    OsRng.fill_bytes(&mut bytes);
+    let encoded = hex::encode_upper(bytes);
+    [
+        &encoded[0..4],
+        &encoded[4..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+    ]
+    .join("-")
+}
+
+fn generate_recovery_salt() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn recovery_code_hash(salt: &str, code: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(b":");
+    hasher.update(code.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn build_totp(secret: Vec<u8>, account_name: &str) -> MfaResult<TOTP> {
@@ -762,6 +897,65 @@ mod tests {
 
         let err = store.verify_totp("u1", &code).unwrap_err();
         assert!(matches!(err, MfaStoreError::TotpCodeReplayed));
+    }
+
+    #[test]
+    fn generate_recovery_codes_rotates_hashed_codes() {
+        let store =
+            MfaStore::from_database_url_and_secret_key("sqlite::memory:", Some(TEST_KEY)).unwrap();
+        let started = store
+            .start_totp_enrollment("u1", "alice@example.com", None)
+            .unwrap();
+        let secret = Secret::Encoded(started.secret_base32.clone())
+            .to_bytes()
+            .unwrap();
+        let code = build_totp(secret, "alice@example.com")
+            .unwrap()
+            .generate_current()
+            .unwrap();
+        store
+            .confirm_totp_enrollment("u1", &started.factor_id, &code)
+            .unwrap();
+
+        let generated = store.generate_recovery_codes("u1").unwrap();
+        assert_eq!(generated.codes.len(), RECOVERY_CODE_COUNT);
+        assert!(generated
+            .codes
+            .iter()
+            .all(|code| code.len() == 24 && code.matches('-').count() == 4));
+        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(10));
+
+        let plaintext = generated.codes[0].clone();
+        let conn = store.connection().unwrap().unwrap();
+        let stored_plaintext_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mfa_recovery_codes WHERE code_hash = ?1",
+                params![plaintext],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_plaintext_count, 0);
+        drop(conn);
+
+        let rejected = store
+            .generate_recovery_codes_with_precommit("u1", |_| false)
+            .unwrap();
+        assert!(rejected.is_none());
+        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(10));
+
+        let rotated = store.generate_recovery_codes("u1").unwrap();
+        assert_eq!(rotated.codes.len(), RECOVERY_CODE_COUNT);
+        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(10));
+    }
+
+    #[test]
+    fn generate_recovery_codes_requires_active_totp() {
+        let store =
+            MfaStore::from_database_url_and_secret_key("sqlite::memory:", Some(TEST_KEY)).unwrap();
+
+        let err = store.generate_recovery_codes("u1").unwrap_err();
+
+        assert!(matches!(err, MfaStoreError::RecoveryCodesRequireTotp));
     }
 
     #[test]

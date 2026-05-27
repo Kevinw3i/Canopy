@@ -11,7 +11,8 @@ use crate::keybindings::KeyBindings;
 use crate::theme::{color_label, Theme};
 use crate::widgets::input::TextInput;
 use shared::dto::auth::{
-    MfaFactorKind, MfaStatusResponse, TotpEnrollStartResponse, TotpVerifyResponse,
+    MfaFactorKind, MfaStatusResponse, RecoveryCodesGenerateResponse, TotpEnrollStartResponse,
+    TotpVerifyResponse,
 };
 
 pub struct SettingsScreen {
@@ -25,6 +26,9 @@ pub struct SettingsScreen {
     totp_enrollment: Option<TotpEnrollmentState>,
     totp_step_up_success: Option<String>,
     totp_verification: Option<TotpVerificationState>,
+    recovery_codes_generating: bool,
+    recovery_codes_error: Option<String>,
+    recovery_codes: Option<Vec<String>>,
 }
 
 struct TotpEnrollmentState {
@@ -53,6 +57,9 @@ impl SettingsScreen {
             totp_enrollment: None,
             totp_step_up_success: None,
             totp_verification: None,
+            recovery_codes_generating: false,
+            recovery_codes_error: None,
+            recovery_codes: None,
         }
     }
 
@@ -66,12 +73,14 @@ impl SettingsScreen {
         self.mfa_loading = false;
         self.mfa_error = None;
         self.totp_starting = false;
+        self.recovery_codes_generating = false;
     }
 
     pub fn set_mfa_error(&mut self, error: String) {
         self.mfa_loading = false;
         self.mfa_error = Some(error);
         self.totp_starting = false;
+        self.recovery_codes_generating = false;
     }
 
     pub fn set_totp_starting(&mut self) {
@@ -81,6 +90,8 @@ impl SettingsScreen {
         self.totp_step_up_success = None;
         self.totp_verification = None;
         self.mfa_error = None;
+        self.recovery_codes = None;
+        self.recovery_codes_error = None;
     }
 
     pub fn set_totp_started(&mut self, response: TotpEnrollStartResponse) {
@@ -97,6 +108,7 @@ impl SettingsScreen {
         self.totp_step_up_success = None;
         self.totp_verification = None;
         self.mfa_error = None;
+        self.recovery_codes_error = None;
     }
 
     pub fn set_totp_start_error(&mut self, error: String) {
@@ -157,6 +169,28 @@ impl SettingsScreen {
         self.totp_step_up_success = Some(format!("verified until {}", response.step_up_expires_at));
         self.set_mfa_status(response.status);
     }
+
+    pub fn set_recovery_codes_generating(&mut self) {
+        self.recovery_codes_generating = true;
+        self.recovery_codes_error = None;
+        self.recovery_codes = None;
+        self.mfa_error = None;
+    }
+
+    pub fn set_recovery_codes_generated(&mut self, response: RecoveryCodesGenerateResponse) {
+        self.mfa_status = Some(response.status);
+        self.mfa_loading = false;
+        self.mfa_error = None;
+        self.recovery_codes_generating = false;
+        self.recovery_codes_error = None;
+        self.recovery_codes = Some(response.codes);
+    }
+
+    pub fn set_recovery_codes_generate_error(&mut self, error: String) {
+        self.recovery_codes_generating = false;
+        self.recovery_codes_error = Some(error);
+        self.recovery_codes = None;
+    }
 }
 
 impl Component for SettingsScreen {
@@ -175,11 +209,19 @@ impl Component for SettingsScreen {
         {
             return Action::Quit;
         }
+        if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Esc)
+            && self.recovery_codes.is_some()
+        {
+            self.recovery_codes = None;
+            return Action::Noop;
+        }
         if self
             .config
             .keybindings
             .matches_any(&self.config.keybindings.settings_back, &key)
         {
+            self.recovery_codes = None;
             return Action::GoBack;
         }
         if self
@@ -204,6 +246,13 @@ impl Component for SettingsScreen {
             && self.can_verify_totp_step_up()
         {
             return Action::StartTotpStepUpVerification;
+        }
+        if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('g'))
+            && self.can_generate_recovery_codes()
+            && !self.recovery_codes_generating
+        {
+            return Action::GenerateRecoveryCodes;
         }
         Action::Noop
     }
@@ -279,6 +328,7 @@ impl Component for SettingsScreen {
         ];
 
         lines.extend(self.totp_lines());
+        lines.extend(self.recovery_code_lines());
 
         lines.extend([
             Line::from(Span::styled("Theme", heading_style)),
@@ -507,6 +557,81 @@ impl SettingsScreen {
     fn can_verify_totp_step_up(&self) -> bool {
         self.totp_factor()
             .is_some_and(|factor| factor.available && factor.enrolled)
+    }
+
+    fn can_generate_recovery_codes(&self) -> bool {
+        self.can_verify_totp_step_up() && self.totp_step_up_success.is_some()
+    }
+
+    fn recovery_code_lines(&self) -> Vec<Line<'static>> {
+        if !self.totp_enrolled()
+            && !self.recovery_codes_generating
+            && self.recovery_codes_error.is_none()
+            && self.recovery_codes.is_none()
+        {
+            return Vec::new();
+        }
+
+        let heading_style = Style::default().fg(self.theme.accent).bold();
+        let label_style = Style::default().fg(self.theme.text).bold();
+        let muted_style = self.theme.muted_style();
+        let success_style = self.theme.success_style();
+        let warning_style = self.theme.warning_style();
+        let danger_style = self.theme.danger_style();
+
+        let mut lines = Vec::new();
+        if self.recovery_codes_generating {
+            lines.push(Line::from(vec![
+                Span::styled("Recovery codes:    ", label_style),
+                Span::styled("generating", warning_style),
+            ]));
+            return lines;
+        }
+        if let Some(error) = self.recovery_codes_error.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Recovery codes:    ", label_style),
+                Span::styled(format!("error: {}", truncate(error, 44)), danger_style),
+            ]));
+            return lines;
+        }
+        if let Some(codes) = self.recovery_codes.as_ref() {
+            lines.push(Line::from(Span::styled("Recovery Codes", heading_style)));
+            lines.push(Line::from(Span::styled(
+                "Shown once; store them now. Esc closes this view.",
+                warning_style,
+            )));
+            for chunk in codes.chunks(2) {
+                lines.push(Line::from(Span::styled(chunk.join("    "), warning_style)));
+            }
+            return lines;
+        }
+        if self.totp_step_up_success.is_none() {
+            lines.push(Line::from(vec![
+                Span::styled("Recovery codes:    ", label_style),
+                Span::styled("verify step-up first; press v", muted_style),
+            ]));
+            return lines;
+        }
+
+        let text = match self
+            .mfa_status
+            .as_ref()
+            .and_then(|status| status.recovery_codes_remaining)
+        {
+            Some(0) => "press g to generate".into(),
+            Some(count) => format!("{count} unused; press g to rotate"),
+            None => "press g to generate".into(),
+        };
+        let style = if text.starts_with("press ") {
+            muted_style
+        } else {
+            success_style
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Recovery codes:    ", label_style),
+            Span::styled(text, style),
+        ]));
+        lines
     }
 
     fn totp_factor(&self) -> Option<&shared::dto::auth::MfaFactorStatus> {
@@ -740,6 +865,7 @@ mod tests {
                     label: Some("Security key".into()),
                 },
             ],
+            recovery_codes_remaining: Some(0),
             message: "Local MFA factor store and TOTP enrollment are configured.".into(),
         });
 
@@ -791,12 +917,126 @@ mod tests {
                     label: Some("Security key".into()),
                 },
             ],
+            recovery_codes_remaining: Some(2),
             message: "Local MFA factor store and TOTP enrollment are configured.".into(),
         });
 
         let action = screen.handle_key(key(KeyCode::Char('v')));
 
         assert!(matches!(action, Action::StartTotpStepUpVerification));
+    }
+
+    #[test]
+    fn g_generates_recovery_codes_when_totp_enrolled() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        let status = MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: true,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: true,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: true,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            recovery_codes_remaining: Some(0),
+            message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+        };
+        screen.set_mfa_status(status.clone());
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('g'))),
+            Action::Noop
+        ));
+        screen.set_totp_step_up_verified(TotpVerifyResponse {
+            factor_id: "factor-1".into(),
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            status,
+        });
+
+        let action = screen.handle_key(key(KeyCode::Char('g')));
+
+        assert!(matches!(action, Action::GenerateRecoveryCodes));
+    }
+
+    #[test]
+    fn recovery_codes_generated_renders_codes_and_esc_closes_view() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.totp_step_up_success = Some("verified until 2026-05-27T00:05:00Z".into());
+        screen.set_recovery_codes_generated(RecoveryCodesGenerateResponse {
+            codes: vec![
+                "AAAA-BBBB-CCCC-DDDD-EEEE".into(),
+                "FFFF-1111-2222-3333-4444".into(),
+            ],
+            generated_at: "2026-05-27T00:00:00Z".into(),
+            remaining_codes: 2,
+            status: MfaStatusResponse {
+                user_id: "dev-admin".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: true,
+                    label: Some("Authenticator app".into()),
+                }],
+                recovery_codes_remaining: Some(2),
+                message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+            },
+        });
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("Recovery Codes"));
+        assert!(text.contains("Shown once"));
+        assert!(text.contains("AAAA-BBBB-CCCC-DDDD-EEEE"));
+
+        assert!(matches!(screen.handle_key(key(KeyCode::Esc)), Action::Noop));
+        let text = rendered_text(&mut screen);
+        assert!(text.contains("2 unused; press g to rotate"));
+        assert!(!text.contains("AAAA-BBBB-CCCC-DDDD-EEEE"));
+    }
+
+    #[test]
+    fn recovery_codes_are_cleared_when_leaving_settings() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.totp_step_up_success = Some("verified until 2026-05-27T00:05:00Z".into());
+        screen.set_recovery_codes_generated(RecoveryCodesGenerateResponse {
+            codes: vec!["AAAA-BBBB-CCCC-DDDD-EEEE".into()],
+            generated_at: "2026-05-27T00:00:00Z".into(),
+            remaining_codes: 1,
+            status: MfaStatusResponse {
+                user_id: "dev-admin".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: true,
+                    label: Some("Authenticator app".into()),
+                }],
+                recovery_codes_remaining: Some(1),
+                message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+            },
+        });
+
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('q'))),
+            Action::GoBack
+        ));
+        let text = rendered_text(&mut screen);
+        assert!(!text.contains("AAAA-BBBB-CCCC-DDDD-EEEE"));
     }
 
     #[test]
@@ -853,6 +1093,7 @@ mod tests {
                     label: Some("Security key".into()),
                 },
             ],
+            recovery_codes_remaining: Some(0),
             message: "OIDC provider MFA/re-auth controls are configured.".into(),
         });
         let text = rendered_text(&mut screen);

@@ -8,12 +8,15 @@ use std::sync::Arc;
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::models::mfa::MfaStoreError;
-use crate::services::step_up::{claims_step_up_key, step_up_expires_at};
+use crate::services::step_up::{
+    claims_step_up_key, local_totp_step_up_required, step_up_expires_at, step_up_required_error,
+};
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::auth::{
-    MfaStatusResponse, TotpEnrollConfirmRequest, TotpEnrollConfirmResponse, TotpEnrollStartRequest,
-    TotpEnrollStartResponse, TotpVerifyRequest, TotpVerifyResponse,
+    MfaStatusResponse, RecoveryCodesGenerateResponse, TotpEnrollConfirmRequest,
+    TotpEnrollConfirmResponse, TotpEnrollStartRequest, TotpEnrollStartResponse, TotpVerifyRequest,
+    TotpVerifyResponse,
 };
 use shared::errors::ApiError;
 
@@ -25,6 +28,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/auth/mfa/totp/start", post(totp_start))
         .route("/api/auth/mfa/totp/confirm", post(totp_confirm))
         .route("/api/auth/mfa/totp/verify", post(totp_verify))
+        .route(
+            "/api/auth/mfa/recovery-codes/generate",
+            post(recovery_codes_generate),
+        )
 }
 
 async fn status(
@@ -163,6 +170,71 @@ async fn totp_verify(
     }
 }
 
+async fn recovery_codes_generate(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+) -> RouteResult<RecoveryCodesGenerateResponse> {
+    require_audit_healthy(&state)?;
+
+    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+        .map_err(mfa_step_up_unavailable_response)?
+    {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::MfaRecoveryCodesGenerate,
+                AuditOutcome::Denied,
+            )
+            .error(Some("step_up_required"))
+            .commit_best_effort();
+        return Err((StatusCode::FORBIDDEN, Json(step_up_required_error())));
+    }
+
+    let result = state
+        .mfa_store
+        .generate_recovery_codes_with_precommit(&claims.sub, |codes| {
+            state
+                .audit_service
+                .event(
+                    &claims.sub,
+                    AuditAction::MfaRecoveryCodesGenerate,
+                    AuditOutcome::Success,
+                )
+                .optional_metadata(Some(serde_json::json!({
+                    "count": codes.len(),
+                })))
+                .commit_or_fail()
+                .is_ok()
+        });
+    match result {
+        Ok(Some(generated)) => {
+            let status = mfa_status_response(&state, &claims.sub)?;
+            Ok(Json(RecoveryCodesGenerateResponse {
+                codes: generated.codes,
+                generated_at: chrono::Utc::now().to_rfc3339(),
+                remaining_codes: generated.remaining_codes,
+                status,
+            }))
+        }
+        Ok(None) => Err(audit_failed_response(
+            "Recovery code generation audit failed",
+        )),
+        Err(err) => {
+            audit_recovery_codes_generate_failure(&state, &claims.sub, &err);
+            Err(mfa_store_error_response(err))
+        }
+    }
+}
+
+fn mfa_step_up_unavailable_response(err: impl std::fmt::Display) -> (StatusCode, Json<ApiError>) {
+    tracing::error!(error = %err, "Failed to evaluate MFA step-up status");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::internal("MFA step-up status unavailable")),
+    )
+}
+
 fn mfa_status_response(
     state: &AppState,
     user_id: &str,
@@ -178,10 +250,21 @@ fn mfa_status_response(
     let local_step_up_available = factors
         .iter()
         .any(|factor| factor.available && factor.enrolled);
+    let recovery_codes_remaining =
+        state
+            .mfa_store
+            .recovery_codes_remaining(user_id)
+            .map_err(|err| {
+                tracing::error!(error = %err, "Failed to load MFA recovery code status");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError::internal("MFA status unavailable")),
+                )
+            })?;
     let message = if state.mfa_store.totp_enrollment_available() {
-        "Local MFA factor store and TOTP enrollment are configured. Step-up enforcement is not enabled yet."
+        "Local MFA factor store and TOTP enrollment are configured. Step-up enforcement protects sensitive local actions."
     } else if state.mfa_store.is_enabled() {
-        "Local MFA factor store is configured, but TOTP enrollment requires mfa_secret_key. Step-up enforcement is not enabled yet."
+        "Local MFA factor store is configured, but TOTP enrollment requires mfa_secret_key."
     } else if provider_step_up_configured {
         "OIDC provider MFA/re-auth controls are configured. Local TOTP/WebAuthn enrollment is not configured yet."
     } else {
@@ -194,6 +277,7 @@ fn mfa_status_response(
         local_step_up_available,
         step_up_required: false,
         factors,
+        recovery_codes_remaining,
         message: message.into(),
     })
 }
@@ -246,6 +330,18 @@ fn audit_totp_verify_failure(state: &AppState, actor: &str, err: &MfaStoreError)
         .commit_best_effort();
 }
 
+fn audit_recovery_codes_generate_failure(state: &AppState, actor: &str, err: &MfaStoreError) {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::MfaRecoveryCodesGenerate,
+            AuditOutcome::Failure,
+        )
+        .error(Some(&err.to_string()))
+        .commit_best_effort();
+}
+
 fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) {
     match err {
         MfaStoreError::StoreUnavailable | MfaStoreError::TotpSecretKeyUnavailable => (
@@ -271,6 +367,10 @@ fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) 
         MfaStoreError::TotpCodeReplayed => (
             StatusCode::BAD_REQUEST,
             Json(ApiError::bad_request(err.to_string())),
+        ),
+        MfaStoreError::RecoveryCodesRequireTotp => (
+            StatusCode::CONFLICT,
+            Json(ApiError::new("CONFLICT", err.to_string())),
         ),
         other => {
             tracing::error!(error = %other, "MFA store operation failed");

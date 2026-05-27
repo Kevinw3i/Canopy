@@ -188,6 +188,7 @@ async fn mfa_status_handler(headers: HeaderMap) -> impl IntoResponse {
         "provider_step_up_configured": true,
         "local_step_up_available": false,
         "step_up_required": false,
+        "recovery_codes_remaining": 0,
         "factors": [
             {
                 "kind": "totp",
@@ -245,6 +246,7 @@ async fn totp_confirm_handler(headers: HeaderMap, Json(body): Json<Value>) -> im
             "provider_step_up_configured": true,
             "local_step_up_available": true,
             "step_up_required": false,
+            "recovery_codes_remaining": 0,
             "factors": [
                 {
                     "kind": "totp",
@@ -290,6 +292,45 @@ async fn totp_verify_handler(headers: HeaderMap, Json(body): Json<Value>) -> imp
             "provider_step_up_configured": true,
             "local_step_up_available": true,
             "step_up_required": false,
+            "recovery_codes_remaining": 0,
+            "factors": [
+                {
+                    "kind": "totp",
+                    "available": true,
+                    "enrolled": true,
+                    "label": "Authenticator app"
+                },
+                {
+                    "kind": "web_authn",
+                    "available": true,
+                    "enrolled": false,
+                    "label": "Security key"
+                }
+            ],
+            "message": "Local MFA factor store and TOTP enrollment are configured."
+        }
+    }))
+    .into_response()
+}
+
+async fn recovery_codes_generate_handler(headers: HeaderMap) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+
+    Json(json!({
+        "codes": [
+            "AAAA-BBBB-CCCC-DDDD-EEEE",
+            "FFFF-1111-2222-3333-4444"
+        ],
+        "generated_at": "2026-05-27T00:00:00Z",
+        "remaining_codes": 2,
+        "status": {
+            "user_id": "alice",
+            "provider_step_up_configured": true,
+            "local_step_up_available": true,
+            "step_up_required": false,
+            "recovery_codes_remaining": 2,
             "factors": [
                 {
                     "kind": "totp",
@@ -469,6 +510,10 @@ fn mock_app() -> Router {
         .route("/api/auth/mfa/totp/start", post(totp_start_handler))
         .route("/api/auth/mfa/totp/confirm", post(totp_confirm_handler))
         .route("/api/auth/mfa/totp/verify", post(totp_verify_handler))
+        .route(
+            "/api/auth/mfa/recovery-codes/generate",
+            post(recovery_codes_generate_handler),
+        )
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
 }
 
@@ -689,6 +734,11 @@ async fn totp_enrollment_start_and_confirm_success() {
         .unwrap();
     assert!(verified.verified);
     assert_eq!(verified.step_up_expires_at, "2026-05-27T00:05:00Z");
+
+    let generated = client.generate_recovery_codes().await.unwrap();
+    assert_eq!(generated.codes.len(), 2);
+    assert_eq!(generated.remaining_codes, 2);
+    assert_eq!(generated.status.recovery_codes_remaining, Some(2));
 }
 
 #[tokio::test]

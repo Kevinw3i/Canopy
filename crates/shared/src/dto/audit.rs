@@ -67,6 +67,9 @@ pub enum AuditAction {
     /// Verify a local TOTP factor for a step-up challenge. Verification codes
     /// must never be placed in metadata.
     MfaTotpVerify,
+    /// Generate local MFA recovery codes. Plaintext recovery codes must never
+    /// be placed in metadata.
+    MfaRecoveryCodesGenerate,
 }
 
 impl AuditAction {
@@ -87,6 +90,7 @@ impl AuditAction {
             Self::EntitlementsView => "entitlements_view",
             Self::MfaTotpEnroll => "mfa_totp_enroll",
             Self::MfaTotpVerify => "mfa_totp_verify",
+            Self::MfaRecoveryCodesGenerate => "mfa_recovery_codes_generate",
         }
     }
 }
@@ -122,6 +126,7 @@ mod tests {
             AuditAction::EntitlementsView,
             AuditAction::MfaTotpEnroll,
             AuditAction::MfaTotpVerify,
+            AuditAction::MfaRecoveryCodesGenerate,
         ] {
             let json = serde_json::to_value(&action).unwrap();
             assert_eq!(json, serde_json::Value::String(action.wire_name().into()));
@@ -185,6 +190,19 @@ mod tests {
 
         let back: AuditAction = serde_json::from_value(json).unwrap();
         assert!(matches!(back, AuditAction::MfaTotpVerify));
+    }
+
+    #[test]
+    fn audit_action_mfa_recovery_codes_generate_roundtrip() {
+        let json = serde_json::to_value(AuditAction::MfaRecoveryCodesGenerate).unwrap();
+        assert_eq!(json, "mfa_recovery_codes_generate");
+        assert_eq!(
+            AuditAction::MfaRecoveryCodesGenerate.wire_name(),
+            "mfa_recovery_codes_generate"
+        );
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::MfaRecoveryCodesGenerate));
     }
 
     #[test]

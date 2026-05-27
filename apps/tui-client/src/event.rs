@@ -174,6 +174,9 @@ pub enum Action {
     },
     TotpStepUpVerified(shared::dto::auth::TotpVerifyResponse),
     TotpStepUpVerifyFailed(String),
+    GenerateRecoveryCodes,
+    RecoveryCodesGenerated(shared::dto::auth::RecoveryCodesGenerateResponse),
+    RecoveryCodesGenerateFailed(String),
 
     // Auto-update
     CheckForUpdate,

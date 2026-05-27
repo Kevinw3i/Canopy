@@ -449,6 +449,16 @@ impl ApiClient {
         .await
     }
 
+    pub async fn generate_recovery_codes(&self) -> ApiResult<RecoveryCodesGenerateResponse> {
+        self.send_authenticated(|| {
+            self.client.post(format!(
+                "{}/api/auth/mfa/recovery-codes/generate",
+                self.base_url
+            ))
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

@@ -989,6 +989,16 @@ impl App {
             Action::TotpStepUpVerifyFailed(error) => {
                 self.settings.set_totp_step_up_verify_error(error);
             }
+            Action::GenerateRecoveryCodes => {
+                self.settings.set_recovery_codes_generating();
+                self.spawn_recovery_codes_generate();
+            }
+            Action::RecoveryCodesGenerated(response) => {
+                self.settings.set_recovery_codes_generated(response);
+            }
+            Action::RecoveryCodesGenerateFailed(error) => {
+                self.settings.set_recovery_codes_generate_error(error);
+            }
 
             // Auto-update
             Action::CheckForUpdate => {
@@ -1396,6 +1406,24 @@ impl App {
                     let _ = tx.send(Self::route_error_to_action(
                         err,
                         Action::TotpStepUpVerifyFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_recovery_codes_generate(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match api.generate_recovery_codes().await {
+                Ok(response) => {
+                    let _ = tx.send(Action::RecoveryCodesGenerated(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::RecoveryCodesGenerateFailed,
                     ));
                 }
             }

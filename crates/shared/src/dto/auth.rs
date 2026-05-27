@@ -101,6 +101,9 @@ pub struct MfaStatusResponse {
     pub local_step_up_available: bool,
     pub step_up_required: bool,
     pub factors: Vec<MfaFactorStatus>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_codes_remaining: Option<usize>,
     pub message: String,
 }
 
@@ -143,6 +146,14 @@ pub struct TotpVerifyResponse {
     pub verified: bool,
     pub verified_at: String,
     pub step_up_expires_at: String,
+    pub status: MfaStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCodesGenerateResponse {
+    pub codes: Vec<String>,
+    pub generated_at: String,
+    pub remaining_codes: usize,
     pub status: MfaStatusResponse,
 }
 
@@ -245,12 +256,14 @@ mod tests {
                     label: Some("Security key".into()),
                 },
             ],
+            recovery_codes_remaining: Some(3),
             message: "OIDC provider MFA/re-auth controls are configured.".into(),
         };
 
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["factors"][0]["kind"], "totp");
         assert_eq!(json["factors"][1]["kind"], "web_authn");
+        assert_eq!(json["recovery_codes_remaining"], 3);
 
         let back: MfaStatusResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back, resp);
@@ -297,6 +310,28 @@ mod tests {
         assert_eq!(json["code"], "123456");
         let back: TotpVerifyRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn recovery_codes_generate_roundtrip() {
+        let resp = RecoveryCodesGenerateResponse {
+            codes: vec!["ABCD-EFGH-IJKL-MNOP".into()],
+            generated_at: "2026-05-27T00:00:00Z".into(),
+            remaining_codes: 1,
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(1),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["codes"][0], "ABCD-EFGH-IJKL-MNOP");
+        let back: RecoveryCodesGenerateResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]
