@@ -110,11 +110,8 @@ fn sanitize_log_text_for_tui(text: &str) -> String {
         if ch.is_control() {
             match ch {
                 '\n' => out.push('\n'),
-                '\r' => {
-                    if !matches!(chars.peek(), Some('\n')) {
-                        out.push('\n');
-                    }
-                }
+                '\r' if !matches!(chars.peek(), Some('\n')) => out.push('\n'),
+                '\r' => {}
                 '\t' => out.push('\t'),
                 _ => {}
             }

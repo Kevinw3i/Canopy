@@ -306,6 +306,14 @@ variable "secrets_kms_key_arns" {
   description = "KMS key ARNs used to encrypt Secrets Manager secrets (jwt_secret, oidc_client_secret, database secrets). Leave empty if using AWS-managed keys."
   type        = list(string)
   default     = []
+
+  validation {
+    condition = alltrue([
+      for arn in var.secrets_kms_key_arns :
+      can(regex("^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", arn))
+    ])
+    error_message = "secrets_kms_key_arns must contain only concrete KMS key ARNs."
+  }
 }
 
 variable "database_secret_arns" {
@@ -315,10 +323,10 @@ variable "database_secret_arns" {
 
   validation {
     condition = alltrue([
-      for arn in var.secrets_kms_key_arns :
-      can(regex("^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", arn))
+      for arn in var.database_secret_arns :
+      can(regex("^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$", arn))
     ])
-    error_message = "secrets_kms_key_arns must contain only concrete KMS key ARNs."
+    error_message = "database_secret_arns must contain only concrete Secrets Manager secret ARNs."
   }
 }
 

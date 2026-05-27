@@ -275,6 +275,18 @@ run "rejects_invalid_secrets_kms_key_arn" {
   ]
 }
 
+run "rejects_invalid_database_secret_arn" {
+  command = plan
+
+  variables {
+    database_secret_arns = ["arn:aws:ssm:ap-northeast-1:123456789012:parameter/canopy/db/orders"]
+  }
+
+  expect_failures = [
+    var.database_secret_arns,
+  ]
+}
+
 run "rejects_non_https_oidc_issuer_url" {
   command = plan
 
