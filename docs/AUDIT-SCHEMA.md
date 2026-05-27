@@ -55,6 +55,7 @@ Current actions:
 - `mfa_totp_enroll`
 - `mfa_totp_verify`
 - `mfa_recovery_codes_generate`
+- `mfa_recovery_code_verify`
 
 `ec2_power` is emitted by the control-plane when an authorized operator requests
 an EC2 start, stop, or reboot action.
@@ -70,6 +71,10 @@ code.
 `mfa_recovery_codes_generate` is emitted when local MFA recovery codes are
 generated or rotated. Metadata includes `count`; it must not include plaintext
 recovery codes.
+
+`mfa_recovery_code_verify` is emitted when a local MFA recovery code is consumed
+for step-up. Metadata includes `remaining_codes`; it must not include the
+plaintext recovery code.
 
 ## Common Metadata Fields
 

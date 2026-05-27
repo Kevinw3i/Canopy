@@ -14,9 +14,9 @@ use crate::services::step_up::{
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::auth::{
-    MfaStatusResponse, RecoveryCodesGenerateResponse, TotpEnrollConfirmRequest,
-    TotpEnrollConfirmResponse, TotpEnrollStartRequest, TotpEnrollStartResponse, TotpVerifyRequest,
-    TotpVerifyResponse,
+    MfaStatusResponse, RecoveryCodeVerifyRequest, RecoveryCodeVerifyResponse,
+    RecoveryCodesGenerateResponse, TotpEnrollConfirmRequest, TotpEnrollConfirmResponse,
+    TotpEnrollStartRequest, TotpEnrollStartResponse, TotpVerifyRequest, TotpVerifyResponse,
 };
 use shared::errors::ApiError;
 
@@ -31,6 +31,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/auth/mfa/recovery-codes/generate",
             post(recovery_codes_generate),
+        )
+        .route(
+            "/api/auth/mfa/recovery-codes/verify",
+            post(recovery_code_verify),
         )
 }
 
@@ -227,6 +231,56 @@ async fn recovery_codes_generate(
     }
 }
 
+async fn recovery_code_verify(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    Json(req): Json<RecoveryCodeVerifyRequest>,
+) -> RouteResult<RecoveryCodeVerifyResponse> {
+    require_audit_healthy(&state)?;
+
+    let result =
+        state
+            .mfa_store
+            .verify_recovery_code_with_precommit(&claims.sub, &req.code, |remaining| {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::MfaRecoveryCodeVerify,
+                        AuditOutcome::Success,
+                    )
+                    .optional_metadata(Some(serde_json::json!({
+                        "remaining_codes": remaining,
+                    })))
+                    .commit_or_fail()
+                    .is_ok()
+            });
+    match result {
+        Ok(Some(verified)) => {
+            let status = mfa_status_response(&state, &claims.sub)?;
+            let verified_at = chrono::Utc::now();
+            let step_up_expires_at = step_up_expires_at(verified_at);
+            state
+                .step_up_sessions
+                .mark_verified_until(&claims_step_up_key(&claims), step_up_expires_at);
+            Ok(Json(RecoveryCodeVerifyResponse {
+                verified: true,
+                verified_at: verified_at.to_rfc3339(),
+                step_up_expires_at: step_up_expires_at.to_rfc3339(),
+                remaining_codes: verified.remaining_codes,
+                status,
+            }))
+        }
+        Ok(None) => Err(audit_failed_response(
+            "Recovery code verification audit failed",
+        )),
+        Err(err) => {
+            audit_recovery_code_verify_failure(&state, &claims.sub, &err);
+            Err(mfa_store_error_response(err))
+        }
+    }
+}
+
 fn mfa_step_up_unavailable_response(err: impl std::fmt::Display) -> (StatusCode, Json<ApiError>) {
     tracing::error!(error = %err, "Failed to evaluate MFA step-up status");
     (
@@ -342,6 +396,18 @@ fn audit_recovery_codes_generate_failure(state: &AppState, actor: &str, err: &Mf
         .commit_best_effort();
 }
 
+fn audit_recovery_code_verify_failure(state: &AppState, actor: &str, err: &MfaStoreError) {
+    state
+        .audit_service
+        .event(
+            actor,
+            AuditAction::MfaRecoveryCodeVerify,
+            AuditOutcome::Failure,
+        )
+        .error(Some(&err.to_string()))
+        .commit_best_effort();
+}
+
 fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) {
     match err {
         MfaStoreError::StoreUnavailable | MfaStoreError::TotpSecretKeyUnavailable => (
@@ -365,6 +431,10 @@ fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) 
             Json(ApiError::bad_request(err.to_string())),
         ),
         MfaStoreError::TotpCodeReplayed => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(err.to_string())),
+        ),
+        MfaStoreError::InvalidRecoveryCode => (
             StatusCode::BAD_REQUEST,
             Json(ApiError::bad_request(err.to_string())),
         ),

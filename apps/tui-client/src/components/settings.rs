@@ -11,8 +11,8 @@ use crate::keybindings::KeyBindings;
 use crate::theme::{color_label, Theme};
 use crate::widgets::input::TextInput;
 use shared::dto::auth::{
-    MfaFactorKind, MfaStatusResponse, RecoveryCodesGenerateResponse, TotpEnrollStartResponse,
-    TotpVerifyResponse,
+    MfaFactorKind, MfaStatusResponse, RecoveryCodeVerifyResponse, RecoveryCodesGenerateResponse,
+    TotpEnrollStartResponse, TotpVerifyResponse,
 };
 
 pub struct SettingsScreen {
@@ -29,6 +29,7 @@ pub struct SettingsScreen {
     recovery_codes_generating: bool,
     recovery_codes_error: Option<String>,
     recovery_codes: Option<Vec<String>>,
+    recovery_code_verification: Option<RecoveryCodeVerificationState>,
 }
 
 struct TotpEnrollmentState {
@@ -39,6 +40,12 @@ struct TotpEnrollmentState {
 }
 
 struct TotpVerificationState {
+    code_input: TextInput,
+    submitting: bool,
+    error: Option<String>,
+}
+
+struct RecoveryCodeVerificationState {
     code_input: TextInput,
     submitting: bool,
     error: Option<String>,
@@ -60,6 +67,7 @@ impl SettingsScreen {
             recovery_codes_generating: false,
             recovery_codes_error: None,
             recovery_codes: None,
+            recovery_code_verification: None,
         }
     }
 
@@ -92,6 +100,7 @@ impl SettingsScreen {
         self.mfa_error = None;
         self.recovery_codes = None;
         self.recovery_codes_error = None;
+        self.recovery_code_verification = None;
     }
 
     pub fn set_totp_started(&mut self, response: TotpEnrollStartResponse) {
@@ -109,6 +118,7 @@ impl SettingsScreen {
         self.totp_verification = None;
         self.mfa_error = None;
         self.recovery_codes_error = None;
+        self.recovery_code_verification = None;
     }
 
     pub fn set_totp_start_error(&mut self, error: String) {
@@ -191,6 +201,44 @@ impl SettingsScreen {
         self.recovery_codes_error = Some(error);
         self.recovery_codes = None;
     }
+
+    pub fn start_recovery_code_step_up_verification(&mut self) {
+        let mut code_input = TextInput::new("Recovery code").with_theme(self.theme);
+        code_input.focused = true;
+        self.recovery_code_verification = Some(RecoveryCodeVerificationState {
+            code_input,
+            submitting: false,
+            error: None,
+        });
+        self.totp_verification = None;
+        self.totp_enrollment = None;
+        self.totp_step_up_success = None;
+        self.recovery_codes_error = None;
+        self.mfa_error = None;
+    }
+
+    pub fn set_recovery_code_step_up_verifying(&mut self) {
+        if let Some(verification) = self.recovery_code_verification.as_mut() {
+            verification.submitting = true;
+            verification.error = None;
+        }
+    }
+
+    pub fn set_recovery_code_step_up_verify_error(&mut self, error: String) {
+        if let Some(verification) = self.recovery_code_verification.as_mut() {
+            verification.submitting = false;
+            verification.error = Some(error);
+        }
+    }
+
+    pub fn set_recovery_code_step_up_verified(&mut self, response: RecoveryCodeVerifyResponse) {
+        self.recovery_code_verification = None;
+        self.totp_step_up_success = Some(format!(
+            "recovery code verified until {}",
+            response.step_up_expires_at
+        ));
+        self.set_mfa_status(response.status);
+    }
 }
 
 impl Component for SettingsScreen {
@@ -200,6 +248,9 @@ impl Component for SettingsScreen {
         }
         if self.totp_verification.is_some() {
             return self.handle_totp_verification_key(key);
+        }
+        if self.recovery_code_verification.is_some() {
+            return self.handle_recovery_code_verification_key(key);
         }
 
         if self
@@ -248,6 +299,12 @@ impl Component for SettingsScreen {
             return Action::StartTotpStepUpVerification;
         }
         if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('u'))
+            && self.can_use_recovery_code_step_up()
+        {
+            return Action::StartRecoveryCodeStepUpVerification;
+        }
+        if key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Char('g'))
             && self.can_generate_recovery_codes()
             && !self.recovery_codes_generating
@@ -267,6 +324,13 @@ impl Component for SettingsScreen {
             enrollment.code_input.insert_str(&digits);
         } else if let Some(verification) = self.totp_verification.as_mut() {
             verification.code_input.insert_str(&digits);
+        } else if let Some(verification) = self.recovery_code_verification.as_mut() {
+            let code: String = text
+                .chars()
+                .filter(|ch| ch.is_ascii_hexdigit() || *ch == '-')
+                .take(24)
+                .collect();
+            verification.code_input.insert_str(&code);
         }
         Action::Noop
     }
@@ -283,7 +347,9 @@ impl Component for SettingsScreen {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
-        let has_code_input = self.totp_enrollment.is_some() || self.totp_verification.is_some();
+        let has_code_input = self.totp_enrollment.is_some()
+            || self.totp_verification.is_some()
+            || self.recovery_code_verification.is_some();
         let (content_area, code_input_area) = if has_code_input && inner.height > 8 {
             let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(inner);
             (chunks[0], Some(chunks[1]))
@@ -394,6 +460,10 @@ impl Component for SettingsScreen {
             (self.totp_verification.as_ref(), code_input_area)
         {
             verification.code_input.render(area, buf);
+        } else if let (Some(verification), Some(area)) =
+            (self.recovery_code_verification.as_ref(), code_input_area)
+        {
+            verification.code_input.render(area, buf);
         }
     }
 
@@ -453,6 +523,32 @@ impl SettingsScreen {
                     Action::Noop
                 } else {
                     Action::VerifyTotpStepUp { code }
+                }
+            }
+            _ => {
+                verification.code_input.handle_key(key);
+                Action::Noop
+            }
+        }
+    }
+
+    fn handle_recovery_code_verification_key(&mut self, key: KeyEvent) -> Action {
+        let Some(verification) = self.recovery_code_verification.as_mut() else {
+            return Action::Noop;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.recovery_code_verification = None;
+                Action::Noop
+            }
+            KeyCode::Enter if !verification.submitting => {
+                let code = verification.code_input.value.trim().to_string();
+                if code.is_empty() {
+                    verification.error = Some("Enter an unused recovery code".into());
+                    Action::Noop
+                } else {
+                    Action::VerifyRecoveryCodeStepUp { code }
                 }
             }
             _ => {
@@ -532,7 +628,7 @@ impl SettingsScreen {
             ]));
         } else if let Some(success) = self.totp_step_up_success.as_deref() {
             lines.push(Line::from(vec![
-                Span::styled("TOTP step-up:       ", label_style),
+                Span::styled("Step-up:            ", label_style),
                 Span::styled(truncate(success, 72), success_style),
             ]));
         } else if self.can_verify_totp_step_up() {
@@ -561,6 +657,15 @@ impl SettingsScreen {
 
     fn can_generate_recovery_codes(&self) -> bool {
         self.can_verify_totp_step_up() && self.totp_step_up_success.is_some()
+    }
+
+    fn can_use_recovery_code_step_up(&self) -> bool {
+        self.totp_enrolled()
+            && self
+                .mfa_status
+                .as_ref()
+                .and_then(|status| status.recovery_codes_remaining)
+                .is_some_and(|remaining| remaining > 0)
     }
 
     fn recovery_code_lines(&self) -> Vec<Line<'static>> {
@@ -594,6 +699,24 @@ impl SettingsScreen {
             ]));
             return lines;
         }
+        if let Some(verification) = self.recovery_code_verification.as_ref() {
+            lines.push(Line::from(Span::styled(
+                "Recovery Code Step-up",
+                heading_style,
+            )));
+            let state = if verification.submitting {
+                Span::styled("verifying", warning_style)
+            } else if let Some(error) = verification.error.as_deref() {
+                Span::styled(format!("error: {}", truncate(error, 46)), danger_style)
+            } else {
+                Span::styled("Enter consumes one code; Esc cancels", muted_style)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Status:             ", label_style),
+                state,
+            ]));
+            return lines;
+        }
         if let Some(codes) = self.recovery_codes.as_ref() {
             lines.push(Line::from(Span::styled("Recovery Codes", heading_style)));
             lines.push(Line::from(Span::styled(
@@ -606,9 +729,20 @@ impl SettingsScreen {
             return lines;
         }
         if self.totp_step_up_success.is_none() {
+            let has_recovery_codes = self
+                .mfa_status
+                .as_ref()
+                .and_then(|status| status.recovery_codes_remaining)
+                .is_some_and(|count| count > 0);
+            let action = match (self.can_verify_totp_step_up(), has_recovery_codes) {
+                (true, true) => "verify first: press v or u",
+                (true, false) => "verify step-up first; press v",
+                (false, true) => "verify first: press u",
+                (false, false) => "step-up unavailable",
+            };
             lines.push(Line::from(vec![
                 Span::styled("Recovery codes:    ", label_style),
-                Span::styled("verify step-up first; press v", muted_style),
+                Span::styled(action, muted_style),
             ]));
             return lines;
         }
@@ -619,7 +753,7 @@ impl SettingsScreen {
             .and_then(|status| status.recovery_codes_remaining)
         {
             Some(0) => "press g to generate".into(),
-            Some(count) => format!("{count} unused; press g to rotate"),
+            Some(count) => format!("{count} unused; u to use, g to rotate"),
             None => "press g to generate".into(),
         };
         let style = if text.starts_with("press ") {
@@ -1003,7 +1137,7 @@ mod tests {
 
         assert!(matches!(screen.handle_key(key(KeyCode::Esc)), Action::Noop));
         let text = rendered_text(&mut screen);
-        assert!(text.contains("2 unused; press g to rotate"));
+        assert!(text.contains("2 unused; u to use, g to rotate"));
         assert!(!text.contains("AAAA-BBBB-CCCC-DDDD-EEEE"));
     }
 
@@ -1037,6 +1171,110 @@ mod tests {
         ));
         let text = rendered_text(&mut screen);
         assert!(!text.contains("AAAA-BBBB-CCCC-DDDD-EEEE"));
+    }
+
+    #[test]
+    fn u_opens_recovery_code_step_up_when_codes_exist() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: true,
+            step_up_required: false,
+            factors: vec![shared::dto::auth::MfaFactorStatus {
+                kind: MfaFactorKind::Totp,
+                available: true,
+                enrolled: true,
+                label: Some("Authenticator app".into()),
+            }],
+            recovery_codes_remaining: Some(1),
+            message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+        });
+
+        let action = screen.handle_key(key(KeyCode::Char('u')));
+
+        assert!(matches!(
+            action,
+            Action::StartRecoveryCodeStepUpVerification
+        ));
+    }
+
+    #[test]
+    fn recovery_codes_prompt_uses_u_when_totp_secret_unavailable() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![shared::dto::auth::MfaFactorStatus {
+                kind: MfaFactorKind::Totp,
+                available: false,
+                enrolled: true,
+                label: Some("Authenticator app".into()),
+            }],
+            recovery_codes_remaining: Some(1),
+            message:
+                "Local MFA factor store is configured, but TOTP enrollment requires mfa_secret_key."
+                    .into(),
+        });
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("verify first: press u"));
+        assert!(!text.contains("press v or u"));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('u'))),
+            Action::StartRecoveryCodeStepUpVerification
+        ));
+    }
+
+    #[test]
+    fn recovery_code_step_up_accepts_paste_and_verifies() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.start_recovery_code_step_up_verification();
+
+        screen.handle_paste("aaaa-bbbb-cccc-dddd-eeee\nextra");
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::VerifyRecoveryCodeStepUp { code }
+                if code == "aaaa-bbbb-cccc-dddd-eeee"
+        ));
+    }
+
+    #[test]
+    fn recovery_code_verified_updates_step_up_and_remaining_count() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.start_recovery_code_step_up_verification();
+        screen.set_recovery_code_step_up_verified(RecoveryCodeVerifyResponse {
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            remaining_codes: 0,
+            status: MfaStatusResponse {
+                user_id: "dev-admin".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: true,
+                    label: Some("Authenticator app".into()),
+                }],
+                recovery_codes_remaining: Some(0),
+                message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+            },
+        });
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("recovery code verified until"));
+        assert!(text.contains("press g to generate"));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('g'))),
+            Action::GenerateRecoveryCodes
+        ));
     }
 
     #[test]

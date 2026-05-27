@@ -999,6 +999,19 @@ impl App {
             Action::RecoveryCodesGenerateFailed(error) => {
                 self.settings.set_recovery_codes_generate_error(error);
             }
+            Action::StartRecoveryCodeStepUpVerification => {
+                self.settings.start_recovery_code_step_up_verification();
+            }
+            Action::VerifyRecoveryCodeStepUp { code } => {
+                self.settings.set_recovery_code_step_up_verifying();
+                self.spawn_recovery_code_step_up_verify(code);
+            }
+            Action::RecoveryCodeStepUpVerified(response) => {
+                self.settings.set_recovery_code_step_up_verified(response);
+            }
+            Action::RecoveryCodeStepUpVerifyFailed(error) => {
+                self.settings.set_recovery_code_step_up_verify_error(error);
+            }
 
             // Auto-update
             Action::CheckForUpdate => {
@@ -1424,6 +1437,25 @@ impl App {
                     let _ = tx.send(Self::route_error_to_action(
                         err,
                         Action::RecoveryCodesGenerateFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_recovery_code_step_up_verify(&self, code: String) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::RecoveryCodeVerifyRequest { code };
+            match api.verify_recovery_code_step_up(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::RecoveryCodeStepUpVerified(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::RecoveryCodeStepUpVerifyFailed,
                     ));
                 }
             }

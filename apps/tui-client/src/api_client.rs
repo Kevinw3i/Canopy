@@ -459,6 +459,21 @@ impl ApiClient {
         .await
     }
 
+    pub async fn verify_recovery_code_step_up(
+        &self,
+        request: &RecoveryCodeVerifyRequest,
+    ) -> ApiResult<RecoveryCodeVerifyResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/recovery-codes/verify",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

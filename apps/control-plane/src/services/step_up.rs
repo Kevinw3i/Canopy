@@ -71,7 +71,7 @@ pub fn step_up_expires_at(now: DateTime<Utc>) -> DateTime<Utc> {
 pub fn step_up_required_error() -> ApiError {
     let mut err = ApiError::new(
         "STEP_UP_REQUIRED",
-        "Local TOTP step-up verification is required. Open Settings and press v to verify, then retry the operation.",
+        "Local step-up verification is required. Open Settings and press v for TOTP or u for an unused recovery code, then retry the operation.",
     );
     err.details = Some("totp".into());
     err

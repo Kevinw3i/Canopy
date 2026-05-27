@@ -351,6 +351,55 @@ async fn recovery_codes_generate_handler(headers: HeaderMap) -> impl IntoRespons
     .into_response()
 }
 
+async fn recovery_code_verify_handler(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+    if body["code"].as_str() != Some("AAAA-BBBB-CCCC-DDDD-EEEE") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "recovery code is invalid or already used"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "verified": true,
+        "verified_at": "2026-05-27T00:00:00Z",
+        "step_up_expires_at": "2026-05-27T00:05:00Z",
+        "remaining_codes": 1,
+        "status": {
+            "user_id": "alice",
+            "provider_step_up_configured": true,
+            "local_step_up_available": true,
+            "step_up_required": false,
+            "recovery_codes_remaining": 1,
+            "factors": [
+                {
+                    "kind": "totp",
+                    "available": true,
+                    "enrolled": true,
+                    "label": "Authenticator app"
+                },
+                {
+                    "kind": "web_authn",
+                    "available": true,
+                    "enrolled": false,
+                    "label": "Security key"
+                }
+            ],
+            "message": "Local MFA factor store and TOTP enrollment are configured."
+        }
+    }))
+    .into_response()
+}
+
 async fn log_groups_handler(headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
@@ -513,6 +562,10 @@ fn mock_app() -> Router {
         .route(
             "/api/auth/mfa/recovery-codes/generate",
             post(recovery_codes_generate_handler),
+        )
+        .route(
+            "/api/auth/mfa/recovery-codes/verify",
+            post(recovery_code_verify_handler),
         )
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
 }
@@ -739,6 +792,16 @@ async fn totp_enrollment_start_and_confirm_success() {
     assert_eq!(generated.codes.len(), 2);
     assert_eq!(generated.remaining_codes, 2);
     assert_eq!(generated.status.recovery_codes_remaining, Some(2));
+
+    let recovery_verified = client
+        .verify_recovery_code_step_up(&shared::dto::auth::RecoveryCodeVerifyRequest {
+            code: generated.codes[0].clone(),
+        })
+        .await
+        .unwrap();
+    assert!(recovery_verified.verified);
+    assert_eq!(recovery_verified.remaining_codes, 1);
+    assert_eq!(recovery_verified.status.recovery_codes_remaining, Some(1));
 }
 
 #[tokio::test]

@@ -80,6 +80,8 @@ pub enum MfaStoreError {
     TotpCodeReplayed,
     #[error("local recovery codes require an active TOTP factor")]
     RecoveryCodesRequireTotp,
+    #[error("recovery code is invalid or already used")]
+    InvalidRecoveryCode,
     #[error("MFA secret key must be base64-encoded 32 bytes")]
     InvalidSecretKey,
     #[error("MFA secret envelope is invalid")]
@@ -111,6 +113,11 @@ pub struct TotpVerifyResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryCodesResult {
     pub codes: Vec<String>,
+    pub remaining_codes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCodeVerifyResult {
     pub remaining_codes: usize,
 }
 
@@ -452,6 +459,90 @@ impl MfaStore {
         }))
     }
 
+    pub fn verify_recovery_code(
+        &self,
+        user_id: &str,
+        code: &str,
+    ) -> MfaResult<RecoveryCodeVerifyResult> {
+        let Some(result) = self.verify_recovery_code_with_precommit(user_id, code, |_| true)?
+        else {
+            unreachable!("recovery code verification precommit returned false")
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn verify_recovery_code_with_precommit<F>(
+        &self,
+        user_id: &str,
+        code: &str,
+        precommit: F,
+    ) -> MfaResult<Option<RecoveryCodeVerifyResult>>
+    where
+        F: FnOnce(usize) -> bool,
+    {
+        let code = normalized_recovery_code(code)?;
+        let mut conn = self.required_connection()?;
+        let tx = conn.transaction()?;
+        let matched_id = {
+            let mut stmt = tx.prepare(
+                "SELECT id, salt, code_hash
+                 FROM mfa_recovery_codes
+                 WHERE user_id = ?1
+                   AND used_at IS NULL
+                   AND disabled_at IS NULL",
+            )?;
+            let rows = stmt.query_map(params![user_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut matched_id = None;
+            for row in rows {
+                let (id, salt, code_hash) = row?;
+                if recovery_code_hash(&salt, &code) == code_hash {
+                    matched_id = Some(id);
+                    break;
+                }
+            }
+            matched_id
+        };
+        let Some(matched_id) = matched_id else {
+            return Err(MfaStoreError::InvalidRecoveryCode);
+        };
+
+        let updated = tx.execute(
+            "UPDATE mfa_recovery_codes
+             SET used_at = CURRENT_TIMESTAMP
+             WHERE id = ?1
+               AND user_id = ?2
+               AND used_at IS NULL
+               AND disabled_at IS NULL",
+            params![matched_id, user_id],
+        )?;
+        if updated == 0 {
+            return Err(MfaStoreError::InvalidRecoveryCode);
+        }
+
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*)
+             FROM mfa_recovery_codes
+             WHERE user_id = ?1
+               AND used_at IS NULL
+               AND disabled_at IS NULL",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        let remaining_codes = remaining as usize;
+        if !precommit(remaining_codes) {
+            return Ok(None);
+        }
+        tx.commit()?;
+
+        Ok(Some(RecoveryCodeVerifyResult { remaining_codes }))
+    }
+
     fn connection(&self) -> MfaResult<Option<MutexGuard<'_, Connection>>> {
         self.conn
             .as_ref()
@@ -648,6 +739,25 @@ fn generate_recovery_salt() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+fn normalized_recovery_code(code: &str) -> MfaResult<String> {
+    let compact = code
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace() && *ch != '-')
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect::<String>();
+    if compact.len() != 20 || !compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(MfaStoreError::InvalidRecoveryCode);
+    }
+    Ok([
+        &compact[0..4],
+        &compact[4..8],
+        &compact[8..12],
+        &compact[12..16],
+        &compact[16..20],
+    ]
+    .join("-"))
 }
 
 fn recovery_code_hash(salt: &str, code: &str) -> String {
@@ -937,11 +1047,33 @@ mod tests {
         assert_eq!(stored_plaintext_count, 0);
         drop(conn);
 
+        let verified = store
+            .verify_recovery_code("u1", &generated.codes[0])
+            .unwrap();
+        assert_eq!(verified.remaining_codes, 9);
+        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(9));
+        let replay = store
+            .verify_recovery_code("u1", &generated.codes[0])
+            .unwrap_err();
+        assert!(matches!(replay, MfaStoreError::InvalidRecoveryCode));
+
+        let normalized_variant = generated.codes[1].to_ascii_lowercase().replace('-', " ");
+        let verified = store
+            .verify_recovery_code("u1", &normalized_variant)
+            .unwrap();
+        assert_eq!(verified.remaining_codes, 8);
+
+        let rejected = store
+            .verify_recovery_code_with_precommit("u1", &generated.codes[2], |_| false)
+            .unwrap();
+        assert!(rejected.is_none());
+        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(8));
+
         let rejected = store
             .generate_recovery_codes_with_precommit("u1", |_| false)
             .unwrap();
         assert!(rejected.is_none());
-        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(10));
+        assert_eq!(store.recovery_codes_remaining("u1").unwrap(), Some(8));
 
         let rotated = store.generate_recovery_codes("u1").unwrap();
         assert_eq!(rotated.codes.len(), RECOVERY_CODE_COUNT);
@@ -956,6 +1088,18 @@ mod tests {
         let err = store.generate_recovery_codes("u1").unwrap_err();
 
         assert!(matches!(err, MfaStoreError::RecoveryCodesRequireTotp));
+    }
+
+    #[test]
+    fn invalid_recovery_code_format_is_rejected() {
+        assert!(matches!(
+            normalized_recovery_code("not-a-code"),
+            Err(MfaStoreError::InvalidRecoveryCode)
+        ));
+        assert!(matches!(
+            normalized_recovery_code("AAAA-BBBB-CCCC-DDDD-EEEZ"),
+            Err(MfaStoreError::InvalidRecoveryCode)
+        ));
     }
 
     #[test]

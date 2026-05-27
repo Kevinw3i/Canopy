@@ -177,6 +177,12 @@ pub enum Action {
     GenerateRecoveryCodes,
     RecoveryCodesGenerated(shared::dto::auth::RecoveryCodesGenerateResponse),
     RecoveryCodesGenerateFailed(String),
+    StartRecoveryCodeStepUpVerification,
+    VerifyRecoveryCodeStepUp {
+        code: String,
+    },
+    RecoveryCodeStepUpVerified(shared::dto::auth::RecoveryCodeVerifyResponse),
+    RecoveryCodeStepUpVerifyFailed(String),
 
     // Auto-update
     CheckForUpdate,

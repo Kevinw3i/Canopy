@@ -894,7 +894,7 @@ async fn recovery_codes_generate_requires_enrolled_totp() {
     let app = build_app(state);
 
     let (status, json) = authed_post_json(
-        app,
+        app.clone(),
         "/api/auth/mfa/recovery-codes/generate",
         &token,
         json!({}),
@@ -918,6 +918,7 @@ async fn recovery_codes_generate_rotates_and_does_not_log_plaintext() {
     config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
     config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
     let token = issue_test_token(&config);
+    let recovery_token = issue_test_token(&config);
     let state = build_state_with_audit_file(config, &audit.path);
     let app = build_app(state);
     let code = enroll_test_totp(app.clone(), &token).await;
@@ -936,7 +937,7 @@ async fn recovery_codes_generate_rotates_and_does_not_log_plaintext() {
     verify_test_totp_step_up(app.clone(), &token, &code).await;
 
     let (status, json) = authed_post_json(
-        app,
+        app.clone(),
         "/api/auth/mfa/recovery-codes/generate",
         &token,
         json!({}),
@@ -953,9 +954,43 @@ async fn recovery_codes_generate_rotates_and_does_not_log_plaintext() {
     assert_eq!(json["remaining_codes"], 10);
     assert_eq!(json["status"]["recovery_codes_remaining"], 10);
 
+    let first_code = codes[0].as_str().unwrap().to_string();
+    let normalized_variant = first_code.to_ascii_lowercase().replace('-', " ");
+    let (verify_status, verify_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/recovery-codes/verify",
+        &recovery_token,
+        json!({
+            "code": normalized_variant
+        }),
+    )
+    .await;
+
+    assert_eq!(verify_status, StatusCode::OK);
+    assert_eq!(verify_json["verified"], true);
+    assert_eq!(verify_json["remaining_codes"], 9);
+    assert_eq!(verify_json["status"]["recovery_codes_remaining"], 9);
+
+    let (replay_status, replay_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/recovery-codes/verify",
+        &recovery_token,
+        json!({
+            "code": first_code
+        }),
+    )
+    .await;
+
+    assert_eq!(replay_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        replay_json["message"],
+        "recovery code is invalid or already used"
+    );
+
     let events = read_audit_events(&audit.path);
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(serialized.contains("mfa_recovery_codes_generate"));
+    assert!(serialized.contains("mfa_recovery_code_verify"));
     for code in codes {
         assert!(!serialized.contains(code.as_str().unwrap()));
     }

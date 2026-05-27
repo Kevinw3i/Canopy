@@ -157,6 +157,20 @@ pub struct RecoveryCodesGenerateResponse {
     pub status: MfaStatusResponse,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCodeVerifyRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryCodeVerifyResponse {
+    pub verified: bool,
+    pub verified_at: String,
+    pub step_up_expires_at: String,
+    pub remaining_codes: usize,
+    pub status: MfaStatusResponse,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -331,6 +345,30 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["codes"][0], "ABCD-EFGH-IJKL-MNOP");
         let back: RecoveryCodesGenerateResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn recovery_code_verify_roundtrip() {
+        let resp = RecoveryCodeVerifyResponse {
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            remaining_codes: 0,
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(0),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["remaining_codes"], 0);
+        let back: RecoveryCodeVerifyResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back, resp);
     }
 
