@@ -504,6 +504,36 @@ impl ApiClient {
         .await
     }
 
+    pub async fn start_webauthn_verification(
+        &self,
+        request: &WebAuthnVerifyStartRequest,
+    ) -> ApiResult<WebAuthnVerifyStartResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/verify/start",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn finish_webauthn_verification(
+        &self,
+        request: &WebAuthnVerifyFinishRequest,
+    ) -> ApiResult<WebAuthnVerifyResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/verify/finish",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

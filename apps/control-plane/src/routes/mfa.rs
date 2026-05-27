@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::models::mfa::MfaStoreError;
 use crate::services::step_up::{
-    claims_step_up_key, local_totp_step_up_required, step_up_expires_at, step_up_required_error,
+    claims_step_up_key, local_step_up_required, step_up_expires_at, step_up_required_error,
 };
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
@@ -18,7 +18,8 @@ use shared::dto::auth::{
     RecoveryCodesGenerateResponse, TotpEnrollConfirmRequest, TotpEnrollConfirmResponse,
     TotpEnrollStartRequest, TotpEnrollStartResponse, TotpVerifyRequest, TotpVerifyResponse,
     WebAuthnRegisterFinishRequest, WebAuthnRegisterFinishResponse, WebAuthnRegisterStartRequest,
-    WebAuthnRegisterStartResponse,
+    WebAuthnRegisterStartResponse, WebAuthnVerifyFinishRequest, WebAuthnVerifyResponse,
+    WebAuthnVerifyStartRequest, WebAuthnVerifyStartResponse,
 };
 use shared::errors::ApiError;
 
@@ -45,6 +46,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/auth/mfa/webauthn/register/finish",
             post(webauthn_register_finish),
+        )
+        .route(
+            "/api/auth/mfa/webauthn/verify/start",
+            post(webauthn_verify_start),
+        )
+        .route(
+            "/api/auth/mfa/webauthn/verify/finish",
+            post(webauthn_verify_finish),
         )
 }
 
@@ -146,7 +155,7 @@ async fn webauthn_register_start(
 ) -> RouteResult<WebAuthnRegisterStartResponse> {
     require_audit_healthy(&state)?;
 
-    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+    if local_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
         .map_err(mfa_step_up_unavailable_response)?
     {
         audit_webauthn_enroll_denied(&state, &claims.sub, "start", None);
@@ -196,7 +205,7 @@ async fn webauthn_register_finish(
 ) -> RouteResult<WebAuthnRegisterFinishResponse> {
     require_audit_healthy(&state)?;
 
-    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+    if local_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
         .map_err(mfa_step_up_unavailable_response)?
     {
         audit_webauthn_enroll_denied(&state, &claims.sub, "finish", Some(req.factor_id.as_str()));
@@ -263,6 +272,122 @@ async fn webauthn_register_finish(
     }
 }
 
+async fn webauthn_verify_start(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    Json(req): Json<WebAuthnVerifyStartRequest>,
+) -> RouteResult<WebAuthnVerifyStartResponse> {
+    require_audit_healthy(&state)?;
+
+    let result = state
+        .mfa_store
+        .start_webauthn_authentication_with_precommit(&claims.sub, &req.origin, |started| {
+            state
+                .audit_service
+                .event(
+                    &claims.sub,
+                    AuditAction::MfaWebAuthnVerify,
+                    AuditOutcome::Success,
+                )
+                .optional_metadata(Some(serde_json::json!({
+                    "stage": "start",
+                    "challenge_id": &started.challenge_id,
+                    "kind": "web_authn",
+                    "origin": &req.origin,
+                })))
+                .commit_or_fail()
+                .is_ok()
+        });
+    match result {
+        Ok(Some(started)) => Ok(Json(WebAuthnVerifyStartResponse {
+            challenge_id: started.challenge_id,
+            public_key: started.public_key,
+            expires_at: (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+        })),
+        Ok(None) => Err(audit_failed_response("WebAuthn verification audit failed")),
+        Err(err) => {
+            audit_webauthn_verify_failure(&state, &claims.sub, "start", None, &err);
+            Err(mfa_store_error_response(err))
+        }
+    }
+}
+
+async fn webauthn_verify_finish(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    Json(req): Json<WebAuthnVerifyFinishRequest>,
+) -> RouteResult<WebAuthnVerifyResponse> {
+    require_audit_healthy(&state)?;
+
+    let credential =
+        match serde_json::from_value::<passkey_auth::AuthenticationResponse>(req.credential) {
+            Ok(credential) => credential,
+            Err(_) => {
+                let err = MfaStoreError::InvalidWebAuthnAuthentication;
+                audit_webauthn_verify_failure(
+                    &state,
+                    &claims.sub,
+                    "finish",
+                    Some(req.challenge_id.as_str()),
+                    &err,
+                );
+                return Err(mfa_store_error_response(err));
+            }
+        };
+    let result = state
+        .mfa_store
+        .finish_webauthn_authentication_with_precommit(
+            &claims.sub,
+            &req.challenge_id,
+            &credential,
+            |verified| {
+                state
+                    .audit_service
+                    .event(
+                        &claims.sub,
+                        AuditAction::MfaWebAuthnVerify,
+                        AuditOutcome::Success,
+                    )
+                    .optional_metadata(Some(serde_json::json!({
+                        "stage": "finish",
+                        "factor_id": &verified.factor_id,
+                        "kind": "web_authn",
+                    })))
+                    .commit_or_fail()
+                    .is_ok()
+            },
+        );
+    match result {
+        Ok(Some(verified)) => {
+            let status = mfa_status_response(&state, &claims.sub)?;
+            let verified_at = chrono::Utc::now();
+            let step_up_expires_at = step_up_expires_at(verified_at);
+            state
+                .step_up_sessions
+                .mark_verified_until(&claims_step_up_key(&claims), step_up_expires_at);
+            Ok(Json(WebAuthnVerifyResponse {
+                factor_id: verified.factor_id,
+                credential_id: verified.credential_id,
+                verified: true,
+                verified_at: verified_at.to_rfc3339(),
+                step_up_expires_at: step_up_expires_at.to_rfc3339(),
+                status,
+            }))
+        }
+        Ok(None) => Err(audit_failed_response("WebAuthn verification audit failed")),
+        Err(err) => {
+            audit_webauthn_verify_failure(
+                &state,
+                &claims.sub,
+                "finish",
+                Some(req.challenge_id.as_str()),
+                &err,
+            );
+            Err(mfa_store_error_response(err))
+        }
+    }
+}
+
 async fn totp_verify(
     State(state): State<Arc<AppState>>,
     AuthenticatedUser(claims): AuthenticatedUser,
@@ -314,7 +439,7 @@ async fn recovery_codes_generate(
 ) -> RouteResult<RecoveryCodesGenerateResponse> {
     require_audit_healthy(&state)?;
 
-    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+    if local_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
         .map_err(mfa_step_up_unavailable_response)?
     {
         state
@@ -450,9 +575,9 @@ fn mfa_status_response(
                 )
             })?;
     let message = if state.mfa_store.totp_enrollment_available() {
-        "Local MFA factor store and TOTP enrollment are configured. Step-up enforcement protects sensitive local actions."
+        "Local MFA factor store, TOTP enrollment, and passkey enrollment are configured. Step-up enforcement protects sensitive local actions."
     } else if state.mfa_store.is_enabled() {
-        "Local MFA factor store is configured, but TOTP enrollment requires mfa_secret_key."
+        "Local MFA factor store and passkey enrollment are configured, but TOTP enrollment requires mfa_secret_key."
     } else if provider_step_up_configured {
         "OIDC provider MFA/re-auth controls are configured. Local TOTP/WebAuthn enrollment is not configured yet."
     } else {
@@ -555,6 +680,25 @@ fn audit_webauthn_enroll_denied(
         .commit_best_effort();
 }
 
+fn audit_webauthn_verify_failure(
+    state: &AppState,
+    actor: &str,
+    stage: &str,
+    challenge_id: Option<&str>,
+    err: &MfaStoreError,
+) {
+    state
+        .audit_service
+        .event(actor, AuditAction::MfaWebAuthnVerify, AuditOutcome::Failure)
+        .error(Some(&err.to_string()))
+        .optional_metadata(Some(serde_json::json!({
+            "stage": stage,
+            "challenge_id": challenge_id,
+            "kind": "web_authn",
+        })))
+        .commit_best_effort();
+}
+
 fn audit_recovery_codes_generate_failure(state: &AppState, actor: &str, err: &MfaStoreError) {
     state
         .audit_service
@@ -585,7 +729,7 @@ fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) 
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError::internal(err.to_string())),
         ),
-        MfaStoreError::NoActiveTotpFactor => (
+        MfaStoreError::NoActiveTotpFactor | MfaStoreError::NoActiveWebAuthnFactor => (
             StatusCode::CONFLICT,
             Json(ApiError::new("CONFLICT", err.to_string())),
         ),
@@ -609,11 +753,14 @@ fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) 
             StatusCode::BAD_REQUEST,
             Json(ApiError::bad_request(err.to_string())),
         ),
-        MfaStoreError::InvalidWebAuthnOrigin | MfaStoreError::InvalidWebAuthnRegistration => (
+        MfaStoreError::InvalidWebAuthnOrigin
+        | MfaStoreError::InvalidWebAuthnRegistration
+        | MfaStoreError::InvalidWebAuthnAuthentication => (
             StatusCode::BAD_REQUEST,
             Json(ApiError::bad_request(err.to_string())),
         ),
-        MfaStoreError::WebAuthnRegistrationNotFound => (
+        MfaStoreError::WebAuthnRegistrationNotFound
+        | MfaStoreError::WebAuthnAuthenticationNotFound => (
             StatusCode::GONE,
             Json(ApiError::new("EXPIRED", err.to_string())),
         ),

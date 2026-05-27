@@ -2,7 +2,8 @@ use crate::api_client::ApiClient;
 use anyhow::{Context, Result};
 use shared::dto::auth::{
     WebAuthnRegisterFinishRequest, WebAuthnRegisterFinishResponse, WebAuthnRegisterStartRequest,
-    WebAuthnRegisterStartResponse,
+    WebAuthnRegisterStartResponse, WebAuthnVerifyFinishRequest, WebAuthnVerifyResponse,
+    WebAuthnVerifyStartRequest, WebAuthnVerifyStartResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,6 +27,11 @@ enum RegistrationServerEvent {
     Finished(WebAuthnRegisterFinishResponse),
 }
 
+enum VerificationServerEvent {
+    Continue,
+    Finished(WebAuthnVerifyResponse),
+}
+
 pub async fn start_webauthn_registration_flow(
     api: &ApiClient,
 ) -> Result<WebAuthnRegisterFinishResponse> {
@@ -46,6 +52,25 @@ pub async fn start_webauthn_registration_flow(
     }
 
     serve_registration_until_finished(listeners, api, started).await
+}
+
+pub async fn start_webauthn_verification_flow(api: &ApiClient) -> Result<WebAuthnVerifyResponse> {
+    let listeners = LocalhostListeners::bind_ephemeral().await?;
+    let origin = listeners.origin();
+    let started = api
+        .start_webauthn_verification(&WebAuthnVerifyStartRequest {
+            origin: origin.clone(),
+        })
+        .await?;
+    let url = format!("{origin}/");
+
+    tracing::info!(url = %url, "Opening browser for WebAuthn verification");
+    if let Err(err) = open::that(&url) {
+        tracing::warn!(error = %err, "Failed to open browser automatically");
+        eprintln!("\nCould not open browser. Please visit:\n  {}\n", url);
+    }
+
+    serve_verification_until_finished(listeners, api, started).await
 }
 
 impl LocalhostListeners {
@@ -73,6 +98,21 @@ async fn serve_registration_until_finished(
         match handle_registration_request(stream, api, &started, &page).await? {
             RegistrationServerEvent::Continue => {}
             RegistrationServerEvent::Finished(response) => return Ok(response),
+        }
+    }
+}
+
+async fn serve_verification_until_finished(
+    listeners: LocalhostListeners,
+    api: &ApiClient,
+    started: WebAuthnVerifyStartResponse,
+) -> Result<WebAuthnVerifyResponse> {
+    let page = verification_page(&started.public_key)?;
+    loop {
+        let stream = accept_next(&listeners).await?;
+        match handle_verification_request(stream, api, &started, &page).await? {
+            VerificationServerEvent::Continue => {}
+            VerificationServerEvent::Finished(response) => return Ok(response),
         }
     }
 }
@@ -154,6 +194,74 @@ async fn handle_registration_request(
             )
             .await?;
             Ok(RegistrationServerEvent::Continue)
+        }
+    }
+}
+
+async fn handle_verification_request(
+    mut stream: TcpStream,
+    api: &ApiClient,
+    started: &WebAuthnVerifyStartResponse,
+    page: &str,
+) -> Result<VerificationServerEvent> {
+    let request = read_http_request(&mut stream).await?;
+    match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/") => {
+            write_response(&mut stream, "200 OK", "text/html; charset=utf-8", page).await?;
+            Ok(VerificationServerEvent::Continue)
+        }
+        ("GET", "/favicon.ico") => {
+            write_empty_response(&mut stream, "204 No Content").await?;
+            Ok(VerificationServerEvent::Continue)
+        }
+        ("POST", "/finish") => {
+            let credential: serde_json::Value = serde_json::from_slice(&request.body)
+                .context("WebAuthn browser response was invalid JSON")?;
+            let request = WebAuthnVerifyFinishRequest {
+                challenge_id: started.challenge_id.clone(),
+                credential,
+            };
+            match api.finish_webauthn_verification(&request).await {
+                Ok(response) => {
+                    let body = serde_json::json!({
+                        "ok": true,
+                        "credential_id": response.credential_id,
+                    });
+                    write_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        &body.to_string(),
+                    )
+                    .await?;
+                    Ok(VerificationServerEvent::Finished(response))
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let body = serde_json::json!({
+                        "ok": false,
+                        "error": message,
+                    });
+                    write_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json; charset=utf-8",
+                        &body.to_string(),
+                    )
+                    .await?;
+                    anyhow::bail!(message)
+                }
+            }
+        }
+        _ => {
+            write_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                "Not found",
+            )
+            .await?;
+            Ok(VerificationServerEvent::Continue)
         }
     }
 }
@@ -364,6 +472,124 @@ fn registration_page(public_key: &serde_json::Value) -> Result<String> {
     ))
 }
 
+fn verification_page(public_key: &serde_json::Value) -> Result<String> {
+    let public_key_json = serde_json::to_string(public_key)?.replace("</", "<\\/");
+    Ok(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Canopy Passkey Verification</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #101827;
+      color: #e5eefb;
+      font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      width: min(520px, calc(100vw - 32px));
+      border: 1px solid #334155;
+      background: #111f33;
+      padding: 28px;
+      box-sizing: border-box;
+    }}
+    h1 {{ margin: 0 0 10px; font-size: 22px; line-height: 1.2; }}
+    p {{ margin: 0 0 20px; color: #b7c4d6; }}
+    button {{
+      appearance: none;
+      border: 0;
+      background: #7dd3fc;
+      color: #082f49;
+      font-weight: 700;
+      padding: 10px 14px;
+      cursor: pointer;
+    }}
+    button:disabled {{ cursor: wait; opacity: .68; }}
+    #status {{ margin-top: 18px; color: #b7c4d6; white-space: pre-wrap; }}
+    .ok {{ color: #86efac; }}
+    .err {{ color: #fca5a5; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Canopy Passkey Verification</h1>
+    <p>Verify your local passkey for this Canopy session. Keep this tab open until the terminal reports completion.</p>
+    <button id="start" type="button">Verify passkey</button>
+    <div id="status">Waiting for browser gesture.</div>
+  </main>
+  <script>
+    const publicKey = {public_key_json};
+    const statusEl = document.getElementById("status");
+    const button = document.getElementById("start");
+
+    function b64urlEncode(buf) {{
+      let s = btoa(String.fromCharCode(...new Uint8Array(buf)));
+      return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }}
+    function b64urlDecode(str) {{
+      str = str.replace(/-/g, "+").replace(/_/g, "/");
+      while (str.length % 4) str += "=";
+      const bin = atob(str);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out.buffer;
+    }}
+    function setStatus(text, cls) {{
+      statusEl.textContent = text;
+      statusEl.className = cls || "";
+    }}
+    function credentialOptions() {{
+      const opts = JSON.parse(JSON.stringify(publicKey));
+      opts.challenge = b64urlDecode(opts.challenge);
+      if (opts.allowCredentials) {{
+        opts.allowCredentials = opts.allowCredentials.map((item) => ({{
+          ...item,
+          id: b64urlDecode(item.id),
+        }}));
+      }}
+      return opts;
+    }}
+
+    button.addEventListener("click", async () => {{
+      button.disabled = true;
+      try {{
+        setStatus("Waiting for authenticator...");
+        const cred = await navigator.credentials.get({{ publicKey: credentialOptions() }});
+        const body = {{
+          id: cred.id,
+          authenticatorData: b64urlEncode(cred.response.authenticatorData),
+          signature: b64urlEncode(cred.response.signature),
+          clientDataJSON: b64urlEncode(cred.response.clientDataJSON),
+        }};
+        if (cred.response.userHandle) {{
+          body.userHandle = b64urlEncode(cred.response.userHandle);
+        }}
+        setStatus("Saving verification in Canopy...");
+        const resp = await fetch("/finish", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(body),
+        }});
+        const result = await resp.json();
+        if (!resp.ok || !result.ok) throw new Error(result.error || "Passkey verification failed");
+        setStatus("Passkey verified. You can close this tab and return to the terminal.", "ok");
+      }} catch (err) {{
+        button.disabled = false;
+        setStatus(err && err.message ? err.message : String(err), "err");
+      }}
+    }});
+  </script>
+</body>
+</html>"#
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +620,20 @@ mod tests {
         assert!(html.contains("navigator.credentials.create"));
         assert!(html.contains("fetch(\"/finish\""));
         assert!(html.contains("\"challenge\":\"abc\""));
+    }
+
+    #[test]
+    fn verification_page_embeds_options_and_finish_endpoint() {
+        let html = verification_page(&json!({
+            "challenge": "abc",
+            "rpId": "localhost",
+            "allowCredentials": [{"type": "public-key", "id": "credential-1"}]
+        }))
+        .unwrap();
+        assert!(html.contains("Canopy Passkey Verification"));
+        assert!(html.contains("navigator.credentials.get"));
+        assert!(html.contains("fetch(\"/finish\""));
+        assert!(html.contains("\"allowCredentials\""));
+        assert!(html.contains("authenticatorData"));
     }
 }

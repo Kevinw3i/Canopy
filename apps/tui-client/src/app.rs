@@ -1022,6 +1022,16 @@ impl App {
             Action::WebAuthnEnrollmentFailed(error) => {
                 self.settings.set_webauthn_error(error);
             }
+            Action::StartWebAuthnStepUpVerification => {
+                self.settings.set_webauthn_verifying();
+                self.spawn_webauthn_step_up_verification();
+            }
+            Action::WebAuthnStepUpVerified(response) => {
+                self.settings.set_webauthn_step_up_verified(response);
+            }
+            Action::WebAuthnStepUpVerifyFailed(error) => {
+                self.settings.set_webauthn_step_up_error(error);
+            }
 
             // Auto-update
             Action::CheckForUpdate => {
@@ -1482,6 +1492,21 @@ impl App {
                 }
                 Err(err) => {
                     let _ = tx.send(Action::WebAuthnEnrollmentFailed(err.to_string()));
+                }
+            }
+        });
+    }
+
+    fn spawn_webauthn_step_up_verification(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match crate::auth::webauthn::start_webauthn_verification_flow(&api).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::WebAuthnStepUpVerified(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Action::WebAuthnStepUpVerifyFailed(err.to_string()));
                 }
             }
         });

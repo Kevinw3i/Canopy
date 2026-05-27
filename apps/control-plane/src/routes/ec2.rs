@@ -18,7 +18,7 @@ use crate::services::ec2::{
 };
 use crate::services::entitlements::EntitlementService;
 use crate::services::step_up::{
-    claims_step_up_key, local_totp_step_up_required, step_up_required_error,
+    claims_step_up_key, local_step_up_required, step_up_required_error,
 };
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
@@ -902,7 +902,7 @@ async fn power_instance(
         ));
     }
 
-    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+    if local_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
         .map_err(mfa_step_up_unavailable_response)?
     {
         state

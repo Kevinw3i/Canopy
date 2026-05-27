@@ -186,6 +186,9 @@ pub enum Action {
     StartWebAuthnEnrollment,
     WebAuthnEnrollmentSucceeded(shared::dto::auth::WebAuthnRegisterFinishResponse),
     WebAuthnEnrollmentFailed(String),
+    StartWebAuthnStepUpVerification,
+    WebAuthnStepUpVerified(shared::dto::auth::WebAuthnVerifyResponse),
+    WebAuthnStepUpVerifyFailed(String),
 
     // Auto-update
     CheckForUpdate,

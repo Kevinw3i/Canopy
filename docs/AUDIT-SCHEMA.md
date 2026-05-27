@@ -82,6 +82,12 @@ finishes. Metadata includes `stage`, `factor_id`, `kind`, and the localhost
 `origin` for start events; it must not include challenge bytes, browser
 credential payloads, credential IDs, or public-key material.
 
+`mfa_webauthn_verify` is emitted when local WebAuthn/passkey verification starts
+or finishes for step-up. Metadata includes `stage`, `challenge_id` on start or
+failure, `factor_id` on finish, `kind`, and the localhost `origin` for start
+events; it must not include challenge bytes, browser assertion payloads,
+credential IDs, or public-key material.
+
 ## Common Metadata Fields
 
 Common request context:

@@ -77,6 +77,10 @@ pub enum AuditAction {
     /// never be placed in metadata.
     #[serde(rename = "mfa_webauthn_enroll")]
     MfaWebAuthnEnroll,
+    /// Verify a local WebAuthn/passkey factor for a step-up challenge. Browser
+    /// assertion payloads must never be placed in metadata.
+    #[serde(rename = "mfa_webauthn_verify")]
+    MfaWebAuthnVerify,
 }
 
 impl AuditAction {
@@ -100,6 +104,7 @@ impl AuditAction {
             Self::MfaRecoveryCodesGenerate => "mfa_recovery_codes_generate",
             Self::MfaRecoveryCodeVerify => "mfa_recovery_code_verify",
             Self::MfaWebAuthnEnroll => "mfa_webauthn_enroll",
+            Self::MfaWebAuthnVerify => "mfa_webauthn_verify",
         }
     }
 }
@@ -138,6 +143,7 @@ mod tests {
             AuditAction::MfaRecoveryCodesGenerate,
             AuditAction::MfaRecoveryCodeVerify,
             AuditAction::MfaWebAuthnEnroll,
+            AuditAction::MfaWebAuthnVerify,
         ] {
             let json = serde_json::to_value(&action).unwrap();
             assert_eq!(json, serde_json::Value::String(action.wire_name().into()));
@@ -240,6 +246,19 @@ mod tests {
 
         let back: AuditAction = serde_json::from_value(json).unwrap();
         assert!(matches!(back, AuditAction::MfaWebAuthnEnroll));
+    }
+
+    #[test]
+    fn audit_action_mfa_webauthn_verify_roundtrip() {
+        let json = serde_json::to_value(AuditAction::MfaWebAuthnVerify).unwrap();
+        assert_eq!(json, "mfa_webauthn_verify");
+        assert_eq!(
+            AuditAction::MfaWebAuthnVerify.wire_name(),
+            "mfa_webauthn_verify"
+        );
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::MfaWebAuthnVerify));
     }
 
     #[test]

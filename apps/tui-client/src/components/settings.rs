@@ -13,6 +13,7 @@ use crate::widgets::input::TextInput;
 use shared::dto::auth::{
     MfaFactorKind, MfaStatusResponse, RecoveryCodeVerifyResponse, RecoveryCodesGenerateResponse,
     TotpEnrollStartResponse, TotpVerifyResponse, WebAuthnRegisterFinishResponse,
+    WebAuthnVerifyResponse,
 };
 
 pub struct SettingsScreen {
@@ -31,6 +32,7 @@ pub struct SettingsScreen {
     recovery_codes: Option<Vec<String>>,
     recovery_code_verification: Option<RecoveryCodeVerificationState>,
     webauthn_starting: bool,
+    webauthn_verifying: bool,
     webauthn_success: Option<String>,
     webauthn_error: Option<String>,
 }
@@ -72,6 +74,7 @@ impl SettingsScreen {
             recovery_codes: None,
             recovery_code_verification: None,
             webauthn_starting: false,
+            webauthn_verifying: false,
             webauthn_success: None,
             webauthn_error: None,
         }
@@ -89,6 +92,7 @@ impl SettingsScreen {
         self.totp_starting = false;
         self.recovery_codes_generating = false;
         self.webauthn_starting = false;
+        self.webauthn_verifying = false;
         self.webauthn_success = None;
         self.webauthn_error = None;
     }
@@ -99,6 +103,7 @@ impl SettingsScreen {
         self.totp_starting = false;
         self.recovery_codes_generating = false;
         self.webauthn_starting = false;
+        self.webauthn_verifying = false;
         self.webauthn_success = None;
     }
 
@@ -257,6 +262,7 @@ impl SettingsScreen {
 
     pub fn set_webauthn_starting(&mut self) {
         self.webauthn_starting = true;
+        self.webauthn_verifying = false;
         self.webauthn_success = None;
         self.webauthn_error = None;
         self.mfa_error = None;
@@ -273,7 +279,32 @@ impl SettingsScreen {
 
     pub fn set_webauthn_error(&mut self, error: String) {
         self.webauthn_starting = false;
+        self.webauthn_verifying = false;
         self.webauthn_success = None;
+        self.webauthn_error = Some(error);
+    }
+
+    pub fn set_webauthn_verifying(&mut self) {
+        self.webauthn_starting = false;
+        self.webauthn_verifying = true;
+        self.webauthn_success = None;
+        self.webauthn_error = None;
+        self.mfa_error = None;
+        self.totp_enrollment = None;
+        self.totp_verification = None;
+        self.recovery_code_verification = None;
+        self.recovery_codes = None;
+    }
+
+    pub fn set_webauthn_step_up_verified(&mut self, response: WebAuthnVerifyResponse) {
+        self.webauthn_verifying = false;
+        self.webauthn_error = None;
+        self.totp_step_up_success = Some(format!("verified until {}", response.step_up_expires_at));
+        self.set_mfa_status(response.status);
+    }
+
+    pub fn set_webauthn_step_up_error(&mut self, error: String) {
+        self.webauthn_verifying = false;
         self.webauthn_error = Some(error);
     }
 }
@@ -354,6 +385,13 @@ impl Component for SettingsScreen {
             && !self.webauthn_starting
         {
             return Action::StartWebAuthnEnrollment;
+        }
+        if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('x'))
+            && self.can_verify_webauthn_step_up()
+            && !self.webauthn_verifying
+        {
+            return Action::StartWebAuthnStepUpVerification;
         }
         Action::Noop
     }
@@ -724,13 +762,19 @@ impl SettingsScreen {
         } else if let Some(error) = self.mfa_error.as_deref() {
             (format!("error: {}", truncate(error, 42)), danger_style)
         } else if self.webauthn_starting {
-            ("opening browser".into(), warning_style)
+            ("opening setup browser".into(), warning_style)
+        } else if self.webauthn_verifying {
+            ("opening verify browser".into(), warning_style)
         } else if let Some(error) = self.webauthn_error.as_deref() {
             (format!("error: {}", truncate(error, 44)), danger_style)
         } else if let Some(success) = self.webauthn_success.as_deref() {
             (success.to_string(), success_style)
+        } else if self.can_verify_webauthn_step_up() && self.totp_step_up_success.is_some() {
+            ("enrolled; step-up active".into(), success_style)
+        } else if self.can_verify_webauthn_step_up() {
+            ("enrolled; press x to verify".into(), success_style)
         } else if self.webauthn_enrolled() {
-            ("enrolled; setup only".into(), success_style)
+            ("enrolled; unavailable".into(), muted_style)
         } else if self.totp_enrolled() && self.totp_step_up_success.is_none() {
             let has_recovery_codes = self
                 .mfa_status
@@ -762,7 +806,8 @@ impl SettingsScreen {
     }
 
     fn can_start_webauthn_enrollment(&self) -> bool {
-        self.local_factor_store_enabled()
+        self.webauthn_factor()
+            .is_some_and(|factor| factor.available && !factor.enrolled)
             && !self.webauthn_enrolled()
             && (!self.totp_enrolled() || self.totp_step_up_success.is_some())
     }
@@ -771,11 +816,9 @@ impl SettingsScreen {
         self.webauthn_factor().is_some_and(|factor| factor.enrolled)
     }
 
-    fn local_factor_store_enabled(&self) -> bool {
-        self.mfa_status
-            .as_ref()
-            .and_then(|status| status.recovery_codes_remaining)
-            .is_some()
+    fn can_verify_webauthn_step_up(&self) -> bool {
+        self.webauthn_factor()
+            .is_some_and(|factor| factor.available && factor.enrolled)
     }
 
     fn recovery_code_lines(&self) -> Vec<Line<'static>> {
@@ -844,11 +887,19 @@ impl SettingsScreen {
                 .as_ref()
                 .and_then(|status| status.recovery_codes_remaining)
                 .is_some_and(|count| count > 0);
-            let action = match (self.can_verify_totp_step_up(), has_recovery_codes) {
-                (true, true) => "verify first: press v or u",
-                (true, false) => "verify step-up first; press v",
-                (false, true) => "verify first: press u",
-                (false, false) => "step-up unavailable",
+            let action = match (
+                self.can_verify_totp_step_up(),
+                self.can_verify_webauthn_step_up(),
+                has_recovery_codes,
+            ) {
+                (true, true, true) => "verify first: press v, x, or u",
+                (true, true, false) => "verify step-up first; press v or x",
+                (true, false, true) => "verify first: press v or u",
+                (true, false, false) => "verify step-up first; press v",
+                (false, true, true) => "verify first: press x or u",
+                (false, true, false) => "verify step-up first; press x",
+                (false, false, true) => "verify first: press u",
+                (false, false, false) => "step-up unavailable",
             };
             lines.push(Line::from(vec![
                 Span::styled("Recovery codes:    ", label_style),
@@ -1147,7 +1198,7 @@ mod tests {
                 },
                 shared::dto::auth::MfaFactorStatus {
                     kind: MfaFactorKind::WebAuthn,
-                    available: false,
+                    available: true,
                     enrolled: false,
                     label: Some("Security key".into()),
                 },
@@ -1182,7 +1233,7 @@ mod tests {
                 },
                 shared::dto::auth::MfaFactorStatus {
                     kind: MfaFactorKind::WebAuthn,
-                    available: false,
+                    available: true,
                     enrolled: false,
                     label: Some("Security key".into()),
                 },
@@ -1214,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn webauthn_enrolled_setup_only_status_is_visible() {
+    fn webauthn_enrolled_step_up_action_is_visible() {
         let mut screen = SettingsScreen::new(test_config(), test_theme());
         screen.set_mfa_status(MfaStatusResponse {
             user_id: "dev-admin".into(),
@@ -1230,7 +1281,7 @@ mod tests {
                 },
                 shared::dto::auth::MfaFactorStatus {
                     kind: MfaFactorKind::WebAuthn,
-                    available: false,
+                    available: true,
                     enrolled: true,
                     label: Some("Security key".into()),
                 },
@@ -1241,7 +1292,49 @@ mod tests {
 
         let text = rendered_text(&mut screen);
         assert!(text.contains("Local WebAuthn:"));
-        assert!(text.contains("enrolled; setup only"));
+        assert!(text.contains("enrolled; press x to verify"));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('x'))),
+            Action::StartWebAuthnStepUpVerification
+        ));
+    }
+
+    #[test]
+    fn webauthn_step_up_success_updates_generic_step_up_state() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_webauthn_step_up_verified(WebAuthnVerifyResponse {
+            factor_id: "webauthn-factor-1".into(),
+            credential_id: "credential-1".into(),
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            status: MfaStatusResponse {
+                user_id: "dev-admin".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![
+                    shared::dto::auth::MfaFactorStatus {
+                        kind: MfaFactorKind::Totp,
+                        available: false,
+                        enrolled: false,
+                        label: Some("Authenticator app".into()),
+                    },
+                    shared::dto::auth::MfaFactorStatus {
+                        kind: MfaFactorKind::WebAuthn,
+                        available: true,
+                        enrolled: true,
+                        label: Some("Security key".into()),
+                    },
+                ],
+                recovery_codes_remaining: Some(0),
+                message: "Local MFA factor store is configured.".into(),
+            },
+        });
+
+        let text = rendered_text(&mut screen);
+        assert!(text.contains("enrolled; step-up active"));
+        assert!(text.contains("verified until 2026-05-27T00:05:00Z"));
     }
 
     #[test]
@@ -1265,7 +1358,7 @@ mod tests {
                     },
                     shared::dto::auth::MfaFactorStatus {
                         kind: MfaFactorKind::WebAuthn,
-                        available: false,
+                        available: true,
                         enrolled: true,
                         label: Some("Security key".into()),
                     },
@@ -1290,7 +1383,7 @@ mod tests {
                 },
                 shared::dto::auth::MfaFactorStatus {
                     kind: MfaFactorKind::WebAuthn,
-                    available: false,
+                    available: true,
                     enrolled: false,
                     label: Some("Security key".into()),
                 },

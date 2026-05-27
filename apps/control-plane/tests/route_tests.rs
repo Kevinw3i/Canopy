@@ -13,6 +13,8 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
+use passkey_auth::{CosePublicKey, CredentialId, PasskeyCredential};
+use rusqlite::params;
 use serde_json::{json, Value};
 use shared::dto::cloudwatch::LiveTailMessage;
 use shared::dto::entitlements::{AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership};
@@ -144,6 +146,28 @@ fn read_audit_events(path: &Path) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn seed_webauthn_factor(db_path: &Path, user_id: &str) -> String {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let factor_id = "webauthn-factor-1".to_string();
+    let credential = PasskeyCredential {
+        id: CredentialId(vec![1, 2, 3, 4]),
+        public_key_cose: CosePublicKey(vec![0xAA, 0xBB, 0xCC]),
+        counter: 0,
+        transports: vec!["internal".into()],
+        aaguid: [0; 16],
+    };
+    let credential_id = credential.id.as_bytes().to_vec();
+    let credential_json = serde_json::to_string(&credential).unwrap();
+    conn.execute(
+        "INSERT INTO mfa_factors
+             (id, user_id, kind, label, credential_id, credential_json, enrolled_at)
+         VALUES (?1, ?2, 'web_authn', 'Security key', ?3, ?4, CURRENT_TIMESTAMP)",
+        params![factor_id, user_id, credential_id, credential_json],
+    )
+    .unwrap();
+    credential.id.to_b64url()
 }
 
 /// Build the full app router (public + protected) exactly like main.rs.
@@ -740,7 +764,7 @@ async fn mfa_status_reports_configured_local_factor_store() {
     assert_eq!(json["local_step_up_available"], false);
     assert_eq!(json["factors"][0]["available"], true);
     assert_eq!(json["factors"][0]["enrolled"], false);
-    assert_eq!(json["factors"][1]["available"], false);
+    assert_eq!(json["factors"][1]["available"], true);
     assert_eq!(json["factors"][1]["enrolled"], false);
 }
 
@@ -996,6 +1020,67 @@ async fn webauthn_register_requires_totp_step_up_when_local_totp_enrolled() {
 }
 
 #[tokio::test]
+async fn webauthn_verify_start_returns_localhost_challenge_and_audits_without_challenge() {
+    let db = AuditFile::new("mfa-webauthn-verify-db");
+    let audit = AuditFile::new("mfa-webauthn-verify-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let credential_id = seed_webauthn_factor(&db.path, "dev-admin");
+    let app = build_app(state);
+
+    let (status, json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/webauthn/verify/start",
+        &token,
+        json!({
+            "origin": "http://localhost:9876"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let challenge_id = json["challenge_id"].as_str().unwrap();
+    let challenge = json["public_key"]["challenge"].as_str().unwrap();
+    assert!(!challenge_id.is_empty());
+    assert!(!challenge.is_empty());
+    assert_eq!(json["public_key"]["rpId"], "localhost");
+    assert_eq!(
+        json["public_key"]["allowCredentials"][0]["id"],
+        credential_id
+    );
+    assert_eq!(json["public_key"]["userVerification"], "required");
+
+    let (finish_status, finish_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/webauthn/verify/finish",
+        &token,
+        json!({
+            "challenge_id": challenge_id,
+            "credential": {
+                "id": credential_id
+            }
+        }),
+    )
+    .await;
+    assert_eq!(finish_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        finish_json["message"],
+        "WebAuthn verification response is invalid"
+    );
+
+    let events = read_audit_events(&audit.path);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_webauthn_verify"));
+    assert!(serialized.contains("\"stage\":\"start\""));
+    assert!(serialized.contains("\"stage\":\"finish\""));
+    assert!(!serialized.contains(challenge));
+}
+
+#[tokio::test]
 async fn recovery_codes_generate_requires_enrolled_totp() {
     let db = AuditFile::new("mfa-recovery-require-db");
     std::fs::create_dir_all(&db.dir).unwrap();
@@ -1135,7 +1220,7 @@ async fn ec2_power_requires_and_accepts_totp_step_up_when_local_factor_enrolled(
 
     assert_eq!(blocked_status, StatusCode::FORBIDDEN);
     assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
-    assert_eq!(blocked_json["details"], "totp");
+    assert_eq!(blocked_json["details"], "local_mfa");
 
     verify_test_totp_step_up(app.clone(), &token, &code).await;
 
@@ -1188,7 +1273,7 @@ async fn ecs_exec_requires_totp_step_up_when_local_factor_enrolled() {
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(json["code"], "STEP_UP_REQUIRED");
-    assert_eq!(json["details"], "totp");
+    assert_eq!(json["details"], "local_mfa");
 
     let events = read_audit_events(&audit.path);
     let event = events

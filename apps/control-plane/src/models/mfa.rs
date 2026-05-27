@@ -4,7 +4,10 @@ use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng, Payload},
     XChaCha20Poly1305, XNonce,
 };
-use passkey_auth::{CredentialId, RegistrationResponse, RegistrationState, Webauthn};
+use passkey_auth::{
+    AuthenticationResponse, AuthenticationState, CredentialId, PasskeyCredential,
+    RegistrationResponse, RegistrationState, Webauthn,
+};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -20,8 +23,6 @@ const TOTP_SKEW: u8 = 1;
 const TOTP_STEP_SECONDS: u64 = 30;
 const TOTP_PENDING_TTL_SQL: &str = "-10 minutes";
 const RECOVERY_CODE_COUNT: usize = 10;
-// Schema fields are reserved for WebAuthn, but no ceremony is exposed yet.
-const WEBAUTHN_ENROLLMENT_AVAILABLE: bool = false;
 
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mfa_factors (
@@ -50,6 +51,20 @@ CREATE INDEX IF NOT EXISTS idx_mfa_factors_pending_user_kind
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mfa_factors_active_credential_id
     ON mfa_factors(credential_id)
     WHERE credential_id IS NOT NULL AND disabled_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS mfa_webauthn_challenges (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mfa_webauthn_challenges_user_created
+    ON mfa_webauthn_challenges(user_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_mfa_webauthn_challenges_created
+    ON mfa_webauthn_challenges(created_at);
 
 CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
     id TEXT PRIMARY KEY,
@@ -92,6 +107,12 @@ pub enum MfaStoreError {
     WebAuthnRegistrationNotFound,
     #[error("WebAuthn registration response is invalid")]
     InvalidWebAuthnRegistration,
+    #[error("no active WebAuthn factor is enrolled")]
+    NoActiveWebAuthnFactor,
+    #[error("WebAuthn verification was not found or has expired")]
+    WebAuthnAuthenticationNotFound,
+    #[error("WebAuthn verification response is invalid")]
+    InvalidWebAuthnAuthentication,
     #[error("MFA secret key must be base64-encoded 32 bytes")]
     InvalidSecretKey,
     #[error("MFA secret envelope is invalid")]
@@ -145,10 +166,27 @@ pub struct WebAuthnRegistrationResult {
     pub credential_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAuthnAuthenticationStart {
+    pub challenge_id: String,
+    pub public_key: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAuthnAuthenticationResult {
+    pub factor_id: String,
+    pub credential_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingWebAuthnRegistration {
     origin: String,
     state: RegistrationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingWebAuthnAuthentication {
+    state: AuthenticationState,
 }
 
 #[derive(Clone)]
@@ -226,7 +264,7 @@ impl MfaStore {
 
         Ok(default_factor_statuses(
             self.totp_enrollment_available(),
-            WEBAUTHN_ENROLLMENT_AVAILABLE,
+            self.is_enabled(),
             &enrolled,
         ))
     }
@@ -366,6 +404,173 @@ impl MfaStore {
         }
         let result = WebAuthnRegistrationResult {
             factor_id: factor_id.into(),
+            credential_id,
+        };
+        if !precommit(&result) {
+            return Ok(None);
+        }
+        tx.commit()?;
+
+        Ok(Some(result))
+    }
+
+    pub fn start_webauthn_authentication(
+        &self,
+        user_id: &str,
+        origin: &str,
+    ) -> MfaResult<WebAuthnAuthenticationStart> {
+        let Some(result) =
+            self.start_webauthn_authentication_with_precommit(user_id, origin, |_| true)?
+        else {
+            unreachable!("WebAuthn authentication start precommit returned false")
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn start_webauthn_authentication_with_precommit<F>(
+        &self,
+        user_id: &str,
+        origin: &str,
+        precommit: F,
+    ) -> MfaResult<Option<WebAuthnAuthenticationStart>>
+    where
+        F: FnOnce(&WebAuthnAuthenticationStart) -> bool,
+    {
+        let mut conn = self.required_connection()?;
+        let origin = normalized_webauthn_origin(origin)?;
+        let credentials = active_webauthn_credentials(&conn, user_id)?;
+        if credentials.is_empty() {
+            return Err(MfaStoreError::NoActiveWebAuthnFactor);
+        }
+
+        let challenge_id = uuid::Uuid::new_v4().to_string();
+        let webauthn = local_webauthn(&origin);
+        let (challenge, state) = webauthn
+            .start_authentication_with_creds_for_user(&webauthn_user_handle(user_id), &credentials);
+        let pending_json = serde_json::to_string(&PendingWebAuthnAuthentication { state })?;
+        let public_key = serde_json::to_value(challenge)?;
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM mfa_webauthn_challenges
+             WHERE created_at < datetime('now', ?1)",
+            params![TOTP_PENDING_TTL_SQL],
+        )?;
+        tx.execute(
+            "DELETE FROM mfa_webauthn_challenges
+             WHERE user_id = ?1",
+            params![user_id],
+        )?;
+        tx.execute(
+            "INSERT INTO mfa_webauthn_challenges (id, user_id, origin, state_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![challenge_id, user_id, origin, pending_json],
+        )?;
+        let result = WebAuthnAuthenticationStart {
+            challenge_id,
+            public_key,
+        };
+        if !precommit(&result) {
+            return Ok(None);
+        }
+        tx.commit()?;
+
+        Ok(Some(result))
+    }
+
+    pub fn finish_webauthn_authentication(
+        &self,
+        user_id: &str,
+        challenge_id: &str,
+        response: &AuthenticationResponse,
+    ) -> MfaResult<WebAuthnAuthenticationResult> {
+        let Some(result) = self.finish_webauthn_authentication_with_precommit(
+            user_id,
+            challenge_id,
+            response,
+            |_| true,
+        )?
+        else {
+            unreachable!("WebAuthn authentication finish precommit returned false")
+        };
+        Ok(result)
+    }
+
+    pub(crate) fn finish_webauthn_authentication_with_precommit<F>(
+        &self,
+        user_id: &str,
+        challenge_id: &str,
+        response: &AuthenticationResponse,
+        precommit: F,
+    ) -> MfaResult<Option<WebAuthnAuthenticationResult>>
+    where
+        F: FnOnce(&WebAuthnAuthenticationResult) -> bool,
+    {
+        let asserted_id = CredentialId::from_b64url(&response.id)
+            .map_err(|_| MfaStoreError::InvalidWebAuthnAuthentication)?;
+        let asserted_id_bytes = asserted_id.as_bytes().to_vec();
+        let mut conn = self.required_connection()?;
+        let tx = conn.transaction()?;
+        let (origin, state_json): (String, String) = tx
+            .query_row(
+                "SELECT origin, state_json
+                 FROM mfa_webauthn_challenges
+                 WHERE id = ?1
+                   AND user_id = ?2
+                   AND created_at >= datetime('now', ?3)",
+                params![challenge_id, user_id, TOTP_PENDING_TTL_SQL],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(MfaStoreError::WebAuthnAuthenticationNotFound)?;
+        let (factor_id, credential_json): (String, String) = tx
+            .query_row(
+                "SELECT id, credential_json
+                 FROM mfa_factors
+                 WHERE user_id = ?1
+                   AND kind = 'web_authn'
+                   AND credential_id = ?2
+                   AND enrolled_at IS NOT NULL
+                   AND disabled_at IS NULL",
+                params![user_id, &asserted_id_bytes],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(MfaStoreError::NoActiveWebAuthnFactor)?;
+        let pending: PendingWebAuthnAuthentication = serde_json::from_str(&state_json)?;
+        let mut credential: PasskeyCredential = serde_json::from_str(&credential_json)?;
+        let webauthn = local_webauthn(&origin);
+        let outcome = webauthn
+            .finish_authentication(&pending.state, response, &credential)
+            .map_err(|_| MfaStoreError::InvalidWebAuthnAuthentication)?;
+        credential.counter = outcome.new_counter;
+        let credential_json = serde_json::to_string(&credential)?;
+        let credential_id = outcome.credential_id.to_b64url();
+
+        let updated = tx.execute(
+            "UPDATE mfa_factors
+             SET credential_json = ?1,
+                 last_used_at = CURRENT_TIMESTAMP
+             WHERE id = ?2
+               AND user_id = ?3
+               AND kind = 'web_authn'
+               AND credential_id = ?4
+               AND enrolled_at IS NOT NULL
+               AND disabled_at IS NULL",
+            params![credential_json, factor_id, user_id, &asserted_id_bytes],
+        )?;
+        if updated == 0 {
+            return Err(MfaStoreError::NoActiveWebAuthnFactor);
+        }
+        tx.execute(
+            "DELETE FROM mfa_webauthn_challenges
+             WHERE id = ?1
+               AND user_id = ?2",
+            params![challenge_id, user_id],
+        )?;
+
+        let result = WebAuthnAuthenticationResult {
+            factor_id,
             credential_id,
         };
         if !precommit(&result) {
@@ -813,6 +1018,28 @@ fn active_webauthn_credential_ids(
         .map_err(MfaStoreError::from)
 }
 
+fn active_webauthn_credentials(
+    conn: &Connection,
+    user_id: &str,
+) -> MfaResult<Vec<PasskeyCredential>> {
+    let mut stmt = conn.prepare(
+        "SELECT credential_json
+         FROM mfa_factors
+         WHERE user_id = ?1
+           AND kind = 'web_authn'
+           AND credential_id IS NOT NULL
+           AND enrolled_at IS NOT NULL
+           AND disabled_at IS NULL",
+    )?;
+    let rows = stmt.query_map(params![user_id], |row| row.get::<_, String>(0))?;
+    let mut credentials = Vec::new();
+    for row in rows {
+        let credential_json = row?;
+        credentials.push(serde_json::from_str(&credential_json)?);
+    }
+    Ok(credentials)
+}
+
 fn ensure_sqlite_schema(conn: &Connection) -> MfaResult<()> {
     conn.execute_batch(SQLITE_SCHEMA)?;
     ensure_column(conn, "mfa_factors", "last_totp_step", "INTEGER")?;
@@ -1031,7 +1258,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
     use ciborium::value::Value as CborValue;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer as _, SigningKey};
 
     const TEST_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const WEBAUTHN_TEST_ORIGIN: &str = "http://localhost:9876";
@@ -1049,7 +1276,7 @@ mod tests {
             }
         }
 
-        fn registration_response(&self, challenge: &str) -> RegistrationResponse {
+        fn registration_response(&self, _user_id: &str, challenge: &str) -> RegistrationResponse {
             let client_data_json = format!(
                 r#"{{"type":"webauthn.create","challenge":"{challenge}","origin":"{WEBAUTHN_TEST_ORIGIN}","crossOrigin":false}}"#
             );
@@ -1058,6 +1285,28 @@ mod tests {
                 transports: vec!["internal".into()],
                 attestation_object: B64URL.encode(self.attestation_object()),
                 client_data_json: B64URL.encode(client_data_json.as_bytes()),
+            }
+        }
+
+        fn authentication_response(
+            &self,
+            user_id: &str,
+            challenge: &str,
+            counter: u32,
+        ) -> AuthenticationResponse {
+            let client_data_json = format!(
+                r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"{WEBAUTHN_TEST_ORIGIN}","crossOrigin":false}}"#
+            );
+            let authenticator_data = self.auth_data_authenticate(counter);
+            let mut signed = authenticator_data.clone();
+            signed.extend_from_slice(&Sha256::digest(client_data_json.as_bytes()));
+            let signature = self.sk.sign(&signed).to_bytes();
+            AuthenticationResponse {
+                id: B64URL.encode(&self.credential_id),
+                authenticator_data: B64URL.encode(authenticator_data),
+                signature: B64URL.encode(signature),
+                client_data_json: B64URL.encode(client_data_json.as_bytes()),
+                user_handle: Some(B64URL.encode(webauthn_user_handle(user_id))),
             }
         }
 
@@ -1095,6 +1344,17 @@ mod tests {
             buf.extend_from_slice(&cid_len.to_be_bytes());
             buf.extend_from_slice(&self.credential_id);
             buf.extend_from_slice(&self.cose_pubkey());
+            buf
+        }
+
+        fn auth_data_authenticate(&self, counter: u32) -> Vec<u8> {
+            const FLAG_UP: u8 = 1 << 0;
+            const FLAG_UV: u8 = 1 << 2;
+
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&Sha256::digest(b"localhost"));
+            buf.push(FLAG_UP | FLAG_UV);
+            buf.extend_from_slice(&counter.to_be_bytes());
             buf
         }
 
@@ -1144,7 +1404,7 @@ mod tests {
             .find(|factor| factor.kind == MfaFactorKind::WebAuthn)
             .unwrap();
         assert!(!totp.available);
-        assert!(!webauthn.available);
+        assert!(webauthn.available);
         assert!(statuses.iter().all(|factor| !factor.enrolled));
     }
 
@@ -1163,7 +1423,7 @@ mod tests {
             .find(|factor| factor.kind == MfaFactorKind::WebAuthn)
             .unwrap();
         assert!(totp.available);
-        assert!(!webauthn.available);
+        assert!(webauthn.available);
         assert!(statuses.iter().all(|factor| !factor.enrolled));
     }
 
@@ -1218,7 +1478,7 @@ mod tests {
 
         assert!(totp.available);
         assert!(totp.enrolled);
-        assert!(!webauthn.available);
+        assert!(webauthn.available);
         assert!(!webauthn.enrolled);
     }
 
@@ -1238,7 +1498,7 @@ mod tests {
 
         let challenge = started.public_key["challenge"].as_str().unwrap();
         let authenticator = FakeAuthenticator::new();
-        let response = authenticator.registration_response(challenge);
+        let response = authenticator.registration_response("u1", challenge);
         let finished = store
             .finish_webauthn_registration("u1", &started.factor_id, &response)
             .unwrap();
@@ -1253,7 +1513,7 @@ mod tests {
             .iter()
             .find(|factor| factor.kind == MfaFactorKind::WebAuthn)
             .unwrap();
-        assert!(!webauthn.available);
+        assert!(webauthn.available);
         assert!(webauthn.enrolled);
 
         let conn = store.connection().unwrap().unwrap();
@@ -1301,7 +1561,7 @@ mod tests {
             .unwrap();
         let challenge = started.public_key["challenge"].as_str().unwrap();
         let authenticator = FakeAuthenticator::new();
-        let response = authenticator.registration_response(challenge);
+        let response = authenticator.registration_response("u1", challenge);
 
         let result = store
             .finish_webauthn_registration_with_precommit(
@@ -1334,6 +1594,145 @@ mod tests {
             finished.credential_id,
             B64URL.encode(&authenticator.credential_id)
         );
+    }
+
+    #[test]
+    fn webauthn_authentication_roundtrip_updates_counter() {
+        let store = MfaStore::from_database_url("sqlite::memory:").unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let registered = store
+            .start_webauthn_registration("u1", WEBAUTHN_TEST_ORIGIN, None)
+            .unwrap();
+        let registration_response = authenticator
+            .registration_response("u1", registered.public_key["challenge"].as_str().unwrap());
+        let finished = store
+            .finish_webauthn_registration("u1", &registered.factor_id, &registration_response)
+            .unwrap();
+
+        let started = store
+            .start_webauthn_authentication("u1", WEBAUTHN_TEST_ORIGIN)
+            .unwrap();
+        assert_eq!(started.public_key["rpId"], "localhost");
+        assert_eq!(
+            started.public_key["allowCredentials"][0]["id"],
+            finished.credential_id
+        );
+        assert_eq!(started.public_key["userVerification"], "required");
+
+        let response = authenticator.authentication_response(
+            "u1",
+            started.public_key["challenge"].as_str().unwrap(),
+            1,
+        );
+        let verified = store
+            .finish_webauthn_authentication("u1", &started.challenge_id, &response)
+            .unwrap();
+        assert_eq!(verified.factor_id, registered.factor_id);
+        assert_eq!(verified.credential_id, finished.credential_id);
+
+        let conn = store.connection().unwrap().unwrap();
+        let (stored_json, last_used_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT credential_json, last_used_at
+                 FROM mfa_factors
+                 WHERE id = ?1",
+                params![registered.factor_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let stored: PasskeyCredential = serde_json::from_str(&stored_json).unwrap();
+        assert_eq!(stored.counter, 1);
+        assert!(last_used_at.is_some());
+        drop(conn);
+
+        let replay = store
+            .finish_webauthn_authentication("u1", &started.challenge_id, &response)
+            .unwrap_err();
+        assert!(matches!(
+            replay,
+            MfaStoreError::WebAuthnAuthenticationNotFound
+        ));
+    }
+
+    #[test]
+    fn webauthn_authentication_requires_active_factor() {
+        let store = MfaStore::from_database_url("sqlite::memory:").unwrap();
+        let err = store
+            .start_webauthn_authentication("u1", WEBAUTHN_TEST_ORIGIN)
+            .unwrap_err();
+        assert!(matches!(err, MfaStoreError::NoActiveWebAuthnFactor));
+    }
+
+    #[test]
+    fn webauthn_authentication_start_precommit_false_rolls_back_challenge() {
+        let store = MfaStore::from_database_url("sqlite::memory:").unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let registered = store
+            .start_webauthn_registration("u1", WEBAUTHN_TEST_ORIGIN, None)
+            .unwrap();
+        let registration_response = authenticator
+            .registration_response("u1", registered.public_key["challenge"].as_str().unwrap());
+        store
+            .finish_webauthn_registration("u1", &registered.factor_id, &registration_response)
+            .unwrap();
+
+        let result = store
+            .start_webauthn_authentication_with_precommit("u1", WEBAUTHN_TEST_ORIGIN, |_| false)
+            .unwrap();
+        assert!(result.is_none());
+
+        let conn = store.connection().unwrap().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mfa_webauthn_challenges", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn webauthn_authentication_finish_precommit_false_rolls_back_counter() {
+        let store = MfaStore::from_database_url("sqlite::memory:").unwrap();
+        let authenticator = FakeAuthenticator::new();
+        let registered = store
+            .start_webauthn_registration("u1", WEBAUTHN_TEST_ORIGIN, None)
+            .unwrap();
+        let registration_response = authenticator
+            .registration_response("u1", registered.public_key["challenge"].as_str().unwrap());
+        store
+            .finish_webauthn_registration("u1", &registered.factor_id, &registration_response)
+            .unwrap();
+        let started = store
+            .start_webauthn_authentication("u1", WEBAUTHN_TEST_ORIGIN)
+            .unwrap();
+        let response = authenticator.authentication_response(
+            "u1",
+            started.public_key["challenge"].as_str().unwrap(),
+            1,
+        );
+
+        let result = store
+            .finish_webauthn_authentication_with_precommit(
+                "u1",
+                &started.challenge_id,
+                &response,
+                |_| false,
+            )
+            .unwrap();
+        assert!(result.is_none());
+
+        let conn = store.connection().unwrap().unwrap();
+        let stored_json: String = conn
+            .query_row(
+                "SELECT credential_json
+                 FROM mfa_factors
+                 WHERE id = ?1",
+                params![registered.factor_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: PasskeyCredential = serde_json::from_str(&stored_json).unwrap();
+        assert_eq!(stored.counter, 0);
     }
 
     #[test]

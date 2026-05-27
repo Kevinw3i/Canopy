@@ -198,6 +198,34 @@ pub struct WebAuthnRegisterFinishResponse {
     pub status: MfaStatusResponse,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyStartRequest {
+    pub origin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyStartResponse {
+    pub challenge_id: String,
+    pub public_key: serde_json::Value,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyFinishRequest {
+    pub challenge_id: String,
+    pub credential: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebAuthnVerifyResponse {
+    pub factor_id: String,
+    pub credential_id: String,
+    pub verified: bool,
+    pub verified_at: String,
+    pub step_up_expires_at: String,
+    pub status: MfaStatusResponse,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -431,6 +459,45 @@ mod tests {
         let json = serde_json::to_value(&finish).unwrap();
         assert_eq!(json["credential_id"], "credential-1");
         let back: WebAuthnRegisterFinishResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, finish);
+    }
+
+    #[test]
+    fn webauthn_verify_roundtrip() {
+        let start = WebAuthnVerifyStartResponse {
+            challenge_id: "challenge-1".into(),
+            public_key: serde_json::json!({
+                "challenge": "abc",
+                "rpId": "localhost",
+                "allowCredentials": [{"type": "public-key", "id": "credential-1"}]
+            }),
+            expires_at: "2026-05-27T00:10:00Z".into(),
+        };
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["challenge_id"], "challenge-1");
+        let back: WebAuthnVerifyStartResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, start);
+
+        let finish = WebAuthnVerifyResponse {
+            factor_id: "factor-1".into(),
+            credential_id: "credential-1".into(),
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            status: MfaStatusResponse {
+                user_id: "alice".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: true,
+                step_up_required: false,
+                factors: vec![],
+                recovery_codes_remaining: Some(0),
+                message: "ok".into(),
+            },
+        };
+        let json = serde_json::to_value(&finish).unwrap();
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["credential_id"], "credential-1");
+        let back: WebAuthnVerifyResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back, finish);
     }
 

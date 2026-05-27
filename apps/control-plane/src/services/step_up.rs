@@ -50,18 +50,23 @@ pub fn claims_step_up_key(claims: &Claims) -> String {
     }
 }
 
-pub fn local_totp_step_up_required(
+pub fn local_step_up_required(
     state: &AppState,
     user_id: &str,
     session_key: &str,
 ) -> Result<bool, MfaStoreError> {
-    let local_totp_enrolled = state
-        .mfa_store
-        .factor_statuses(user_id)?
-        .into_iter()
-        .any(|factor| factor.kind == MfaFactorKind::Totp && factor.available && factor.enrolled);
+    let local_factor_enrolled =
+        state
+            .mfa_store
+            .factor_statuses(user_id)?
+            .into_iter()
+            .any(|factor| {
+                matches!(factor.kind, MfaFactorKind::Totp | MfaFactorKind::WebAuthn)
+                    && factor.available
+                    && factor.enrolled
+            });
 
-    Ok(local_totp_enrolled && !state.step_up_sessions.is_verified(session_key))
+    Ok(local_factor_enrolled && !state.step_up_sessions.is_verified(session_key))
 }
 
 pub fn step_up_expires_at(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -71,9 +76,9 @@ pub fn step_up_expires_at(now: DateTime<Utc>) -> DateTime<Utc> {
 pub fn step_up_required_error() -> ApiError {
     let mut err = ApiError::new(
         "STEP_UP_REQUIRED",
-        "Local step-up verification is required. Open Settings and press v for TOTP or u for an unused recovery code, then retry the operation.",
+        "Local step-up verification is required. Open Settings and press v for TOTP, x for passkey, or u for an unused recovery code, then retry the operation.",
     );
-    err.details = Some("totp".into());
+    err.details = Some("local_mfa".into());
     err
 }
 
