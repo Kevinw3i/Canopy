@@ -183,6 +183,9 @@ pub enum Action {
     },
     RecoveryCodeStepUpVerified(shared::dto::auth::RecoveryCodeVerifyResponse),
     RecoveryCodeStepUpVerifyFailed(String),
+    StartWebAuthnEnrollment,
+    WebAuthnEnrollmentSucceeded(shared::dto::auth::WebAuthnRegisterFinishResponse),
+    WebAuthnEnrollmentFailed(String),
 
     // Auto-update
     CheckForUpdate,

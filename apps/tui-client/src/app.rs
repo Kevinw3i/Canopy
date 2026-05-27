@@ -1012,6 +1012,16 @@ impl App {
             Action::RecoveryCodeStepUpVerifyFailed(error) => {
                 self.settings.set_recovery_code_step_up_verify_error(error);
             }
+            Action::StartWebAuthnEnrollment => {
+                self.settings.set_webauthn_starting();
+                self.spawn_webauthn_enrollment();
+            }
+            Action::WebAuthnEnrollmentSucceeded(response) => {
+                self.settings.set_webauthn_enrolled(response);
+            }
+            Action::WebAuthnEnrollmentFailed(error) => {
+                self.settings.set_webauthn_error(error);
+            }
 
             // Auto-update
             Action::CheckForUpdate => {
@@ -1457,6 +1467,21 @@ impl App {
                         err,
                         Action::RecoveryCodeStepUpVerifyFailed,
                     ));
+                }
+            }
+        });
+    }
+
+    fn spawn_webauthn_enrollment(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            match crate::auth::webauthn::start_webauthn_registration_flow(&api).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::WebAuthnEnrollmentSucceeded(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Action::WebAuthnEnrollmentFailed(err.to_string()));
                 }
             }
         });

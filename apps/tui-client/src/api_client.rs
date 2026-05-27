@@ -474,6 +474,36 @@ impl ApiClient {
         .await
     }
 
+    pub async fn start_webauthn_registration(
+        &self,
+        request: &WebAuthnRegisterStartRequest,
+    ) -> ApiResult<WebAuthnRegisterStartResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/register/start",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn finish_webauthn_registration(
+        &self,
+        request: &WebAuthnRegisterFinishRequest,
+    ) -> ApiResult<WebAuthnRegisterFinishResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!(
+                    "{}/api/auth/mfa/webauthn/register/finish",
+                    self.base_url
+                ))
+                .json(request)
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

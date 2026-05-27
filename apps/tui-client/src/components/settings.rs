@@ -12,7 +12,7 @@ use crate::theme::{color_label, Theme};
 use crate::widgets::input::TextInput;
 use shared::dto::auth::{
     MfaFactorKind, MfaStatusResponse, RecoveryCodeVerifyResponse, RecoveryCodesGenerateResponse,
-    TotpEnrollStartResponse, TotpVerifyResponse,
+    TotpEnrollStartResponse, TotpVerifyResponse, WebAuthnRegisterFinishResponse,
 };
 
 pub struct SettingsScreen {
@@ -30,6 +30,9 @@ pub struct SettingsScreen {
     recovery_codes_error: Option<String>,
     recovery_codes: Option<Vec<String>>,
     recovery_code_verification: Option<RecoveryCodeVerificationState>,
+    webauthn_starting: bool,
+    webauthn_success: Option<String>,
+    webauthn_error: Option<String>,
 }
 
 struct TotpEnrollmentState {
@@ -68,6 +71,9 @@ impl SettingsScreen {
             recovery_codes_error: None,
             recovery_codes: None,
             recovery_code_verification: None,
+            webauthn_starting: false,
+            webauthn_success: None,
+            webauthn_error: None,
         }
     }
 
@@ -82,6 +88,9 @@ impl SettingsScreen {
         self.mfa_error = None;
         self.totp_starting = false;
         self.recovery_codes_generating = false;
+        self.webauthn_starting = false;
+        self.webauthn_success = None;
+        self.webauthn_error = None;
     }
 
     pub fn set_mfa_error(&mut self, error: String) {
@@ -89,6 +98,8 @@ impl SettingsScreen {
         self.mfa_error = Some(error);
         self.totp_starting = false;
         self.recovery_codes_generating = false;
+        self.webauthn_starting = false;
+        self.webauthn_success = None;
     }
 
     pub fn set_totp_starting(&mut self) {
@@ -101,6 +112,8 @@ impl SettingsScreen {
         self.recovery_codes = None;
         self.recovery_codes_error = None;
         self.recovery_code_verification = None;
+        self.webauthn_success = None;
+        self.webauthn_error = None;
     }
 
     pub fn set_totp_started(&mut self, response: TotpEnrollStartResponse) {
@@ -119,6 +132,8 @@ impl SettingsScreen {
         self.mfa_error = None;
         self.recovery_codes_error = None;
         self.recovery_code_verification = None;
+        self.webauthn_success = None;
+        self.webauthn_error = None;
     }
 
     pub fn set_totp_start_error(&mut self, error: String) {
@@ -239,6 +254,28 @@ impl SettingsScreen {
         ));
         self.set_mfa_status(response.status);
     }
+
+    pub fn set_webauthn_starting(&mut self) {
+        self.webauthn_starting = true;
+        self.webauthn_success = None;
+        self.webauthn_error = None;
+        self.mfa_error = None;
+        self.totp_enrollment = None;
+        self.totp_verification = None;
+        self.recovery_code_verification = None;
+        self.recovery_codes = None;
+    }
+
+    pub fn set_webauthn_enrolled(&mut self, response: WebAuthnRegisterFinishResponse) {
+        self.set_mfa_status(response.status);
+        self.webauthn_success = Some("Security key enrolled".into());
+    }
+
+    pub fn set_webauthn_error(&mut self, error: String) {
+        self.webauthn_starting = false;
+        self.webauthn_success = None;
+        self.webauthn_error = Some(error);
+    }
 }
 
 impl Component for SettingsScreen {
@@ -311,6 +348,13 @@ impl Component for SettingsScreen {
         {
             return Action::GenerateRecoveryCodes;
         }
+        if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('w'))
+            && self.can_start_webauthn_enrollment()
+            && !self.webauthn_starting
+        {
+            return Action::StartWebAuthnEnrollment;
+        }
         Action::Noop
     }
 
@@ -382,7 +426,7 @@ impl Component for SettingsScreen {
                 "not configured",
             ),
             self.factor_line("Local TOTP:         ", MfaFactorKind::Totp),
-            self.factor_line("Local WebAuthn:     ", MfaFactorKind::WebAuthn),
+            self.webauthn_line("Local WebAuthn:     "),
             self.mfa_line(
                 "Step-up:            ",
                 self.mfa_status
@@ -668,6 +712,72 @@ impl SettingsScreen {
                 .is_some_and(|remaining| remaining > 0)
     }
 
+    fn webauthn_line(&self, label: &'static str) -> Line<'static> {
+        let label_style = Style::default().fg(self.theme.text).bold();
+        let muted_style = self.theme.muted_style();
+        let success_style = self.theme.success_style();
+        let warning_style = self.theme.warning_style();
+        let danger_style = self.theme.danger_style();
+
+        let (text, style) = if self.mfa_loading {
+            ("loading".into(), warning_style)
+        } else if let Some(error) = self.mfa_error.as_deref() {
+            (format!("error: {}", truncate(error, 42)), danger_style)
+        } else if self.webauthn_starting {
+            ("opening browser".into(), warning_style)
+        } else if let Some(error) = self.webauthn_error.as_deref() {
+            (format!("error: {}", truncate(error, 44)), danger_style)
+        } else if let Some(success) = self.webauthn_success.as_deref() {
+            (success.to_string(), success_style)
+        } else if self.webauthn_enrolled() {
+            ("enrolled; setup only".into(), success_style)
+        } else if self.totp_enrolled() && self.totp_step_up_success.is_none() {
+            let has_recovery_codes = self
+                .mfa_status
+                .as_ref()
+                .and_then(|status| status.recovery_codes_remaining)
+                .is_some_and(|count| count > 0);
+            let action = if self.can_verify_totp_step_up() && has_recovery_codes {
+                "verify step-up first; press v or u"
+            } else if self.can_verify_totp_step_up() {
+                "verify step-up first; press v"
+            } else if has_recovery_codes {
+                "verify step-up first; press u"
+            } else {
+                "step-up required before setup"
+            };
+            (action.into(), muted_style)
+        } else if self.can_start_webauthn_enrollment() {
+            ("press w to set up in browser".into(), success_style)
+        } else if self.webauthn_factor().is_some() {
+            ("not configured".into(), muted_style)
+        } else {
+            ("unknown".into(), muted_style)
+        };
+
+        Line::from(vec![
+            Span::styled(label, label_style),
+            Span::styled(text, style),
+        ])
+    }
+
+    fn can_start_webauthn_enrollment(&self) -> bool {
+        self.local_factor_store_enabled()
+            && !self.webauthn_enrolled()
+            && (!self.totp_enrolled() || self.totp_step_up_success.is_some())
+    }
+
+    fn webauthn_enrolled(&self) -> bool {
+        self.webauthn_factor().is_some_and(|factor| factor.enrolled)
+    }
+
+    fn local_factor_store_enabled(&self) -> bool {
+        self.mfa_status
+            .as_ref()
+            .and_then(|status| status.recovery_codes_remaining)
+            .is_some()
+    }
+
     fn recovery_code_lines(&self) -> Vec<Line<'static>> {
         if !self.totp_enrolled()
             && !self.recovery_codes_generating
@@ -777,6 +887,15 @@ impl SettingsScreen {
         })
     }
 
+    fn webauthn_factor(&self) -> Option<&shared::dto::auth::MfaFactorStatus> {
+        self.mfa_status.as_ref().and_then(|status| {
+            status
+                .factors
+                .iter()
+                .find(|factor| factor.kind == MfaFactorKind::WebAuthn)
+        })
+    }
+
     fn mfa_line(
         &self,
         label: &'static str,
@@ -822,6 +941,9 @@ impl SettingsScreen {
         match factor {
             Some(factor) if factor.available && factor.enrolled => {
                 self.mfa_line(label, Some(true), "enrolled", "not enrolled")
+            }
+            Some(factor) if factor.enrolled => {
+                self.mfa_line(label, Some(false), "enrolled", "enrolled; unavailable")
             }
             Some(factor) if factor.available => {
                 self.mfa_line(label, Some(false), "enrolled", "not enrolled")
@@ -1006,6 +1128,180 @@ mod tests {
         let action = screen.handle_key(key(KeyCode::Char('e')));
 
         assert!(matches!(action, Action::StartTotpEnrollment));
+    }
+
+    #[test]
+    fn w_starts_webauthn_enrollment_when_factor_store_enabled() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            recovery_codes_remaining: Some(0),
+            message: "Local MFA factor store is configured.".into(),
+        });
+
+        let text = rendered_text(&mut screen);
+        assert!(text.contains("Local WebAuthn:"));
+        assert!(text.contains("press w to set up in browser"));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('w'))),
+            Action::StartWebAuthnEnrollment
+        ));
+    }
+
+    #[test]
+    fn webauthn_setup_requires_step_up_when_totp_enrolled() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        let status = MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: true,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: true,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            recovery_codes_remaining: Some(1),
+            message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+        };
+        screen.set_mfa_status(status.clone());
+
+        let text = rendered_text(&mut screen);
+        assert!(text.contains("verify step-up first; press v or u"));
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('w'))),
+            Action::Noop
+        ));
+
+        screen.set_totp_step_up_verified(TotpVerifyResponse {
+            factor_id: "factor-1".into(),
+            verified: true,
+            verified_at: "2026-05-27T00:00:00Z".into(),
+            step_up_expires_at: "2026-05-27T00:05:00Z".into(),
+            status,
+        });
+
+        assert!(matches!(
+            screen.handle_key(key(KeyCode::Char('w'))),
+            Action::StartWebAuthnEnrollment
+        ));
+    }
+
+    #[test]
+    fn webauthn_enrolled_setup_only_status_is_visible() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: true,
+                    label: Some("Security key".into()),
+                },
+            ],
+            recovery_codes_remaining: Some(0),
+            message: "Local MFA factor store is configured.".into(),
+        });
+
+        let text = rendered_text(&mut screen);
+        assert!(text.contains("Local WebAuthn:"));
+        assert!(text.contains("enrolled; setup only"));
+    }
+
+    #[test]
+    fn mfa_status_refresh_clears_webauthn_success_banner() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_webauthn_enrolled(WebAuthnRegisterFinishResponse {
+            factor_id: "webauthn-factor-1".into(),
+            credential_id: "credential-1".into(),
+            enrolled: true,
+            status: MfaStatusResponse {
+                user_id: "dev-admin".into(),
+                provider_step_up_configured: false,
+                local_step_up_available: false,
+                step_up_required: false,
+                factors: vec![
+                    shared::dto::auth::MfaFactorStatus {
+                        kind: MfaFactorKind::Totp,
+                        available: false,
+                        enrolled: false,
+                        label: Some("Authenticator app".into()),
+                    },
+                    shared::dto::auth::MfaFactorStatus {
+                        kind: MfaFactorKind::WebAuthn,
+                        available: false,
+                        enrolled: true,
+                        label: Some("Security key".into()),
+                    },
+                ],
+                recovery_codes_remaining: Some(0),
+                message: "Local MFA factor store is configured.".into(),
+            },
+        });
+        assert!(rendered_text(&mut screen).contains("Security key enrolled"));
+
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: false,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            recovery_codes_remaining: Some(0),
+            message: "Local MFA factor store is configured.".into(),
+        });
+
+        let text = rendered_text(&mut screen);
+        assert!(!text.contains("Security key enrolled"));
+        assert!(text.contains("press w to set up in browser"));
     }
 
     #[test]

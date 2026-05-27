@@ -1,5 +1,6 @@
 pub mod device_code;
 pub mod pkce;
+pub mod webauthn;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

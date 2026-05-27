@@ -400,6 +400,88 @@ async fn recovery_code_verify_handler(
     .into_response()
 }
 
+async fn webauthn_register_start_handler(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+    if body["origin"].as_str() != Some("http://localhost:9876") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "invalid origin"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "factor_id": "webauthn-factor-1",
+        "public_key": {
+            "challenge": "challenge-1",
+            "rp": {"id": "localhost", "name": "Canopy"},
+            "user": {"id": "user-1", "name": "alice", "displayName": "alice"},
+            "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
+            "authenticatorSelection": {"userVerification": "required"}
+        },
+        "expires_at": "2026-05-27T00:10:00Z"
+    }))
+    .into_response()
+}
+
+async fn webauthn_register_finish_handler(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+    if body["factor_id"].as_str() != Some("webauthn-factor-1")
+        || body["credential"]["id"].as_str() != Some("credential-1")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "WebAuthn registration response is invalid"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "factor_id": "webauthn-factor-1",
+        "credential_id": "credential-1",
+        "enrolled": true,
+        "status": {
+            "user_id": "alice",
+            "provider_step_up_configured": true,
+            "local_step_up_available": false,
+            "step_up_required": false,
+            "recovery_codes_remaining": 0,
+            "factors": [
+                {
+                    "kind": "totp",
+                    "available": false,
+                    "enrolled": false,
+                    "label": "Authenticator app"
+                },
+                {
+                    "kind": "web_authn",
+                    "available": false,
+                    "enrolled": true,
+                    "label": "Security key"
+                }
+            ],
+            "message": "Local MFA factor store is configured."
+        }
+    }))
+    .into_response()
+}
+
 async fn log_groups_handler(headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
@@ -566,6 +648,14 @@ fn mock_app() -> Router {
         .route(
             "/api/auth/mfa/recovery-codes/verify",
             post(recovery_code_verify_handler),
+        )
+        .route(
+            "/api/auth/mfa/webauthn/register/start",
+            post(webauthn_register_start_handler),
+        )
+        .route(
+            "/api/auth/mfa/webauthn/register/finish",
+            post(webauthn_register_finish_handler),
         )
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
 }
@@ -802,6 +892,42 @@ async fn totp_enrollment_start_and_confirm_success() {
     assert!(recovery_verified.verified);
     assert_eq!(recovery_verified.remaining_codes, 1);
     assert_eq!(recovery_verified.status.recovery_codes_remaining, Some(1));
+}
+
+#[tokio::test]
+async fn webauthn_registration_start_and_finish_success() {
+    let base_url = start_mock(mock_app()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_token("access-token".into());
+
+    let started = client
+        .start_webauthn_registration(&shared::dto::auth::WebAuthnRegisterStartRequest {
+            origin: "http://localhost:9876".into(),
+            label: Some("Security key".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(started.factor_id, "webauthn-factor-1");
+    assert_eq!(started.public_key["rp"]["id"], "localhost");
+    assert_eq!(started.expires_at, "2026-05-27T00:10:00Z");
+
+    let finished = client
+        .finish_webauthn_registration(&shared::dto::auth::WebAuthnRegisterFinishRequest {
+            factor_id: started.factor_id,
+            credential: json!({
+                "id": "credential-1",
+                "attestationObject": "attestation-1",
+                "clientDataJSON": "client-data-1",
+                "transports": ["internal"]
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(finished.enrolled);
+    assert_eq!(finished.credential_id, "credential-1");
+    assert!(finished.status.factors.iter().any(|factor| factor.kind
+        == shared::dto::auth::MfaFactorKind::WebAuthn
+        && factor.enrolled));
 }
 
 #[tokio::test]
