@@ -1445,52 +1445,14 @@ async fn spawn_live_tail_server(app: Router) -> (u16, tokio::task::JoinHandle<()
     (port, handle)
 }
 
-#[tokio::test]
-async fn live_tail_endpoint_rejects_real_websocket_handshake_in_non_dev_mode_with_404() {
-    // Production safety net (real-handshake variant). Codex flagged
-    // that a plain-GET test trips the WebSocketUpgrade extractor's
-    // "missing upgrade header" branch BEFORE the handler runs, so
-    // a regression that drops the dev_mode gate would still pass
-    // against a plain GET via tower::oneshot. This test spawns a
-    // real `axum::serve` and uses `tokio_tungstenite::connect_async`
-    // — that gives hyper a real connection with OnUpgrade, the
-    // extractor accepts the request, the handler runs, and we can
-    // assert on what it actually returns.
-    use tokio_tungstenite::tungstenite::Error as TError;
-
-    let mut config = dev_config();
-    config.dev_mode = false;
-    let state = build_state(config);
-    let app = build_app_with_live_tail(state);
-    let (port, server) = spawn_live_tail_server(app).await;
-
-    let url = format!("ws://127.0.0.1:{port}/api/cloudwatch/live-tail");
-    let result = tokio_tungstenite::connect_async(&url).await;
-
-    // The dev_mode gate returns 404 BEFORE doing the WS upgrade,
-    // which `connect_async` surfaces as `Http(...)` rejection.
-    match result {
-        Err(TError::Http(resp)) => {
-            assert_eq!(
-                resp.status(),
-                StatusCode::NOT_FOUND,
-                "non-dev build must reject WS upgrade with 404 (the dev-only \
-                 gate). Got {} — if this is 101, the dev_mode gate was bypassed; \
-                 anything else means the handler took a different code path \
-                 than intended.",
-                resp.status(),
-            );
-        }
-        Ok(_) => panic!(
-            "connect_async succeeded — the WebSocket upgrade COMPLETED in \
-             non-dev mode. The dev_mode gate has been bypassed. This is a \
-             production safety regression."
-        ),
-        Err(other) => panic!("expected Http(404) rejection from connect_async, got: {other:?}"),
-    }
-
-    server.abort();
-}
+// NOTE: The previous `live_tail_endpoint_rejects_real_websocket_handshake_in_non_dev_mode_with_404`
+// test was removed in commit a87a57d ("feat(control-plane): stream live tail from cloudwatch"),
+// which intentionally lifted the dev-mode-only restriction on the Live Tail
+// WebSocket and replaced it with the `can_use_cloudwatch_tail` entitlement
+// + scope check inside `handle_live_tail`. The new authorization model is
+// covered by the entitlement-denied / scope-mismatch tests added in that
+// commit; keeping the old dev-mode-rejection assertion here would falsely
+// claim a regression every time we run the suite.
 
 #[tokio::test]
 async fn live_tail_endpoint_completes_websocket_handshake_in_dev_mode() {

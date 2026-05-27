@@ -1545,12 +1545,14 @@ mod tests {
             mfa_store: crate::models::mfa::MfaStore::disabled(),
             step_up_sessions: crate::services::step_up::StepUpSessionStore::default(),
             base_aws_config: aws_config::SdkConfig::builder()
+                .behavior_version(aws_config::BehaviorVersion::latest())
                 .region(aws_types::region::Region::new("us-east-1"))
                 .build(),
             database_secret_provider: Arc::new(
                 crate::services::database::AwsSecretsDatabaseSecretProvider::new(
                     aws_sdk_secretsmanager::Client::new(
                         &aws_config::SdkConfig::builder()
+                            .behavior_version(aws_config::BehaviorVersion::latest())
                             .region(aws_types::region::Region::new("us-east-1"))
                             .build(),
                     ),
