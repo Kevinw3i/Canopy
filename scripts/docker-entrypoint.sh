@@ -291,14 +291,6 @@ ${DATABASE_CONNECTIONS_TOML}
 TOML
   fi
 
-  # Append CORS origins at top level (before first [section])
-  if [ -n "$CORS_ALLOWED_ORIGINS" ]; then
-    # Trim whitespace around each comma-separated origin
-    CORS_ARRAY=$(printf '%s' "$CORS_ALLOWED_ORIGINS" | sed 's/[[:space:]]*,[[:space:]]*/", "/g')
-    sed -i "1a\\
-cors_allowed_origins = [\"${CORS_ARRAY}\"]" "$WRITABLE_CONFIG"
-  fi
-
   chmod 0600 "$WRITABLE_CONFIG"
 
   CONFIG_PATH="$WRITABLE_CONFIG"
