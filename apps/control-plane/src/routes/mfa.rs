@@ -12,17 +12,19 @@ use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::auth::{
     MfaStatusResponse, TotpEnrollConfirmRequest, TotpEnrollConfirmResponse, TotpEnrollStartRequest,
-    TotpEnrollStartResponse,
+    TotpEnrollStartResponse, TotpVerifyRequest, TotpVerifyResponse,
 };
 use shared::errors::ApiError;
 
 type RouteResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
+const TOTP_STEP_UP_TTL_SECONDS: i64 = 300;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/auth/mfa/status", get(status))
         .route("/api/auth/mfa/totp/start", post(totp_start))
         .route("/api/auth/mfa/totp/confirm", post(totp_confirm))
+        .route("/api/auth/mfa/totp/verify", post(totp_verify))
 }
 
 async fn status(
@@ -116,6 +118,49 @@ async fn totp_confirm(
     }
 }
 
+async fn totp_verify(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    Json(req): Json<TotpVerifyRequest>,
+) -> RouteResult<TotpVerifyResponse> {
+    require_audit_healthy(&state)?;
+
+    let result = state.mfa_store.verify_totp(&claims.sub, &req.code);
+
+    match result {
+        Ok(verified) => {
+            state
+                .audit_service
+                .event(
+                    &claims.sub,
+                    AuditAction::MfaTotpVerify,
+                    AuditOutcome::Success,
+                )
+                .optional_metadata(Some(serde_json::json!({
+                    "factor_id": &verified.factor_id,
+                    "kind": "totp",
+                })))
+                .commit_or_fail()
+                .map_err(|_| audit_failed_response("TOTP verification audit failed"))?;
+            let verified_at = chrono::Utc::now();
+            let status = mfa_status_response(&state, &claims.sub)?;
+            Ok(Json(TotpVerifyResponse {
+                factor_id: verified.factor_id,
+                verified: true,
+                verified_at: verified_at.to_rfc3339(),
+                step_up_expires_at: (verified_at
+                    + chrono::Duration::seconds(TOTP_STEP_UP_TTL_SECONDS))
+                .to_rfc3339(),
+                status,
+            }))
+        }
+        Err(err) => {
+            audit_totp_verify_failure(&state, &claims.sub, &err);
+            Err(mfa_store_error_response(err))
+        }
+    }
+}
+
 fn mfa_status_response(
     state: &AppState,
     user_id: &str,
@@ -188,11 +233,26 @@ fn audit_totp_enroll_failure(
         .commit_best_effort();
 }
 
+fn audit_totp_verify_failure(state: &AppState, actor: &str, err: &MfaStoreError) {
+    state
+        .audit_service
+        .event(actor, AuditAction::MfaTotpVerify, AuditOutcome::Failure)
+        .error(Some(&err.to_string()))
+        .optional_metadata(Some(serde_json::json!({
+            "kind": "totp",
+        })))
+        .commit_best_effort();
+}
+
 fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) {
     match err {
         MfaStoreError::StoreUnavailable | MfaStoreError::TotpSecretKeyUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError::internal(err.to_string())),
+        ),
+        MfaStoreError::NoActiveTotpFactor => (
+            StatusCode::CONFLICT,
+            Json(ApiError::new("CONFLICT", err.to_string())),
         ),
         MfaStoreError::TotpAlreadyEnrolled => (
             StatusCode::CONFLICT,
@@ -203,6 +263,10 @@ fn mfa_store_error_response(err: MfaStoreError) -> (StatusCode, Json<ApiError>) 
             Json(ApiError::new("EXPIRED", err.to_string())),
         ),
         MfaStoreError::InvalidTotpCode => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(err.to_string())),
+        ),
+        MfaStoreError::TotpCodeReplayed => (
             StatusCode::BAD_REQUEST,
             Json(ApiError::bad_request(err.to_string())),
         ),

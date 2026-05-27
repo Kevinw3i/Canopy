@@ -64,6 +64,9 @@ pub enum AuditAction {
     /// Start or confirm local TOTP factor enrollment. Secret material and
     /// verification codes must never be placed in metadata.
     MfaTotpEnroll,
+    /// Verify a local TOTP factor for a step-up challenge. Verification codes
+    /// must never be placed in metadata.
+    MfaTotpVerify,
 }
 
 impl AuditAction {
@@ -83,6 +86,7 @@ impl AuditAction {
             Self::EcsExec => "ecs_exec",
             Self::EntitlementsView => "entitlements_view",
             Self::MfaTotpEnroll => "mfa_totp_enroll",
+            Self::MfaTotpVerify => "mfa_totp_verify",
         }
     }
 }
@@ -117,6 +121,7 @@ mod tests {
             AuditAction::EcsExec,
             AuditAction::EntitlementsView,
             AuditAction::MfaTotpEnroll,
+            AuditAction::MfaTotpVerify,
         ] {
             let json = serde_json::to_value(&action).unwrap();
             assert_eq!(json, serde_json::Value::String(action.wire_name().into()));
@@ -170,6 +175,16 @@ mod tests {
 
         let back: AuditAction = serde_json::from_value(json).unwrap();
         assert!(matches!(back, AuditAction::MfaTotpEnroll));
+    }
+
+    #[test]
+    fn audit_action_mfa_totp_verify_roundtrip() {
+        let json = serde_json::to_value(AuditAction::MfaTotpVerify).unwrap();
+        assert_eq!(json, "mfa_totp_verify");
+        assert_eq!(AuditAction::MfaTotpVerify.wire_name(), "mfa_totp_verify");
+
+        let back: AuditAction = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, AuditAction::MfaTotpVerify));
     }
 
     #[test]

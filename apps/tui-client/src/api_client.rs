@@ -437,6 +437,18 @@ impl ApiClient {
         .await
     }
 
+    pub async fn verify_totp_step_up(
+        &self,
+        request: &TotpVerifyRequest,
+    ) -> ApiResult<TotpVerifyResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/auth/mfa/totp/verify", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

@@ -168,6 +168,12 @@ pub enum Action {
     },
     TotpEnrollmentConfirmed(shared::dto::auth::TotpEnrollConfirmResponse),
     TotpEnrollmentConfirmFailed(String),
+    StartTotpStepUpVerification,
+    VerifyTotpStepUp {
+        code: String,
+    },
+    TotpStepUpVerified(shared::dto::auth::TotpVerifyResponse),
+    TotpStepUpVerifyFailed(String),
 
     // Auto-update
     CheckForUpdate,

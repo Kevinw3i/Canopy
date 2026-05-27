@@ -976,6 +976,19 @@ impl App {
             Action::TotpEnrollmentConfirmFailed(error) => {
                 self.settings.set_totp_confirm_error(error);
             }
+            Action::StartTotpStepUpVerification => {
+                self.settings.start_totp_step_up_verification();
+            }
+            Action::VerifyTotpStepUp { code } => {
+                self.settings.set_totp_step_up_verifying();
+                self.spawn_totp_step_up_verify(code);
+            }
+            Action::TotpStepUpVerified(response) => {
+                self.settings.set_totp_step_up_verified(response);
+            }
+            Action::TotpStepUpVerifyFailed(error) => {
+                self.settings.set_totp_step_up_verify_error(error);
+            }
 
             // Auto-update
             Action::CheckForUpdate => {
@@ -1364,6 +1377,25 @@ impl App {
                     let _ = tx.send(Self::route_error_to_action(
                         err,
                         Action::TotpEnrollmentConfirmFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_totp_step_up_verify(&self, code: String) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::TotpVerifyRequest { code };
+            match api.verify_totp_step_up(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TotpStepUpVerified(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::TotpStepUpVerifyFailed,
                     ));
                 }
             }

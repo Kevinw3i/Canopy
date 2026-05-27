@@ -737,7 +737,7 @@ async fn totp_enrollment_start_and_confirm_enrolls_factor() {
     .unwrap();
 
     let (confirm_status, confirm_json) = authed_post_json(
-        app,
+        app.clone(),
         "/api/auth/mfa/totp/confirm",
         &token,
         json!({
@@ -751,6 +751,20 @@ async fn totp_enrollment_start_and_confirm_enrolls_factor() {
     assert_eq!(confirm_json["enrolled"], true);
     assert_eq!(confirm_json["status"]["local_step_up_available"], true);
     assert_eq!(confirm_json["status"]["factors"][0]["enrolled"], true);
+
+    let (verify_status, verify_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/verify",
+        &token,
+        json!({
+            "code": code
+        }),
+    )
+    .await;
+
+    assert_eq!(verify_status, StatusCode::OK);
+    assert_eq!(verify_json["verified"], true);
+    assert!(verify_json["step_up_expires_at"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -788,21 +802,33 @@ async fn totp_enrollment_audit_does_not_log_secret_or_code() {
     .unwrap();
 
     let (confirm_status, _) = authed_post_json(
-        app,
+        app.clone(),
         "/api/auth/mfa/totp/confirm",
         &token,
         json!({
             "factor_id": factor_id,
-            "code": code
+            "code": code.clone()
         }),
     )
     .await;
     assert_eq!(confirm_status, StatusCode::OK);
 
+    let (verify_status, _) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/verify",
+        &token,
+        json!({
+            "code": code.clone()
+        }),
+    )
+    .await;
+    assert_eq!(verify_status, StatusCode::OK);
+
     let events = read_audit_events(&audit.path);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(serialized.contains("mfa_totp_enroll"));
+    assert!(serialized.contains("mfa_totp_verify"));
     assert!(!serialized.contains(&secret_base32));
     assert!(!serialized.contains(&code));
 }

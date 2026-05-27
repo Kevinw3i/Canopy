@@ -53,6 +53,7 @@ Current actions:
 - `log_group_list`
 - `entitlements_view`
 - `mfa_totp_enroll`
+- `mfa_totp_verify`
 
 `ec2_power` is emitted by the control-plane when an authorized operator requests
 an EC2 start, stop, or reboot action.
@@ -60,6 +61,10 @@ an EC2 start, stop, or reboot action.
 `mfa_totp_enroll` is emitted when a local TOTP enrollment starts or confirms.
 Metadata includes `stage`, `factor_id`, and `kind`; it must not include the
 TOTP secret or verification code.
+
+`mfa_totp_verify` is emitted when a local TOTP factor is verified for step-up.
+Metadata includes `factor_id` and `kind`; it must not include the verification
+code.
 
 ## Common Metadata Fields
 

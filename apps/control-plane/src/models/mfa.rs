@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS mfa_factors (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     enrolled_at TEXT,
     last_used_at TEXT,
+    last_totp_step INTEGER,
     disabled_at TEXT
 );
 
@@ -56,6 +57,10 @@ pub enum MfaStoreError {
     TotpEnrollmentNotFound,
     #[error("TOTP code is invalid")]
     InvalidTotpCode,
+    #[error("no active TOTP factor is enrolled")]
+    NoActiveTotpFactor,
+    #[error("TOTP code has already been used for this time step")]
+    TotpCodeReplayed,
     #[error("MFA secret key must be base64-encoded 32 bytes")]
     InvalidSecretKey,
     #[error("MFA secret envelope is invalid")]
@@ -77,6 +82,12 @@ pub enum MfaStoreError {
 }
 
 type MfaResult<T> = Result<T, MfaStoreError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TotpVerifyResult {
+    pub factor_id: String,
+    pub matched_step: u64,
+}
 
 #[derive(Clone)]
 pub struct MfaStore {
@@ -121,7 +132,7 @@ impl MfaStore {
     ) -> MfaResult<Self> {
         let path = sqlite_path_from_url(url)?;
         let conn = Connection::open(path)?;
-        conn.execute_batch(SQLITE_SCHEMA)?;
+        ensure_sqlite_schema(&conn)?;
         Ok(Self {
             conn: Some(Arc::new(Mutex::new(conn))),
             secret_key: parse_secret_key(secret_key)?,
@@ -269,6 +280,71 @@ impl MfaStore {
         Ok(())
     }
 
+    pub fn verify_totp(&self, user_id: &str, code: &str) -> MfaResult<TotpVerifyResult> {
+        let conn = self.required_connection()?;
+        let secret_key = self
+            .secret_key
+            .ok_or(MfaStoreError::TotpSecretKeyUnavailable)?;
+        let code = normalized_totp_code(code)?;
+        let now = current_unix_seconds()?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, secret_ciphertext, last_totp_step
+             FROM mfa_factors
+             WHERE user_id = ?1
+               AND kind = 'totp'
+               AND enrolled_at IS NOT NULL
+               AND disabled_at IS NULL",
+        )?;
+        let rows = stmt.query_map(params![user_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let factors = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if factors.is_empty() {
+            return Err(MfaStoreError::NoActiveTotpFactor);
+        }
+
+        for (factor_id, secret_ciphertext, last_totp_step) in factors {
+            let aad = secret_aad(user_id, &factor_id);
+            let secret_bytes = decrypt_secret(&secret_key, &aad, &secret_ciphertext)?;
+            let totp = build_totp(secret_bytes, &safe_totp_account_name(user_id, user_id))?;
+            let Some(matched_step) = matching_totp_step(&totp, &code, now) else {
+                continue;
+            };
+
+            if last_totp_step.is_some_and(|step| step >= matched_step as i64) {
+                return Err(MfaStoreError::TotpCodeReplayed);
+            }
+
+            let updated = conn.execute(
+                "UPDATE mfa_factors
+                 SET last_used_at = CURRENT_TIMESTAMP,
+                     last_totp_step = ?1
+                 WHERE id = ?2
+                   AND user_id = ?3
+                   AND kind = 'totp'
+                   AND enrolled_at IS NOT NULL
+                   AND disabled_at IS NULL
+                   AND (last_totp_step IS NULL OR last_totp_step < ?1)",
+                params![matched_step as i64, factor_id, user_id],
+            )?;
+            if updated == 0 {
+                return Err(MfaStoreError::TotpCodeReplayed);
+            }
+
+            return Ok(TotpVerifyResult {
+                factor_id,
+                matched_step,
+            });
+        }
+
+        Err(MfaStoreError::InvalidTotpCode)
+    }
+
     fn connection(&self) -> MfaResult<Option<MutexGuard<'_, Connection>>> {
         self.conn
             .as_ref()
@@ -312,6 +388,26 @@ fn kind_label(kind: MfaFactorKind) -> &'static str {
         MfaFactorKind::Totp => "Authenticator app",
         MfaFactorKind::WebAuthn => "Security key",
     }
+}
+
+fn ensure_sqlite_schema(conn: &Connection) -> MfaResult<()> {
+    conn.execute_batch(SQLITE_SCHEMA)?;
+    ensure_column(conn, "mfa_factors", "last_totp_step", "INTEGER")?;
+    Ok(())
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, column_type: &str) -> MfaResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    if !columns.contains(column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn sqlite_path_from_url(url: &str) -> MfaResult<String> {
@@ -437,6 +533,23 @@ fn build_totp(secret: Vec<u8>, account_name: &str) -> MfaResult<TOTP> {
         Some(TOTP_ISSUER.into()),
         account_name.into(),
     )?)
+}
+
+fn current_unix_seconds() -> MfaResult<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
+}
+
+fn matching_totp_step(totp: &TOTP, code: &str, now: u64) -> Option<u64> {
+    let current_step = now / TOTP_STEP_SECONDS;
+    let first_step = current_step.saturating_sub(TOTP_SKEW as u64);
+    let last_step = current_step.saturating_add(TOTP_SKEW as u64);
+
+    (first_step..=last_step).find(|step| {
+        let step_time = step.saturating_mul(TOTP_STEP_SECONDS);
+        totp.generate(step_time) == code
+    })
 }
 
 #[cfg(test)]
@@ -612,5 +725,76 @@ mod tests {
             .find(|factor| factor.kind == MfaFactorKind::Totp)
             .unwrap();
         assert!(!totp.enrolled);
+    }
+
+    #[test]
+    fn verify_totp_updates_last_used_and_rejects_replay() {
+        let store =
+            MfaStore::from_database_url_and_secret_key("sqlite::memory:", Some(TEST_KEY)).unwrap();
+        let started = store
+            .start_totp_enrollment("u1", "alice@example.com", None)
+            .unwrap();
+        let secret = Secret::Encoded(started.secret_base32.clone())
+            .to_bytes()
+            .unwrap();
+        let code = build_totp(secret, "alice@example.com")
+            .unwrap()
+            .generate_current()
+            .unwrap();
+
+        store
+            .confirm_totp_enrollment("u1", &started.factor_id, &code)
+            .unwrap();
+        let verified = store.verify_totp("u1", &code).unwrap();
+        assert_eq!(verified.factor_id, started.factor_id);
+
+        let (last_used_at, last_step): (Option<String>, Option<i64>) = {
+            let conn = store.connection().unwrap().unwrap();
+            conn.query_row(
+                "SELECT last_used_at, last_totp_step FROM mfa_factors WHERE id = ?1",
+                params![started.factor_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert!(last_used_at.is_some());
+        assert_eq!(last_step, Some(verified.matched_step as i64));
+
+        let err = store.verify_totp("u1", &code).unwrap_err();
+        assert!(matches!(err, MfaStoreError::TotpCodeReplayed));
+    }
+
+    #[test]
+    fn schema_migration_adds_last_totp_step_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mfa_factors (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                label TEXT,
+                secret_ciphertext BLOB,
+                credential_id BLOB,
+                credential_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                enrolled_at TEXT,
+                last_used_at TEXT,
+                disabled_at TEXT
+            );",
+        )
+        .unwrap();
+
+        ensure_sqlite_schema(&conn).unwrap();
+
+        let has_column: bool = conn
+            .prepare("PRAGMA table_info(mfa_factors)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "last_totp_step");
+        assert!(has_column);
     }
 }

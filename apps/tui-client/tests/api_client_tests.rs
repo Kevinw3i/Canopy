@@ -265,6 +265,51 @@ async fn totp_confirm_handler(headers: HeaderMap, Json(body): Json<Value>) -> im
     .into_response()
 }
 
+async fn totp_verify_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+    if body["code"].as_str() != Some("123456") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "TOTP code is invalid"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "factor_id": "factor-1",
+        "verified": true,
+        "verified_at": "2026-05-27T00:00:00Z",
+        "step_up_expires_at": "2026-05-27T00:05:00Z",
+        "status": {
+            "user_id": "alice",
+            "provider_step_up_configured": true,
+            "local_step_up_available": true,
+            "step_up_required": false,
+            "factors": [
+                {
+                    "kind": "totp",
+                    "available": true,
+                    "enrolled": true,
+                    "label": "Authenticator app"
+                },
+                {
+                    "kind": "web_authn",
+                    "available": true,
+                    "enrolled": false,
+                    "label": "Security key"
+                }
+            ],
+            "message": "Local MFA factor store and TOTP enrollment are configured."
+        }
+    }))
+    .into_response()
+}
+
 async fn log_groups_handler(headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
@@ -423,6 +468,7 @@ fn mock_app() -> Router {
         .route("/api/auth/mfa/status", get(mfa_status_handler))
         .route("/api/auth/mfa/totp/start", post(totp_start_handler))
         .route("/api/auth/mfa/totp/confirm", post(totp_confirm_handler))
+        .route("/api/auth/mfa/totp/verify", post(totp_verify_handler))
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
 }
 
@@ -634,6 +680,15 @@ async fn totp_enrollment_start_and_confirm_success() {
         .unwrap();
     assert!(confirmed.enrolled);
     assert!(confirmed.status.local_step_up_available);
+
+    let verified = client
+        .verify_totp_step_up(&shared::dto::auth::TotpVerifyRequest {
+            code: "123456".into(),
+        })
+        .await
+        .unwrap();
+    assert!(verified.verified);
+    assert_eq!(verified.step_up_expires_at, "2026-05-27T00:05:00Z");
 }
 
 #[tokio::test]

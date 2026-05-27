@@ -10,7 +10,9 @@ use crate::event::Action;
 use crate::keybindings::KeyBindings;
 use crate::theme::{color_label, Theme};
 use crate::widgets::input::TextInput;
-use shared::dto::auth::{MfaFactorKind, MfaStatusResponse, TotpEnrollStartResponse};
+use shared::dto::auth::{
+    MfaFactorKind, MfaStatusResponse, TotpEnrollStartResponse, TotpVerifyResponse,
+};
 
 pub struct SettingsScreen {
     pub config: ClientConfig,
@@ -21,10 +23,18 @@ pub struct SettingsScreen {
     totp_starting: bool,
     totp_success: Option<String>,
     totp_enrollment: Option<TotpEnrollmentState>,
+    totp_step_up_success: Option<String>,
+    totp_verification: Option<TotpVerificationState>,
 }
 
 struct TotpEnrollmentState {
     response: TotpEnrollStartResponse,
+    code_input: TextInput,
+    submitting: bool,
+    error: Option<String>,
+}
+
+struct TotpVerificationState {
     code_input: TextInput,
     submitting: bool,
     error: Option<String>,
@@ -41,6 +51,8 @@ impl SettingsScreen {
             totp_starting: false,
             totp_success: None,
             totp_enrollment: None,
+            totp_step_up_success: None,
+            totp_verification: None,
         }
     }
 
@@ -66,6 +78,8 @@ impl SettingsScreen {
         self.totp_starting = true;
         self.totp_success = None;
         self.totp_enrollment = None;
+        self.totp_step_up_success = None;
+        self.totp_verification = None;
         self.mfa_error = None;
     }
 
@@ -80,6 +94,8 @@ impl SettingsScreen {
         });
         self.totp_starting = false;
         self.totp_success = None;
+        self.totp_step_up_success = None;
+        self.totp_verification = None;
         self.mfa_error = None;
     }
 
@@ -108,12 +124,48 @@ impl SettingsScreen {
         self.totp_success = Some("TOTP enrolled".into());
         self.set_mfa_status(status);
     }
+
+    pub fn start_totp_step_up_verification(&mut self) {
+        let mut code_input = TextInput::new("Step-up code").with_theme(self.theme);
+        code_input.focused = true;
+        self.totp_verification = Some(TotpVerificationState {
+            code_input,
+            submitting: false,
+            error: None,
+        });
+        self.totp_step_up_success = None;
+        self.totp_enrollment = None;
+        self.mfa_error = None;
+    }
+
+    pub fn set_totp_step_up_verifying(&mut self) {
+        if let Some(verification) = self.totp_verification.as_mut() {
+            verification.submitting = true;
+            verification.error = None;
+        }
+    }
+
+    pub fn set_totp_step_up_verify_error(&mut self, error: String) {
+        if let Some(verification) = self.totp_verification.as_mut() {
+            verification.submitting = false;
+            verification.error = Some(error);
+        }
+    }
+
+    pub fn set_totp_step_up_verified(&mut self, response: TotpVerifyResponse) {
+        self.totp_verification = None;
+        self.totp_step_up_success = Some(format!("verified until {}", response.step_up_expires_at));
+        self.set_mfa_status(response.status);
+    }
 }
 
 impl Component for SettingsScreen {
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         if self.totp_enrollment.is_some() {
             return self.handle_totp_enrollment_key(key);
+        }
+        if self.totp_verification.is_some() {
+            return self.handle_totp_verification_key(key);
         }
 
         if self
@@ -147,20 +199,26 @@ impl Component for SettingsScreen {
         {
             return Action::StartTotpEnrollment;
         }
+        if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('v'))
+            && self.can_verify_totp_step_up()
+        {
+            return Action::StartTotpStepUpVerification;
+        }
         Action::Noop
     }
 
     fn handle_paste(&mut self, text: &str) -> Action {
-        let Some(enrollment) = self.totp_enrollment.as_mut() else {
-            return Action::Noop;
-        };
-
         let digits: String = text
             .chars()
             .filter(|ch| ch.is_ascii_digit())
             .take(6)
             .collect();
-        enrollment.code_input.insert_str(&digits);
+        if let Some(enrollment) = self.totp_enrollment.as_mut() {
+            enrollment.code_input.insert_str(&digits);
+        } else if let Some(verification) = self.totp_verification.as_mut() {
+            verification.code_input.insert_str(&digits);
+        }
         Action::Noop
     }
 
@@ -176,8 +234,8 @@ impl Component for SettingsScreen {
         let inner = outer.inner(area);
         outer.render(area, buf);
 
-        let (content_area, code_input_area) = if self.totp_enrollment.is_some() && inner.height > 8
-        {
+        let has_code_input = self.totp_enrollment.is_some() || self.totp_verification.is_some();
+        let (content_area, code_input_area) = if has_code_input && inner.height > 8 {
             let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(inner);
             (chunks[0], Some(chunks[1]))
         } else {
@@ -282,6 +340,10 @@ impl Component for SettingsScreen {
 
         if let (Some(enrollment), Some(area)) = (self.totp_enrollment.as_ref(), code_input_area) {
             enrollment.code_input.render(area, buf);
+        } else if let (Some(verification), Some(area)) =
+            (self.totp_verification.as_ref(), code_input_area)
+        {
+            verification.code_input.render(area, buf);
         }
     }
 
@@ -319,6 +381,32 @@ impl SettingsScreen {
             }
             _ => {
                 enrollment.code_input.handle_key(key);
+                Action::Noop
+            }
+        }
+    }
+
+    fn handle_totp_verification_key(&mut self, key: KeyEvent) -> Action {
+        let Some(verification) = self.totp_verification.as_mut() else {
+            return Action::Noop;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.totp_verification = None;
+                Action::Noop
+            }
+            KeyCode::Enter if !verification.submitting => {
+                let code = verification.code_input.value.trim().to_string();
+                if code.is_empty() {
+                    verification.error = Some("Enter the current 6-digit code".into());
+                    Action::Noop
+                } else {
+                    Action::VerifyTotpStepUp { code }
+                }
+            }
+            _ => {
+                verification.code_input.handle_key(key);
                 Action::Noop
             }
         }
@@ -376,6 +464,34 @@ impl SettingsScreen {
             ]));
         }
 
+        if let Some(verification) = self.totp_verification.as_ref() {
+            lines.push(Line::from(Span::styled("TOTP Step-up", heading_style)));
+            let state = if verification.submitting {
+                Span::styled("verifying", warning_style)
+            } else if let Some(error) = verification.error.as_deref() {
+                Span::styled(format!("error: {}", truncate(error, 46)), danger_style)
+            } else {
+                Span::styled(
+                    "Enter verifies; Esc cancels local step-up view",
+                    muted_style,
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Status:             ", label_style),
+                state,
+            ]));
+        } else if let Some(success) = self.totp_step_up_success.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("TOTP step-up:       ", label_style),
+                Span::styled(truncate(success, 72), success_style),
+            ]));
+        } else if self.can_verify_totp_step_up() {
+            lines.push(Line::from(vec![
+                Span::styled("TOTP step-up:       ", label_style),
+                Span::styled("press v to verify", success_style),
+            ]));
+        }
+
         lines
     }
 
@@ -386,6 +502,11 @@ impl SettingsScreen {
 
     fn totp_enrolled(&self) -> bool {
         self.totp_factor().is_some_and(|factor| factor.enrolled)
+    }
+
+    fn can_verify_totp_step_up(&self) -> bool {
+        self.totp_factor()
+            .is_some_and(|factor| factor.available && factor.enrolled)
     }
 
     fn totp_factor(&self) -> Option<&shared::dto::auth::MfaFactorStatus> {
@@ -645,6 +766,50 @@ mod tests {
             action,
             Action::ConfirmTotpEnrollment { factor_id, code }
                 if factor_id == "factor-1" && code == "123456"
+        ));
+    }
+
+    #[test]
+    fn v_opens_totp_step_up_when_enrolled() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: true,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: true,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: true,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+        });
+
+        let action = screen.handle_key(key(KeyCode::Char('v')));
+
+        assert!(matches!(action, Action::StartTotpStepUpVerification));
+    }
+
+    #[test]
+    fn totp_step_up_accepts_paste_and_verifies() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.start_totp_step_up_verification();
+
+        screen.handle_paste("123\n456");
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::VerifyTotpStepUp { code } if code == "123456"
         ));
     }
 

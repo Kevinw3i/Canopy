@@ -132,6 +132,20 @@ pub struct TotpEnrollConfirmResponse {
     pub status: MfaStatusResponse,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpVerifyRequest {
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpVerifyResponse {
+    pub factor_id: String,
+    pub verified: bool,
+    pub verified_at: String,
+    pub step_up_expires_at: String,
+    pub status: MfaStatusResponse,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -271,6 +285,17 @@ mod tests {
         assert_eq!(json["code"], "123456");
 
         let back: TotpEnrollConfirmRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn totp_verify_roundtrip() {
+        let req = TotpVerifyRequest {
+            code: "123456".into(),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["code"], "123456");
+        let back: TotpVerifyRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back, req);
     }
 
