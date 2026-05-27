@@ -523,6 +523,7 @@ mod tests {
             groups: vec![],
             exp: 9999999999,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         }
     }

@@ -99,6 +99,7 @@ fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService
         audit_service,
         oidc_client,
         mfa_store,
+        step_up_sessions: control_plane::services::step_up::StepUpSessionStore::default(),
         base_aws_config,
         ready: std::sync::atomic::AtomicBool::new(true),
     })
@@ -242,6 +243,54 @@ async fn authed_get_json(app: Router, path: &str, token: &str) -> (StatusCode, V
     let status = resp.status();
     let json = body_json(resp.into_body()).await;
     (status, json)
+}
+
+async fn enroll_test_totp(app: Router, token: &str) -> String {
+    let (start_status, start_json) =
+        authed_post_json(app.clone(), "/api/auth/mfa/totp/start", token, json!({})).await;
+    assert_eq!(start_status, StatusCode::OK);
+    let factor_id = start_json["factor_id"].as_str().unwrap().to_string();
+    let secret_base32 = start_json["secret_base32"].as_str().unwrap().to_string();
+    let secret = totp_rs::Secret::Encoded(secret_base32).to_bytes().unwrap();
+    let code = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Canopy".into()),
+        "dev-admin@dev.local".into(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap();
+
+    let (confirm_status, _) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/confirm",
+        token,
+        json!({
+            "factor_id": factor_id,
+            "code": code.clone()
+        }),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+    code
+}
+
+async fn verify_test_totp_step_up(app: Router, token: &str, code: &str) {
+    let (verify_status, verify_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/verify",
+        token,
+        json!({
+            "code": code
+        }),
+    )
+    .await;
+    assert_eq!(verify_status, StatusCode::OK);
+    assert_eq!(verify_json["verified"], true);
 }
 
 struct RouteTestOidcKey {
@@ -831,6 +880,97 @@ async fn totp_enrollment_audit_does_not_log_secret_or_code() {
     assert!(serialized.contains("mfa_totp_verify"));
     assert!(!serialized.contains(&secret_base32));
     assert!(!serialized.contains(&code));
+}
+
+#[tokio::test]
+async fn ec2_power_requires_and_accepts_totp_step_up_when_local_factor_enrolled() {
+    let db = AuditFile::new("mfa-ec2-power-db");
+    let audit = AuditFile::new("mfa-ec2-power-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let second_token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let code = enroll_test_totp(app.clone(), &token).await;
+    let body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "action": "stop",
+        "confirmation_instance_id": "i-0123456789abcdef0"
+    });
+
+    let (blocked_status, blocked_json) =
+        authed_post_json(app.clone(), "/api/ec2/power", &token, body.clone()).await;
+
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    assert_eq!(blocked_json["code"], "STEP_UP_REQUIRED");
+    assert_eq!(blocked_json["details"], "totp");
+
+    verify_test_totp_step_up(app.clone(), &token, &code).await;
+
+    let (status, json) =
+        authed_post_json(app.clone(), "/api/ec2/power", &token, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["instance_id"], "i-0123456789abcdef0");
+
+    let (second_status, second_json) =
+        authed_post_json(app.clone(), "/api/ec2/power", &second_token, body).await;
+    assert_eq!(second_status, StatusCode::FORBIDDEN);
+    assert_eq!(second_json["code"], "STEP_UP_REQUIRED");
+
+    let events = read_audit_events(&audit.path);
+    assert!(events.iter().any(|event| {
+        event["action"] == "ec2_power"
+            && event["outcome"] == "denied"
+            && event["error_message"] == "step_up_required"
+    }));
+    assert!(events
+        .iter()
+        .any(|event| event["action"] == "ec2_power" && event["outcome"] == "success"));
+}
+
+#[tokio::test]
+async fn ecs_exec_requires_totp_step_up_when_local_factor_enrolled() {
+    let db = AuditFile::new("mfa-ecs-exec-db");
+    let audit = AuditFile::new("mfa-ecs-exec-audit");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (list_status, list_json) =
+        authed_post_json(app.clone(), "/api/ecs/tasks", &token, json!({})).await;
+    assert_eq!(list_status, StatusCode::OK);
+    let task = &list_json["tasks"][0];
+    enroll_test_totp(app.clone(), &token).await;
+    let body = json!({
+        "account_id": task["account_id"],
+        "region": task["region"],
+        "cluster_arn": task["cluster_arn"],
+        "task_arn": task["task_arn"],
+        "container_name": "app"
+    });
+
+    let (status, json) = authed_post_json(app, "/api/ecs/exec", &token, body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(json["code"], "STEP_UP_REQUIRED");
+    assert_eq!(json["details"], "totp");
+
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .find(|event| {
+            event["action"] == "ecs_exec" && event["metadata"]["error_kind"] == "step_up_required"
+        })
+        .expect("ecs exec step-up denied audit event");
+    assert_eq!(event["outcome"], "denied");
 }
 
 #[tokio::test]

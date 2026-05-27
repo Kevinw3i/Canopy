@@ -1,5 +1,10 @@
 use aws_credential_types::provider::ProvideCredentials;
-use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use std::{collections::HashSet, sync::Arc};
 
 use crate::aws::clients::AwsClients;
@@ -12,6 +17,9 @@ use crate::services::ec2::{
     power_feature_enabled, requested_state_for_power_action, AssumedRoleCredentials,
 };
 use crate::services::entitlements::EntitlementService;
+use crate::services::step_up::{
+    claims_step_up_key, local_totp_step_up_required, step_up_required_error,
+};
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::ec2::*;
@@ -111,6 +119,14 @@ fn ec2_connect_metadata(ctx: &AuditRequestContext, req: &ConnectRequest) -> serd
         "method": &req.method,
         "os_user": req.os_user.as_deref(),
     }))
+}
+
+fn mfa_step_up_unavailable_response(err: impl std::fmt::Display) -> (StatusCode, Json<ApiError>) {
+    tracing::error!(error = %err, "Failed to evaluate MFA step-up status");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::internal("MFA step-up status unavailable")),
+    )
 }
 
 fn power_action_iam_name(action: Ec2PowerAction) -> &'static str {
@@ -884,6 +900,27 @@ async fn power_instance(
                 "Instance does not match any allowed power-action tag selector",
             )),
         ));
+    }
+
+    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+        .map_err(mfa_step_up_unavailable_response)?
+    {
+        state
+            .audit_service
+            .event(&claims.sub, AuditAction::Ec2Power, AuditOutcome::Denied)
+            .account(Some(&req.account_id))
+            .region(Some(&req.region))
+            .target(Some(&req.instance_id))
+            .target_name(target_instance.name.as_deref())
+            .error(Some("step_up_required"))
+            .metadata(ec2_power_metadata(
+                &audit_ctx,
+                &req,
+                Some(&target_instance.state),
+                None,
+            ))
+            .commit_best_effort();
+        return Err((StatusCode::FORBIDDEN, Json(step_up_required_error())));
     }
 
     let (selected_account, ec2_client) = if state.config.use_mock_aws() {

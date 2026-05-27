@@ -17,6 +17,8 @@ pub struct Claims {
     pub groups: Vec<String>,
     pub exp: usize,
     pub iat: usize,
+    #[serde(default)]
+    pub jti: String,
     /// Whether the email was verified by the IdP. Only verified emails
     /// are used for entitlement membership matching.
     #[serde(default)]
@@ -53,6 +55,7 @@ impl AuthService {
             groups: identity.groups.clone(),
             exp,
             iat: now,
+            jti: uuid::Uuid::new_v4().to_string(),
             email_verified: identity.email_verified,
         };
 
@@ -333,6 +336,7 @@ mod tests {
             groups: vec![],
             exp: 0, // epoch — definitely expired
             iat: 0,
+            jti: "expired-token".into(),
             email_verified: false,
         };
         let token = jsonwebtoken::encode(

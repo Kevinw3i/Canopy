@@ -1,5 +1,10 @@
 use aws_credential_types::provider::ProvideCredentials;
-use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use std::sync::Arc;
 
 use crate::aws::clients::AwsClients;
@@ -14,6 +19,9 @@ use crate::services::ecs::{
     matching_rule_scopes, mock_tasks, AssumedRoleCredentials,
 };
 use crate::services::entitlements::EntitlementService;
+use crate::services::step_up::{
+    claims_step_up_key, local_totp_step_up_required, step_up_required_error,
+};
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::ecs::*;
@@ -116,6 +124,14 @@ fn ecs_exec_metadata(
         "broad_discovery": false,
         "error_kind": error_kind,
     }))
+}
+
+fn mfa_step_up_unavailable_response(err: impl std::fmt::Display) -> (StatusCode, Json<ApiError>) {
+    tracing::error!(error = %err, "Failed to evaluate MFA step-up status");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::internal("MFA step-up status unavailable")),
+    )
 }
 
 fn requested_cluster_for_account_region(
@@ -1309,6 +1325,17 @@ async fn exec_task(
         ));
     }
 
+    if local_totp_step_up_required(&state, &claims.sub, &claims_step_up_key(&claims))
+        .map_err(mfa_step_up_unavailable_response)?
+    {
+        audit_deny(
+            &state,
+            "Step-up verification required",
+            Some("step_up_required"),
+        );
+        return Err((StatusCode::FORBIDDEN, Json(step_up_required_error())));
+    }
+
     if let Err((kind, status, message)) = validate_task_for_exec(&task, &req) {
         state
             .audit_service
@@ -1515,6 +1542,7 @@ mod tests {
             audit_service: crate::services::audit::AuditService::new(),
             oidc_client,
             mfa_store: crate::models::mfa::MfaStore::disabled(),
+            step_up_sessions: crate::services::step_up::StepUpSessionStore::default(),
             base_aws_config: aws_config::SdkConfig::builder()
                 .region(aws_types::region::Region::new("us-east-1"))
                 .build(),

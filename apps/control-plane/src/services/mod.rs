@@ -5,6 +5,7 @@ pub mod ec2;
 pub mod ecs;
 pub mod entitlements;
 pub mod oidc;
+pub mod step_up;
 
 use crate::config::AppConfig;
 use crate::models::entitlements::EntitlementStore;
@@ -79,6 +80,7 @@ pub struct AppState {
     pub audit_service: audit::AuditService,
     pub oidc_client: oidc::OidcClient,
     pub mfa_store: MfaStore,
+    pub step_up_sessions: step_up::StepUpSessionStore,
     pub base_aws_config: SdkConfig,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     pub ready: std::sync::atomic::AtomicBool,
@@ -158,6 +160,7 @@ impl AppState {
             audit_service,
             oidc_client,
             mfa_store,
+            step_up_sessions: step_up::StepUpSessionStore::default(),
             base_aws_config,
             ready: std::sync::atomic::AtomicBool::new(false),
         })

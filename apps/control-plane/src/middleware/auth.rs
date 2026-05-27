@@ -150,6 +150,7 @@ mod tests {
             audit_service: AuditService::new(),
             oidc_client: OidcClient::new(test_config().oidc),
             mfa_store: crate::models::mfa::MfaStore::disabled(),
+            step_up_sessions: crate::services::step_up::StepUpSessionStore::default(),
             base_aws_config,
             ready: std::sync::atomic::AtomicBool::new(true),
         })
@@ -176,6 +177,7 @@ mod tests {
             groups: vec!["eng".into()],
             exp: now + 3600,
             iat: now,
+            jti: "test-token".into(),
             email_verified: true,
         };
         jsonwebtoken::encode(
@@ -277,6 +279,7 @@ mod tests {
             groups: vec![],
             exp: 0, // epoch — expired
             iat: 0,
+            jti: "expired-token".into(),
             email_verified: false,
         };
         let token = jsonwebtoken::encode(

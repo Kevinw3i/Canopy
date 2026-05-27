@@ -903,6 +903,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         };
 
@@ -935,6 +936,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         };
 
@@ -958,6 +960,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: true,
         };
 
@@ -976,6 +979,7 @@ mod tests {
             groups: vec![],
             exp: 1,
             iat: 0,
+            jti: "test-token".into(),
             email_verified: false,
         };
 

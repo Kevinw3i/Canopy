@@ -75,6 +75,7 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
         audit_service: AuditService::new(),
         oidc_client,
         mfa_store,
+        step_up_sessions: control_plane::services::step_up::StepUpSessionStore::default(),
         base_aws_config,
         ready: std::sync::atomic::AtomicBool::new(true),
     })

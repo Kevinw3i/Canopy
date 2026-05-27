@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::models::mfa::MfaStoreError;
+use crate::services::step_up::{claims_step_up_key, step_up_expires_at};
 use crate::services::AppState;
 use shared::dto::audit::{AuditAction, AuditOutcome};
 use shared::dto::auth::{
@@ -17,7 +18,6 @@ use shared::dto::auth::{
 use shared::errors::ApiError;
 
 type RouteResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
-const TOTP_STEP_UP_TTL_SECONDS: i64 = 300;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -142,15 +142,17 @@ async fn totp_verify(
                 })))
                 .commit_or_fail()
                 .map_err(|_| audit_failed_response("TOTP verification audit failed"))?;
-            let verified_at = chrono::Utc::now();
             let status = mfa_status_response(&state, &claims.sub)?;
+            let verified_at = chrono::Utc::now();
+            let step_up_expires_at = step_up_expires_at(verified_at);
+            state
+                .step_up_sessions
+                .mark_verified_until(&claims_step_up_key(&claims), step_up_expires_at);
             Ok(Json(TotpVerifyResponse {
                 factor_id: verified.factor_id,
                 verified: true,
                 verified_at: verified_at.to_rfc3339(),
-                step_up_expires_at: (verified_at
-                    + chrono::Duration::seconds(TOTP_STEP_UP_TTL_SECONDS))
-                .to_rfc3339(),
+                step_up_expires_at: step_up_expires_at.to_rfc3339(),
                 status,
             }))
         }
