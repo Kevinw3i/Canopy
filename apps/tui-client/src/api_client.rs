@@ -413,6 +413,30 @@ impl ApiClient {
         .await
     }
 
+    pub async fn start_totp_enrollment(
+        &self,
+        request: &TotpEnrollStartRequest,
+    ) -> ApiResult<TotpEnrollStartResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/auth/mfa/totp/start", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
+    pub async fn confirm_totp_enrollment(
+        &self,
+        request: &TotpEnrollConfirmRequest,
+    ) -> ApiResult<TotpEnrollConfirmResponse> {
+        self.send_authenticated(|| {
+            self.client
+                .post(format!("{}/api/auth/mfa/totp/confirm", self.base_url))
+                .json(request)
+        })
+        .await
+    }
+
     // ── EC2 ─────────────────────────────────────────────
 
     pub async fn list_ec2(&self, request: &Ec2ListRequest) -> ApiResult<Ec2ListResponse> {

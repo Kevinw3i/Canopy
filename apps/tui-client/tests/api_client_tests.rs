@@ -207,6 +207,64 @@ async fn mfa_status_handler(headers: HeaderMap) -> impl IntoResponse {
     .into_response()
 }
 
+async fn totp_start_handler(headers: HeaderMap, Json(_body): Json<Value>) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+
+    Json(json!({
+        "factor_id": "factor-1",
+        "secret_base32": "ABCDEFGHIJKLMNOP",
+        "otpauth_url": "otpauth://totp/Canopy:alice?secret=ABCDEFGHIJKLMNOP&issuer=Canopy",
+        "issuer": "Canopy",
+        "account_name": "alice"
+    }))
+    .into_response()
+}
+
+async fn totp_confirm_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+    if body["factor_id"].as_str() != Some("factor-1") || body["code"].as_str() != Some("123456") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "BAD_REQUEST",
+                "message": "TOTP code is invalid"
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "factor_id": "factor-1",
+        "enrolled": true,
+        "status": {
+            "user_id": "alice",
+            "provider_step_up_configured": true,
+            "local_step_up_available": true,
+            "step_up_required": false,
+            "factors": [
+                {
+                    "kind": "totp",
+                    "available": true,
+                    "enrolled": true,
+                    "label": "Authenticator app"
+                },
+                {
+                    "kind": "web_authn",
+                    "available": true,
+                    "enrolled": false,
+                    "label": "Security key"
+                }
+            ],
+            "message": "Local MFA factor store and TOTP enrollment are configured."
+        }
+    }))
+    .into_response()
+}
+
 async fn log_groups_handler(headers: HeaderMap) -> impl IntoResponse {
     if let Err(e) = require_bearer(&headers) {
         return e.into_response();
@@ -363,6 +421,8 @@ fn mock_app() -> Router {
         .route("/api/ec2/list", post(list_ec2_handler))
         .route("/api/entitlements", get(entitlements_handler))
         .route("/api/auth/mfa/status", get(mfa_status_handler))
+        .route("/api/auth/mfa/totp/start", post(totp_start_handler))
+        .route("/api/auth/mfa/totp/confirm", post(totp_confirm_handler))
         .route("/api/cloudwatch/log-groups", post(log_groups_handler))
 }
 
@@ -549,6 +609,31 @@ async fn mfa_status_success() {
         status.factors[1].kind,
         shared::dto::auth::MfaFactorKind::WebAuthn
     );
+}
+
+#[tokio::test]
+async fn totp_enrollment_start_and_confirm_success() {
+    let base_url = start_mock(mock_app()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_token("access-token".into());
+
+    let started = client
+        .start_totp_enrollment(&shared::dto::auth::TotpEnrollStartRequest { label: None })
+        .await
+        .unwrap();
+    assert_eq!(started.factor_id, "factor-1");
+    assert_eq!(started.issuer, "Canopy");
+    assert!(started.otpauth_url.starts_with("otpauth://totp/"));
+
+    let confirmed = client
+        .confirm_totp_enrollment(&shared::dto::auth::TotpEnrollConfirmRequest {
+            factor_id: started.factor_id,
+            code: "123456".into(),
+        })
+        .await
+        .unwrap();
+    assert!(confirmed.enrolled);
+    assert!(confirmed.status.local_step_up_available);
 }
 
 #[tokio::test]

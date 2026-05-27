@@ -37,6 +37,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub mfa_database_url: Option<String>,
 
+    /// Base64-encoded 32-byte key used to encrypt local MFA secrets before
+    /// they are written to `mfa_database_url`.
+    #[serde(default)]
+    pub mfa_secret_key: Option<String>,
+
     /// Path to the audit log file (JSON-lines). If set, all audit events
     /// are appended here in addition to structured tracing output.
     #[serde(default)]
@@ -260,6 +265,7 @@ impl AppConfig {
             entitlements_file: None,
             entitlements_database_url: None,
             mfa_database_url: None,
+            mfa_secret_key: None,
             audit_log: None,
             audit_export: AuditExportConfig::default(),
             cors_allowed_origins: vec![],
@@ -273,8 +279,27 @@ impl AppConfig {
 
     fn validate(&self) -> anyhow::Result<()> {
         self.audit_export.validate()?;
+        validate_optional_32_byte_base64_key("mfa_secret_key", self.mfa_secret_key.as_deref())?;
         Ok(())
     }
+}
+
+fn validate_optional_32_byte_base64_key(name: &str, value: Option<&str>) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|_| anyhow::anyhow!("{name} must be base64 encoded"))?;
+    if decoded.len() != 32 {
+        anyhow::bail!("{name} must decode to exactly 32 bytes");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -305,6 +330,7 @@ mod tests {
         assert_eq!(config.audit_export.queue_size, 1024);
         assert!(!config.audit_export.is_enabled());
         assert_eq!(config.mfa_database_url, None);
+        assert_eq!(config.mfa_secret_key, None);
         config.validate().unwrap();
     }
 
@@ -316,6 +342,7 @@ mod tests {
             mock_aws_data = false
             entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
             mfa_database_url = "sqlite:///var/lib/canopy/mfa.db"
+            mfa_secret_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
             audit_log = "/tmp/audit.jsonl"
             cors_allowed_origins = ["http://localhost:3000"]
 
@@ -364,6 +391,10 @@ mod tests {
             config.mfa_database_url.as_deref(),
             Some("sqlite:///var/lib/canopy/mfa.db")
         );
+        assert_eq!(
+            config.mfa_secret_key.as_deref(),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        );
         assert_eq!(config.audit_log.as_deref(), Some("/tmp/audit.jsonl"));
         assert_eq!(config.audit_export.queue_size, 2048);
         let cw = config.audit_export.cloudwatch_logs.as_ref().unwrap();
@@ -384,6 +415,24 @@ mod tests {
         assert_eq!(config.aws.sts_external_id.as_deref(), Some("custom-id"));
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_validation_rejects_invalid_mfa_secret_key() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            mfa_secret_key = "not-base64"
+            [oidc]
+            issuer_url = "x"
+            client_id = "x"
+            [jwt]
+            secret = "x"
+            [aws]
+        "#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

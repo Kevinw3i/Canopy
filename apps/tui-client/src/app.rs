@@ -956,6 +956,26 @@ impl App {
             Action::MfaStatusFailed(error) => {
                 self.settings.set_mfa_error(error);
             }
+            Action::StartTotpEnrollment => {
+                self.settings.set_totp_starting();
+                self.spawn_totp_enrollment_start();
+            }
+            Action::TotpEnrollmentStarted(response) => {
+                self.settings.set_totp_started(response);
+            }
+            Action::TotpEnrollmentStartFailed(error) => {
+                self.settings.set_totp_start_error(error);
+            }
+            Action::ConfirmTotpEnrollment { factor_id, code } => {
+                self.settings.set_totp_confirming();
+                self.spawn_totp_enrollment_confirm(factor_id, code);
+            }
+            Action::TotpEnrollmentConfirmed(response) => {
+                self.settings.set_totp_confirmed(response.status);
+            }
+            Action::TotpEnrollmentConfirmFailed(error) => {
+                self.settings.set_totp_confirm_error(error);
+            }
 
             // Auto-update
             Action::CheckForUpdate => {
@@ -1307,6 +1327,44 @@ impl App {
                 }
                 Err(err) => {
                     let _ = tx.send(Self::route_error_to_action(err, Action::MfaStatusFailed));
+                }
+            }
+        });
+    }
+
+    fn spawn_totp_enrollment_start(&self) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::TotpEnrollStartRequest { label: None };
+            match api.start_totp_enrollment(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TotpEnrollmentStarted(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::TotpEnrollmentStartFailed,
+                    ));
+                }
+            }
+        });
+    }
+
+    fn spawn_totp_enrollment_confirm(&self, factor_id: String, code: String) {
+        let api = self.api.clone();
+        let tx = self.action_tx.clone();
+        tokio::spawn(async move {
+            let request = shared::dto::auth::TotpEnrollConfirmRequest { factor_id, code };
+            match api.confirm_totp_enrollment(&request).await {
+                Ok(response) => {
+                    let _ = tx.send(Action::TotpEnrollmentConfirmed(response));
+                }
+                Err(err) => {
+                    let _ = tx.send(Self::route_error_to_action(
+                        err,
+                        Action::TotpEnrollmentConfirmFailed,
+                    ));
                 }
             }
         });

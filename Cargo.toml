@@ -51,6 +51,8 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
+chacha20poly1305 = "0.10"
+totp-rs = { version = "5.7.1", features = ["gen_secret", "otpauth", "zeroize"] }
 
 # TUI
 ratatui = "0.28"

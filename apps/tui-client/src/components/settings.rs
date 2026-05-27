@@ -1,4 +1,4 @@
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Paragraph},
@@ -9,7 +9,8 @@ use crate::config::ClientConfig;
 use crate::event::Action;
 use crate::keybindings::KeyBindings;
 use crate::theme::{color_label, Theme};
-use shared::dto::auth::{MfaFactorKind, MfaStatusResponse};
+use crate::widgets::input::TextInput;
+use shared::dto::auth::{MfaFactorKind, MfaStatusResponse, TotpEnrollStartResponse};
 
 pub struct SettingsScreen {
     pub config: ClientConfig,
@@ -17,6 +18,16 @@ pub struct SettingsScreen {
     mfa_status: Option<MfaStatusResponse>,
     mfa_loading: bool,
     mfa_error: Option<String>,
+    totp_starting: bool,
+    totp_success: Option<String>,
+    totp_enrollment: Option<TotpEnrollmentState>,
+}
+
+struct TotpEnrollmentState {
+    response: TotpEnrollStartResponse,
+    code_input: TextInput,
+    submitting: bool,
+    error: Option<String>,
 }
 
 impl SettingsScreen {
@@ -27,6 +38,9 @@ impl SettingsScreen {
             mfa_status: None,
             mfa_loading: false,
             mfa_error: None,
+            totp_starting: false,
+            totp_success: None,
+            totp_enrollment: None,
         }
     }
 
@@ -39,16 +53,69 @@ impl SettingsScreen {
         self.mfa_status = Some(status);
         self.mfa_loading = false;
         self.mfa_error = None;
+        self.totp_starting = false;
     }
 
     pub fn set_mfa_error(&mut self, error: String) {
         self.mfa_loading = false;
         self.mfa_error = Some(error);
+        self.totp_starting = false;
+    }
+
+    pub fn set_totp_starting(&mut self) {
+        self.totp_starting = true;
+        self.totp_success = None;
+        self.totp_enrollment = None;
+        self.mfa_error = None;
+    }
+
+    pub fn set_totp_started(&mut self, response: TotpEnrollStartResponse) {
+        let mut code_input = TextInput::new("Verification code").with_theme(self.theme);
+        code_input.focused = true;
+        self.totp_enrollment = Some(TotpEnrollmentState {
+            response,
+            code_input,
+            submitting: false,
+            error: None,
+        });
+        self.totp_starting = false;
+        self.totp_success = None;
+        self.mfa_error = None;
+    }
+
+    pub fn set_totp_start_error(&mut self, error: String) {
+        self.totp_starting = false;
+        self.mfa_error = Some(error);
+    }
+
+    pub fn set_totp_confirming(&mut self) {
+        if let Some(enrollment) = self.totp_enrollment.as_mut() {
+            enrollment.submitting = true;
+            enrollment.error = None;
+        }
+    }
+
+    pub fn set_totp_confirm_error(&mut self, error: String) {
+        if let Some(enrollment) = self.totp_enrollment.as_mut() {
+            enrollment.submitting = false;
+            enrollment.error = Some(error);
+        }
+    }
+
+    pub fn set_totp_confirmed(&mut self, status: MfaStatusResponse) {
+        self.totp_enrollment = None;
+        self.totp_starting = false;
+        self.totp_success = Some("TOTP enrolled".into());
+        self.set_mfa_status(status);
     }
 }
 
 impl Component for SettingsScreen {
     fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if self.totp_enrollment.is_some() {
+            return self.handle_totp_enrollment_key(key);
+        }
+
         if self
             .config
             .keybindings
@@ -70,9 +137,30 @@ impl Component for SettingsScreen {
         {
             return Action::ChangePassword;
         }
-        if key.modifiers.is_empty() && matches!(key.code, crossterm::event::KeyCode::Char('r')) {
+        if key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('r')) {
             return Action::RefreshMfaStatus;
         }
+        if key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('e'))
+            && self.can_start_totp_enrollment()
+            && !self.totp_starting
+        {
+            return Action::StartTotpEnrollment;
+        }
+        Action::Noop
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Action {
+        let Some(enrollment) = self.totp_enrollment.as_mut() else {
+            return Action::Noop;
+        };
+
+        let digits: String = text
+            .chars()
+            .filter(|ch| ch.is_ascii_digit())
+            .take(6)
+            .collect();
+        enrollment.code_input.insert_str(&digits);
         Action::Noop
     }
 
@@ -87,6 +175,14 @@ impl Component for SettingsScreen {
             .border_style(Style::default().fg(self.theme.accent));
         let inner = outer.inner(area);
         outer.render(area, buf);
+
+        let (content_area, code_input_area) = if self.totp_enrollment.is_some() && inner.height > 8
+        {
+            let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(inner);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (inner, None)
+        };
 
         let mut lines = vec![
             Line::from(Span::styled("Runtime", heading_style)),
@@ -122,6 +218,11 @@ impl Component for SettingsScreen {
                 "available",
                 "not configured",
             ),
+        ];
+
+        lines.extend(self.totp_lines());
+
+        lines.extend([
             Line::from(Span::styled("Theme", heading_style)),
             Line::from(vec![
                 Span::styled("Preset:             ", label_style),
@@ -143,7 +244,7 @@ impl Component for SettingsScreen {
                 )),
             ]),
             Line::from(Span::styled("Keyboard Shortcuts", heading_style)),
-        ];
+        ]);
 
         let rows = self.config.keybindings.settings_rows();
         for row in rows.chunks(2) {
@@ -175,7 +276,13 @@ impl Component for SettingsScreen {
             )),
         ]);
 
-        Paragraph::new(lines).style(body_style).render(inner, buf);
+        Paragraph::new(lines)
+            .style(body_style)
+            .render(content_area, buf);
+
+        if let (Some(enrollment), Some(area)) = (self.totp_enrollment.as_ref(), code_input_area) {
+            enrollment.code_input.render(area, buf);
+        }
     }
 
     fn on_enter(&mut self) -> Vec<Action> {
@@ -188,6 +295,108 @@ fn shortcut_cell(name: &str, keys: &str) -> String {
 }
 
 impl SettingsScreen {
+    fn handle_totp_enrollment_key(&mut self, key: KeyEvent) -> Action {
+        let Some(enrollment) = self.totp_enrollment.as_mut() else {
+            return Action::Noop;
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.totp_enrollment = None;
+                Action::Noop
+            }
+            KeyCode::Enter if !enrollment.submitting => {
+                let code = enrollment.code_input.value.trim().to_string();
+                if code.is_empty() {
+                    enrollment.error = Some("Enter the current 6-digit code".into());
+                    Action::Noop
+                } else {
+                    Action::ConfirmTotpEnrollment {
+                        factor_id: enrollment.response.factor_id.clone(),
+                        code,
+                    }
+                }
+            }
+            _ => {
+                enrollment.code_input.handle_key(key);
+                Action::Noop
+            }
+        }
+    }
+
+    fn totp_lines(&self) -> Vec<Line<'static>> {
+        let heading_style = Style::default().fg(self.theme.accent).bold();
+        let label_style = Style::default().fg(self.theme.text).bold();
+        let muted_style = self.theme.muted_style();
+        let success_style = self.theme.success_style();
+        let warning_style = self.theme.warning_style();
+        let danger_style = self.theme.danger_style();
+
+        let mut lines = Vec::new();
+        if self.totp_starting {
+            lines.push(Line::from(vec![
+                Span::styled("TOTP enrollment:   ", label_style),
+                Span::styled("starting", warning_style),
+            ]));
+        } else if let Some(enrollment) = self.totp_enrollment.as_ref() {
+            lines.push(Line::from(Span::styled("TOTP Setup", heading_style)));
+            lines.push(Line::from(vec![
+                Span::styled("Secret:             ", label_style),
+                Span::raw(truncate(&enrollment.response.secret_base32, 72)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("otpauth URL:        ", label_style),
+                Span::raw(truncate(&enrollment.response.otpauth_url, 72)),
+            ]));
+            let state = if enrollment.submitting {
+                Span::styled("verifying", warning_style)
+            } else if let Some(error) = enrollment.error.as_deref() {
+                Span::styled(format!("error: {}", truncate(error, 46)), danger_style)
+            } else {
+                Span::styled("Enter verifies; Esc cancels local setup view", muted_style)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Status:             ", label_style),
+                state,
+            ]));
+        } else if let Some(success) = self.totp_success.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("TOTP enrollment:   ", label_style),
+                Span::styled(success.to_string(), success_style),
+            ]));
+        } else if self.can_start_totp_enrollment() {
+            lines.push(Line::from(vec![
+                Span::styled("TOTP enrollment:   ", label_style),
+                Span::styled("press e to set up", success_style),
+            ]));
+        } else if self.totp_enrolled() {
+            lines.push(Line::from(vec![
+                Span::styled("TOTP enrollment:   ", label_style),
+                Span::styled("enrolled", success_style),
+            ]));
+        }
+
+        lines
+    }
+
+    fn can_start_totp_enrollment(&self) -> bool {
+        self.totp_factor()
+            .is_some_and(|factor| factor.available && !factor.enrolled)
+    }
+
+    fn totp_enrolled(&self) -> bool {
+        self.totp_factor().is_some_and(|factor| factor.enrolled)
+    }
+
+    fn totp_factor(&self) -> Option<&shared::dto::auth::MfaFactorStatus> {
+        self.mfa_status.as_ref().and_then(|status| {
+            status
+                .factors
+                .iter()
+                .find(|factor| factor.kind == MfaFactorKind::Totp)
+        })
+    }
+
     fn mfa_line(
         &self,
         label: &'static str,
@@ -386,6 +595,75 @@ mod tests {
         let mut screen = SettingsScreen::new(test_config(), test_theme());
         let action = screen.handle_key(key(KeyCode::Char('r')));
         assert!(matches!(action, Action::RefreshMfaStatus));
+    }
+
+    #[test]
+    fn e_starts_totp_enrollment_when_available() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_mfa_status(MfaStatusResponse {
+            user_id: "dev-admin".into(),
+            provider_step_up_configured: false,
+            local_step_up_available: false,
+            step_up_required: false,
+            factors: vec![
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::Totp,
+                    available: true,
+                    enrolled: false,
+                    label: Some("Authenticator app".into()),
+                },
+                shared::dto::auth::MfaFactorStatus {
+                    kind: MfaFactorKind::WebAuthn,
+                    available: true,
+                    enrolled: false,
+                    label: Some("Security key".into()),
+                },
+            ],
+            message: "Local MFA factor store and TOTP enrollment are configured.".into(),
+        });
+
+        let action = screen.handle_key(key(KeyCode::Char('e')));
+
+        assert!(matches!(action, Action::StartTotpEnrollment));
+    }
+
+    #[test]
+    fn totp_setup_accepts_paste_and_confirms() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_totp_started(TotpEnrollStartResponse {
+            factor_id: "factor-1".into(),
+            secret_base32: "ABCDEFGHIJKLMNOP".into(),
+            otpauth_url: "otpauth://totp/Canopy:dev-admin".into(),
+            issuer: "Canopy".into(),
+            account_name: "dev-admin".into(),
+        });
+
+        screen.handle_paste("123\n456");
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            Action::ConfirmTotpEnrollment { factor_id, code }
+                if factor_id == "factor-1" && code == "123456"
+        ));
+    }
+
+    #[test]
+    fn render_shows_totp_setup_without_secret_in_input() {
+        let mut screen = SettingsScreen::new(test_config(), test_theme());
+        screen.set_totp_started(TotpEnrollStartResponse {
+            factor_id: "factor-1".into(),
+            secret_base32: "ABCDEFGHIJKLMNOP".into(),
+            otpauth_url: "otpauth://totp/Canopy:dev-admin".into(),
+            issuer: "Canopy".into(),
+            account_name: "dev-admin".into(),
+        });
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("TOTP Setup"));
+        assert!(text.contains("Secret:"));
+        assert!(text.contains("ABCDEFGHIJKLMNOP"));
+        assert!(text.contains("Verification code"));
     }
 
     #[test]

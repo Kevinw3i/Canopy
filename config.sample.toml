@@ -26,6 +26,13 @@ dev_mode = false                    # 生產環境必須為 false
 # entitlements_file = "entitlements.toml"
 # entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
 
+# ── 本機 MFA factor store（可選）──────────────────────
+
+# 啟用本機 TOTP/WebAuthn factor store。TOTP secret 會先用
+# mfa_secret_key 加密後才寫入 SQLite；用 openssl rand -base64 32 產生。
+# mfa_database_url = "sqlite:///var/lib/canopy/mfa.db"
+# mfa_secret_key = "<openssl-rand-base64-32>"
+
 # ── 稽核日誌 ────────────────────────────────────────
 
 # 可選。設定後所有操作會寫入此檔案（JSON-lines 格式）。

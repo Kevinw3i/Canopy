@@ -108,7 +108,10 @@ impl AppState {
         };
 
         let oidc_client = oidc::OidcClient::new(config.oidc.clone());
-        let mfa_store = MfaStore::from_optional_database_url(config.mfa_database_url.as_deref())?;
+        let mfa_store = MfaStore::from_optional_config(
+            config.mfa_database_url.as_deref(),
+            config.mfa_secret_key.as_deref(),
+        )?;
 
         // Load the base AWS SDK config (uses ambient credentials: env vars,
         // instance profile, ~/.aws/credentials, etc.).

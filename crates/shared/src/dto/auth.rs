@@ -104,6 +104,34 @@ pub struct MfaStatusResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollStartRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollStartResponse {
+    pub factor_id: String,
+    pub secret_base32: String,
+    pub otpauth_url: String,
+    pub issuer: String,
+    pub account_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollConfirmRequest {
+    pub factor_id: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpEnrollConfirmResponse {
+    pub factor_id: String,
+    pub enrolled: bool,
+    pub status: MfaStatusResponse,
+}
+
 /// Refresh token request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshTokenRequest {
@@ -212,6 +240,38 @@ mod tests {
 
         let back: MfaStatusResponse = serde_json::from_value(json).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn totp_enroll_start_roundtrip() {
+        let resp = TotpEnrollStartResponse {
+            factor_id: "factor-1".into(),
+            secret_base32: "ABCDEF234567".into(),
+            otpauth_url: "otpauth://totp/Canopy:alice".into(),
+            issuer: "Canopy".into(),
+            account_name: "alice@example.com".into(),
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["issuer"], "Canopy");
+        assert_eq!(json["account_name"], "alice@example.com");
+
+        let back: TotpEnrollStartResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn totp_enroll_confirm_roundtrip() {
+        let req = TotpEnrollConfirmRequest {
+            factor_id: "factor-1".into(),
+            code: "123456".into(),
+        };
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["code"], "123456");
+
+        let back: TotpEnrollConfirmRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]

@@ -424,8 +424,9 @@ dev_mode = false
 entitlements_file = "entitlements.toml"
 # 或使用 SQLite 權限後端：
 # entitlements_database_url = "sqlite:///var/lib/canopy/entitlements.db"
-# 啟用本機 TOTP/WebAuthn factor store（註冊與驗證流程分階段開放）：
+# 啟用本機 TOTP/WebAuthn factor store；TOTP secret 需 mfa_secret_key 加密：
 # mfa_database_url = "sqlite:///var/lib/canopy/mfa.db"
+# mfa_secret_key = "<openssl-rand-base64-32>"
 audit_log = "/var/log/canopy/audit.jsonl"
 cors_allowed_origins = ["http://localhost:9876"]
 
@@ -563,7 +564,7 @@ Control Plane 啟動時會一次載入 SQLite 內容並套用與 TOML 相同的 
 
 ### 9.5 本機 MFA factor store
 
-`mfa_database_url = "sqlite:///path/to/mfa.db"` 啟用本機 MFA factor store。Control Plane 啟動時會建立 `mfa_factors` schema；status endpoint 會回報 TOTP / WebAuthn factor store 是否可用與使用者是否已有 active enrolled factor。查詢使用 `(user_id, kind)` partial index，只掃描 `enrolled_at IS NOT NULL AND disabled_at IS NULL` 的 active factors。
+`mfa_database_url = "sqlite:///path/to/mfa.db"` 啟用本機 MFA factor store。Control Plane 啟動時會建立 `mfa_factors` schema；status endpoint 會回報 TOTP / WebAuthn factor store 是否可用與使用者是否已有 active enrolled factor。TOTP enrollment 需要 `mfa_secret_key`（base64 32 bytes，例：`openssl rand -base64 32`），secret 以 XChaCha20-Poly1305 加密後才寫入 SQLite。查詢使用 `(user_id, kind)` partial index，只掃描 `enrolled_at IS NOT NULL AND disabled_at IS NULL` 的 active factors；pending TOTP setup 使用 `(user_id, kind, created_at)` partial index 並在 confirm 時套用 10 分鐘 TTL。
 
 ---
 
@@ -646,7 +647,7 @@ TUI 客戶端支援自動更新功能（預設關閉）。啟用 `auto_update = 
 - EC2 Instance Connect 支援判斷為近似值
 - AWS Organizations 帳號發現為啟動時一次性展開 `ACTIVE` accounts，尚未提供線上熱重載
 - 權限規則支援 TOML 檔案與 SQLite 後端；SQLite 目前為啟動時載入，尚未提供線上熱重載
-- MFA 目前為 OIDC Provider-driven；TUI 已顯示本機 MFA / step-up readiness，且 `mfa_database_url` 可啟用本機 factor store；本機 TOTP/WebAuthn 註冊、復原碼與 step-up enforcement 尚未實作
+- MFA 目前仍以 OIDC Provider-driven enforcement 為主；TUI 已顯示本機 MFA / step-up readiness，且在 `mfa_database_url` + `mfa_secret_key` 設定後可註冊本機 TOTP；本機 WebAuthn 註冊、復原碼與 step-up enforcement 尚未實作
 
 ### 未來規劃
 

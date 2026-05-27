@@ -50,6 +50,7 @@ fn dev_config() -> AppConfig {
         entitlements_file: None,
         entitlements_database_url: None,
         mfa_database_url: None,
+        mfa_secret_key: None,
         audit_log: None,
         audit_export: Default::default(),
         cors_allowed_origins: vec![],
@@ -59,8 +60,9 @@ fn dev_config() -> AppConfig {
 fn build_state(config: AppConfig) -> Arc<AppState> {
     let entitlement_store = EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
-    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_database_url(
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
         config.mfa_database_url.as_deref(),
+        config.mfa_secret_key.as_deref(),
     )
     .unwrap();
     let base_aws_config = aws_config::SdkConfig::builder()

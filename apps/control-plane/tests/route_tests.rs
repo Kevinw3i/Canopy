@@ -31,6 +31,8 @@ use control_plane::services::auth::AuthService;
 use control_plane::services::oidc::OidcClient;
 use control_plane::services::AppState;
 
+const TEST_MFA_SECRET_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 fn dev_config() -> AppConfig {
@@ -66,6 +68,7 @@ fn dev_config() -> AppConfig {
         entitlements_file: None,
         entitlements_database_url: None,
         mfa_database_url: None,
+        mfa_secret_key: None,
         audit_log: None,
         audit_export: Default::default(),
         cors_allowed_origins: vec![],
@@ -79,8 +82,9 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
 fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
-    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_database_url(
+    let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
         config.mfa_database_url.as_deref(),
+        config.mfa_secret_key.as_deref(),
     )
     .unwrap();
 
@@ -676,6 +680,7 @@ async fn mfa_status_reports_configured_local_factor_store() {
     std::fs::create_dir_all(&db.dir).unwrap();
     let mut config = dev_config();
     config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
     let token = issue_test_token(&config);
     let state = build_state(config);
     let app = build_app(state);
@@ -688,6 +693,118 @@ async fn mfa_status_reports_configured_local_factor_store() {
     assert_eq!(json["factors"][0]["enrolled"], false);
     assert_eq!(json["factors"][1]["available"], true);
     assert_eq!(json["factors"][1]["enrolled"], false);
+}
+
+#[tokio::test]
+async fn totp_enrollment_start_and_confirm_enrolls_factor() {
+    let db = AuditFile::new("mfa-totp");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state(config);
+    let app = build_app(state);
+
+    let (start_status, start_json) = authed_post_json(
+        app.clone(),
+        "/api/auth/mfa/totp/start",
+        &token,
+        json!({"label": "Phone"}),
+    )
+    .await;
+
+    assert_eq!(start_status, StatusCode::OK);
+    let factor_id = start_json["factor_id"].as_str().unwrap().to_string();
+    let secret_base32 = start_json["secret_base32"].as_str().unwrap().to_string();
+    assert!(start_json["otpauth_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("otpauth://totp/"));
+
+    let secret = totp_rs::Secret::Encoded(secret_base32).to_bytes().unwrap();
+    let code = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Canopy".into()),
+        "dev-admin@dev.local".into(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap();
+
+    let (confirm_status, confirm_json) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/confirm",
+        &token,
+        json!({
+            "factor_id": factor_id,
+            "code": code.clone()
+        }),
+    )
+    .await;
+
+    assert_eq!(confirm_status, StatusCode::OK);
+    assert_eq!(confirm_json["enrolled"], true);
+    assert_eq!(confirm_json["status"]["local_step_up_available"], true);
+    assert_eq!(confirm_json["status"]["factors"][0]["enrolled"], true);
+}
+
+#[tokio::test]
+async fn totp_enrollment_audit_does_not_log_secret_or_code() {
+    let db = AuditFile::new("mfa-audit-db");
+    let audit = AuditFile::new("mfa-audit-log");
+    std::fs::create_dir_all(&db.dir).unwrap();
+    std::fs::create_dir_all(&audit.dir).unwrap();
+    let mut config = dev_config();
+    config.mfa_database_url = Some(format!("sqlite://{}", db.path.display()));
+    config.mfa_secret_key = Some(TEST_MFA_SECRET_KEY.into());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let (start_status, start_json) =
+        authed_post_json(app.clone(), "/api/auth/mfa/totp/start", &token, json!({})).await;
+    assert_eq!(start_status, StatusCode::OK);
+    let factor_id = start_json["factor_id"].as_str().unwrap().to_string();
+    let secret_base32 = start_json["secret_base32"].as_str().unwrap().to_string();
+    let secret = totp_rs::Secret::Encoded(secret_base32.clone())
+        .to_bytes()
+        .unwrap();
+    let code = totp_rs::TOTP::new(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
+        Some("Canopy".into()),
+        "dev-admin@dev.local".into(),
+    )
+    .unwrap()
+    .generate_current()
+    .unwrap();
+
+    let (confirm_status, _) = authed_post_json(
+        app,
+        "/api/auth/mfa/totp/confirm",
+        &token,
+        json!({
+            "factor_id": factor_id,
+            "code": code
+        }),
+    )
+    .await;
+    assert_eq!(confirm_status, StatusCode::OK);
+
+    let events = read_audit_events(&audit.path);
+    assert_eq!(events.len(), 2);
+    let serialized = serde_json::to_string(&events).unwrap();
+    assert!(serialized.contains("mfa_totp_enroll"));
+    assert!(!serialized.contains(&secret_base32));
+    assert!(!serialized.contains(&code));
 }
 
 #[tokio::test]

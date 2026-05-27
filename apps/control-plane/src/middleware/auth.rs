@@ -130,6 +130,7 @@ mod tests {
             entitlements_file: None,
             entitlements_database_url: None,
             mfa_database_url: None,
+            mfa_secret_key: None,
             audit_log: None,
             audit_export: Default::default(),
             cors_allowed_origins: vec![],

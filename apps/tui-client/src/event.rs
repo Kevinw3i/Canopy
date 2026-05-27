@@ -159,6 +159,15 @@ pub enum Action {
     RefreshMfaStatus,
     MfaStatusLoaded(shared::dto::auth::MfaStatusResponse),
     MfaStatusFailed(String),
+    StartTotpEnrollment,
+    TotpEnrollmentStarted(shared::dto::auth::TotpEnrollStartResponse),
+    TotpEnrollmentStartFailed(String),
+    ConfirmTotpEnrollment {
+        factor_id: String,
+        code: String,
+    },
+    TotpEnrollmentConfirmed(shared::dto::auth::TotpEnrollConfirmResponse),
+    TotpEnrollmentConfirmFailed(String),
 
     // Auto-update
     CheckForUpdate,

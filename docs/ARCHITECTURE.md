@@ -408,6 +408,8 @@ No shared state -- survives restarts and multi-replica routing.
 | `bind_address` | `127.0.0.1:8443` | Server listen address |
 | `dev_mode` | `false` | Dev login + mock data |
 | `entitlements_file` | -- | Entitlements TOML (required in prod) |
+| `mfa_database_url` | -- | Optional SQLite local MFA factor store |
+| `mfa_secret_key` | -- | Optional base64 32-byte key for encrypted local TOTP secrets |
 | `audit_log` | -- | Durable JSONL audit file |
 | `cors_allowed_origins` | `[]` | CORS origins (permissive in dev) |
 | `oidc.issuer_url` | -- | OIDC provider URL |
