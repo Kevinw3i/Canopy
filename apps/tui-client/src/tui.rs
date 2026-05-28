@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,7 +16,12 @@ pub type Tui = Terminal<CrosstermBackend<io::Stdout>>;
 /// app routes that event to text inputs and the embedded SSH PTY explicitly.
 pub fn init() -> Result<Tui> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout());
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -25,14 +30,24 @@ pub fn init() -> Result<Tui> {
 /// Restore terminal to normal mode
 pub fn restore() -> Result<()> {
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     Ok(())
 }
 
 /// Temporarily leave alternate screen (for spawning external commands like SSM)
 pub fn suspend() -> Result<()> {
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     Ok(())
 }
 

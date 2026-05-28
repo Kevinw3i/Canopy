@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::event::Action;
+use crate::event::{Action, MouseScrollDirection};
 use crate::theme::Theme;
 
 const STATUS_RIGHT_PADDING: u16 = 1;
@@ -505,6 +505,29 @@ impl ConnectSessionScreen {
         Action::Noop
     }
 
+    pub(crate) fn handle_mouse_scroll(&mut self, direction: MouseScrollDirection) -> Action {
+        if self.is_terminal()
+            || self.overlay.is_some()
+            || self.copy_capture.is_some()
+            || self.parser.screen().alternate_screen()
+        {
+            return Action::Noop;
+        }
+
+        let current = self.parser.screen().scrollback();
+        let target = match direction {
+            MouseScrollDirection::Up => Some(current.saturating_add(1)),
+            MouseScrollDirection::Down if current > 0 => Some(current.saturating_sub(1)),
+            MouseScrollDirection::Down => None,
+        };
+
+        if let Some(target) = target {
+            self.parser.screen_mut().set_scrollback(target);
+        }
+
+        Action::Noop
+    }
+
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
         if area.is_empty() {
             return;
@@ -648,7 +671,7 @@ impl ConnectSessionScreen {
     }
 
     fn render_help_overlay(&self, area: Rect, buf: &mut Buffer) {
-        let modal_area = centered_rect(area, 74, 12);
+        let modal_area = centered_rect(area, 74, 13);
         Clear.render(modal_area, buf);
 
         let block = Block::default()
@@ -674,6 +697,10 @@ impl ConnectSessionScreen {
             Line::from(vec![
                 Span::styled("Shift+Down", self.theme.warning_style().bold()),
                 Span::raw("    scroll down one line"),
+            ]),
+            Line::from(vec![
+                Span::styled("Mouse wheel", self.theme.warning_style().bold()),
+                Span::raw("  scrolls local scrollback"),
             ]),
             Line::from(vec![
                 Span::styled("End", self.theme.warning_style().bold()),
@@ -2132,6 +2159,44 @@ mod tests {
             Action::Noop
         ));
         assert_eq!(session.parser.screen().scrollback(), 0);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_wheel_scrolls_local_scrollback_only() {
+        let mut session = spawn_sleeping_session();
+        feed_enough_scrollback_lines(&mut session);
+
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        assert!(matches!(
+            session.handle_mouse_scroll(MouseScrollDirection::Up),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), 1);
+
+        assert!(matches!(
+            session.handle_mouse_scroll(MouseScrollDirection::Down),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_wheel_does_not_scroll_local_buffer_in_alternate_screen() {
+        let mut session = spawn_sleeping_session();
+        feed_enough_scrollback_lines(&mut session);
+        session.process_output(b"\x1b[?1049h");
+        assert!(session.parser.screen().alternate_screen());
+        let before = session.parser.screen().scrollback();
+
+        assert!(matches!(
+            session.handle_mouse_scroll(MouseScrollDirection::Up),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), before);
         cleanup_session(session);
     }
 

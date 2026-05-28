@@ -1,6 +1,12 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEventKind};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseScrollDirection {
+    Up,
+    Down,
+}
 
 /// Events that flow from the terminal and async tasks into the app
 #[derive(Debug, Clone)]
@@ -9,6 +15,9 @@ pub enum Event {
     Key(KeyEvent),
     /// Bracketed paste payload from the terminal
     Paste(String),
+    /// Mouse wheel or trackpad scroll events. Only scroll direction is
+    /// modeled so click/drag/move never flow into app screens or remote PTYs.
+    MouseScroll(MouseScrollDirection),
     /// Terminal resize
     Resize(u16, u16),
     /// Periodic tick for animations and polling
@@ -305,8 +314,8 @@ impl EventReader {
 }
 
 /// Map a raw `crossterm::Event` to our `Event` enum. Returns None for
-/// variants we deliberately ignore (Focus/Mouse — we don't drive
-/// mouse input, and focus changes don't need their own action).
+/// variants we deliberately ignore (Focus, mouse click/drag/move, and
+/// horizontal scroll).
 ///
 /// Extracted from `EventReader::spawn` so the conversion logic can be
 /// unit-tested independently of the stdin-poll loop. Without this
@@ -317,7 +326,12 @@ pub(crate) fn map_crossterm_to_event(ce: CrosstermEvent) -> Option<Event> {
         CrosstermEvent::Key(key) => Some(Event::Key(key)),
         CrosstermEvent::Paste(text) => Some(Event::Paste(text)),
         CrosstermEvent::Resize(w, h) => Some(Event::Resize(w, h)),
-        // FocusGained / FocusLost / Mouse — deliberately ignored.
+        CrosstermEvent::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(Event::MouseScroll(MouseScrollDirection::Up)),
+            MouseEventKind::ScrollDown => Some(Event::MouseScroll(MouseScrollDirection::Down)),
+            _ => None,
+        },
+        // FocusGained / FocusLost — deliberately ignored.
         _ => None,
     }
 }
@@ -680,11 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn map_mouse_event_returns_none_because_tui_ignores_mouse_input() {
-        // Contract: we don't enable mouse capture, but crossterm can
-        // still surface mouse events on some terminals. They must NOT
-        // be sent into the action channel; otherwise the app would
-        // need to handle Event::Mouse — which we don't model.
+    fn map_mouse_click_event_returns_none_because_tui_only_uses_scroll() {
+        // Contract: mouse capture is used only for wheel/trackpad
+        // scrollback. Click/drag/move must never enter app screens
+        // or get forwarded into a remote PTY.
         let mouse = CrosstermEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 10,
@@ -693,8 +706,33 @@ mod tests {
         });
         assert!(
             map_crossterm_to_event(mouse).is_none(),
-            "Mouse events must be silently dropped by the mapper",
+            "Mouse click events must be silently dropped by the mapper",
         );
+    }
+
+    #[test]
+    fn map_mouse_scroll_events_to_direction_only() {
+        let up = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        let down = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(matches!(
+            map_crossterm_to_event(up),
+            Some(Event::MouseScroll(MouseScrollDirection::Up)),
+        ));
+        assert!(matches!(
+            map_crossterm_to_event(down),
+            Some(Event::MouseScroll(MouseScrollDirection::Down)),
+        ));
     }
 
     #[test]
@@ -839,6 +877,15 @@ mod tests {
             &tx,
             CrosstermEvent::Resize(100, 50),
         ));
+        assert!(dispatch_crossterm_event(
+            &tx,
+            CrosstermEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 3,
+                row: 4,
+                modifiers: KeyModifiers::empty(),
+            }),
+        ));
 
         match try_recv(&mut rx) {
             Some(Event::Paste(s)) => assert_eq!(s, "multi-line\npaste"),
@@ -850,6 +897,12 @@ mod tests {
                 assert_eq!(h, 50);
             }
             other => panic!("expected Event::Resize second, got {other:?}"),
+        }
+        match try_recv(&mut rx) {
+            Some(Event::MouseScroll(direction)) => {
+                assert_eq!(direction, MouseScrollDirection::Up);
+            }
+            other => panic!("expected Event::MouseScroll third, got {other:?}"),
         }
     }
 }
