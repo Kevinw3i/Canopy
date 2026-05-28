@@ -432,6 +432,36 @@ run_aws ecs wait services-stable \
   --region "$AWS_REGION"
 
 echo ""
+echo "== Verify ECS service image =="
+ACTIVE_TASK_DEFINITION="$(run_aws ecs describe-services \
+  --cluster "$ECS_CLUSTER" \
+  --services "$ECS_SERVICE" \
+  --region "$AWS_REGION" \
+  --query 'services[0].taskDefinition' \
+  --output text)"
+
+if [ -z "$ACTIVE_TASK_DEFINITION" ] || [ "$ACTIVE_TASK_DEFINITION" = "None" ]; then
+  fail "Unable to resolve active task definition for ECS service '$ECS_SERVICE'."
+fi
+
+ACTIVE_IMAGES="$(run_aws ecs describe-task-definition \
+  --task-definition "$ACTIVE_TASK_DEFINITION" \
+  --region "$AWS_REGION" \
+  --query 'taskDefinition.containerDefinitions[].image' \
+  --output text)"
+EXPECTED_IMAGE="$ECR_URL:$IMAGE_TAG"
+
+if ! printf '%s\n' "$ACTIVE_IMAGES" | tr '\t' '\n' | grep -qxF "$EXPECTED_IMAGE"; then
+  echo "Active task definition: $ACTIVE_TASK_DEFINITION" >&2
+  echo "Expected image: $EXPECTED_IMAGE" >&2
+  echo "Active images:" >&2
+  printf '%s\n' "$ACTIVE_IMAGES" >&2
+  fail "ECS service stabilized on a different image than requested. The deployment may have rolled back."
+fi
+
+echo "Verified ECS service image: $EXPECTED_IMAGE"
+
+echo ""
 echo "== ECS service status =="
 run_aws ecs describe-services \
   --cluster "$ECS_CLUSTER" \

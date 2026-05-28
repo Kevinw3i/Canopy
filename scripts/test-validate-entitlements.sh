@@ -84,6 +84,23 @@ write_entitlements "$TMP_DIR/gov-entitlements.toml" "$GOV_ROLE"
 write_tfvars "$TMP_DIR/gov.tfvars" "$GOV_ROLE"
 expect_success "gov-partition" "$TMP_DIR/gov-entitlements.toml" "$TMP_DIR/gov.tfvars"
 
+cat > "$TMP_DIR/duplicate-key-entitlements.toml" <<EOF
+[[rules]]
+id = "duplicate-key"
+allowed_regions = ["ap-northeast-1"]
+allowed_regions = ["us-east-1"]
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "invalid-toml-duplicate-key" \
+  "$TMP_DIR/duplicate-key-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "entitlements TOML parse failed"
+
 ORG_ROLE_TEMPLATE="arn:aws:iam::{account_id}:role/CanopyRole"
 ORG_ROLE_PATTERN="arn:aws:iam::*:role/CanopyRole"
 cat > "$TMP_DIR/org-discovery-entitlements.toml" <<EOF

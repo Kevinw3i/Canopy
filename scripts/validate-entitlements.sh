@@ -34,8 +34,35 @@ TFVARS="$2"
 
 [ -f "$ENTITLEMENTS" ] || fail "Entitlements file not found: $ENTITLEMENTS"
 [ -f "$TFVARS" ] || fail "Terraform tfvars not found: $TFVARS"
+command -v python3 >/dev/null 2>&1 \
+  || fail "python3 with tomllib (Python 3.11+) is required to parse entitlements TOML"
 
 ERRORS=0
+
+if ! TOML_PARSE_OUTPUT=$(
+  python3 - "$ENTITLEMENTS" <<'PY' 2>&1
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print("python3 with tomllib (Python 3.11+) is required", file=sys.stderr)
+    sys.exit(2)
+
+path = Path(sys.argv[1])
+try:
+    with path.open("rb") as f:
+        tomllib.load(f)
+except tomllib.TOMLDecodeError as exc:
+    print(f"{path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+); then
+  echo "ERROR: entitlements TOML parse failed." >&2
+  printf '%s\n' "$TOML_PARSE_OUTPUT" >&2
+  exit 1
+fi
 
 # Strip comments from both files before matching
 strip_comments() {

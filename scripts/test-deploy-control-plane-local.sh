@@ -101,8 +101,14 @@ case "$service:$operation" in
   ecr:get-login-password)
     printf 'stub-password\n'
     ;;
-  ecs:wait|ecs:describe-services|elbv2:describe-target-health)
+  ecs:wait|elbv2:describe-target-health)
     printf 'stub %s %s\n' "$service" "$operation"
+    ;;
+  ecs:describe-services)
+    printf '%s\n' "${CANOPY_SERVICE_TASK_DEFINITION_OUTPUT:-arn:aws:ecs:us-west-2:123456789012:task-definition/canopy-control-plane:42}"
+    ;;
+  ecs:describe-task-definition)
+    printf '%s\n' "${CANOPY_TASK_DEFINITION_IMAGE_OUTPUT:-123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.1.0}"
     ;;
   elbv2:describe-target-groups)
     default_tg_arn="arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/canopy/abcdef1234567890"
@@ -284,6 +290,7 @@ if ! env \
 fi
 grep -qF -- "AWS profile:       default credential chain" "$FULL_DEPLOY_OUT"
 grep -qF -- "Tag is available: cp-v0.1.0" "$FULL_DEPLOY_OUT"
+grep -qF -- "Verified ECS service image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.1.0" "$FULL_DEPLOY_OUT"
 grep -qF -- "Image deployed: 123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.1.0" "$FULL_DEPLOY_OUT"
 grep -qF -- "CloudWatch:     aws logs tail /ecs/canopy/control-plane --region us-west-2 --since 30m --follow" "$FULL_DEPLOY_OUT"
 if grep -qF -- "AWS_PROFILE=" "$FULL_DEPLOY_OUT"; then
@@ -320,6 +327,30 @@ if ! env \
 fi
 grep -qF -- "Target group name: canopy-tg" "$FULL_DEPLOY_TG_NAME_OUT"
 grep -qF -- "Image deployed: 123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.1.0" "$FULL_DEPLOY_TG_NAME_OUT"
+
+ROLLBACK_OUT="$TMP_DIR/rollback-detected.out"
+rm -f "$TMP_DIR/aws-describe-images-count"
+if env \
+  PATH="$REPO_TMP_DIR/bin:$PATH" \
+  TERRAFORM_DIR=".canopy-test-deploy-$$/infra" \
+  AWS_PROFILE= \
+  CANOPY_EXPECT_AWS_PROFILE_UNSET=1 \
+  CANOPY_ALLOW_AWS=1 \
+  CANOPY_ALLOW_DOCKER=1 \
+  CANOPY_ALLOW_TERRAFORM_OUTPUTS=1 \
+  CANOPY_AWS_STATE_DIR="$TMP_DIR" \
+  CANOPY_TASK_DEFINITION_IMAGE_OUTPUT="123456789012.dkr.ecr.us-west-2.amazonaws.com/canopy/control-plane:cp-v0.0.9" \
+  "$DEPLOY_SCRIPT" cp-v0.1.0 \
+  --yes \
+  --entitlements ".canopy-test-deploy-$$/entitlements.toml" \
+  --cluster canopy \
+  --service control-plane \
+  > "$ROLLBACK_OUT" 2>&1; then
+  cat "$ROLLBACK_OUT" >&2
+  echo "ERROR: expected service image mismatch to fail." >&2
+  exit 1
+fi
+grep -qF -- "ECS service stabilized on a different image than requested" "$ROLLBACK_OUT"
 
 MISSING_TG_OUT="$TMP_DIR/missing-target-group.out"
 rm -f "$TMP_DIR/aws-describe-images-count"
