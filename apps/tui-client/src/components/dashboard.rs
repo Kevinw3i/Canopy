@@ -138,10 +138,6 @@ impl DashboardScreen {
             return Style::default().fg(self.theme.muted);
         }
 
-        if item.screen == Screen::Mcp && self.mcp_server_running {
-            return self.mcp_running_style(selected);
-        }
-
         if selected {
             return Style::default()
                 .fg(self.theme.selected_fg)
@@ -152,18 +148,64 @@ impl DashboardScreen {
         Style::default().fg(self.theme.text)
     }
 
-    fn mcp_running_style(&self, selected: bool) -> Style {
-        let bright = self.mcp_pulse_tick % 8 < 4;
-        let fg = if bright {
-            Color::LightGreen
+    fn mcp_running_line(&self, prefix: &str, body: &str, selected: bool) -> Line<'static> {
+        let prefix_style = self.menu_text_style(selected);
+        let body_len = body.chars().count();
+        let mut spans = Vec::with_capacity(body_len + 1);
+
+        spans.push(Span::styled(prefix.to_string(), prefix_style));
+        for (idx, ch) in body.chars().enumerate() {
+            spans.push(Span::styled(
+                ch.to_string(),
+                self.mcp_sweep_style(idx, body_len, selected),
+            ));
+        }
+
+        Line::from(spans)
+    }
+
+    fn menu_text_style(&self, selected: bool) -> Style {
+        if selected {
+            Style::default()
+                .fg(self.theme.selected_fg)
+                .bg(self.theme.selected_bg)
+                .bold()
         } else {
-            Color::Green
+            Style::default().fg(self.theme.text)
+        }
+    }
+
+    fn mcp_sweep_style(&self, index: usize, text_len: usize, selected: bool) -> Style {
+        const SWEEP_WIDTH: isize = 5;
+
+        let cycle_len = text_len.saturating_add(SWEEP_WIDTH as usize).max(1);
+        let sweep_head = (self.mcp_pulse_tick as usize % cycle_len) as isize;
+        let sweep_start = sweep_head - SWEEP_WIDTH + 1;
+        let offset = index as isize - sweep_start;
+
+        let (fg, modifier) = match offset {
+            2 => (
+                Color::Rgb(210, 255, 150),
+                Modifier::BOLD | Modifier::UNDERLINED,
+            ),
+            1 | 3 => (Color::LightGreen, Modifier::BOLD),
+            0 | 4 => (Color::Green, Modifier::BOLD),
+            _ => (Color::Rgb(44, 170, 70), Modifier::BOLD),
         };
 
+        let style = Style::default().fg(fg).add_modifier(modifier);
         if selected {
-            Style::default().fg(fg).bg(self.theme.selected_bg).bold()
+            style.bg(self.theme.selected_bg)
         } else {
-            Style::default().fg(fg).bold()
+            style
+        }
+    }
+
+    fn selected_row_style(&self, selected: bool) -> Style {
+        if selected {
+            Style::default().bg(self.theme.selected_bg)
+        } else {
+            Style::default()
         }
     }
 }
@@ -299,19 +341,35 @@ impl Component for DashboardScreen {
 
             let selected = i == self.selected;
             let style = self.menu_item_style(item, selected);
-            let prefix = if selected { ">>" } else { "  " };
+            let prefix = if selected { ">> " } else { "   " };
 
             let label = if item.screen == Screen::Ec2Inventory {
                 inventory_label(self.entitlements.as_ref(), item.label)
             } else {
                 item.label
             };
-            let status = if item.enabled { "" } else { " (disabled)" };
+            let mcp_running = item.screen == Screen::Mcp && self.mcp_server_running && item.enabled;
+            let status = if mcp_running {
+                " ( Server Running )"
+            } else if item.enabled {
+                ""
+            } else {
+                " (disabled)"
+            };
             let key_label = KeyBindings::first_label(
                 self.keybindings.dashboard_shortcut_bindings(item.shortcut),
             );
-            let text = format!("{} [{}] {}{}", prefix, key_label, label, status);
-            Paragraph::new(text).style(style).render(item_area, buf);
+            let body = format!("[{}] {}{}", key_label, label, status);
+
+            if mcp_running {
+                Paragraph::new(self.mcp_running_line(prefix, &body, selected))
+                    .style(self.selected_row_style(selected))
+                    .render(item_area, buf);
+            } else {
+                Paragraph::new(format!("{}{}", prefix, body))
+                    .style(style)
+                    .render(item_area, buf);
+            }
         }
 
         // Help bar
@@ -429,6 +487,14 @@ mod tests {
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf);
         buf
+    }
+
+    fn mcp_sweep_peak_index(buf: &Buffer) -> Option<usize> {
+        buf.content.iter().position(|cell| {
+            cell.symbol() != " "
+                && cell.fg == Color::Rgb(210, 255, 150)
+                && cell.modifier.contains(Modifier::UNDERLINED)
+        })
     }
 
     #[test]
@@ -621,35 +687,46 @@ mod tests {
     }
 
     #[test]
-    fn running_mcp_menu_item_uses_green_pulse_style() {
+    fn running_mcp_menu_item_uses_sweep_style_and_status() {
         let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
         let mut ent = test_entitlements(false, false, false);
         ent.features.can_use_mcp = true;
         screen.set_entitlements(ent);
         screen.set_mcp_server_running(true);
         screen.selected = screen.visible_items().len() - 1;
+        screen.mcp_pulse_tick = 2;
 
-        let bright = rendered_buffer(&mut screen);
-        assert!(bright.content.iter().any(|cell| cell.symbol() != " "
-            && cell.fg == Color::LightGreen
-            && cell.bg == screen.theme.selected_bg));
-        assert!(!bright
-            .content
-            .iter()
-            .any(|cell| cell.symbol() != " " && cell.bg == Color::LightGreen));
+        let initial_text = rendered_text(&mut screen);
+        assert!(initial_text.contains("MCP / AI Tools ( Server Running )"));
 
-        for _ in 0..4 {
+        let initial = rendered_buffer(&mut screen);
+        let initial_peak = mcp_sweep_peak_index(&initial).expect("sweep peak must render");
+        assert!(initial.content.iter().any(|cell| cell.symbol() != " "
+            && cell.fg == Color::Rgb(210, 255, 150)
+            && cell.bg == screen.theme.selected_bg
+            && cell.modifier.contains(Modifier::BOLD)
+            && cell.modifier.contains(Modifier::UNDERLINED)));
+
+        for _ in 0..8 {
             screen.on_tick();
         }
 
-        let dim = rendered_buffer(&mut screen);
-        assert!(dim.content.iter().any(|cell| cell.symbol() != " "
-            && cell.fg == Color::Green
-            && cell.bg == screen.theme.selected_bg));
-        assert!(!dim
+        let later = rendered_buffer(&mut screen);
+        let later_peak = mcp_sweep_peak_index(&later).expect("sweep peak must keep rendering");
+        assert!(later_peak > initial_peak);
+        assert!(later.content.iter().any(|cell| cell.symbol() != " "
+            && cell.fg == Color::Rgb(210, 255, 150)
+            && cell.bg == screen.theme.selected_bg
+            && cell.modifier.contains(Modifier::BOLD)
+            && cell.modifier.contains(Modifier::UNDERLINED)));
+        assert!(!later
             .content
             .iter()
-            .any(|cell| cell.symbol() != " " && cell.bg == Color::Indexed(22)));
+            .any(|cell| cell.symbol() != " " && cell.bg == Color::LightGreen));
+        assert!(!later
+            .content
+            .iter()
+            .any(|cell| cell.symbol() != " " && cell.bg == Color::Rgb(210, 255, 150)));
     }
 
     #[test]
@@ -663,6 +740,8 @@ mod tests {
         screen.selected = screen.visible_items().len() - 1;
 
         let buf = rendered_buffer(&mut screen);
+        let text = rendered_text(&mut screen);
+        assert!(!text.contains("Server Running"));
         assert!(buf
             .content
             .iter()
