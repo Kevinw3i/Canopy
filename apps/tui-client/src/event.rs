@@ -168,6 +168,7 @@ pub enum Action {
     // MCP local server
     EnableMcp,
     LaunchMcpAiClient,
+    LaunchMcpAiClientConfirmed,
     StopMcp,
     RestartMcp,
     TestMcp,

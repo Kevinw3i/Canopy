@@ -1,4 +1,6 @@
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::prelude::{Buffer, Line, Rect, Span, Widget};
 use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest, Ec2PowerRequest};
 use shared::dto::ecs::{EcsExecRequest, EcsTasksRequest};
@@ -98,6 +100,8 @@ pub struct App {
     // cancelling a freshly-armed replacement stream).
     pub(crate) live_tail_generation: u64,
     mcp_runtime: Option<McpRuntime>,
+    mcp_launch_prompt: Option<McpLaunchPrompt>,
+    pending_mcp_ai_launch: Option<McpAiLaunchSelection>,
 
     // Auto-update banner message, shown until dismissed
     update_banner: Option<String>,
@@ -166,8 +170,6 @@ const TOKEN_EXPIRED_MODAL_MESSAGE: &str =
 /// Canopy sessions cannot stomp on each other AND a user's own pre-existing
 /// MCP entry called `canopy` is never deleted by Canopy's launcher cleanup.
 const MCP_AI_CLIENT_SERVER_NAME_PREFIX: &str = "canopy-session";
-const MCP_AI_CLIENT_ENV: &str = "CANOPY_MCP_AI_CLIENT";
-const MCP_TERMINAL_ENV: &str = "CANOPY_MCP_TERMINAL";
 
 fn mcp_ai_client_server_name() -> String {
     format!(
@@ -273,6 +275,17 @@ enum McpAiClient {
     Claude,
 }
 
+const MCP_AI_CLIENT_OPTIONS: [McpAiClient; 2] = [McpAiClient::Codex, McpAiClient::Claude];
+
+impl McpAiClient {
+    fn label(self) -> &'static str {
+        match self {
+            McpAiClient::Codex => "Codex CLI",
+            McpAiClient::Claude => "Claude Code",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalLaunchAdapter {
     AppleTerminal,
@@ -300,6 +313,205 @@ struct AppBundleInfo {
 struct McpAiLaunchResult {
     client_label: &'static str,
     terminal_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct McpAiLaunchSelection {
+    endpoint: String,
+    session: crate::mcp::McpSessionFile,
+    client: McpAiClient,
+    terminal: DetectedTerminalApp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpLaunchPromptStep {
+    AiClient,
+    Terminal,
+}
+
+#[derive(Debug, Clone)]
+struct McpLaunchPrompt {
+    endpoint: String,
+    session: crate::mcp::McpSessionFile,
+    terminals: Vec<DetectedTerminalApp>,
+    step: McpLaunchPromptStep,
+    selected_client: usize,
+    selected_terminal: usize,
+}
+
+impl McpLaunchPrompt {
+    fn new(
+        endpoint: String,
+        session: crate::mcp::McpSessionFile,
+        terminals: Vec<DetectedTerminalApp>,
+    ) -> Self {
+        Self {
+            endpoint,
+            session,
+            terminals,
+            step: McpLaunchPromptStep::AiClient,
+            selected_client: 0,
+            selected_terminal: 0,
+        }
+    }
+
+    fn option_count(&self) -> usize {
+        match self.step {
+            McpLaunchPromptStep::AiClient => MCP_AI_CLIENT_OPTIONS.len(),
+            McpLaunchPromptStep::Terminal => self.terminals.len(),
+        }
+    }
+
+    fn selected_index_mut(&mut self) -> &mut usize {
+        match self.step {
+            McpLaunchPromptStep::AiClient => &mut self.selected_client,
+            McpLaunchPromptStep::Terminal => &mut self.selected_terminal,
+        }
+    }
+
+    fn select_previous(&mut self) {
+        let count = self.option_count();
+        if count == 0 {
+            return;
+        }
+        let selected = self.selected_index_mut();
+        *selected = selected.saturating_sub(1);
+    }
+
+    fn select_next(&mut self) {
+        let count = self.option_count();
+        if count == 0 {
+            return;
+        }
+        let selected = self.selected_index_mut();
+        *selected = (*selected + 1).min(count - 1);
+    }
+
+    fn selected_client(&self) -> McpAiClient {
+        MCP_AI_CLIENT_OPTIONS[self.selected_client]
+    }
+
+    fn select_client(&mut self, client: McpAiClient) {
+        if let Some(index) = MCP_AI_CLIENT_OPTIONS
+            .iter()
+            .position(|option| *option == client)
+        {
+            self.selected_client = index;
+        }
+    }
+
+    fn select_terminal(&mut self, terminal: &DetectedTerminalApp) {
+        if let Some(index) = self.terminals.iter().position(|option| option == terminal) {
+            self.selected_terminal = index;
+        }
+    }
+
+    fn confirm(&mut self) -> Option<McpAiLaunchSelection> {
+        match self.step {
+            McpLaunchPromptStep::AiClient => {
+                self.step = McpLaunchPromptStep::Terminal;
+                None
+            }
+            McpLaunchPromptStep::Terminal => {
+                let terminal = self.terminals.get(self.selected_terminal)?.clone();
+                Some(McpAiLaunchSelection {
+                    endpoint: self.endpoint.clone(),
+                    session: self.session.clone(),
+                    client: self.selected_client(),
+                    terminal,
+                })
+            }
+        }
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer, theme: Theme) {
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+        let option_count = self.option_count().max(1) as u16;
+        let popup_width = 78.min(area.width.saturating_sub(4)).max(36.min(area.width));
+        let popup_height = (option_count + 6)
+            .min(area.height.saturating_sub(2))
+            .max(6.min(area.height));
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(popup_width) / 2,
+            y: area.y + area.height.saturating_sub(popup_height) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        Clear.render(popup, buf);
+
+        let title = match self.step {
+            McpLaunchPromptStep::AiClient => " Select MCP AI Client ",
+            McpLaunchPromptStep::Terminal => " Select Terminal ",
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(theme.accent_style());
+        let inner = block.inner(popup);
+        block.render(popup, buf);
+
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "j/k or arrows: select | Enter: confirm | Esc/q: cancel",
+                theme.muted_style(),
+            )),
+            Line::from(""),
+        ];
+
+        match self.step {
+            McpLaunchPromptStep::AiClient => {
+                for (index, client) in MCP_AI_CLIENT_OPTIONS.iter().enumerate() {
+                    let style = if index == self.selected_client {
+                        theme.selected_style()
+                    } else {
+                        theme.text_style()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} [{}] {}",
+                            selection_prefix(index == self.selected_client),
+                            index + 1,
+                            client.label()
+                        ),
+                        style,
+                    )));
+                }
+            }
+            McpLaunchPromptStep::Terminal => {
+                for (index, terminal) in self.terminals.iter().enumerate() {
+                    let style = if index == self.selected_terminal {
+                        theme.selected_style()
+                    } else {
+                        theme.text_style()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} [{}] {} ({})",
+                            selection_prefix(index == self.selected_terminal),
+                            index + 1,
+                            terminal.display_name,
+                            terminal.bundle_id
+                        ),
+                        style,
+                    )));
+                }
+            }
+        }
+
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
+    }
+}
+
+fn selection_prefix(selected: bool) -> &'static str {
+    if selected {
+        ">"
+    } else {
+        " "
+    }
 }
 
 fn connect_method_label(method: &ConnectMethod) -> &'static str {
@@ -330,25 +542,6 @@ fn parse_mcp_ai_client_choice(input: &str) -> Result<Option<McpAiClient>, String
         "2" | "claude" => Ok(Some(McpAiClient::Claude)),
         "q" | "quit" | "cancel" | "" => Ok(None),
         other => Err(format!("Invalid AI client choice: {other}")),
-    }
-}
-
-fn select_mcp_ai_client(choice: Option<&str>) -> Result<McpAiClient, String> {
-    let Some(choice) = choice.map(str::trim).filter(|choice| !choice.is_empty()) else {
-        return Ok(McpAiClient::Codex);
-    };
-
-    parse_mcp_ai_client_choice(choice)?
-        .ok_or_else(|| format!("{MCP_AI_CLIENT_ENV} must be 'codex' or 'claude'."))
-}
-
-fn select_mcp_ai_client_from_env() -> Result<McpAiClient, String> {
-    match std::env::var(MCP_AI_CLIENT_ENV) {
-        Ok(choice) => select_mcp_ai_client(Some(&choice)),
-        Err(std::env::VarError::NotPresent) => select_mcp_ai_client(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(format!("{MCP_AI_CLIENT_ENV} is not valid UTF-8."))
-        }
     }
 }
 
@@ -383,34 +576,6 @@ fn parse_terminal_app_choice(
         .cloned()
         .map(Some)
         .ok_or_else(|| format!("Invalid terminal choice: {choice}"))
-}
-
-fn select_mcp_terminal_app(
-    terminals: &[DetectedTerminalApp],
-) -> Result<DetectedTerminalApp, String> {
-    match std::env::var(MCP_TERMINAL_ENV) {
-        Ok(choice) => select_mcp_terminal_app_choice(terminals, Some(&choice)),
-        Err(std::env::VarError::NotPresent) => select_mcp_terminal_app_choice(terminals, None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            Err(format!("{MCP_TERMINAL_ENV} is not valid UTF-8."))
-        }
-    }
-}
-
-fn select_mcp_terminal_app_choice(
-    terminals: &[DetectedTerminalApp],
-    choice: Option<&str>,
-) -> Result<DetectedTerminalApp, String> {
-    if terminals.is_empty() {
-        return Err("No supported terminal app was detected on this computer.".into());
-    }
-
-    let Some(choice) = choice.map(str::trim).filter(|choice| !choice.is_empty()) else {
-        return Ok(terminals[0].clone());
-    };
-
-    parse_terminal_app_choice(choice, terminals)?
-        .ok_or_else(|| format!("{MCP_TERMINAL_ENV} must select a terminal app."))
 }
 
 fn resolve_command(program: &str) -> Result<String, String> {
@@ -884,6 +1049,8 @@ impl App {
             live_tail_cancel: None,
             live_tail_generation: 0,
             mcp_runtime: None,
+            mcp_launch_prompt: None,
+            pending_mcp_ai_launch: None,
             update_banner: None,
             session_expired_pending_login: false,
         })
@@ -1004,6 +1171,11 @@ impl App {
                 connect_cursor = None;
             }
 
+            if let Some(prompt) = self.mcp_launch_prompt.as_ref() {
+                prompt.render(area, buf, self.theme);
+                connect_cursor = None;
+            }
+
             // Render error modal on top
             if self.error_modal.is_visible() {
                 self.error_modal.render(area, buf);
@@ -1022,6 +1194,12 @@ impl App {
                 // Error modal intercepts all keys when visible
                 if self.error_modal.is_visible() {
                     let action = self.error_modal.handle_key(key);
+                    let _ = self.action_tx.send(action);
+                    return;
+                }
+
+                if self.mcp_launch_prompt.is_some() {
+                    let action = self.handle_mcp_launch_prompt_key(key);
                     let _ = self.action_tx.send(action);
                     return;
                 }
@@ -1055,6 +1233,9 @@ impl App {
             }
             Event::Paste(text) => {
                 if self.error_modal.is_visible() {
+                    return;
+                }
+                if self.mcp_launch_prompt.is_some() {
                     return;
                 }
 
@@ -1094,6 +1275,69 @@ impl App {
                 let _ = self.action_tx.send(Action::ShowError(msg));
             }
         }
+    }
+
+    fn handle_mcp_launch_prompt_key(&mut self, key: KeyEvent) -> Action {
+        let Some(prompt) = self.mcp_launch_prompt.as_mut() else {
+            return Action::Noop;
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mcp_launch_prompt = None;
+                self.mcp
+                    .set_status_line("AI client launch cancelled; MCP server is running.".into());
+                Action::Noop
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                prompt.select_previous();
+                Action::Noop
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                prompt.select_next();
+                Action::Noop
+            }
+            KeyCode::Enter => self.confirm_mcp_launch_prompt(),
+            KeyCode::Char(ch) => self.handle_mcp_launch_prompt_shortcut(ch),
+            _ => Action::Noop,
+        }
+    }
+
+    fn handle_mcp_launch_prompt_shortcut(&mut self, ch: char) -> Action {
+        let Some(prompt) = self.mcp_launch_prompt.as_mut() else {
+            return Action::Noop;
+        };
+        let choice = ch.to_string();
+
+        match prompt.step {
+            McpLaunchPromptStep::AiClient => {
+                if let Ok(Some(client)) = parse_mcp_ai_client_choice(&choice) {
+                    prompt.select_client(client);
+                    return self.confirm_mcp_launch_prompt();
+                }
+            }
+            McpLaunchPromptStep::Terminal => {
+                if let Ok(Some(terminal)) = parse_terminal_app_choice(&choice, &prompt.terminals) {
+                    prompt.select_terminal(&terminal);
+                    return self.confirm_mcp_launch_prompt();
+                }
+            }
+        }
+
+        Action::Noop
+    }
+
+    fn confirm_mcp_launch_prompt(&mut self) -> Action {
+        let Some(prompt) = self.mcp_launch_prompt.as_mut() else {
+            return Action::Noop;
+        };
+        let Some(selection) = prompt.confirm() else {
+            return Action::Noop;
+        };
+
+        self.pending_mcp_ai_launch = Some(selection);
+        self.mcp_launch_prompt = None;
+        Action::LaunchMcpAiClientConfirmed
     }
 
     async fn handle_action(&mut self, action: Action, terminal: &mut Tui) {
@@ -1516,6 +1760,9 @@ impl App {
                 if !self.reject_direct_mcp_launch_when_stopped() {
                     self.launch_mcp_ai_client(terminal).await;
                 }
+            }
+            Action::LaunchMcpAiClientConfirmed => {
+                self.finish_pending_mcp_ai_launch();
             }
             Action::StopMcp => {
                 self.stop_mcp_runtime();
@@ -2132,6 +2379,8 @@ impl App {
     }
 
     fn stop_mcp_runtime(&mut self) {
+        self.mcp_launch_prompt = None;
+        self.pending_mcp_ai_launch = None;
         if let Some(runtime) = self.mcp_runtime.take() {
             if let Err(error) = runtime.stop() {
                 self.mcp
@@ -2209,43 +2458,61 @@ impl App {
             }
         };
 
-        let result = self.run_mcp_ai_launcher(&endpoint, &session);
+        let terminals = match detect_supported_terminal_apps() {
+            Ok(terminals) => terminals,
+            Err(error) => {
+                self.mcp.set_error(error);
+                return;
+            }
+        };
+
+        self.mcp_launch_prompt = Some(McpLaunchPrompt::new(endpoint, session, terminals));
+        self.mcp
+            .set_status_line("Select an AI client and terminal to launch.".into());
+    }
+
+    fn finish_pending_mcp_ai_launch(&mut self) {
+        let Some(selection) = self.pending_mcp_ai_launch.take() else {
+            return;
+        };
+
+        let result = self.run_mcp_ai_launcher(&selection);
         match result {
-            Ok(Some(result)) => self.mcp.set_status_line(format!(
+            Ok(result) => self.mcp.set_status_line(format!(
                 "{} launched in {}.",
                 result.client_label, result.terminal_label
             )),
-            Ok(None) => self
-                .mcp
-                .set_status_line("AI client launch cancelled; MCP server is running.".into()),
             Err(error) => self.mcp.set_error(error),
         }
     }
 
     fn run_mcp_ai_launcher(
         &self,
-        endpoint: &str,
-        session: &crate::mcp::McpSessionFile,
-    ) -> Result<Option<McpAiLaunchResult>, String> {
-        let client = select_mcp_ai_client_from_env()?;
-        let terminals = detect_supported_terminal_apps()?;
-        let terminal = select_mcp_terminal_app(&terminals)?;
-
-        let client_label = match client {
+        selection: &McpAiLaunchSelection,
+    ) -> Result<McpAiLaunchResult, String> {
+        let client_label = match selection.client {
             McpAiClient::Codex => {
-                self.run_codex_with_mcp(endpoint, &session.bearer_token, &terminal)?;
-                "Codex CLI"
+                self.run_codex_with_mcp(
+                    &selection.endpoint,
+                    &selection.session.bearer_token,
+                    &selection.terminal,
+                )?;
+                McpAiClient::Codex.label()
             }
             McpAiClient::Claude => {
-                self.run_claude_with_mcp(endpoint, &session.authorization_header, &terminal)?;
-                "Claude Code"
+                self.run_claude_with_mcp(
+                    &selection.endpoint,
+                    &selection.session.authorization_header,
+                    &selection.terminal,
+                )?;
+                McpAiClient::Claude.label()
             }
         };
 
-        Ok(Some(McpAiLaunchResult {
+        Ok(McpAiLaunchResult {
             client_label,
-            terminal_label: terminal.display_name,
-        }))
+            terminal_label: selection.terminal.display_name.clone(),
+        })
     }
 
     fn run_codex_with_mcp(
@@ -3785,6 +4052,7 @@ mod tests {
     use super::*;
     use crate::components::Component;
     use crate::event::Screen;
+    use chrono::TimeZone;
     use ratatui::{buffer::Buffer, layout::Rect};
     use shared::dto::ec2::Ec2Instance;
     use shared::dto::entitlements::*;
@@ -3921,6 +4189,25 @@ mod tests {
         buf.content.iter().map(|c| c.symbol()).collect()
     }
 
+    fn sample_mcp_session() -> crate::mcp::McpSessionFile {
+        let timestamp = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 28, 0, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        crate::mcp::McpSessionFile {
+            session_file_version: 1,
+            endpoint: "http://127.0.0.1:53121/mcp".into(),
+            stable_proxy_endpoint: "http://localhost:51234/mcp".into(),
+            bearer_token: "bearer".into(),
+            authorization_header: "Bearer bearer".into(),
+            local_secret_generation: "generation".into(),
+            canopy_mcp_session_id: "session".into(),
+            secret_created_at: timestamp,
+            expires_at: timestamp,
+            pid: 1234,
+        }
+    }
+
     // ── MCP launcher helpers ────────────────────────────────
 
     #[test]
@@ -3995,7 +4282,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_launcher_selects_codex_and_first_terminal_without_prompt() {
+    fn mcp_launch_prompt_asks_for_client_then_terminal() {
         let terminals = vec![
             detected_terminal(
                 "Terminal",
@@ -4008,20 +4295,24 @@ mod tests {
                 TerminalLaunchAdapter::WarpStable,
             ),
         ];
-
-        assert_eq!(select_mcp_ai_client(None).unwrap(), McpAiClient::Codex);
-        assert_eq!(
-            select_mcp_ai_client(Some("claude")).unwrap(),
-            McpAiClient::Claude
+        let mut prompt = McpLaunchPrompt::new(
+            "http://localhost:51234/mcp".into(),
+            sample_mcp_session(),
+            terminals,
         );
-        assert!(select_mcp_ai_client(Some("q")).is_err());
 
-        let selected = select_mcp_terminal_app_choice(&terminals, None).unwrap();
-        assert_eq!(selected.display_name, "Terminal");
+        assert_eq!(prompt.step, McpLaunchPromptStep::AiClient);
+        assert_eq!(prompt.selected_client(), McpAiClient::Codex);
 
-        let selected = select_mcp_terminal_app_choice(&terminals, Some("warp")).unwrap();
-        assert_eq!(selected.display_name, "Warp");
-        assert!(select_mcp_terminal_app_choice(&terminals, Some("q")).is_err());
+        prompt.select_next();
+        assert_eq!(prompt.selected_client(), McpAiClient::Claude);
+        assert!(prompt.confirm().is_none());
+        assert_eq!(prompt.step, McpLaunchPromptStep::Terminal);
+
+        prompt.select_next();
+        let selection = prompt.confirm().expect("terminal selection");
+        assert_eq!(selection.client, McpAiClient::Claude);
+        assert_eq!(selection.terminal.display_name, "Warp");
     }
 
     #[test]
