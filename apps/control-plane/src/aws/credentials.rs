@@ -2,6 +2,12 @@ use aws_config::SdkConfig;
 use aws_sdk_sts::Client as StsClient;
 use shared::dto::entitlements::AllowedAccount;
 
+#[derive(Clone, Copy)]
+enum SessionTagSet {
+    AuditContext,
+    ConnectAction,
+}
+
 /// Sanitize a string for use as STS RoleSessionName.
 /// Must be 2-64 chars matching [\w+=,.@-]+.
 fn sanitize_session_name(prefix: &str, raw: &str) -> String {
@@ -23,6 +29,162 @@ fn sanitize_session_name(prefix: &str, raw: &str) -> String {
     } else {
         truncated
     }
+}
+
+fn is_tag_session_authorization_error_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("tagsession")
+        && (normalized.contains("accessdenied") || normalized.contains("not authorized"))
+}
+
+fn is_tag_session_authorization_error(err: &anyhow::Error) -> bool {
+    is_tag_session_authorization_error_message(&format!("{err:?}"))
+}
+
+async fn assume_role_credentials(
+    sts_client: &StsClient,
+    account: &AllowedAccount,
+    session_name_prefix: &str,
+    duration_seconds: i32,
+    session_context: &SessionContext,
+    inline_policy: Option<&str>,
+    tag_set: Option<SessionTagSet>,
+) -> anyhow::Result<aws_sdk_sts::types::Credentials> {
+    let mut assume = sts_client
+        .assume_role()
+        .role_arn(&account.role_arn)
+        .role_session_name(sanitize_session_name(
+            session_name_prefix,
+            &session_context.user_id,
+        ))
+        .duration_seconds(duration_seconds);
+
+    if let Some(policy) = inline_policy {
+        assume = assume.policy(policy);
+    }
+
+    if let Some(ref external_id) = session_context.sts_external_id {
+        assume = assume.external_id(external_id);
+    }
+
+    match tag_set {
+        Some(SessionTagSet::AuditContext) => {
+            assume = assume
+                .tags(
+                    aws_sdk_sts::types::Tag::builder()
+                        .key("canopy-user")
+                        .value(&session_context.user_id)
+                        .build()
+                        .expect("valid tag"),
+                )
+                .tags(
+                    aws_sdk_sts::types::Tag::builder()
+                        .key("canopy-team")
+                        .value(&session_context.team)
+                        .build()
+                        .expect("valid tag"),
+                )
+                .tags(
+                    aws_sdk_sts::types::Tag::builder()
+                        .key("canopy-environment")
+                        .value(&session_context.environment)
+                        .build()
+                        .expect("valid tag"),
+                );
+        }
+        Some(SessionTagSet::ConnectAction) => {
+            assume = assume
+                .tags(
+                    aws_sdk_sts::types::Tag::builder()
+                        .key("canopy-user")
+                        .value(&session_context.user_id)
+                        .build()
+                        .expect("valid tag"),
+                )
+                .tags(
+                    aws_sdk_sts::types::Tag::builder()
+                        .key("canopy-action")
+                        .value("connect")
+                        .build()
+                        .expect("valid tag"),
+                );
+        }
+        None => {}
+    }
+
+    let resp = assume.send().await?;
+    resp.credentials().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "AssumeRole returned no credentials for {}",
+            account.role_arn
+        )
+    })
+}
+
+async fn assume_role_credentials_with_tag_fallback(
+    sts_client: &StsClient,
+    account: &AllowedAccount,
+    session_name_prefix: &str,
+    duration_seconds: i32,
+    session_context: &SessionContext,
+    inline_policy: Option<&str>,
+    tag_set: SessionTagSet,
+) -> anyhow::Result<aws_sdk_sts::types::Credentials> {
+    match assume_role_credentials(
+        sts_client,
+        account,
+        session_name_prefix,
+        duration_seconds,
+        session_context,
+        inline_policy,
+        Some(tag_set),
+    )
+    .await
+    {
+        Ok(credentials) => Ok(credentials),
+        Err(err) if is_tag_session_authorization_error(&err) => {
+            tracing::warn!(
+                role = %account.role_arn,
+                error = ?err,
+                "AssumeRole with session tags failed; retrying without session tags"
+            );
+            assume_role_credentials(
+                sts_client,
+                account,
+                session_name_prefix,
+                duration_seconds,
+                session_context,
+                inline_policy,
+                None,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn config_from_assumed_credentials(
+    credentials: aws_sdk_sts::types::Credentials,
+    region: &str,
+    provider_name: &'static str,
+) -> SdkConfig {
+    let exp = credentials.expiration();
+    let expiration =
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp.secs() as u64));
+
+    let aws_creds = aws_credential_types::Credentials::new(
+        credentials.access_key_id(),
+        credentials.secret_access_key(),
+        Some(credentials.session_token().to_string()),
+        expiration,
+        provider_name,
+    );
+
+    aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(region.to_string()))
+        .credentials_provider(aws_creds)
+        .load()
+        .await
 }
 
 /// Assume a role in a target account with STS session tags for audit context.
@@ -54,67 +216,17 @@ pub async fn assume_role_with_duration(
 ) -> anyhow::Result<SdkConfig> {
     let sts_client = StsClient::new(base_config);
 
-    let mut assume = sts_client
-        .assume_role()
-        .role_arn(&account.role_arn)
-        .role_session_name(sanitize_session_name("canopy", &session_context.user_id))
-        .duration_seconds(duration_seconds);
-
-    // Set ExternalId to satisfy the target role's trust policy
-    if let Some(ref external_id) = session_context.sts_external_id {
-        assume = assume.external_id(external_id);
-    }
-
-    // Attach STS session tags for audit trail
-    assume = assume
-        .tags(
-            aws_sdk_sts::types::Tag::builder()
-                .key("canopy-user")
-                .value(&session_context.user_id)
-                .build()
-                .expect("valid tag"),
-        )
-        .tags(
-            aws_sdk_sts::types::Tag::builder()
-                .key("canopy-team")
-                .value(&session_context.team)
-                .build()
-                .expect("valid tag"),
-        )
-        .tags(
-            aws_sdk_sts::types::Tag::builder()
-                .key("canopy-environment")
-                .value(&session_context.environment)
-                .build()
-                .expect("valid tag"),
-        );
-
-    let creds = assume.send().await?;
-
-    let credentials = creds.credentials().ok_or_else(|| {
-        anyhow::anyhow!(
-            "AssumeRole returned no credentials for {}",
-            account.role_arn
-        )
-    })?;
-
-    let exp = credentials.expiration();
-    let expiration =
-        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp.secs() as u64));
-
-    let aws_creds = aws_credential_types::Credentials::new(
-        credentials.access_key_id(),
-        credentials.secret_access_key(),
-        Some(credentials.session_token().to_string()),
-        expiration,
-        "canopy-assume-role",
-    );
-
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_string()))
-        .credentials_provider(aws_creds)
-        .load()
-        .await;
+    let credentials = assume_role_credentials_with_tag_fallback(
+        &sts_client,
+        account,
+        "canopy",
+        duration_seconds,
+        session_context,
+        None,
+        SessionTagSet::AuditContext,
+    )
+    .await?;
+    let config = config_from_assumed_credentials(credentials, region, "canopy-assume-role").await;
 
     // Verify the assumed role landed in the expected account
     verify_account_identity(&config, &account.account_id).await?;
@@ -146,63 +258,18 @@ pub async fn assume_role_scoped(
         None => 900,
     };
 
-    let mut assume = sts_client
-        .assume_role()
-        .role_arn(&account.role_arn)
-        .role_session_name(sanitize_session_name(
-            "ops-connect",
-            &session_context.user_id,
-        ))
-        .duration_seconds(duration)
-        .policy(inline_policy);
-
-    // Set ExternalId to satisfy the target role's trust policy
-    if let Some(ref external_id) = session_context.sts_external_id {
-        assume = assume.external_id(external_id);
-    }
-
-    assume = assume
-        .tags(
-            aws_sdk_sts::types::Tag::builder()
-                .key("canopy-user")
-                .value(&session_context.user_id)
-                .build()
-                .expect("valid tag"),
-        )
-        .tags(
-            aws_sdk_sts::types::Tag::builder()
-                .key("canopy-action")
-                .value("connect")
-                .build()
-                .expect("valid tag"),
-        );
-
-    let creds = assume.send().await?;
-
-    let credentials = creds.credentials().ok_or_else(|| {
-        anyhow::anyhow!(
-            "AssumeRole returned no credentials for {}",
-            account.role_arn
-        )
-    })?;
-
-    let exp = credentials.expiration();
-    let expiration =
-        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp.secs() as u64));
-
-    let aws_creds = aws_credential_types::Credentials::new(
-        credentials.access_key_id(),
-        credentials.secret_access_key(),
-        Some(credentials.session_token().to_string()),
-        expiration,
-        "canopy-connect-scoped",
-    );
-
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(region.to_string()))
-        .credentials_provider(aws_creds)
-        .load()
-        .await;
+    let credentials = assume_role_credentials_with_tag_fallback(
+        &sts_client,
+        account,
+        "ops-connect",
+        duration,
+        session_context,
+        Some(inline_policy),
+        SessionTagSet::ConnectAction,
+    )
+    .await?;
+    let config =
+        config_from_assumed_credentials(credentials, region, "canopy-connect-scoped").await;
 
     Ok(config)
 }
@@ -454,6 +521,19 @@ mod tests {
     fn test_sanitize_preserves_valid_special_chars() {
         let name = sanitize_session_name("p", "user+=,.@-_test");
         assert_eq!(name, "p-user+=,.@-_test");
+    }
+
+    #[test]
+    fn tag_session_authorization_error_detection_is_specific() {
+        assert!(is_tag_session_authorization_error_message(
+            "AccessDenied: not authorized to perform: sts:TagSession on resource"
+        ));
+        assert!(is_tag_session_authorization_error_message(
+            "unhandled error (AccessDenied): action TagSession denied"
+        ));
+        assert!(!is_tag_session_authorization_error_message(
+            "AccessDenied: not authorized to perform: sts:AssumeRole on resource"
+        ));
     }
 
     // ── connect_session_policy ──────────────────────────

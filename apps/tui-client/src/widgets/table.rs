@@ -134,6 +134,7 @@ impl SelectableTable {
 
         let table = Table::new(rows, &self.column_widths)
             .header(header)
+            .column_spacing(2)
             .block(
                 Block::default()
                     .borders(Borders::ALL)

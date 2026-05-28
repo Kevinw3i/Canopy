@@ -182,14 +182,14 @@ impl Ec2Screen {
                     "Env".into(),
                 ],
                 vec![
-                    Constraint::Length(21),
-                    Constraint::Min(15),
+                    Constraint::Length(19),
+                    Constraint::Min(16),
                     Constraint::Length(15),
-                    Constraint::Length(15),
-                    Constraint::Length(10),
-                    Constraint::Length(12),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
+                    Constraint::Length(13),
+                    Constraint::Length(9),
+                    Constraint::Length(11),
+                    Constraint::Length(4),
+                    Constraint::Length(4),
                     Constraint::Length(12),
                 ],
             )
@@ -206,13 +206,13 @@ impl Ec2Screen {
                     "Region".into(),
                 ],
                 vec![
-                    Constraint::Length(20),
-                    Constraint::Min(14),
-                    Constraint::Length(18),
-                    Constraint::Length(8),
-                    Constraint::Length(10),
+                    Constraint::Length(19),
+                    Constraint::Min(12),
+                    Constraint::Length(19),
+                    Constraint::Length(7),
+                    Constraint::Length(9),
                     Constraint::Length(24),
-                    Constraint::Length(14),
+                    Constraint::Length(12),
                     Constraint::Length(14),
                 ],
             )
@@ -1059,7 +1059,7 @@ impl Ec2Screen {
         if !task.enable_execute_command {
             return Action::ShowError("ECS Exec is not enabled for this task".into());
         }
-        let containers = ecs_exec_ready_container_names(task);
+        let containers = ecs_exec_ready_container_names(task, self.entitlements.as_ref());
         if containers.is_empty() {
             return Action::ShowError("No containers are ready for ECS Exec".into());
         }
@@ -1077,14 +1077,29 @@ impl Ec2Screen {
     }
 }
 
-fn ecs_exec_ready_container_names(task: &EcsTask) -> Vec<String> {
+fn ecs_exec_ready_container_names(
+    task: &EcsTask,
+    entitlements: Option<&UserEntitlements>,
+) -> Vec<String> {
+    let excluded_container_names = excluded_container_names(entitlements);
+
     task.containers
         .iter()
         .filter(|container| {
-            ecs_status_is_running(&container.last_status) && container.execute_command_agent_running
+            ecs_status_is_running(&container.last_status)
+                && container.execute_command_agent_running
+                && !excluded_container_names
+                    .iter()
+                    .any(|excluded| excluded == &container.name)
         })
         .map(|container| container.name.clone())
         .collect()
+}
+
+fn excluded_container_names(entitlements: Option<&UserEntitlements>) -> &[String] {
+    entitlements
+        .map(|entitlements| entitlements.excluded_container_names.as_slice())
+        .unwrap_or(&[])
 }
 
 fn ecs_status_is_running(status: &str) -> bool {
@@ -1972,6 +1987,7 @@ impl Ec2Screen {
 
     fn render_ecs_table(&mut self, area: Rect, buf: &mut Buffer) {
         let tasks = self.filtered_tasks();
+        let excluded_container_names = excluded_container_names(self.entitlements.as_ref());
         let rows: Vec<_> = tasks
             .into_iter()
             .map(|task| {
@@ -1983,11 +1999,21 @@ impl Ec2Screen {
                 let containers = task
                     .containers
                     .iter()
+                    .filter(|container| {
+                        !excluded_container_names
+                            .iter()
+                            .any(|excluded| excluded == &container.name)
+                    })
                     .map(|container| {
                         ecs_container_readiness_label(task.enable_execute_command, container)
                     })
                     .collect::<Vec<_>>()
                     .join(",");
+                let containers = if containers.is_empty() {
+                    "-".into()
+                } else {
+                    containers
+                };
 
                 Row::new(vec![
                     Cell::from(task.cluster_name.clone()).style(self.theme.accent_style()),
@@ -2503,6 +2529,24 @@ mod tests {
     }
 
     #[test]
+    fn ecs_table_hides_entitlement_excluded_container_labels() {
+        let mut screen = Ec2Screen::new();
+        let mut entitlements = ecs_entitlements(true);
+        entitlements.excluded_container_names = vec!["excluded-sidecar".into()];
+        screen.set_entitlements(entitlements);
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("excluded-sidecar", "RUNNING", true),
+            ("app", "RUNNING", true),
+        ])]);
+
+        let text = rendered_text(&mut screen);
+
+        assert!(text.contains("app:ready"));
+        assert!(!text.contains("excluded-sidecar"));
+    }
+
+    #[test]
     fn ecs_table_marks_containers_disabled_when_task_exec_is_disabled() {
         let mut screen = Ec2Screen::new();
         screen.set_entitlements(ecs_entitlements(true));
@@ -2538,8 +2582,8 @@ mod tests {
 │└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
 │ Account: All │ Region: All                                                                                                               │
 │┌ ECS Tasks ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
-││  Cluster              Family              Task ID            Launch   Status     Containers               Account        Region        ││
-││> prod-api             payments            task-abcdef123456  FARGATE  RUNNING    app:ready,api:no-agent   111            us-east-1     ││
+││  Cluster              Family            Task ID              Launch   Status     Containers                Account       Region        ││
+││> prod-api             payments          task-abcdef123456    FARGATE  RUNNING    app:ready,api:no-agent    111           us-east-1     ││
 ││                                                                                                                                        ││
 ││                                                                                                                                        ││
 ││                                                                                                                                        ││
@@ -2836,6 +2880,47 @@ mod tests {
         assert!(matches!(action, Action::Noop));
         let pending = screen.pending_ecs_exec.as_ref().unwrap();
         assert_eq!(pending.containers, vec!["app"]);
+    }
+
+    #[test]
+    fn container_picker_skips_entitlement_excluded_containers() {
+        let mut screen = Ec2Screen::new();
+        let mut entitlements = ecs_entitlements(true);
+        entitlements.excluded_container_names = vec!["excluded-sidecar".into()];
+        screen.set_entitlements(entitlements);
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![
+            ("excluded-sidecar", "RUNNING", true),
+            ("app", "RUNNING", true),
+        ])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, Action::Noop));
+        let pending = screen.pending_ecs_exec.as_ref().unwrap();
+        assert_eq!(pending.containers, vec!["app"]);
+    }
+
+    #[test]
+    fn container_picker_errors_when_only_excluded_containers_are_ready() {
+        let mut screen = Ec2Screen::new();
+        let mut entitlements = ecs_entitlements(true);
+        entitlements.excluded_container_names = vec!["excluded-sidecar".into()];
+        screen.set_entitlements(entitlements);
+        screen.view = InventoryView::Ecs;
+        screen.set_tasks(vec![ecs_task_with_containers(vec![(
+            "excluded-sidecar",
+            "RUNNING",
+            true,
+        )])]);
+
+        let action = screen.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            matches!(action, Action::ShowError(ref msg) if msg.contains("No containers are ready"))
+        );
+        assert!(screen.pending_ecs_exec.is_none());
+        assert_eq!(screen.test_focus(), "Table");
     }
 
     #[test]

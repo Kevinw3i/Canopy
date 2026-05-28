@@ -5,7 +5,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::aws::clients::AwsClients;
 use crate::aws::credentials::{
@@ -704,15 +704,20 @@ async fn fetch_tasks_from_aws(
 
     let mut all_tasks = Vec::new();
     let mut failed_scopes = Vec::new();
+    let mut seen_task_arns = HashSet::new();
     let mut truncated = false;
     for handle in handles {
         match handle.await {
             Ok(Ok((tasks, scope_truncated))) => {
                 truncated |= scope_truncated;
-                all_tasks.extend(tasks);
+                for task in tasks {
+                    if seen_task_arns.insert(task.task_arn.clone()) {
+                        all_tasks.push(task);
+                    }
+                }
             }
             Ok(Err(err)) => {
-                tracing::error!("Failed to fetch ECS tasks: {}", err);
+                tracing::error!(error = ?err, "Failed to fetch ECS tasks");
                 failed_scopes.push(err.to_string());
             }
             Err(err) => {
@@ -1402,7 +1407,7 @@ async fn exec_task(
         )
         .await
         .map_err(|err| {
-            tracing::error!("Scoped ECS AssumeRole failed: {}", err);
+            tracing::error!(role = %selected_account.role_arn, error = ?err, "Scoped ECS AssumeRole failed");
             audit_deny(
                 &state,
                 "Failed to create scoped credentials for ECS exec",
