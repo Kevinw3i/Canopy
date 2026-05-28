@@ -24,6 +24,8 @@ pub struct DashboardScreen {
     entitlements: Option<UserEntitlements>,
     selected: usize,
     items: Vec<MenuItem>,
+    mcp_server_running: bool,
+    mcp_pulse_tick: u8,
     live_tail_enabled: bool,
     pub public_ip: Option<String>,
     pub show_public_ip: bool,
@@ -42,6 +44,8 @@ impl DashboardScreen {
         Self {
             entitlements: None,
             selected: 0,
+            mcp_server_running: false,
+            mcp_pulse_tick: 0,
             live_tail_enabled: enable_live_tail,
             public_ip: None,
             show_public_ip,
@@ -110,6 +114,13 @@ impl DashboardScreen {
         self.entitlements = Some(ent);
     }
 
+    pub fn set_mcp_server_running(&mut self, running: bool) {
+        self.mcp_server_running = running;
+        if !running {
+            self.mcp_pulse_tick = 0;
+        }
+    }
+
     fn try_navigate(&self, item: &MenuItem) -> Action {
         if !item.enabled {
             return Action::ShowError(
@@ -120,6 +131,44 @@ impl DashboardScreen {
             return Action::ShowError("Live Tail — Coming Soon".into());
         }
         Action::NavigateTo(item.screen.clone())
+    }
+
+    fn menu_item_style(&self, item: &MenuItem, selected: bool) -> Style {
+        if !item.enabled {
+            return Style::default().fg(self.theme.muted);
+        }
+
+        if item.screen == Screen::Mcp && self.mcp_server_running {
+            return self.mcp_running_style(selected);
+        }
+
+        if selected {
+            return Style::default()
+                .fg(self.theme.selected_fg)
+                .bg(self.theme.selected_bg)
+                .bold();
+        }
+
+        Style::default().fg(self.theme.text)
+    }
+
+    fn mcp_running_style(&self, selected: bool) -> Style {
+        let bright = self.mcp_pulse_tick % 8 < 4;
+        if selected {
+            let (fg, bg) = if bright {
+                (Color::Black, Color::LightGreen)
+            } else {
+                (self.theme.text, Color::Indexed(22))
+            };
+            Style::default().fg(fg).bg(bg).bold()
+        } else {
+            let fg = if bright {
+                Color::LightGreen
+            } else {
+                Color::Green
+            };
+            Style::default().fg(fg).bold()
+        }
     }
 }
 
@@ -252,19 +301,9 @@ impl Component for DashboardScreen {
                 height: item_height,
             };
 
-            let (style, prefix) = if !item.enabled {
-                (Style::default().fg(self.theme.muted), "  ")
-            } else if i == self.selected {
-                (
-                    Style::default()
-                        .fg(self.theme.selected_fg)
-                        .bg(self.theme.selected_bg)
-                        .bold(),
-                    ">>",
-                )
-            } else {
-                (Style::default().fg(self.theme.text), "  ")
-            };
+            let selected = i == self.selected;
+            let style = self.menu_item_style(item, selected);
+            let prefix = if selected { ">>" } else { "  " };
 
             let label = if item.screen == Screen::Ec2Inventory {
                 inventory_label(self.entitlements.as_ref(), item.label)
@@ -298,6 +337,12 @@ impl Component for DashboardScreen {
             vec![Action::FetchPublicIp]
         } else {
             vec![]
+        }
+    }
+
+    fn on_tick(&mut self) {
+        if self.mcp_server_running {
+            self.mcp_pulse_tick = self.mcp_pulse_tick.wrapping_add(1);
         }
     }
 }
@@ -381,6 +426,13 @@ mod tests {
             out.push_str(cell.symbol());
         }
         out
+    }
+
+    fn rendered_buffer(screen: &mut DashboardScreen) -> Buffer {
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+        buf
     }
 
     #[test]
@@ -570,6 +622,53 @@ mod tests {
         assert!(buf.content.iter().any(|cell| {
             cell.symbol() != " " && cell.bg == Color::Blue && cell.fg == Color::LightYellow
         }));
+    }
+
+    #[test]
+    fn running_mcp_menu_item_uses_green_pulse_style() {
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
+        let mut ent = test_entitlements(false, false, false);
+        ent.features.can_use_mcp = true;
+        screen.set_entitlements(ent);
+        screen.set_mcp_server_running(true);
+        screen.selected = screen.visible_items().len() - 1;
+
+        let bright = rendered_buffer(&mut screen);
+        assert!(bright
+            .content
+            .iter()
+            .any(|cell| cell.symbol() != " " && cell.bg == Color::LightGreen));
+
+        for _ in 0..4 {
+            screen.on_tick();
+        }
+
+        let dim = rendered_buffer(&mut screen);
+        assert!(dim
+            .content
+            .iter()
+            .any(|cell| cell.symbol() != " " && cell.bg == Color::Indexed(22)));
+    }
+
+    #[test]
+    fn stopping_mcp_resets_dashboard_pulse_style() {
+        let mut screen = DashboardScreen::new(false, false, KeyBindings::default(), test_theme());
+        let mut ent = test_entitlements(false, false, false);
+        ent.features.can_use_mcp = true;
+        screen.set_entitlements(ent);
+        screen.set_mcp_server_running(true);
+        screen.set_mcp_server_running(false);
+        screen.selected = screen.visible_items().len() - 1;
+
+        let buf = rendered_buffer(&mut screen);
+        assert!(buf
+            .content
+            .iter()
+            .any(|cell| cell.symbol() != " " && cell.bg == screen.theme.selected_bg));
+        assert!(!buf
+            .content
+            .iter()
+            .any(|cell| cell.symbol() != " " && cell.bg == Color::LightGreen));
     }
 
     #[test]

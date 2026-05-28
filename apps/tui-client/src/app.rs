@@ -1080,6 +1080,7 @@ impl App {
                 let _ = self.action_tx.send(action);
             }
             Event::Tick => match self.current_screen {
+                Screen::Dashboard => self.dashboard.on_tick(),
                 Screen::Ec2Inventory => self.ec2.on_tick(),
                 Screen::CloudWatchSearch => self.cloudwatch_search.on_tick(),
                 Screen::ConnectSession => {
@@ -1561,12 +1562,15 @@ impl App {
             }
             Action::McpStarted(status) => {
                 self.mcp.set_running(&status);
+                self.dashboard.set_mcp_server_running(true);
             }
             Action::McpStartFailed(error) => {
                 self.mcp.set_error(error);
+                self.dashboard.set_mcp_server_running(false);
             }
             Action::McpStopped => {
                 self.mcp.set_stopped();
+                self.dashboard.set_mcp_server_running(false);
             }
             Action::McpHealthChecked(result) => match result {
                 Ok(()) => self
@@ -2101,6 +2105,7 @@ impl App {
     async fn start_mcp_runtime(&mut self, terminal: &mut Tui, launch_client: bool) {
         if let Some(runtime) = self.mcp_runtime.as_ref() {
             self.mcp.set_running(runtime.status());
+            self.dashboard.set_mcp_server_running(true);
             if launch_client {
                 self.launch_mcp_ai_client(terminal).await;
             }
@@ -2118,6 +2123,7 @@ impl App {
             Ok(runtime) => {
                 let status = runtime.status().clone();
                 self.mcp.set_running(&status);
+                self.dashboard.set_mcp_server_running(true);
                 self.mcp_runtime = Some(runtime);
                 if launch_client {
                     self.launch_mcp_ai_client(terminal).await;
@@ -2125,6 +2131,7 @@ impl App {
             }
             Err(error) => {
                 self.mcp.set_error(error.to_string());
+                self.dashboard.set_mcp_server_running(false);
             }
         }
     }
@@ -2138,6 +2145,7 @@ impl App {
             }
         }
         self.mcp.set_stopped();
+        self.dashboard.set_mcp_server_running(false);
     }
 
     async fn test_mcp_runtime(&mut self) {
