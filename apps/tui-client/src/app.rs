@@ -166,6 +166,8 @@ const TOKEN_EXPIRED_MODAL_MESSAGE: &str =
 /// Canopy sessions cannot stomp on each other AND a user's own pre-existing
 /// MCP entry called `canopy` is never deleted by Canopy's launcher cleanup.
 const MCP_AI_CLIENT_SERVER_NAME_PREFIX: &str = "canopy-session";
+const MCP_AI_CLIENT_ENV: &str = "CANOPY_MCP_AI_CLIENT";
+const MCP_TERMINAL_ENV: &str = "CANOPY_MCP_TERMINAL";
 
 fn mcp_ai_client_server_name() -> String {
     format!(
@@ -331,26 +333,23 @@ fn parse_mcp_ai_client_choice(input: &str) -> Result<Option<McpAiClient>, String
     }
 }
 
-fn prompt_mcp_ai_client() -> Result<Option<McpAiClient>, String> {
-    use std::io::Write;
+fn select_mcp_ai_client(choice: Option<&str>) -> Result<McpAiClient, String> {
+    let Some(choice) = choice.map(str::trim).filter(|choice| !choice.is_empty()) else {
+        return Ok(McpAiClient::Codex);
+    };
 
-    println!("\n== Canopy MCP AI launcher ==");
-    println!("MCP health check passed.");
-    println!("\nChoose AI client:");
-    println!("  1) Codex CLI");
-    println!("  2) Claude Code");
-    println!("  q) Cancel");
-    print!("Start which client? [1/2/q]: ");
-    std::io::stdout()
-        .flush()
-        .map_err(|err| format!("Failed to write prompt: {err}"))?;
+    parse_mcp_ai_client_choice(choice)?
+        .ok_or_else(|| format!("{MCP_AI_CLIENT_ENV} must be 'codex' or 'claude'."))
+}
 
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|err| format!("Failed to read choice: {err}"))?;
-
-    parse_mcp_ai_client_choice(&input)
+fn select_mcp_ai_client_from_env() -> Result<McpAiClient, String> {
+    match std::env::var(MCP_AI_CLIENT_ENV) {
+        Ok(choice) => select_mcp_ai_client(Some(&choice)),
+        Err(std::env::VarError::NotPresent) => select_mcp_ai_client(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{MCP_AI_CLIENT_ENV} is not valid UTF-8."))
+        }
+    }
 }
 
 fn parse_terminal_app_choice(
@@ -386,36 +385,32 @@ fn parse_terminal_app_choice(
         .ok_or_else(|| format!("Invalid terminal choice: {choice}"))
 }
 
-fn prompt_mcp_terminal_app(
+fn select_mcp_terminal_app(
     terminals: &[DetectedTerminalApp],
-) -> Result<Option<DetectedTerminalApp>, String> {
-    use std::io::Write;
+) -> Result<DetectedTerminalApp, String> {
+    match std::env::var(MCP_TERMINAL_ENV) {
+        Ok(choice) => select_mcp_terminal_app_choice(terminals, Some(&choice)),
+        Err(std::env::VarError::NotPresent) => select_mcp_terminal_app_choice(terminals, None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{MCP_TERMINAL_ENV} is not valid UTF-8."))
+        }
+    }
+}
 
+fn select_mcp_terminal_app_choice(
+    terminals: &[DetectedTerminalApp],
+    choice: Option<&str>,
+) -> Result<DetectedTerminalApp, String> {
     if terminals.is_empty() {
         return Err("No supported terminal app was detected on this computer.".into());
     }
 
-    println!("\nChoose terminal app:");
-    for (index, terminal) in terminals.iter().enumerate() {
-        println!(
-            "  {}) {} ({})",
-            index + 1,
-            terminal.display_name,
-            terminal.app_path.display()
-        );
-    }
-    println!("  q) Cancel");
-    print!("Open in which terminal? [1-{}/q]: ", terminals.len());
-    std::io::stdout()
-        .flush()
-        .map_err(|err| format!("Failed to write terminal prompt: {err}"))?;
+    let Some(choice) = choice.map(str::trim).filter(|choice| !choice.is_empty()) else {
+        return Ok(terminals[0].clone());
+    };
 
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|err| format!("Failed to read terminal choice: {err}"))?;
-
-    parse_terminal_app_choice(&input, terminals)
+    parse_terminal_app_choice(choice, terminals)?
+        .ok_or_else(|| format!("{MCP_TERMINAL_ENV} must select a terminal app."))
 }
 
 fn resolve_command(program: &str) -> Result<String, String> {
@@ -2198,14 +2193,14 @@ impl App {
         }
     }
 
-    async fn launch_mcp_ai_client(&mut self, terminal: &mut Tui) {
+    async fn launch_mcp_ai_client(&mut self, _terminal: &mut Tui) {
         let Some(runtime) = self.mcp_runtime.as_ref() else {
             self.mcp.set_error("MCP server is not running.".into());
             return;
         };
 
         let endpoint = runtime.status().stable_endpoint.clone();
-        let (session, health_url) = match self.mcp_health_check(runtime).await {
+        let (session, _) = match self.mcp_health_check(runtime).await {
             Ok(result) => result,
             Err(error) => {
                 self.mcp
@@ -2214,10 +2209,7 @@ impl App {
             }
         };
 
-        self.suspend_for_external_command();
-        let result = self.run_mcp_ai_launcher(&endpoint, &health_url, &session);
-        self.resume_after_external_command(terminal);
-
+        let result = self.run_mcp_ai_launcher(&endpoint, &session);
         match result {
             Ok(Some(result)) => self.mcp.set_status_line(format!(
                 "{} launched in {}.",
@@ -2233,18 +2225,11 @@ impl App {
     fn run_mcp_ai_launcher(
         &self,
         endpoint: &str,
-        health_url: &str,
         session: &crate::mcp::McpSessionFile,
     ) -> Result<Option<McpAiLaunchResult>, String> {
-        println!("\nCanopy MCP server is healthy: {health_url}");
-
-        let Some(client) = prompt_mcp_ai_client()? else {
-            return Ok(None);
-        };
+        let client = select_mcp_ai_client_from_env()?;
         let terminals = detect_supported_terminal_apps()?;
-        let Some(terminal) = prompt_mcp_terminal_app(&terminals)? else {
-            return Ok(None);
-        };
+        let terminal = select_mcp_terminal_app(&terminals)?;
 
         let client_label = match client {
             McpAiClient::Codex => {
@@ -4007,6 +3992,36 @@ mod tests {
         assert!(parse_terminal_app_choice("", &terminals).unwrap().is_none());
         assert!(parse_terminal_app_choice("3", &terminals).is_err());
         assert!(parse_terminal_app_choice("Ghostty", &terminals).is_err());
+    }
+
+    #[test]
+    fn mcp_launcher_selects_codex_and_first_terminal_without_prompt() {
+        let terminals = vec![
+            detected_terminal(
+                "Terminal",
+                "com.apple.Terminal",
+                TerminalLaunchAdapter::AppleTerminal,
+            ),
+            detected_terminal(
+                "Warp",
+                "dev.warp.Warp-Stable",
+                TerminalLaunchAdapter::WarpStable,
+            ),
+        ];
+
+        assert_eq!(select_mcp_ai_client(None).unwrap(), McpAiClient::Codex);
+        assert_eq!(
+            select_mcp_ai_client(Some("claude")).unwrap(),
+            McpAiClient::Claude
+        );
+        assert!(select_mcp_ai_client(Some("q")).is_err());
+
+        let selected = select_mcp_terminal_app_choice(&terminals, None).unwrap();
+        assert_eq!(selected.display_name, "Terminal");
+
+        let selected = select_mcp_terminal_app_choice(&terminals, Some("warp")).unwrap();
+        assert_eq!(selected.display_name, "Warp");
+        assert!(select_mcp_terminal_app_choice(&terminals, Some("q")).is_err());
     }
 
     #[test]

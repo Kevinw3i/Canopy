@@ -178,7 +178,7 @@ impl Component for McpScreen {
             .wrap(Wrap { trim: true })
             .render(chunks[1], buf);
 
-        let help = "Use e to enable the local MCP server, verify healthz, then choose Codex CLI or Claude Code. Use l to launch a CLI against the already-running MCP server; it will not start MCP automatically. Use s to stop, r to restart, t to test health. Phase 3 exposes CloudWatch discovery plus preflight-gated search and Insights tools.";
+        let help = "Use e to enable the local MCP server and launch Codex CLI in a new terminal. Use l to launch another CLI against the already-running MCP server; it will not start MCP automatically. Set CANOPY_MCP_AI_CLIENT=claude to launch Claude Code, or CANOPY_MCP_TERMINAL to choose a terminal app. Use s to stop, r to restart, t to test health. Phase 3 exposes CloudWatch discovery plus preflight-gated search and Insights tools.";
         let body = if let Some(error) = self.last_error.as_ref() {
             format!("{help}\n\nLast error:\n{error}")
         } else {
