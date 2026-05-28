@@ -154,19 +154,15 @@ impl DashboardScreen {
 
     fn mcp_running_style(&self, selected: bool) -> Style {
         let bright = self.mcp_pulse_tick % 8 < 4;
-        if selected {
-            let (fg, bg) = if bright {
-                (Color::Black, Color::LightGreen)
-            } else {
-                (self.theme.text, Color::Indexed(22))
-            };
-            Style::default().fg(fg).bg(bg).bold()
+        let fg = if bright {
+            Color::LightGreen
         } else {
-            let fg = if bright {
-                Color::LightGreen
-            } else {
-                Color::Green
-            };
+            Color::Green
+        };
+
+        if selected {
+            Style::default().fg(fg).bg(self.theme.selected_bg).bold()
+        } else {
             Style::default().fg(fg).bold()
         }
     }
@@ -634,7 +630,10 @@ mod tests {
         screen.selected = screen.visible_items().len() - 1;
 
         let bright = rendered_buffer(&mut screen);
-        assert!(bright
+        assert!(bright.content.iter().any(|cell| cell.symbol() != " "
+            && cell.fg == Color::LightGreen
+            && cell.bg == screen.theme.selected_bg));
+        assert!(!bright
             .content
             .iter()
             .any(|cell| cell.symbol() != " " && cell.bg == Color::LightGreen));
@@ -644,7 +643,10 @@ mod tests {
         }
 
         let dim = rendered_buffer(&mut screen);
-        assert!(dim
+        assert!(dim.content.iter().any(|cell| cell.symbol() != " "
+            && cell.fg == Color::Green
+            && cell.bg == screen.theme.selected_bg));
+        assert!(!dim
             .content
             .iter()
             .any(|cell| cell.symbol() != " " && cell.bg == Color::Indexed(22)));
