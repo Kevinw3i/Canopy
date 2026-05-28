@@ -4125,6 +4125,7 @@ mod tests {
             allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             database_scopes: vec![],
+            business_scopes: vec![],
         }
     }
 

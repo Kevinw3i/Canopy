@@ -118,6 +118,7 @@ TUI                     Control Plane              OIDC Provider
 | `allowed_accounts` | 允許存取的 AWS 帳號 + 對應的 IAM Role ARN |
 | `allowed_regions` | 允許的 AWS 區域 |
 | `allowed_log_group_arns` | 允許的 CloudWatch Log Group ARN 樣式（支援萬用字元） |
+| `metadata.scopes` | MCP Business Scopes discovery hint；描述 platform/environment/aliases，但不授權任何資源 |
 | `instance_tag_selectors` | EC2 標籤過濾條件（執行個體必須匹配至少一個 selector） |
 | `allowed_os_users` | 允許的作業系統使用者（用於 SSM/EIC/SSH 連線）。設定 2+ 個時連線時會彈出選擇介面 |
 | `excluded_tag_selectors` | 排除規則：匹配的機器即使通過 allow 也會被隱藏 |
@@ -528,6 +529,16 @@ can_use_cloudwatch_search = true
 can_use_cloudwatch_tail = true
 can_use_ssm = true
 can_use_ec2_instance_connect = true
+can_use_mcp = true
+can_use_mcp_cloudwatch = true
+
+[rules.metadata]
+description = "MCP CloudWatch business scopes"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["正式環境", "prod", "PRO"]
 
 [[rules.task_tag_selectors]]
 [rules.task_tag_selectors.tags]
@@ -537,6 +548,14 @@ Environment = ["production"]
 user_id = "alice@example.com"
 group = "platform-engineering"
 ```
+
+`metadata.scopes` 只做 MCP / AI usability discovery hint。`region` 不放
+metadata，來源是同一條 rule 的 `allowed_regions`；metadata 不能作為授權來源，
+也不能放大 `allowed_accounts`、`allowed_regions` 或
+`allowed_log_group_arns`。MCP client 應先透過
+`canopy_describe_capabilities` 取得 `business_scopes`，再用回傳的
+`account_id + region` 呼叫 `canopy_list_allowed_log_groups`；server 仍會套用
+原本 rule-local entitlement 檢查。
 
 AWS Organizations 帳號自動發現可用 `account_id = "*"` 明確 opt-in；`role_arn`
 必須是包含 `{account_id}` 的 IAM role ARN template。Control Plane 啟動時會

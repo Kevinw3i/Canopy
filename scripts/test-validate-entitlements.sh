@@ -324,6 +324,36 @@ expect_failure \
 
 expect_success "direct-enabled" "$TMP_DIR/direct-entitlements.toml" "$TMP_DIR/direct-enabled.tfvars"
 
+cat > "$TMP_DIR/metadata-scopes-entitlements.toml" <<EOF
+[[rules]]
+id = "metadata-scopes"
+allowed_regions = ["ap-northeast-1"]
+allowed_log_group_arns = ["arn:aws:logs:*:123456789012:log-group:/ws168/*"]
+
+[rules.features]
+can_use_mcp = true
+can_use_mcp_cloudwatch = true
+
+[rules.metadata]
+description = "MCP CloudWatch business scopes"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["正式環境", "prod", "PRO"]
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "demo"
+aliases = ["Demo", "測試環境"]
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_success "metadata-scopes" "$TMP_DIR/metadata-scopes-entitlements.toml" "$TMP_DIR/gov.tfvars"
+
 write_entitlements "$TMP_DIR/profile-entitlements.toml" "profile:dev"
 expect_failure \
   "profile-role" \

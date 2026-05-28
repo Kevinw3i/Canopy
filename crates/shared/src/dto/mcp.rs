@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::cloudwatch::{LogEvent, LogGroup, QueryResultField, QueryStatistics, QueryStatus};
+use super::entitlements::McpBusinessScope;
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MCP_PRODUCT_PHASE: &str = "phase_3_data_tools";
@@ -191,6 +192,8 @@ pub struct McpDescribeCapabilitiesResponse {
     pub mcp_product_phase: String,
     pub scope_disclosure: String,
     pub available_tools: Vec<McpToolAvailability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub business_scopes: Vec<McpBusinessScope>,
     pub guardrails: McpGuardrails,
     pub message: String,
 }

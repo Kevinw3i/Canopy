@@ -232,6 +232,22 @@ can_view_mcp_raw_audit_plaintext = false  # Default: encrypt raw MCP CloudWatch 
 can_use_mcp_ec2 = false           # Reserved for future MCP EC2 tools
 can_use_mcp_database = true       # Can use MCP Database tools when scoped below
 
+# Optional MCP Business Scopes. These are AI/MCP discovery hints only;
+# authorization still comes from this same rule's accounts, regions, and
+# log group ARN patterns.
+[rules.metadata]
+description = "MCP CloudWatch business scopes"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["正式環境", "prod", "PRO"]
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "demo"
+aliases = ["Demo", "測試環境"]
+
 # Optional MCP Database v1 scope. v1 is MySQL only and SELECT-only.
 # The referenced connection must exist in config.toml / Terraform
 # database_connections_toml, and passwords must live in Secrets Manager.
@@ -439,6 +455,8 @@ MCP permissions are intentionally separate from the normal TUI permissions:
 
 - `can_use_mcp` is the master switch for the local MCP server.
 - `can_use_mcp_cloudwatch` does **not** follow `can_use_cloudwatch_search`; it is a separate MCP feature gate.
+- `rules.metadata.scopes` can describe business names such as `WS168 production` or aliases such as `正式環境`, but it is only a discovery hint. It never authorizes AWS resources, never contains regions, and is returned only from matching rules that also grant MCP CloudWatch access, allowed accounts, allowed regions, and log group ARN patterns.
+- The AI workflow is: call `canopy_describe_capabilities`, choose a returned `business_scopes` entry, then call `canopy_list_allowed_log_groups` with that entry's `account_id` and one of its `regions`. The server still performs the normal entitlement check for `account_id + region + log group`.
 - MCP CloudWatch raw filter/query audit values are encrypted by default; set `can_view_mcp_raw_audit_plaintext = true` only on the same rule that authorizes the exact account/region/log-group scope.
 - `can_use_mcp_database` enables MCP database tools only when a matching `[[rules.database_scopes]]` grants a specific connection/schema/table scope.
 - Product Phase 3 exposes MCP foundation tools (`canopy_describe_capabilities`, `canopy_get_guidance`), CloudWatch discovery (`canopy_list_allowed_log_groups`), and preflight-gated CloudWatch data tools (`canopy_preflight_request`, `canopy_search_logs`, `canopy_run_insights_query`) when MCP CloudWatch is enabled, plus MCP Database v1 when explicitly enabled. Initial CloudWatch search/Insights calls require a server-issued preflight token; continuation/poll calls require the returned cursor/token.

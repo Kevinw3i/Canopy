@@ -555,6 +555,7 @@ mod tests {
                 EntitlementRule {
                     id: "rule-eng".into(),
                     group: "eng".into(),
+                    metadata: RuleMetadata::default(),
                     features: FeatureFlags {
                         can_view_ec2: true,
                         can_use_cloudwatch_search: true,
@@ -584,6 +585,7 @@ mod tests {
                 EntitlementRule {
                     id: "rule-ops".into(),
                     group: "ops".into(),
+                    metadata: RuleMetadata::default(),
                     features: FeatureFlags {
                         can_view_ec2: true,
                         can_use_cloudwatch_search: true,
@@ -751,6 +753,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-eng-power-prod".into(),
             group: "eng".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_stop_ec2: true,
                 ..Default::default()
@@ -778,6 +781,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-eng-power-staging".into(),
             group: "eng".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_stop_ec2: true,
                 ..Default::default()
@@ -850,6 +854,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-eng-ecs".into(),
             group: "eng".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_view_ecs: true,
                 can_use_ecs_exec: true,

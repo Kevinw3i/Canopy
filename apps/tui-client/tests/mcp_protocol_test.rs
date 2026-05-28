@@ -60,6 +60,7 @@ fn dev_admin_entitlements() -> UserEntitlements {
         allowed_os_users: vec![],
         max_session_seconds: None,
         database_scopes: vec![],
+        business_scopes: vec![],
     }
 }
 

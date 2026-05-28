@@ -74,6 +74,34 @@ can_use_mcp_database = false
 # can_view_ecs = false
 # can_use_ecs_exec = false
 
+# ── MCP Business Scopes（AI / MCP 業務語意提示）──────
+#
+# metadata 只提供 AI/MCP discovery usability hint，不授權任何 AWS
+# 資源，也不能放大 allowed_accounts / allowed_regions /
+# allowed_log_group_arns 的安全邊界。
+#
+# region 不放在 metadata；MCP 回傳的 regions 直接來自同一條
+# rule 的 allowed_regions。platform / environment 採單值；多組
+# 平台環境請用多個 [[rules.metadata.scopes]] 明確列出。
+#
+# 只有同一條 matching rule 同時具備：
+#   can_use_mcp = true
+#   can_use_mcp_cloudwatch = true
+#   allowed_accounts / allowed_regions / allowed_log_group_arns
+# 時，canopy_describe_capabilities 才會回傳 business_scopes。
+[rules.metadata]
+description = "MCP CloudWatch business scopes"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["正式環境", "prod", "PRO"]
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "demo"
+aliases = ["Demo", "測試環境"]
+
 [[rules.allowed_accounts]]
 account_id = "<ACCOUNT_ID>"                    # ← 改成你的 AWS 帳號 ID
 account_name = "production"                    # ← 自訂名稱，顯示在 TUI 裡

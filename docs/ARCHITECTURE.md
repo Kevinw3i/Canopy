@@ -284,6 +284,7 @@ the only connect path that does not need AWS-scoped credentials.
   |
   |-- rules[]
   |    |-- id, group
+  |    |-- metadata.scopes: [{platform, environment, aliases}]
   |    |-- features: {can_view_ec2, can_view_ecs, can_use_ecs_exec, can_use_ssm, ...}
   |    |-- allowed_accounts: [{account_id, account_name, role_arn}]
   |    |-- allowed_regions: ["us-east-1", ...]
@@ -309,9 +310,17 @@ the only connect path that does not need AWS-scoped credentials.
   tag_selectors:         concatenate (match ANY)
   excluded_tag_selectors: concatenate (match ANY → hidden)
   ECS scopes:            displayed as merged entitlements, enforced rule-locally
+  MCP business scopes:   generated rule-locally; never a merged cartesian product
   os_users:              dedup
   max_session_seconds:   MIN non-zero (strictest wins)
 ```
+
+`rules.metadata.scopes` is a discovery hint for MCP clients. It lets
+`canopy_describe_capabilities` expose business labels such as `WS168 production`
+with the same rule's account, region list, and log group ARN patterns. It is not
+an authorization source: metadata cannot add accounts, regions, log groups, or
+roles, and MCP CloudWatch routes still authorize every request through the
+rule-local `allowed_accounts`, `allowed_regions`, and `allowed_log_group_arns`.
 
 ## Security Boundaries
 
@@ -324,15 +333,16 @@ the only connect path that does not need AWS-scoped credentials.
 | 5 | SSM os_user | SSH ProxyCommand + IAM condition `ssm:SessionDocumentAccessCheck` |
 | 6 | EIC creds | Allows AWS CLI `ec2:DescribeInstances` preflight only in the target region; OS-user bound via `ec2:osuser` condition |
 | 7 | ECS scope | Task list and exec must match one rule-local account/role/region/cluster/task-tag/container scope |
-| 8 | Audit | Fail-closed on all endpoints (auth, EC2, ECS, CW, entitlements). Transient recovery without restart |
-| 9 | Config | dev_mode refuses non-loopback bind; CORS restricted with real AWS; SSM requires explicit allowed_os_users |
-| 10 | Insights token | HMAC-signed query auth (survives restart), rejects empty log_group_names |
-| 11 | IAM Simulation | SimulatePrincipalPolicy selects EC2 describe/power/connect and ECS Exec AssumeRole candidates with full action+resource sets; local direct/profile candidates are not simulated, and inconclusive AssumeRole simulations fall back only when every simulated candidate errors |
-| 12 | Session timeout | max_session_seconds per group, min 900s for STS, kill after timeout (strictest wins) |
-| 13 | Account identity | GetCallerIdentity verifies direct/profile/AssumeRole credentials match configured account_id |
-| 14 | Email verification | Entitlement email matching gated on IdP `email_verified` claim |
-| 15 | STS ExternalId | Configurable ExternalId on all AssumeRole calls (default "canopy") |
-| 16 | Token storage | Unix 0600 enforced on every write; insecure permissions rejected on load |
+| 8 | MCP business metadata | `metadata.scopes` is only a discovery hint; business labels are generated from one matching rule and cannot authorize resources |
+| 9 | Audit | Fail-closed on all endpoints (auth, EC2, ECS, CW, entitlements). Transient recovery without restart |
+| 10 | Config | dev_mode refuses non-loopback bind; CORS restricted with real AWS; SSM requires explicit allowed_os_users |
+| 11 | Insights token | HMAC-signed query auth (survives restart), rejects empty log_group_names |
+| 12 | IAM Simulation | SimulatePrincipalPolicy selects EC2 describe/power/connect and ECS Exec AssumeRole candidates with full action+resource sets; local direct/profile candidates are not simulated, and inconclusive AssumeRole simulations fall back only when every simulated candidate errors |
+| 13 | Session timeout | max_session_seconds per group, min 900s for STS, kill after timeout (strictest wins) |
+| 14 | Account identity | GetCallerIdentity verifies direct/profile/AssumeRole credentials match configured account_id |
+| 15 | Email verification | Entitlement email matching gated on IdP `email_verified` claim |
+| 16 | STS ExternalId | Configurable ExternalId on all AssumeRole calls (default "canopy") |
+| 17 | Token storage | Unix 0600 enforced on every write; insecure permissions rejected on load |
 
 ## Scoped Credential Policies
 

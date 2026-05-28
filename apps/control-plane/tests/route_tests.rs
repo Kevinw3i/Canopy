@@ -17,7 +17,9 @@ use passkey_auth::{CosePublicKey, CredentialId, PasskeyCredential};
 use rusqlite::params;
 use serde_json::{json, Value};
 use shared::dto::cloudwatch::LiveTailMessage;
-use shared::dto::entitlements::{AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership};
+use shared::dto::entitlements::{
+    AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, RuleMetadata,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -5608,6 +5610,7 @@ async fn live_tail_ws_rejects_log_group_from_non_tail_rule() {
         store.rules.push(EntitlementRule {
             id: "rule-log-pattern-no-tail".into(),
             group: "log-pattern-no-tail".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_use_cloudwatch_search: true,
                 can_use_cloudwatch_tail: false,

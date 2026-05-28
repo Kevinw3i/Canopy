@@ -231,6 +231,21 @@ can_view_mcp_raw_audit_plaintext = false  # 預設：MCP CloudWatch raw filter/q
 can_use_mcp_ec2 = false           # 預留給未來 MCP EC2 tools
 can_use_mcp_database = true       # 搭配下方 scope 使用 MCP Database tools
 
+# 可選：MCP Business Scopes。這只提供 AI/MCP discovery 提示；
+# 真正授權仍看同一條 rule 的 accounts、regions、log group ARN patterns。
+[rules.metadata]
+description = "MCP CloudWatch business scopes"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["正式環境", "prod", "PRO"]
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "demo"
+aliases = ["Demo", "測試環境"]
+
 # 可選：MCP Database v1 scope。v1 只支援 MySQL，且只允許 SELECT。
 # connection 必須存在於 config.toml / Terraform database_connections_toml，
 # 密碼只能放 Secrets Manager。
@@ -436,6 +451,8 @@ MCP 權限刻意和一般 TUI 權限分開：
 
 - `can_use_mcp` 是本機 MCP server 的總開關。
 - `can_use_mcp_cloudwatch` 不會跟隨 `can_use_cloudwatch_search`；這是獨立的 MCP feature gate。
+- `rules.metadata.scopes` 可以描述 `WS168 production`、`正式環境` 這類業務語意，但它只是一個 discovery hint。metadata 不授權 AWS 資源、不放 region，且只有同一條 matching rule 同時具備 MCP CloudWatch 權限、allowed accounts、allowed regions、log group ARN patterns 時才會回傳。
+- AI 使用流程是：先呼叫 `canopy_describe_capabilities` 取得 `business_scopes`，選出對應的 `account_id` 與其中一個 `regions`，再呼叫 `canopy_list_allowed_log_groups`。server 仍會對 `account_id + region + log group` 做原本的 entitlement 檢查。
 - MCP CloudWatch raw filter/query audit 預設加密保存；只有同一條 rule 同時授權該 account / region / log group scope 時，才應設定 `can_view_mcp_raw_audit_plaintext = true`。
 - `can_use_mcp_database` 只是在 MCP 開 DB tools；真正能查哪些 DB / schema / table，要看同一條 matching rule 裡的 `[[rules.database_scopes]]`。
 - Product Phase 3 提供 MCP 基礎工具（`canopy_describe_capabilities`、`canopy_get_guidance`），並在 MCP CloudWatch 啟用時提供 CloudWatch discovery（`canopy_list_allowed_log_groups`）與 preflight-gated CloudWatch data tools（`canopy_preflight_request`、`canopy_search_logs`、`canopy_run_insights_query`），也可在明確啟用時提供 MCP Database v1。CloudWatch search / Insights 初始呼叫必須使用 control-plane 發出的 preflight token；續頁 / polling 則必須使用 response 回傳的 cursor/token。

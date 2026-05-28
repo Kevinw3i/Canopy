@@ -140,6 +140,38 @@ can_use_mcp = true
 - `canopy_search_logs`
 - `canopy_run_insights_query`
 
+若要讓 AI 能把「WS168 正式環境」這類描述解析成可授權查詢的
+`account_id + region`，可在同一條 MCP CloudWatch rule 加
+Business Scopes：
+
+```toml
+[rules.features]
+can_use_mcp = true
+can_use_mcp_cloudwatch = true
+
+[rules.metadata]
+description = "MCP CloudWatch business scopes"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["正式環境", "prod", "PRO"]
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "demo"
+aliases = ["Demo", "測試環境"]
+```
+
+`metadata.scopes` 只做 discovery usability hint，不授權 AWS 資源。
+`region` 不放 metadata，來源是同一條 rule 的 `allowed_regions`；
+`platform` / `environment` 採單值，多組平台環境就用多個
+`[[rules.metadata.scopes]]`。AI client 應先呼叫
+`canopy_describe_capabilities` 讀取 `business_scopes`，再用回傳的
+`account_id` 與其中一個 `regions` 呼叫 `canopy_list_allowed_log_groups`。
+control-plane 仍會用同一 scope 的 entitlement 檢查最終
+account / region / log group。
+
 並可在明確啟用時提供 MCP Database v1。CloudWatch search / Insights 初始呼叫必須先用
 `canopy_preflight_request` 取得 scoped token；search 續頁必須只帶 `search_cursor`，
 Insights polling 必須只帶 `query_token`。EC2 MCP data tools 尚未開放。即使使用者有

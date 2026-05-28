@@ -44,6 +44,8 @@ pub struct UserEntitlements {
     pub max_session_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub database_scopes: Vec<DatabaseScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub business_scopes: Vec<McpBusinessScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -102,6 +104,42 @@ pub struct AllowedAccount {
     pub role_arn: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuleMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<BusinessScopeMetadata>,
+}
+
+impl RuleMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none() && self.scopes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BusinessScopeMetadata {
+    pub platform: String,
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpBusinessScope {
+    pub platform: String,
+    pub environment: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    pub account_id: String,
+    pub account_name: String,
+    pub regions: Vec<String>,
+    pub log_group_arn_patterns: Vec<String>,
+}
+
 /// Tag selector for EC2 instance filtering
 /// Instances must match ALL specified tags to be visible
 ///
@@ -133,6 +171,8 @@ impl TagSelector {
 pub struct EntitlementRule {
     pub id: String,
     pub group: String,
+    #[serde(default, skip_serializing_if = "RuleMetadata::is_empty")]
+    pub metadata: RuleMetadata,
     #[serde(default)]
     pub features: FeatureFlags,
     #[serde(default)]
@@ -393,6 +433,7 @@ mod tests {
         let rule: EntitlementRule = serde_json::from_value(json).unwrap();
         assert_eq!(rule.id, "r1");
         assert_eq!(rule.group, "ops");
+        assert!(rule.metadata.is_empty());
         assert!(rule.allowed_accounts.is_empty());
         assert!(rule.allowed_regions.is_empty());
         assert!(rule.allowed_log_group_arns.is_empty());
@@ -408,6 +449,47 @@ mod tests {
         assert!(rule.database_scopes.is_empty());
         // features should default to all-false
         assert!(!rule.features.can_view_ec2);
+    }
+
+    #[test]
+    fn rule_metadata_scopes_toml_roundtrip() {
+        let toml = r#"
+            description = "Business scopes for MCP CloudWatch"
+
+            [[scopes]]
+            platform = "WS168"
+            environment = "production"
+            aliases = ["正式環境", "prod", "PRO"]
+
+            [[scopes]]
+            platform = "WS168"
+            environment = "demo"
+        "#;
+        let metadata: RuleMetadata = toml::from_str(toml).unwrap();
+        assert_eq!(
+            metadata.description.as_deref(),
+            Some("Business scopes for MCP CloudWatch")
+        );
+        assert_eq!(metadata.scopes.len(), 2);
+        assert_eq!(metadata.scopes[0].platform, "WS168");
+        assert_eq!(metadata.scopes[0].environment, "production");
+        assert_eq!(metadata.scopes[0].aliases, vec!["正式環境", "prod", "PRO"]);
+        assert!(metadata.scopes[1].aliases.is_empty());
+
+        let encoded = toml::to_string(&metadata).unwrap();
+        let back: RuleMetadata = toml::from_str(&encoded).unwrap();
+        assert_eq!(back, metadata);
+    }
+
+    #[test]
+    fn rule_metadata_rejects_unknown_fields() {
+        let err = toml::from_str::<RuleMetadata>(
+            r#"
+            role_arn = "arn:aws:iam::111111111111:role/ShouldNotAppear"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -431,6 +513,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            business_scopes: vec![],
         };
         let json = serde_json::to_string(&ent).unwrap();
         assert!(!json.contains("excluded_tag_selectors"));
@@ -490,6 +573,15 @@ mod tests {
                 allow_full_table_scan: false,
                 allow_views: false,
             }],
+            business_scopes: vec![McpBusinessScope {
+                platform: "WS168".into(),
+                environment: "production".into(),
+                aliases: vec!["prod".into()],
+                account_id: "111".into(),
+                account_name: "prod".into(),
+                regions: vec!["us-east-1".into()],
+                log_group_arn_patterns: vec!["arn:aws:logs:us-east-1:111:log-group:/app".into()],
+            }],
         };
         let json = serde_json::to_value(&ent).unwrap();
         let back: UserEntitlements = serde_json::from_value(json).unwrap();
@@ -505,6 +597,8 @@ mod tests {
         assert!(back.allow_broad_cluster_discovery);
         assert_eq!(back.max_session_seconds, Some(3600));
         assert_eq!(back.database_scopes.len(), 1);
+        assert_eq!(back.business_scopes.len(), 1);
+        assert_eq!(back.business_scopes[0].platform, "WS168");
     }
 
     #[test]

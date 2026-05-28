@@ -351,6 +351,7 @@ mod ecs_scope_tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            business_scopes: vec![],
         });
         screen
     }
@@ -439,6 +440,7 @@ mod tests {
             allow_broad_cluster_discovery: false,
             allowed_os_users: vec![],
             database_scopes: vec![],
+            business_scopes: vec![],
         }
     }
 

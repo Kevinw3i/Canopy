@@ -195,6 +195,7 @@ impl EntitlementStore {
         let mut max_session_seconds: Option<u64> = None;
         let mut database_scopes: Vec<DatabaseScope> = Vec::new();
         let mut ambiguous_database_scope_keys: Vec<DatabaseScopeKey> = Vec::new();
+        let mut business_scopes: Vec<McpBusinessScope> = Vec::new();
 
         for rule in &matching_rules {
             // Additive merge for feature flags
@@ -315,6 +316,10 @@ impl EntitlementStore {
                     );
                 }
             }
+
+            if rule.features.can_use_mcp && rule.features.can_use_mcp_cloudwatch {
+                push_rule_business_scopes(&mut business_scopes, rule);
+            }
         }
 
         UserEntitlements {
@@ -336,6 +341,7 @@ impl EntitlementStore {
             allowed_os_users,
             max_session_seconds,
             database_scopes,
+            business_scopes,
         }
     }
 
@@ -728,6 +734,9 @@ impl EntitlementStore {
             for scope in &rule.database_scopes {
                 validate_database_scope_identifiers(&rule.id, scope)?;
             }
+            for scope in &rule.metadata.scopes {
+                validate_business_scope_metadata(&rule.id, scope)?;
+            }
         }
 
         Ok(())
@@ -817,6 +826,7 @@ impl EntitlementStore {
             rules.push(EntitlementRule {
                 id: id.clone(),
                 group: row.get("group_name")?,
+                metadata: RuleMetadata::default(),
                 features: FeatureFlags {
                     can_view_ec2: sqlite_bool(row.get("can_view_ec2")?),
                     can_use_cloudwatch_search: sqlite_bool(row.get("can_use_cloudwatch_search")?),
@@ -902,6 +912,21 @@ impl EntitlementStore {
                 EntitlementRule {
                     id: "rule-platform-eng".into(),
                     group: "platform-engineering".into(),
+                    metadata: RuleMetadata {
+                        description: Some("Demo MCP CloudWatch business scopes".into()),
+                        scopes: vec![
+                            BusinessScopeMetadata {
+                                platform: "CanopyDemo".into(),
+                                environment: "production".into(),
+                                aliases: vec!["prod".into(), "PRO".into()],
+                            },
+                            BusinessScopeMetadata {
+                                platform: "CanopyDemo".into(),
+                                environment: "staging".into(),
+                                aliases: vec!["stage".into()],
+                            },
+                        ],
+                    },
                     features: FeatureFlags {
                         can_view_ec2: true,
                         can_use_cloudwatch_search: true,
@@ -973,6 +998,7 @@ impl EntitlementStore {
                 EntitlementRule {
                     id: "rule-platform-eng-power".into(),
                     group: "platform-engineering".into(),
+                    metadata: RuleMetadata::default(),
                     features: FeatureFlags {
                         can_start_ec2: true,
                         can_stop_ec2: true,
@@ -1016,6 +1042,14 @@ impl EntitlementStore {
                 EntitlementRule {
                     id: "rule-readonly".into(),
                     group: "readonly-ops".into(),
+                    metadata: RuleMetadata {
+                        description: Some("Readonly staging MCP CloudWatch business scopes".into()),
+                        scopes: vec![BusinessScopeMetadata {
+                            platform: "CanopyDemo".into(),
+                            environment: "staging".into(),
+                            aliases: vec!["stage".into()],
+                        }],
+                    },
                     features: FeatureFlags {
                         can_view_ec2: true,
                         can_use_cloudwatch_search: true,
@@ -1129,6 +1163,94 @@ fn push_unambiguous_database_scope(
     }
 
     scopes.push(scope.clone());
+}
+
+fn push_rule_business_scopes(scopes: &mut Vec<McpBusinessScope>, rule: &EntitlementRule) {
+    if rule.metadata.scopes.is_empty()
+        || rule.allowed_accounts.is_empty()
+        || rule.allowed_regions.is_empty()
+        || rule.allowed_log_group_arns.is_empty()
+    {
+        return;
+    }
+
+    for business_scope in &rule.metadata.scopes {
+        for account in &rule.allowed_accounts {
+            let log_group_arn_patterns = rule
+                .allowed_log_group_arns
+                .iter()
+                .filter(|pattern| {
+                    log_group_pattern_applies_to_account(pattern, &account.account_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if log_group_arn_patterns.is_empty() {
+                continue;
+            }
+
+            let candidate = McpBusinessScope {
+                platform: business_scope.platform.trim().to_string(),
+                environment: business_scope.environment.trim().to_string(),
+                aliases: normalized_aliases(&business_scope.aliases),
+                account_id: account.account_id.clone(),
+                account_name: account.account_name.clone(),
+                regions: rule.allowed_regions.clone(),
+                log_group_arn_patterns,
+            };
+            if !scopes.contains(&candidate) {
+                scopes.push(candidate);
+            }
+        }
+    }
+}
+
+fn log_group_pattern_applies_to_account(pattern: &str, account_id: &str) -> bool {
+    let mut parts = pattern.split(':');
+    if parts.next() != Some("arn") {
+        return true;
+    }
+    let _partition = parts.next();
+    if parts.next() != Some("logs") {
+        return true;
+    }
+    let _region = parts.next();
+    let Some(pattern_account) = parts.next() else {
+        return true;
+    };
+    pattern_account == "*" || pattern_account == account_id
+}
+
+fn normalized_aliases(aliases: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for alias in aliases {
+        let trimmed = alias.trim();
+        if !trimmed.is_empty() && !result.iter().any(|existing| existing == trimmed) {
+            result.push(trimmed.to_string());
+        }
+    }
+    result
+}
+
+fn validate_business_scope_metadata(
+    rule_id: &str,
+    scope: &BusinessScopeMetadata,
+) -> anyhow::Result<()> {
+    if scope.platform.trim().is_empty() {
+        anyhow::bail!("Rule '{rule_id}' has metadata scope with empty platform");
+    }
+    if scope.environment.trim().is_empty() {
+        anyhow::bail!("Rule '{rule_id}' has metadata scope with empty environment");
+    }
+    for alias in &scope.aliases {
+        if alias.trim().is_empty() {
+            anyhow::bail!(
+                "Rule '{rule_id}' metadata scope '{}:{}' has an empty alias",
+                scope.platform,
+                scope.environment
+            );
+        }
+    }
+    Ok(())
 }
 
 fn sqlite_path_from_url(url: &str) -> anyhow::Result<String> {
@@ -1419,7 +1541,10 @@ fn normalize_allowed_clusters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_TOML_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_store() -> EntitlementStore {
         EntitlementStore::dev_defaults()
@@ -1430,8 +1555,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
+        let counter = TEMP_TOML_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "canopy-entitlements-test-{}-{nonce}.toml",
+            "canopy-entitlements-test-{}-{nonce}-{counter}.toml",
             std::process::id()
         ));
         std::fs::write(&path, content)?;
@@ -1455,6 +1581,7 @@ mod tests {
         EntitlementRule {
             id: "org-discovery".into(),
             group: "ops".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_view_ec2: true,
                 ..Default::default()
@@ -1462,6 +1589,53 @@ mod tests {
             allowed_accounts: accounts,
             allowed_regions: vec!["us-east-1".into()],
             allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+        }
+    }
+
+    fn business_scope_metadata(platform: &str, environment: &str) -> RuleMetadata {
+        RuleMetadata {
+            description: Some(format!("{platform} {environment} scope")),
+            scopes: vec![BusinessScopeMetadata {
+                platform: platform.into(),
+                environment: environment.into(),
+                aliases: vec![],
+            }],
+        }
+    }
+
+    fn mcp_cloudwatch_business_rule(
+        id: &str,
+        group: &str,
+        metadata: RuleMetadata,
+        account_id: &str,
+        log_group_arns: Vec<String>,
+    ) -> EntitlementRule {
+        EntitlementRule {
+            id: id.into(),
+            group: group.into(),
+            metadata,
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_cloudwatch: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: account_id.into(),
+                account_name: format!("{id}-account"),
+                role_arn: format!("arn:aws:iam::{account_id}:role/CanopyReadOnly"),
+            }],
+            allowed_regions: vec!["ap-northeast-1".into()],
+            allowed_log_group_arns: log_group_arns,
             instance_tag_selectors: vec![],
             excluded_tag_selectors: vec![],
             allowed_clusters: vec![],
@@ -1567,6 +1741,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-raw-audit-reviewer".into(),
             group: "raw-audit-reviewers".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_use_mcp: true,
                 can_use_mcp_cloudwatch: true,
@@ -1627,6 +1802,317 @@ mod tests {
             "us-east-1",
             &[],
         ));
+    }
+
+    #[test]
+    fn mcp_business_scopes_require_mcp_cloudwatch_and_authorized_log_patterns() {
+        let store = EntitlementStore {
+            rules: vec![
+                mcp_cloudwatch_business_rule(
+                    "metadata-without-logs",
+                    "rd",
+                    business_scope_metadata("WS168", "production"),
+                    "111111111111",
+                    vec![],
+                ),
+                {
+                    let mut rule = mcp_cloudwatch_business_rule(
+                        "logs-without-metadata",
+                        "rd",
+                        RuleMetadata::default(),
+                        "111111111111",
+                        vec!["arn:aws:logs:*:111111111111:log-group:/ws168/*".into()],
+                    );
+                    rule.metadata = RuleMetadata::default();
+                    rule
+                },
+                {
+                    let mut rule = mcp_cloudwatch_business_rule(
+                        "metadata-without-mcp-master",
+                        "rd",
+                        business_scope_metadata("DS88", "production"),
+                        "222222222222",
+                        vec!["arn:aws:logs:*:222222222222:log-group:/ds88/*".into()],
+                    );
+                    rule.features.can_use_mcp = false;
+                    rule
+                },
+                {
+                    let mut rule = mcp_cloudwatch_business_rule(
+                        "metadata-without-mcp-cloudwatch",
+                        "rd",
+                        business_scope_metadata("DS88", "demo"),
+                        "333333333333",
+                        vec!["arn:aws:logs:*:333333333333:log-group:/ds88-demo/*".into()],
+                    );
+                    rule.features.can_use_mcp_cloudwatch = false;
+                    rule
+                },
+                {
+                    let mut rule = mcp_cloudwatch_business_rule(
+                        "metadata-without-account",
+                        "rd",
+                        business_scope_metadata("WS168", "demo"),
+                        "444444444444",
+                        vec!["arn:aws:logs:*:444444444444:log-group:/ws168-demo/*".into()],
+                    );
+                    rule.allowed_accounts.clear();
+                    rule
+                },
+                {
+                    let mut rule = mcp_cloudwatch_business_rule(
+                        "metadata-without-region",
+                        "rd",
+                        business_scope_metadata("WS168", "qa"),
+                        "555555555555",
+                        vec!["arn:aws:logs:*:555555555555:log-group:/ws168-qa/*".into()],
+                    );
+                    rule.allowed_regions.clear();
+                    rule
+                },
+            ],
+            memberships: vec![GroupMembership {
+                user_id: "alice".into(),
+                group: "rd".into(),
+            }],
+        };
+        store.validate().unwrap();
+
+        let ent = store.evaluate("alice", "alice@example.com", "Alice", true);
+        assert!(
+            ent.business_scopes.is_empty(),
+            "metadata must not be combined with sibling account/log-group grants"
+        );
+    }
+
+    #[test]
+    fn mcp_business_scopes_keep_rule_local_scope_without_cartesian_merge() {
+        let store = EntitlementStore {
+            rules: vec![
+                {
+                    let mut rule = mcp_cloudwatch_business_rule(
+                        "ws168-prod",
+                        "rd",
+                        RuleMetadata {
+                            description: None,
+                            scopes: vec![BusinessScopeMetadata {
+                                platform: "WS168".into(),
+                                environment: "production".into(),
+                                aliases: vec!["正式環境".into(), "prod".into(), "prod".into()],
+                            }],
+                        },
+                        "111111111111",
+                        vec![
+                            "arn:aws:logs:*:111111111111:log-group:/ws168/prod/*".into(),
+                            "arn:aws:logs:*:111111111112:log-group:/ws168/prod-secondary/*".into(),
+                        ],
+                    );
+                    rule.allowed_accounts.push(AllowedAccount {
+                        account_id: "111111111112".into(),
+                        account_name: "ws168-prod-secondary".into(),
+                        role_arn: "arn:aws:iam::111111111112:role/CanopyReadOnly".into(),
+                    });
+                    rule.allowed_regions.push("us-west-2".into());
+                    rule
+                },
+                mcp_cloudwatch_business_rule(
+                    "ds88-demo",
+                    "rd",
+                    business_scope_metadata("DS88", "demo"),
+                    "222222222222",
+                    vec!["arn:aws:logs:*:222222222222:log-group:/ds88/demo/*".into()],
+                ),
+                mcp_cloudwatch_business_rule(
+                    "ws168-prod-dr",
+                    "rd",
+                    business_scope_metadata("WS168", "production"),
+                    "333333333333",
+                    vec!["arn:aws:logs:*:333333333333:log-group:/ws168/prod-dr/*".into()],
+                ),
+            ],
+            memberships: vec![GroupMembership {
+                user_id: "alice".into(),
+                group: "rd".into(),
+            }],
+        };
+
+        let ent = store.evaluate("alice", "alice@example.com", "Alice", true);
+        assert_eq!(ent.business_scopes.len(), 4);
+
+        let ws168 = ent
+            .business_scopes
+            .iter()
+            .find(|scope| scope.platform == "WS168" && scope.account_id == "111111111111")
+            .expect("WS168 scope should be present");
+        assert_eq!(ws168.environment, "production");
+        assert_eq!(ws168.account_id, "111111111111");
+        assert_eq!(ws168.regions, vec!["ap-northeast-1", "us-west-2"]);
+        assert_eq!(
+            ws168.log_group_arn_patterns,
+            vec!["arn:aws:logs:*:111111111111:log-group:/ws168/prod/*"]
+        );
+        assert_eq!(ws168.aliases, vec!["正式環境", "prod"]);
+        assert!(
+            ent.business_scopes
+                .iter()
+                .any(|scope| scope.platform == "WS168"
+                    && scope.environment == "production"
+                    && scope.account_id == "111111111112"
+                    && scope.regions.as_slice() == ["ap-northeast-1", "us-west-2"]
+                    && scope.log_group_arn_patterns.as_slice()
+                        == ["arn:aws:logs:*:111111111112:log-group:/ws168/prod-secondary/*"]),
+            "same rule should emit account-local log group patterns per allowed account"
+        );
+        assert!(
+            ent.business_scopes
+                .iter()
+                .any(|scope| scope.platform == "WS168"
+                    && scope.environment == "production"
+                    && scope.account_id == "333333333333"
+                    && scope.log_group_arn_patterns.as_slice()
+                        == ["arn:aws:logs:*:333333333333:log-group:/ws168/prod-dr/*"]),
+            "same business label in another rule must remain a separate rule-local candidate"
+        );
+
+        let ds88 = ent
+            .business_scopes
+            .iter()
+            .find(|scope| scope.platform == "DS88")
+            .expect("DS88 scope should be present");
+        assert_eq!(ds88.environment, "demo");
+        assert_eq!(ds88.account_id, "222222222222");
+        assert_eq!(
+            ds88.log_group_arn_patterns,
+            vec!["arn:aws:logs:*:222222222222:log-group:/ds88/demo/*"]
+        );
+    }
+
+    #[test]
+    fn mcp_business_scopes_respect_group_and_verified_email_boundaries() {
+        let store = EntitlementStore {
+            rules: vec![
+                mcp_cloudwatch_business_rule(
+                    "rd-ws168",
+                    "rd",
+                    business_scope_metadata("WS168", "production"),
+                    "111111111111",
+                    vec!["arn:aws:logs:*:111111111111:log-group:/ws168/*".into()],
+                ),
+                mcp_cloudwatch_business_rule(
+                    "ops-ds88",
+                    "ops",
+                    business_scope_metadata("DS88", "production"),
+                    "222222222222",
+                    vec!["arn:aws:logs:*:222222222222:log-group:/ds88/*".into()],
+                ),
+            ],
+            memberships: vec![
+                GroupMembership {
+                    user_id: "alice".into(),
+                    group: "rd".into(),
+                },
+                GroupMembership {
+                    user_id: "bob@example.com".into(),
+                    group: "ops".into(),
+                },
+            ],
+        };
+
+        let alice = store.evaluate("alice", "alice@example.com", "Alice", true);
+        assert_eq!(alice.business_scopes.len(), 1);
+        assert_eq!(alice.business_scopes[0].platform, "WS168");
+
+        let unverified_bob = store.evaluate("bob-sub", "bob@example.com", "Bob", false);
+        assert!(
+            unverified_bob.business_scopes.is_empty(),
+            "unverified email membership must not disclose business scopes"
+        );
+
+        let verified_bob = store.evaluate("bob-sub", "bob@example.com", "Bob", true);
+        assert_eq!(verified_bob.business_scopes.len(), 1);
+        assert_eq!(verified_bob.business_scopes[0].platform, "DS88");
+    }
+
+    #[test]
+    fn load_from_file_validates_business_scope_metadata_fail_closed() {
+        let empty_platform = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "bad-platform"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+allowed_log_group_arns = ["arn:aws:logs:*:111111111111:log-group:/app/*"]
+
+[rules.features]
+can_use_mcp = true
+can_use_mcp_cloudwatch = true
+
+[[rules.metadata.scopes]]
+platform = ""
+environment = "production"
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect_err("empty platform should fail closed");
+        assert!(empty_platform.to_string().contains("empty platform"));
+
+        let empty_alias = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "bad-alias"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+allowed_log_group_arns = ["arn:aws:logs:*:111111111111:log-group:/app/*"]
+
+[rules.features]
+can_use_mcp = true
+can_use_mcp_cloudwatch = true
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+aliases = ["prod", " "]
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect_err("empty alias should fail closed");
+        assert!(empty_alias.to_string().contains("empty alias"));
+
+        let unknown_secret_key = load_from_temp_toml(
+            r#"
+[[rules]]
+id = "bad-secret"
+group = "ops"
+allowed_accounts = [{ account_id = "111111111111", account_name = "prod", role_arn = "arn:aws:iam::111111111111:role/CanopyRole" }]
+allowed_regions = ["ap-northeast-1"]
+allowed_log_group_arns = ["arn:aws:logs:*:111111111111:log-group:/app/*"]
+
+[rules.features]
+can_use_mcp = true
+can_use_mcp_cloudwatch = true
+
+[rules.metadata]
+token = "do-not-allow"
+
+[[rules.metadata.scopes]]
+platform = "WS168"
+environment = "production"
+
+[[memberships]]
+user_id = "alice"
+group = "ops"
+"#,
+        )
+        .expect_err("unknown metadata key should fail closed");
+        assert!(unknown_secret_key.to_string().contains("unknown field"));
     }
 
     // ── Boundary tests ─────────────────────────────────
@@ -1694,6 +2180,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-extra".into(),
             group: "extra-group".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags::default(),
             allowed_accounts: vec![AllowedAccount {
                 account_id: "111111111111".into(),
@@ -1736,6 +2223,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-duplicate-db-scope".into(),
             group: "duplicate-db-scope".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_use_mcp: true,
                 can_use_mcp_database: true,
@@ -1786,6 +2274,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-conflicting-db-scope".into(),
             group: "conflicting-db-scope".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_use_mcp: true,
                 can_use_mcp_database: true,
@@ -1899,6 +2388,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-db-scope-without-feature".into(),
             group: "db-scope-without-feature".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_use_mcp: true,
                 can_use_mcp_database: false,
@@ -2039,6 +2529,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-duplicate-selector".into(),
             group: "duplicate-selector".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags::default(),
             allowed_accounts: vec![],
             allowed_regions: vec![],
@@ -2091,6 +2582,7 @@ mod tests {
         store.rules.push(EntitlementRule {
             id: "rule-ecs-extra".into(),
             group: "ecs-extra".into(),
+            metadata: RuleMetadata::default(),
             features: FeatureFlags {
                 can_view_ecs: true,
                 can_use_ecs_exec: true,
