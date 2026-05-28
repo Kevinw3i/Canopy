@@ -374,17 +374,25 @@ pub fn connect_session_policy(
 /// The local TUI still shells out to `aws ecs execute-command`; these scoped
 /// credentials prevent that spawned CLI from reusing the operator's broader
 /// ambient permissions.
-pub fn ecs_exec_session_policy(cluster_arn: &str, task_arn: &str, region: &str) -> String {
+pub fn ecs_exec_session_policy(
+    cluster_arn: &str,
+    task_arn: &str,
+    container_name: &str,
+    region: &str,
+) -> String {
     serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [
             {
                 "Effect": "Allow",
                 "Action": ["ecs:ExecuteCommand"],
-                "Resource": task_arn,
+                "Resource": [cluster_arn, task_arn],
                 "Condition": {
                     "ArnEquals": {
                         "ecs:cluster": cluster_arn
+                    },
+                    "StringEquals": {
+                        "ecs:container-name": container_name
                     }
                 }
             },
@@ -773,10 +781,11 @@ mod tests {
     }
 
     #[test]
-    fn ecs_exec_session_policy_contains_execute_command_on_task_arn() {
+    fn ecs_exec_session_policy_contains_execute_command_on_cluster_and_task_arns() {
         let policy = ecs_exec_session_policy(
             "arn:aws:ecs:ap-northeast-1:111111111111:cluster/prod-app",
             "arn:aws:ecs:ap-northeast-1:111111111111:task/prod-app/abc123",
+            "app",
             "ap-northeast-1",
         );
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
@@ -785,17 +794,24 @@ mod tests {
         assert_eq!(stmts[0]["Action"][0], "ecs:ExecuteCommand");
         assert_eq!(
             stmts[0]["Resource"],
-            "arn:aws:ecs:ap-northeast-1:111111111111:task/prod-app/abc123"
+            serde_json::json!([
+                "arn:aws:ecs:ap-northeast-1:111111111111:cluster/prod-app",
+                "arn:aws:ecs:ap-northeast-1:111111111111:task/prod-app/abc123"
+            ])
         );
         assert_eq!(
             stmts[0]["Condition"]["ArnEquals"]["ecs:cluster"],
             "arn:aws:ecs:ap-northeast-1:111111111111:cluster/prod-app"
         );
+        assert_eq!(
+            stmts[0]["Condition"]["StringEquals"]["ecs:container-name"],
+            "app"
+        );
     }
 
     #[test]
     fn ecs_exec_session_policy_contains_ssmmessages_actions() {
-        let policy = ecs_exec_session_policy("cluster", "task", "ap-northeast-1");
+        let policy = ecs_exec_session_policy("cluster", "task", "app", "ap-northeast-1");
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
         let statement = &v["Statement"][2];
         let actions = statement["Action"].as_array().unwrap();
@@ -811,7 +827,7 @@ mod tests {
 
     #[test]
     fn ecs_exec_session_policy_constrains_describe_tasks_by_region() {
-        let policy = ecs_exec_session_policy("cluster", "task", "ap-northeast-1");
+        let policy = ecs_exec_session_policy("cluster", "task", "app", "ap-northeast-1");
         let v: serde_json::Value = serde_json::from_str(&policy).unwrap();
         assert_eq!(v["Statement"][1]["Action"][0], "ecs:DescribeTasks");
         assert_eq!(v["Statement"][1]["Resource"], "*");
@@ -823,7 +839,7 @@ mod tests {
 
     #[test]
     fn ecs_exec_session_policy_excludes_ec2_or_eic_statements() {
-        let policy = ecs_exec_session_policy("cluster", "task", "us-east-1");
+        let policy = ecs_exec_session_policy("cluster", "task", "app", "us-east-1");
         assert!(!policy.contains("ec2-instance-connect"));
         assert!(!policy.contains("ec2:DescribeInstances"));
         assert!(!policy.contains("ssm:StartSession"));

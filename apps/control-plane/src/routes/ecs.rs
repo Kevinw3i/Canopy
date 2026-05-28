@@ -64,7 +64,7 @@ fn required_ecs_exec_simulations(req: &EcsExecRequest) -> Vec<RequiredIamSimulat
     vec![
         RequiredIamSimulation {
             action: "ecs:ExecuteCommand",
-            resources: vec![req.task_arn.clone()],
+            resources: vec![req.cluster_arn.clone(), req.task_arn.clone()],
         },
         RequiredIamSimulation {
             action: "ecs:DescribeTasks",
@@ -1396,7 +1396,12 @@ async fn exec_task(
         })
     } else {
         let session_ctx = session_context(&state, &entitlements);
-        let policy = ecs_exec_session_policy(&req.cluster_arn, &req.task_arn, &req.region);
+        let policy = ecs_exec_session_policy(
+            &req.cluster_arn,
+            &req.task_arn,
+            &req.container_name,
+            &req.region,
+        );
         let scoped_config = assume_role_scoped(
             &state.base_aws_config,
             &selected_account,
@@ -1613,12 +1618,22 @@ mod tests {
 
     #[test]
     fn required_ecs_exec_simulations_include_execute_and_ssmmessages() {
-        let simulations = required_ecs_exec_simulations(&exec_req());
+        let req = exec_req();
+        let simulations = required_ecs_exec_simulations(&req);
         let actions = simulations.iter().map(|sim| sim.action).collect::<Vec<_>>();
         assert!(actions.contains(&"ecs:ExecuteCommand"));
         assert!(actions.contains(&"ecs:DescribeTasks"));
         assert!(actions.contains(&"ssmmessages:CreateDataChannel"));
         assert!(actions.contains(&"ssmmessages:OpenControlChannel"));
+
+        let execute = simulations
+            .iter()
+            .find(|sim| sim.action == "ecs:ExecuteCommand")
+            .expect("execute-command simulation must be present");
+        assert_eq!(
+            execute.resources,
+            vec![req.cluster_arn.clone(), req.task_arn.clone()]
+        );
     }
 
     #[test]

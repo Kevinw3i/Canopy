@@ -115,6 +115,53 @@ impl StateFilter {
     }
 }
 
+fn ec2_table_layout(width: u16) -> (Vec<Constraint>, u16) {
+    let spacing: u16 = if width >= 170 { 4 } else { 2 };
+    let fixed_width = 19 + 15 + 15 + 9 + 11 + 5 + 5 + 14;
+    let separators = spacing.saturating_mul(8);
+    let name_width = width
+        .saturating_sub(fixed_width + separators + 4)
+        .clamp(22, 40);
+
+    (
+        vec![
+            Constraint::Length(19),
+            Constraint::Length(name_width),
+            Constraint::Length(15),
+            Constraint::Length(15),
+            Constraint::Length(9),
+            Constraint::Length(11),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(14),
+        ],
+        spacing,
+    )
+}
+
+fn ecs_table_layout(width: u16) -> (Vec<Constraint>, u16) {
+    let spacing: u16 = if width >= 170 { 4 } else { 2 };
+    let fixed_width = 14 + 18 + 8 + 9 + 12 + 14;
+    let separators = spacing.saturating_mul(7);
+    let remaining = width.saturating_sub(fixed_width + separators + 4);
+    let family_width = if width >= 170 { 24 } else { 22 };
+    let containers_width = remaining.saturating_sub(family_width).clamp(24, 34);
+
+    (
+        vec![
+            Constraint::Length(14),
+            Constraint::Length(family_width),
+            Constraint::Length(18),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(containers_width),
+            Constraint::Length(12),
+            Constraint::Length(14),
+        ],
+        spacing,
+    )
+}
+
 pub struct Ec2Screen {
     pub instances: Vec<Ec2Instance>,
     pub tasks: Vec<EcsTask>,
@@ -183,17 +230,18 @@ impl Ec2Screen {
                 ],
                 vec![
                     Constraint::Length(19),
-                    Constraint::Min(16),
+                    Constraint::Length(36),
                     Constraint::Length(15),
-                    Constraint::Length(13),
+                    Constraint::Length(15),
                     Constraint::Length(9),
                     Constraint::Length(11),
-                    Constraint::Length(4),
-                    Constraint::Length(4),
-                    Constraint::Length(12),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(14),
                 ],
             )
-            .with_theme(theme),
+            .with_theme(theme)
+            .with_column_spacing(4),
             ecs_table: SelectableTable::new(
                 vec![
                     "Cluster".into(),
@@ -206,17 +254,18 @@ impl Ec2Screen {
                     "Region".into(),
                 ],
                 vec![
-                    Constraint::Length(19),
-                    Constraint::Min(12),
-                    Constraint::Length(19),
-                    Constraint::Length(7),
-                    Constraint::Length(9),
+                    Constraint::Length(14),
                     Constraint::Length(24),
+                    Constraint::Length(18),
+                    Constraint::Length(8),
+                    Constraint::Length(9),
+                    Constraint::Length(34),
                     Constraint::Length(12),
                     Constraint::Length(14),
                 ],
             )
-            .with_theme(theme),
+            .with_theme(theme)
+            .with_column_spacing(4),
             view: InventoryView::Ec2,
             focus: Ec2Focus::Table,
             show_detail: false,
@@ -1926,6 +1975,10 @@ impl Ec2Screen {
             return;
         }
 
+        let (column_widths, column_spacing) = ec2_table_layout(area.width);
+        self.table.column_widths = column_widths;
+        self.table.set_column_spacing(column_spacing);
+
         let filter = self.state_filter;
         let rows: Vec<_> = self
             .instances
@@ -1986,6 +2039,10 @@ impl Ec2Screen {
     }
 
     fn render_ecs_table(&mut self, area: Rect, buf: &mut Buffer) {
+        let (column_widths, column_spacing) = ecs_table_layout(area.width);
+        self.ecs_table.column_widths = column_widths;
+        self.ecs_table.set_column_spacing(column_spacing);
+
         let tasks = self.filtered_tasks();
         let excluded_container_names = excluded_container_names(self.entitlements.as_ref());
         let rows: Vec<_> = tasks
@@ -2582,8 +2639,8 @@ mod tests {
 │└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
 │ Account: All │ Region: All                                                                                                               │
 │┌ ECS Tasks ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
-││  Cluster              Family            Task ID              Launch   Status     Containers                Account       Region        ││
-││> prod-api             payments          task-abcdef123456    FARGATE  RUNNING    app:ready,api:no-agent    111           us-east-1     ││
+││  Cluster         Family                 Task ID             Launch    Status     Containers                Account       Region        ││
+││> prod-api        payments               task-abcdef123456   FARGATE   RUNNING    app:ready,api:no-agent    111           us-east-1     ││
 ││                                                                                                                                        ││
 ││                                                                                                                                        ││
 ││                                                                                                                                        ││

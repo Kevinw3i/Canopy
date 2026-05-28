@@ -26,6 +26,7 @@ pub struct SelectableTable {
     pub row_count: usize,
     pub column_widths: Vec<Constraint>,
     pub headers: Vec<String>,
+    column_spacing: u16,
     theme: Theme,
 }
 
@@ -36,6 +37,7 @@ impl SelectableTable {
             row_count: 0,
             column_widths,
             headers,
+            column_spacing: 2,
             theme: Theme::default(),
         }
     }
@@ -43,6 +45,15 @@ impl SelectableTable {
     pub fn with_theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
         self
+    }
+
+    pub fn with_column_spacing(mut self, spacing: u16) -> Self {
+        self.column_spacing = spacing;
+        self
+    }
+
+    pub fn set_column_spacing(&mut self, spacing: u16) {
+        self.column_spacing = spacing;
     }
 
     pub fn set_row_count(&mut self, count: usize) {
@@ -134,7 +145,7 @@ impl SelectableTable {
 
         let table = Table::new(rows, &self.column_widths)
             .header(header)
-            .column_spacing(2)
+            .column_spacing(self.column_spacing)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -281,5 +292,28 @@ mod tests {
         assert!(buf.content.iter().any(|cell| {
             cell.symbol() != " " && cell.bg == Color::Blue && cell.fg == Color::LightYellow
         }));
+    }
+
+    #[test]
+    fn render_uses_configured_column_spacing() {
+        let mut table = SelectableTable::new(
+            vec!["A".into(), "B".into()],
+            vec![Constraint::Length(3), Constraint::Length(3)],
+        )
+        .with_column_spacing(4);
+        table.set_row_count(1);
+
+        let rows = vec![Row::new(vec![Cell::from("one"), Cell::from("two")])];
+        let area = Rect::new(0, 0, 18, 5);
+        let mut buf = Buffer::empty(area);
+        table.render_with_rows_focused(rows.into_iter(), "Demo", area, &mut buf, false);
+
+        let rendered = buf
+            .content
+            .chunks(area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("one    two"));
     }
 }
