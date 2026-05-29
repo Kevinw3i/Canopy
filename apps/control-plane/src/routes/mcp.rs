@@ -1437,9 +1437,7 @@ async fn list_database_scopes(
                 denial.audit_outcome_kind(),
             )?;
         }
-        return Err(denial.http_response(
-            "Required MCP database guidance has not been completed",
-        ));
+        return Err(denial.http_response("Required MCP database guidance has not been completed"));
     }
 
     state
@@ -1531,9 +1529,7 @@ async fn query_database(
                 None,
             )?;
         }
-        return Err(denial.http_response(
-            "Required MCP database guidance has not been completed",
-        ));
+        return Err(denial.http_response("Required MCP database guidance has not been completed"));
     }
 
     let store = state.entitlement_store.read().await;

@@ -238,10 +238,25 @@ pub async fn assume_role_with_duration(
 /// returned credentials can do. Used by the connect handler to scope
 /// credentials to only SSM/EIC operations on the target instance.
 ///
-/// `max_session_seconds`: entitlement-derived session cap. The actual STS
-/// duration is clamped to `[900, max_session_seconds]` — STS requires at
-/// least 900s for AssumeRole. If the entitlement cap is below 900s, the
-/// request is rejected at the caller before reaching this function.
+fn scoped_session_duration_seconds(max_session_seconds: Option<u64>) -> anyhow::Result<i32> {
+    const STS_MIN_DURATION_SECONDS: u64 = 900;
+
+    if let Some(cap) = max_session_seconds {
+        anyhow::ensure!(
+            cap >= STS_MIN_DURATION_SECONDS,
+            "max_session_seconds ({cap}s) is below STS minimum ({STS_MIN_DURATION_SECONDS}s)"
+        );
+    }
+
+    // Connect/ECS Exec scoped credentials are short-lived by design. The
+    // entitlement value is a cap, not the requested duration; requesting a
+    // larger value can exceed the target role's MaxSessionDuration.
+    Ok(STS_MIN_DURATION_SECONDS as i32)
+}
+
+/// `max_session_seconds`: entitlement-derived session cap. Scoped connect/exec
+/// credentials intentionally request the STS minimum duration (900s); the cap is
+/// enforced as a maximum and must not be used as the requested duration.
 pub async fn assume_role_scoped(
     base_config: &SdkConfig,
     account: &AllowedAccount,
@@ -252,11 +267,7 @@ pub async fn assume_role_scoped(
 ) -> anyhow::Result<SdkConfig> {
     let sts_client = StsClient::new(base_config);
 
-    // STS minimum is 900s. Use entitlement cap if set, otherwise default 900s.
-    let duration = match max_session_seconds {
-        Some(cap) => (cap as i32).max(900),
-        None => 900,
-    };
+    let duration = scoped_session_duration_seconds(max_session_seconds)?;
 
     let credentials = assume_role_credentials_with_tag_fallback(
         &sts_client,
@@ -542,6 +553,22 @@ mod tests {
         assert!(!is_tag_session_authorization_error_message(
             "AccessDenied: not authorized to perform: sts:AssumeRole on resource"
         ));
+    }
+
+    #[test]
+    fn scoped_session_duration_uses_sts_minimum_when_cap_is_higher() {
+        assert_eq!(scoped_session_duration_seconds(None).unwrap(), 900);
+        assert_eq!(scoped_session_duration_seconds(Some(900)).unwrap(), 900);
+        assert_eq!(scoped_session_duration_seconds(Some(3600)).unwrap(), 900);
+        assert_eq!(scoped_session_duration_seconds(Some(43_200)).unwrap(), 900);
+    }
+
+    #[test]
+    fn scoped_session_duration_rejects_caps_below_sts_minimum() {
+        let err = scoped_session_duration_seconds(Some(899)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("max_session_seconds (899s) is below STS minimum"));
     }
 
     // ── connect_session_policy ──────────────────────────

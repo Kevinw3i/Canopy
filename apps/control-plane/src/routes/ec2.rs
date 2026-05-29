@@ -1646,7 +1646,7 @@ async fn connect_instance(
                 )
                 .await
                 .map_err(|e| {
-                    tracing::error!("Scoped AssumeRole failed: {}", e);
+                    tracing::error!(error = ?e, "Scoped AssumeRole failed");
                     state
                         .audit_service
                         .event(&claims.sub, AuditAction::Ec2Connect, AuditOutcome::Failure)

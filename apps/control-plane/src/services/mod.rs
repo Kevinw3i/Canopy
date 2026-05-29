@@ -213,11 +213,10 @@ impl AppState {
                 // present and non-empty for the dynamodb store, so this is an
                 // invariant, not a second validation (which would duplicate the
                 // check and error message in config.rs).
-                let table_name = config
-                    .mcp
-                    .session_table_name
-                    .clone()
-                    .expect("session_table_name is validated by AppConfig::validate for dynamodb");
+                let table_name =
+                    config.mcp.session_table_name.clone().expect(
+                        "session_table_name is validated by AppConfig::validate for dynamodb",
+                    );
                 Arc::new(DynamoMcpSessionStore::new(
                     aws_sdk_dynamodb::Client::new(&base_aws_config),
                     table_name,

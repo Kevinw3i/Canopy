@@ -1535,7 +1535,13 @@ impl McpSessionStore for FailingGetSessionStore {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, control_plane::services::mcp_sessions::McpSessionStoreError> {
         self.inner
-            .mark_guidance_delivered(session_id, actor, local_secret_generation, guidance_key, now)
+            .mark_guidance_delivered(
+                session_id,
+                actor,
+                local_secret_generation,
+                guidance_key,
+                now,
+            )
             .await
     }
 }
