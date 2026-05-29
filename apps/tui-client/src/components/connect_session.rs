@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::event::{Action, MouseInput, MouseScrollDirection};
+use crate::event::{Action, MouseInput, MouseInputKind, MouseScrollDirection};
 use crate::theme::Theme;
 
 const STATUS_RIGHT_PADDING: u16 = 1;
@@ -105,6 +105,19 @@ pub(crate) enum ConnectSessionStatus {
     TimedOut,
     Disconnected,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionPoint {
+    row: u16,
+    col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseSelection {
+    anchor: SelectionPoint,
+    focus: SelectionPoint,
+    dragging: bool,
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +230,7 @@ pub(crate) struct ConnectSessionScreen {
     terminal_message: Option<String>,
     overlay: Option<ConnectOverlay>,
     copy_capture: Option<CopyCapture>,
+    selection: Option<MouseSelection>,
     clipboard: Arc<dyn ClipboardWriter>,
     pty_cols: u16,
     pty_rows: u16,
@@ -316,6 +330,7 @@ impl ConnectSessionScreen {
             terminal_message: None,
             overlay: None,
             copy_capture: None,
+            selection: None,
             clipboard: Arc::new(SystemClipboardWriter),
             pty_cols,
             pty_rows,
@@ -359,6 +374,7 @@ impl ConnectSessionScreen {
             return;
         }
 
+        self.clear_selection();
         self.parser.process(&bytes);
         let terminal_responses = self.parser.callbacks_mut().take_responses();
         if !terminal_responses.is_empty() {
@@ -436,6 +452,7 @@ impl ConnectSessionScreen {
             return;
         }
 
+        self.clear_selection();
         self.pty_cols = pty_cols;
         self.pty_rows = pty_rows;
         self.parser.screen_mut().set_size(pty_rows, pty_cols);
@@ -447,6 +464,7 @@ impl ConnectSessionScreen {
             return Action::Noop;
         }
 
+        self.clear_selection();
         if self.is_terminal() {
             return match key.code {
                 KeyCode::Enter => Action::ConnectSessionExit,
@@ -498,6 +516,7 @@ impl ConnectSessionScreen {
             return Action::Noop;
         }
 
+        self.clear_selection();
         let bytes = bracketed_paste_bytes(text);
         if let Err(e) = self.write_to_pty(&bytes) {
             return Action::ConnectSessionFailure(e);
@@ -522,14 +541,90 @@ impl ConnectSessionScreen {
         };
 
         if let Some(target) = target {
+            self.clear_selection();
             self.parser.screen_mut().set_scrollback(target);
         }
 
         Action::Noop
     }
 
-    pub(crate) fn handle_mouse_input(&mut self, _mouse: MouseInput) -> Action {
+    pub(crate) fn handle_mouse_input(&mut self, mouse: MouseInput) -> Action {
+        if self.is_terminal() || self.overlay.is_some() || self.copy_capture.is_some() {
+            return Action::Noop;
+        }
+
+        match mouse.kind {
+            MouseInputKind::LeftDown => {
+                let Some(point) = self.mouse_to_selection_point(mouse, false) else {
+                    return Action::Noop;
+                };
+                self.selection = Some(MouseSelection {
+                    anchor: point,
+                    focus: point,
+                    dragging: true,
+                });
+            }
+            MouseInputKind::LeftDrag => {
+                let Some(current) = self.selection else {
+                    return Action::Noop;
+                };
+                if !current.dragging {
+                    return Action::Noop;
+                }
+                let Some(point) = self.mouse_to_selection_point(mouse, true) else {
+                    return Action::Noop;
+                };
+                self.selection = Some(MouseSelection {
+                    focus: point,
+                    ..current
+                });
+            }
+            MouseInputKind::LeftUp => {
+                let Some(current) = self.selection else {
+                    return Action::Noop;
+                };
+                if !current.dragging {
+                    return Action::Noop;
+                }
+                let Some(point) = self.mouse_to_selection_point(mouse, true) else {
+                    return Action::Noop;
+                };
+                self.selection = Some(MouseSelection {
+                    focus: point,
+                    dragging: false,
+                    ..current
+                });
+            }
+        }
+
         Action::Noop
+    }
+
+    fn mouse_to_selection_point(&self, mouse: MouseInput, clamp: bool) -> Option<SelectionPoint> {
+        let max_col = self.pty_cols.saturating_sub(1);
+        let max_row = self.pty_rows.saturating_sub(1);
+
+        if !clamp {
+            if mouse.row < STATUS_BAR_HEIGHT || mouse.col >= self.pty_cols {
+                return None;
+            }
+            let row = mouse.row - STATUS_BAR_HEIGHT;
+            if row >= self.pty_rows {
+                return None;
+            }
+            return Some(SelectionPoint {
+                row,
+                col: mouse.col,
+            });
+        }
+
+        let row = mouse.row.saturating_sub(STATUS_BAR_HEIGHT).min(max_row);
+        let col = mouse.col.min(max_col);
+        Some(SelectionPoint { row, col })
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
     }
 
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -1211,11 +1306,13 @@ impl ConnectSessionScreen {
             return false;
         };
 
+        self.clear_selection();
         self.parser.screen_mut().set_scrollback(target);
         true
     }
 
     fn reset_scrollback(&mut self) {
+        self.clear_selection();
         if self.parser.screen().scrollback() > 0 {
             self.parser.screen_mut().set_scrollback(0);
         }
@@ -1790,6 +1887,10 @@ mod tests {
         session.parser.screen_mut().set_scrollback(0);
     }
 
+    fn mouse(kind: MouseInputKind, col: u16, row: u16) -> MouseInput {
+        MouseInput { kind, col, row }
+    }
+
     #[cfg(unix)]
     #[test]
     fn left_status_text_uses_ecs_surface_for_ecs_method() {
@@ -2206,18 +2307,121 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mouse_input_is_local_noop_until_selection_state_exists() {
+    fn mouse_input_tracks_selection_lifecycle() {
         let mut session = spawn_sleeping_session();
 
         assert!(matches!(
-            session.handle_mouse_input(crate::event::MouseInput {
-                kind: crate::event::MouseInputKind::LeftDown,
-                col: 3,
-                row: 2,
-            }),
+            session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 3, STATUS_BAR_HEIGHT)),
             Action::Noop
         ));
+        let selection = session.selection.expect("selection starts on left down");
+        assert_eq!(selection.anchor, SelectionPoint { row: 0, col: 3 });
+        assert_eq!(selection.focus, SelectionPoint { row: 0, col: 3 });
+        assert!(selection.dragging);
 
+        assert!(matches!(
+            session.handle_mouse_input(mouse(MouseInputKind::LeftDrag, 5, STATUS_BAR_HEIGHT + 2)),
+            Action::Noop
+        ));
+        let selection = session.selection.expect("selection updates on drag");
+        assert_eq!(selection.anchor, SelectionPoint { row: 0, col: 3 });
+        assert_eq!(selection.focus, SelectionPoint { row: 2, col: 5 });
+        assert!(selection.dragging);
+
+        assert!(matches!(
+            session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 7, STATUS_BAR_HEIGHT + 3)),
+            Action::Noop
+        ));
+        let selection = session.selection.expect("selection finishes on left up");
+        assert_eq!(selection.anchor, SelectionPoint { row: 0, col: 3 });
+        assert_eq!(selection.focus, SelectionPoint { row: 3, col: 7 });
+        assert!(!selection.dragging);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_input_starts_only_inside_terminal_area_and_clamps_drag() {
+        let mut session = spawn_sleeping_session();
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, 0));
+        assert!(session.selection.is_none());
+        let _ = session.handle_mouse_input(mouse(
+            MouseInputKind::LeftDown,
+            session.pty_cols,
+            STATUS_BAR_HEIGHT,
+        ));
+        assert!(session.selection.is_none());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDrag, u16::MAX, u16::MAX));
+        let selection = session.selection.expect("drag clamps existing selection");
+        assert_eq!(
+            selection.focus,
+            SelectionPoint {
+                row: session.pty_rows - 1,
+                col: session.pty_cols - 1,
+            }
+        );
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 0, 0));
+        let selection = session.selection.expect("left up clamps above terminal");
+        assert_eq!(selection.focus, SelectionPoint { row: 0, col: 0 });
+        assert!(!selection.dragging);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_input_is_noop_when_session_cannot_select() {
+        let mut session = spawn_sleeping_session();
+
+        session.overlay = Some(ConnectOverlay::Help);
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_none());
+
+        session.overlay = None;
+        session.copy_capture = Some(CopyCapture::new("/tmp/app.log".into(), "copyid"));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_none());
+
+        session.copy_capture = None;
+        session.disconnect();
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_none());
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_paste_output_scrollback_and_resize_clear_selection() {
+        let mut session = spawn_sleeping_session();
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_some());
+        let _ = session.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(session.selection.is_none());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_some());
+        let _ = session.handle_paste("hello");
+        assert!(session.selection.is_none());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_some());
+        session.process_output(b"remote output");
+        assert!(session.selection.is_none());
+
+        feed_enough_scrollback_lines(&mut session);
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_some());
+        let _ = session.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(session.selection.is_none());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_some());
+        session.resize(100, 40);
+        assert!(session.selection.is_none());
         cleanup_session(session);
     }
 
