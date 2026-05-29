@@ -540,6 +540,9 @@ impl ConnectSessionScreen {
         {
             return Action::Noop;
         }
+        if self.selection.is_some_and(|selection| selection.dragging) {
+            return Action::Noop;
+        }
 
         let current = self.parser.screen().scrollback();
         let target = match direction {
@@ -2024,6 +2027,27 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn visible_screen_row_text(session: &ConnectSessionScreen, row: u16) -> String {
+        let screen = session.parser.screen();
+        let mut line = String::new();
+        for col in 0..session.pty_cols {
+            let Some(cell) = screen.cell(row, col) else {
+                line.push(' ');
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            if cell.has_contents() {
+                line.push_str(cell.contents());
+            } else {
+                line.push(' ');
+            }
+        }
+        line.trim_end_matches(' ').to_string()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn left_status_text_uses_ecs_surface_for_ecs_method() {
         let session = spawn_test_session_with_method(vec!["-c".into(), "sleep 30".into()], "ECS");
@@ -2434,6 +2458,106 @@ mod tests {
             Action::Noop
         ));
         assert_eq!(session.parser.screen().scrollback(), before);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_wheel_is_noop_during_drag_and_resumes_after_mouse_up() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard;
+        feed_enough_scrollback_lines(&mut session);
+
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        assert!(session
+            .selection
+            .is_some_and(|selection| selection.dragging));
+
+        assert!(matches!(
+            session.handle_mouse_scroll(MouseScrollDirection::Up),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        assert!(session
+            .selection
+            .is_some_and(|selection| selection.dragging));
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 0, STATUS_BAR_HEIGHT));
+        assert!(session
+            .selection
+            .is_some_and(|selection| !selection.dragging));
+
+        assert!(matches!(
+            session.handle_mouse_scroll(MouseScrollDirection::Up),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), 1);
+        assert!(session.selection.is_none());
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn alternate_screen_allows_visible_mouse_selection() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"\x1b[?1049hALT-VISIBLE");
+        assert!(session.parser.screen().alternate_screen());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 10, STATUS_BAR_HEIGHT));
+
+        assert_eq!(
+            clipboard.bytes.lock().expect("lock").as_slice(),
+            b"ALT-VISIBLE"
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_selection_reads_current_scrollback_view() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        feed_scrollback_lines(&mut session, 80);
+        session.parser.screen_mut().set_scrollback(10);
+
+        let expected = visible_screen_row_text(&session, 0);
+        assert!(expected.starts_with("line-"));
+        let end_col = expected.chars().count().saturating_sub(1) as u16;
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ =
+            session.handle_mouse_input(mouse(MouseInputKind::LeftUp, end_col, STATUS_BAR_HEIGHT));
+
+        assert_eq!(
+            String::from_utf8(clipboard.bytes.lock().expect("lock").clone()).unwrap(),
+            expected
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_key_returning_to_live_view_clears_mouse_selection() {
+        let mut session = spawn_sleeping_session();
+        feed_enough_scrollback_lines(&mut session);
+        session.parser.screen_mut().set_scrollback(1);
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        assert!(session.selection.is_some());
+        assert!(session.parser.screen().scrollback() > 0);
+
+        assert!(matches!(
+            session.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Action::Noop
+        ));
+        assert_eq!(session.parser.screen().scrollback(), 0);
+        assert!(session.selection.is_none());
         cleanup_session(session);
     }
 
