@@ -117,7 +117,7 @@ cargo test --workspace
 
 ### Manual Smoke Tests
 
-- iTerm2 SSH session 拖曳文字，釋放後貼上確認 clipboard；若 iTerm2 profile 將普通 drag 保留給 native selection，改用 Option-drag 驗證 TUI mouse event path。
+- iTerm2 SSH session 拖曳文字，釋放後貼上確認 clipboard；若 iTerm2 profile 將普通 drag 保留給 native selection，改用 Option-drag 或調整 iTerm2 mouse reporting 設定，並以 TUI status 顯示 `COPIED` 或 clipboard 內容確認。
 - 同 session 使用 mouse wheel 確認 local scrollback 仍正常。
 - `less` / `vim` / `top` 中確認 alternate screen 可選可見文字，wheel 不誤捲 local scrollback。
 - 中英文混合輸出確認 highlight 與 copied text 不錯位。
