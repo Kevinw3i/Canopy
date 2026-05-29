@@ -893,8 +893,8 @@ impl ConnectSessionScreen {
                 Span::raw("  scrolls local scrollback"),
             ]),
             Line::from(vec![
-                Span::styled("Drag mouse", self.theme.warning_style().bold()),
-                Span::raw("   select and copy text"),
+                Span::styled("Drag / Option-drag", self.theme.warning_style().bold()),
+                Span::raw(" select and copy text"),
             ]),
             Line::from(vec![
                 Span::styled("End", self.theme.warning_style().bold()),
@@ -2907,7 +2907,7 @@ mod tests {
         session.render(area, &mut buf);
         let text = buffer_text(&buf, area);
 
-        assert!(text.contains("Drag mouse"));
+        assert!(text.contains("Drag / Option-drag"));
         assert!(text.contains("select and copy text"));
         cleanup_session(session);
     }
