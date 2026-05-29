@@ -120,6 +120,12 @@ struct MouseSelection {
     dragging: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionNotice {
+    Copied { chars: usize },
+    CopyFailed,
+}
+
 #[derive(Debug, Default)]
 struct OutputBuffer {
     bytes: Vec<u8>,
@@ -231,6 +237,7 @@ pub(crate) struct ConnectSessionScreen {
     overlay: Option<ConnectOverlay>,
     copy_capture: Option<CopyCapture>,
     selection: Option<MouseSelection>,
+    selection_notice: Option<SelectionNotice>,
     clipboard: Arc<dyn ClipboardWriter>,
     pty_cols: u16,
     pty_rows: u16,
@@ -331,6 +338,7 @@ impl ConnectSessionScreen {
             overlay: None,
             copy_capture: None,
             selection: None,
+            selection_notice: None,
             clipboard: Arc::new(SystemClipboardWriter),
             pty_cols,
             pty_rows,
@@ -558,6 +566,7 @@ impl ConnectSessionScreen {
                 let Some(point) = self.mouse_to_selection_point(mouse, false) else {
                     return Action::Noop;
                 };
+                self.selection_notice = None;
                 self.selection = Some(MouseSelection {
                     anchor: point,
                     focus: point,
@@ -594,6 +603,7 @@ impl ConnectSessionScreen {
                     dragging: false,
                     ..current
                 });
+                self.copy_selection_to_clipboard();
             }
         }
 
@@ -625,6 +635,62 @@ impl ConnectSessionScreen {
 
     fn clear_selection(&mut self) {
         self.selection = None;
+        self.selection_notice = None;
+    }
+
+    fn copy_selection_to_clipboard(&mut self) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let text = self.extract_selection_text(selection);
+        if !text.chars().any(|ch| ch != ' ' && ch != '\n') {
+            self.selection_notice = None;
+            return;
+        }
+
+        match self.clipboard.write_clipboard(text.as_bytes()) {
+            Ok(()) => {
+                self.selection_notice = Some(SelectionNotice::Copied {
+                    chars: text.chars().count(),
+                });
+            }
+            Err(_) => {
+                self.selection_notice = Some(SelectionNotice::CopyFailed);
+            }
+        }
+    }
+
+    fn extract_selection_text(&self, selection: MouseSelection) -> String {
+        let (start, end) = ordered_selection_points(selection.anchor, selection.focus);
+        let screen = self.parser.screen();
+        let mut lines = Vec::new();
+
+        for row in start.row..=end.row {
+            let start_col = if row == start.row { start.col } else { 0 };
+            let end_col = if row == end.row {
+                end.col
+            } else {
+                self.pty_cols.saturating_sub(1)
+            };
+            let mut line = String::new();
+            for col in start_col..=end_col {
+                let Some(cell) = screen.cell(row, col) else {
+                    line.push(' ');
+                    continue;
+                };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                if cell.has_contents() {
+                    line.push_str(cell.contents());
+                } else {
+                    line.push(' ');
+                }
+            }
+            lines.push(line.trim_end_matches(' ').to_string());
+        }
+
+        lines.join("\n")
     }
 
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -1331,6 +1397,17 @@ fn pty_size(rows: u16, cols: u16) -> PtySize {
         cols,
         pixel_width: 0,
         pixel_height: 0,
+    }
+}
+
+fn ordered_selection_points(
+    a: SelectionPoint,
+    b: SelectionPoint,
+) -> (SelectionPoint, SelectionPoint) {
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -2422,6 +2499,141 @@ mod tests {
         assert!(session.selection.is_some());
         session.resize(100, 40);
         assert!(session.selection.is_none());
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_selection_copies_single_line_text_to_clipboard() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"abcdef");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 3, STATUS_BAR_HEIGHT));
+
+        assert_eq!(clipboard.bytes.lock().expect("lock").as_slice(), b"bcd");
+        assert_eq!(
+            session.selection_notice,
+            Some(SelectionNotice::Copied { chars: 3 })
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_selection_copies_reverse_multiline_text() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"abcde\r\n12345");
+
+        let _ =
+            session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 3, STATUS_BAR_HEIGHT + 1));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 1, STATUS_BAR_HEIGHT));
+
+        assert_eq!(
+            clipboard.bytes.lock().expect("lock").as_slice(),
+            b"bcde\n1234"
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_selection_copies_wide_characters_once() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output("a中b".as_bytes());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 3, STATUS_BAR_HEIGHT));
+
+        assert_eq!(
+            String::from_utf8(clipboard.bytes.lock().expect("lock").clone()).unwrap(),
+            "a中b"
+        );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_selection_preserves_middle_spaces_and_trims_line_end() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"a  b   ");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 6, STATUS_BAR_HEIGHT));
+
+        assert_eq!(clipboard.bytes.lock().expect("lock").as_slice(), b"a  b");
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blank_mouse_selection_does_not_overwrite_clipboard() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        *clipboard.bytes.lock().expect("lock") = b"previous".to_vec();
+        session.clipboard = clipboard.clone();
+
+        let _ =
+            session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 5, STATUS_BAR_HEIGHT + 5));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 8, STATUS_BAR_HEIGHT + 5));
+
+        assert_eq!(
+            clipboard.bytes.lock().expect("lock").as_slice(),
+            b"previous"
+        );
+        assert_eq!(session.selection_notice, None);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_selection_reports_clipboard_failure_without_overwriting() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        *clipboard.bytes.lock().expect("lock") = b"previous".to_vec();
+        *clipboard.error.lock().expect("lock") = Some("clipboard denied".into());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"abc");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 2, STATUS_BAR_HEIGHT));
+
+        assert_eq!(
+            clipboard.bytes.lock().expect("lock").as_slice(),
+            b"previous"
+        );
+        assert_eq!(session.selection_notice, Some(SelectionNotice::CopyFailed));
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn later_mouse_selection_overwrites_previous_clipboard_text() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"abcdef");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 0, STATUS_BAR_HEIGHT));
+        assert_eq!(clipboard.bytes.lock().expect("lock").as_slice(), b"a");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 3, STATUS_BAR_HEIGHT));
+        assert_eq!(session.selection_notice, None);
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 5, STATUS_BAR_HEIGHT));
+        assert_eq!(clipboard.bytes.lock().expect("lock").as_slice(), b"def");
+        assert_eq!(
+            session.selection_notice,
+            Some(SelectionNotice::Copied { chars: 3 })
+        );
         cleanup_session(session);
     }
 
