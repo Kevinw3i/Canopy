@@ -811,11 +811,33 @@ impl ConnectSessionScreen {
                 } else {
                     " "
                 };
+                let style = if self.selection_contains_cell(row, col) {
+                    self.theme.selected_plain_style()
+                } else {
+                    vt_style(term_cell)
+                };
                 let cell = &mut buf[(area.x + col, area.y + row)];
                 cell.set_symbol(symbol);
-                cell.set_style(vt_style(term_cell));
+                cell.set_style(style);
             }
         }
+    }
+
+    fn selection_contains_cell(&self, row: u16, col: u16) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        let (start, end) = ordered_selection_points(selection.anchor, selection.focus);
+        if row < start.row || row > end.row {
+            return false;
+        }
+        let start_col = if row == start.row { start.col } else { 0 };
+        let end_col = if row == end.row {
+            end.col
+        } else {
+            self.pty_cols.saturating_sub(1)
+        };
+        col >= start_col && col <= end_col
     }
 
     fn render_overlay(&self, overlay: &ConnectOverlay, area: Rect, buf: &mut Buffer) {
@@ -836,7 +858,7 @@ impl ConnectSessionScreen {
     }
 
     fn render_help_overlay(&self, area: Rect, buf: &mut Buffer) {
-        let modal_area = centered_rect(area, 74, 13);
+        let modal_area = centered_rect(area, 74, 14);
         Clear.render(modal_area, buf);
 
         let block = Block::default()
@@ -866,6 +888,10 @@ impl ConnectSessionScreen {
             Line::from(vec![
                 Span::styled("Mouse wheel", self.theme.warning_style().bold()),
                 Span::raw("  scrolls local scrollback"),
+            ]),
+            Line::from(vec![
+                Span::styled("Drag mouse", self.theme.warning_style().bold()),
+                Span::raw("   select and copy text"),
             ]),
             Line::from(vec![
                 Span::styled("End", self.theme.warning_style().bold()),
@@ -1021,7 +1047,24 @@ impl ConnectSessionScreen {
                 let (timer, style) = countdown_status_with_theme(self.remaining_secs(), self.theme);
                 let scrollback = self.parser.screen().scrollback();
                 let copying = self.copy_capture.is_some();
-                if scrollback > 0 {
+                let selecting = self.selection.is_some_and(|selection| selection.dragging);
+                if selecting {
+                    (
+                        "SELECTING".into(),
+                        self.theme.warning_style().bg(self.theme.selected_bg).bold(),
+                    )
+                } else if let Some(notice) = self.selection_notice {
+                    match notice {
+                        SelectionNotice::Copied { chars } => (
+                            format!("COPIED {chars} chars"),
+                            self.theme.success_style().bg(self.theme.selected_bg).bold(),
+                        ),
+                        SelectionNotice::CopyFailed => (
+                            "COPY FAILED".into(),
+                            self.theme.danger_style().bg(self.theme.selected_bg).bold(),
+                        ),
+                    }
+                } else if scrollback > 0 {
                     (format!("SCROLL +{scrollback}  {timer}"), style)
                 } else if copying {
                     (format!("COPYING  {timer}"), style)
@@ -1968,6 +2011,18 @@ mod tests {
         MouseInput { kind, col, row }
     }
 
+    fn buffer_text(buf: &Buffer, area: Rect) -> String {
+        let mut lines = Vec::new();
+        for row in area.y..area.y.saturating_add(area.height) {
+            let mut line = String::new();
+            for col in area.x..area.x.saturating_add(area.width) {
+                line.push_str(buf[(col, row)].symbol());
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n")
+    }
+
     #[cfg(unix)]
     #[test]
     fn left_status_text_uses_ecs_surface_for_ecs_method() {
@@ -2634,6 +2689,102 @@ mod tests {
             session.selection_notice,
             Some(SelectionNotice::Copied { chars: 3 })
         );
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_terminal_applies_selection_style_without_clearing_text() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard;
+        session.process_output(b"abcdef");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 3, STATUS_BAR_HEIGHT));
+
+        let theme = session.theme;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        session.render(area, &mut buf);
+
+        let selected = &buf[(1, STATUS_BAR_HEIGHT)];
+        assert_eq!(selected.symbol(), "b");
+        assert_eq!(selected.fg, theme.selected_fg);
+        assert_eq!(selected.bg, theme.selected_bg);
+        assert!(selected.modifier.contains(Modifier::BOLD));
+
+        let unselected = &buf[(0, STATUS_BAR_HEIGHT)];
+        assert_eq!(unselected.symbol(), "a");
+        assert_ne!(unselected.bg, theme.selected_bg);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_terminal_skips_wide_continuation_selection_highlight() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard;
+        session.process_output("a中b".as_bytes());
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 3, STATUS_BAR_HEIGHT));
+
+        let theme = session.theme;
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        session.render(area, &mut buf);
+
+        let wide_lead = &buf[(1, STATUS_BAR_HEIGHT)];
+        assert_eq!(wide_lead.symbol(), "中");
+        assert_eq!(wide_lead.bg, theme.selected_bg);
+
+        let wide_continuation = &buf[(2, STATUS_BAR_HEIGHT)];
+        assert_eq!(wide_continuation.symbol(), " ");
+        assert_ne!(wide_continuation.bg, theme.selected_bg);
+
+        let after_wide = &buf[(3, STATUS_BAR_HEIGHT)];
+        assert_eq!(after_wide.symbol(), "b");
+        assert_eq!(after_wide.bg, theme.selected_bg);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_label_reports_mouse_selection_copy_and_failure() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard.clone();
+        session.process_output(b"abc");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
+        assert_eq!(session.status_label().0, "SELECTING");
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 0, STATUS_BAR_HEIGHT));
+        assert_eq!(session.status_label().0, "COPIED 1 chars");
+
+        *clipboard.error.lock().expect("lock") = Some("clipboard denied".into());
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 1, STATUS_BAR_HEIGHT));
+        assert_eq!(session.status_label().0, "SELECTING");
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 2, STATUS_BAR_HEIGHT));
+        assert_eq!(session.status_label().0, "COPY FAILED");
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn help_overlay_includes_mouse_selection_hint() {
+        let mut session = spawn_sleeping_session();
+        session.overlay = Some(ConnectOverlay::Help);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        session.render(area, &mut buf);
+        let text = buffer_text(&buf, area);
+
+        assert!(text.contains("Drag mouse"));
+        assert!(text.contains("select and copy text"));
         cleanup_session(session);
     }
 
