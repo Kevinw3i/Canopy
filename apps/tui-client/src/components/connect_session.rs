@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::event::{Action, MouseScrollDirection};
+use crate::event::{Action, MouseInput, MouseScrollDirection};
 use crate::theme::Theme;
 
 const STATUS_RIGHT_PADDING: u16 = 1;
@@ -525,6 +525,10 @@ impl ConnectSessionScreen {
             self.parser.screen_mut().set_scrollback(target);
         }
 
+        Action::Noop
+    }
+
+    pub(crate) fn handle_mouse_input(&mut self, _mouse: MouseInput) -> Action {
         Action::Noop
     }
 
@@ -2197,6 +2201,23 @@ mod tests {
             Action::Noop
         ));
         assert_eq!(session.parser.screen().scrollback(), before);
+        cleanup_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mouse_input_is_local_noop_until_selection_state_exists() {
+        let mut session = spawn_sleeping_session();
+
+        assert!(matches!(
+            session.handle_mouse_input(crate::event::MouseInput {
+                kind: crate::event::MouseInputKind::LeftDown,
+                col: 3,
+                row: 2,
+            }),
+            Action::Noop
+        ));
+
         cleanup_session(session);
     }
 

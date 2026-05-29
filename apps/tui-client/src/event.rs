@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseEventKind};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, MouseButton, MouseEventKind};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -8,6 +8,20 @@ pub enum MouseScrollDirection {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseInputKind {
+    LeftDown,
+    LeftDrag,
+    LeftUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseInput {
+    pub kind: MouseInputKind,
+    pub col: u16,
+    pub row: u16,
+}
+
 /// Events that flow from the terminal and async tasks into the app
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -15,9 +29,11 @@ pub enum Event {
     Key(KeyEvent),
     /// Bracketed paste payload from the terminal
     Paste(String),
-    /// Mouse wheel or trackpad scroll events. Only scroll direction is
-    /// modeled so click/drag/move never flow into app screens or remote PTYs.
+    /// Mouse wheel or trackpad scroll events. Only scroll direction is modeled.
     MouseScroll(MouseScrollDirection),
+    /// Left-button mouse events used by ConnectSession in-app selection.
+    /// These events must stay local to the TUI and never flow into a remote PTY.
+    MouseInput(MouseInput),
     /// Terminal resize
     Resize(u16, u16),
     /// Periodic tick for animations and polling
@@ -314,8 +330,8 @@ impl EventReader {
 }
 
 /// Map a raw `crossterm::Event` to our `Event` enum. Returns None for
-/// variants we deliberately ignore (Focus, mouse click/drag/move, and
-/// horizontal scroll).
+/// variants we deliberately ignore (Focus, non-left mouse input, plain mouse
+/// move, and horizontal scroll).
 ///
 /// Extracted from `EventReader::spawn` so the conversion logic can be
 /// unit-tested independently of the stdin-poll loop. Without this
@@ -329,6 +345,21 @@ pub(crate) fn map_crossterm_to_event(ce: CrosstermEvent) -> Option<Event> {
         CrosstermEvent::Mouse(mouse) => match mouse.kind {
             MouseEventKind::ScrollUp => Some(Event::MouseScroll(MouseScrollDirection::Up)),
             MouseEventKind::ScrollDown => Some(Event::MouseScroll(MouseScrollDirection::Down)),
+            MouseEventKind::Down(MouseButton::Left) => Some(Event::MouseInput(MouseInput {
+                kind: MouseInputKind::LeftDown,
+                col: mouse.column,
+                row: mouse.row,
+            })),
+            MouseEventKind::Drag(MouseButton::Left) => Some(Event::MouseInput(MouseInput {
+                kind: MouseInputKind::LeftDrag,
+                col: mouse.column,
+                row: mouse.row,
+            })),
+            MouseEventKind::Up(MouseButton::Left) => Some(Event::MouseInput(MouseInput {
+                kind: MouseInputKind::LeftUp,
+                col: mouse.column,
+                row: mouse.row,
+            })),
             _ => None,
         },
         // FocusGained / FocusLost — deliberately ignored.
@@ -371,9 +402,9 @@ mod tests {
     //!
     //!   * `map_crossterm_to_event` — the conversion fn the spawn
     //!     loop calls. Tests synthesize `crossterm::Event` values
-    //!     and assert the mapping (Paste/Resize/Key → matching
-    //!     `Event` variants with all fields preserved; ignored
-    //!     variants like Mouse return None).
+    //!     and assert the mapping (Paste/Resize/Key/left mouse input
+    //!     → matching `Event` variants with all fields preserved;
+    //!     ignored variants like non-left mouse input return None).
     //!   * channel wiring (tx forwards to rx)
     //!   * pause flag initial state and atomic toggling
     //!   * pause flag is genuinely shared with spawned tasks
@@ -644,8 +675,8 @@ mod tests {
     //
     // These tests exercise the conversion function the spawn loop
     // calls on every poll, so a regression that swaps Resize
-    // dimensions, drops Paste payloads, or accidentally maps Mouse
-    // events into the channel will fail the unit tests rather than
+    // dimensions, drops Paste payloads, or accidentally maps ignored
+    // mouse events into the channel will fail the unit tests rather than
     // sneak past behind "channel forwards fine".
 
     #[test]
@@ -694,20 +725,109 @@ mod tests {
     }
 
     #[test]
-    fn map_mouse_click_event_returns_none_because_tui_only_uses_scroll() {
-        // Contract: mouse capture is used only for wheel/trackpad
-        // scrollback. Click/drag/move must never enter app screens
-        // or get forwarded into a remote PTY.
-        let mouse = CrosstermEvent::Mouse(MouseEvent {
+    fn map_left_mouse_input_events_preserve_kind_and_coordinates() {
+        let down = CrosstermEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 10,
             row: 5,
             modifiers: KeyModifiers::empty(),
         });
-        assert!(
-            map_crossterm_to_event(mouse).is_none(),
-            "Mouse click events must be silently dropped by the mapper",
-        );
+        let drag = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 11,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+        let up = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 12,
+            row: 7,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        match map_crossterm_to_event(down) {
+            Some(Event::MouseInput(mouse)) => {
+                assert_eq!(mouse.kind, MouseInputKind::LeftDown);
+                assert_eq!(mouse.col, 10);
+                assert_eq!(mouse.row, 5);
+            }
+            other => panic!("expected left down mouse input, got {other:?}"),
+        }
+        match map_crossterm_to_event(drag) {
+            Some(Event::MouseInput(mouse)) => {
+                assert_eq!(mouse.kind, MouseInputKind::LeftDrag);
+                assert_eq!(mouse.col, 11);
+                assert_eq!(mouse.row, 6);
+            }
+            other => panic!("expected left drag mouse input, got {other:?}"),
+        }
+        match map_crossterm_to_event(up) {
+            Some(Event::MouseInput(mouse)) => {
+                assert_eq!(mouse.kind, MouseInputKind::LeftUp);
+                assert_eq!(mouse.col, 12);
+                assert_eq!(mouse.row, 7);
+            }
+            other => panic!("expected left up mouse input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_left_mouse_input_accepts_extreme_coordinates() {
+        let zero = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        let max = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: u16::MAX,
+            row: u16::MAX,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(matches!(
+            map_crossterm_to_event(zero),
+            Some(Event::MouseInput(MouseInput {
+                kind: MouseInputKind::LeftDown,
+                col: 0,
+                row: 0,
+            })),
+        ));
+        assert!(matches!(
+            map_crossterm_to_event(max),
+            Some(Event::MouseInput(MouseInput {
+                kind: MouseInputKind::LeftUp,
+                col,
+                row,
+            })) if col == u16::MAX && row == u16::MAX,
+        ));
+    }
+
+    #[test]
+    fn map_non_left_mouse_input_and_plain_move_return_none() {
+        let right_down = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        let middle_drag = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Middle),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        let moved = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(map_crossterm_to_event(right_down).is_none());
+        assert!(map_crossterm_to_event(middle_drag).is_none());
+        assert!(map_crossterm_to_event(moved).is_none());
     }
 
     #[test]
@@ -796,12 +916,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_drops_mouse_event_silently_and_returns_true_for_continue() {
-        // Ignored variants (Mouse/Focus) must NOT signal "break" —
+    fn dispatch_drops_ignored_mouse_event_silently_and_returns_true_for_continue() {
+        // Ignored variants (non-left Mouse/Focus) must NOT signal "break" —
         // the spawn loop must keep polling.
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mouse = CrosstermEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
+            kind: MouseEventKind::Down(MouseButton::Right),
             column: 1,
             row: 1,
             modifiers: KeyModifiers::empty(),
@@ -818,6 +938,29 @@ mod tests {
             try_recv(&mut rx).is_none(),
             "ignored events must NOT land on the channel",
         );
+    }
+
+    #[test]
+    fn dispatch_forwards_left_mouse_input_through_channel_and_returns_true() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mouse = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 21,
+            row: 9,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        let kept = dispatch_crossterm_event(&tx, mouse);
+
+        assert!(kept, "dispatch must signal continue (true) on success");
+        match try_recv(&mut rx) {
+            Some(Event::MouseInput(mouse)) => {
+                assert_eq!(mouse.kind, MouseInputKind::LeftDrag);
+                assert_eq!(mouse.col, 21);
+                assert_eq!(mouse.row, 9);
+            }
+            other => panic!("expected Event::MouseInput on the channel, got {other:?}"),
+        }
     }
 
     #[test]

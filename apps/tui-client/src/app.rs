@@ -1270,6 +1270,19 @@ impl App {
                 };
                 let _ = self.action_tx.send(action);
             }
+            Event::MouseInput(mouse) => {
+                if self.error_modal.is_visible() || self.mcp_launch_prompt.is_some() {
+                    return;
+                }
+                let action = match self.current_screen {
+                    Screen::ConnectSession => self
+                        .connect_session
+                        .as_mut()
+                        .map_or(Action::Noop, |session| session.handle_mouse_input(mouse)),
+                    _ => Action::Noop,
+                };
+                let _ = self.action_tx.send(action);
+            }
             Event::Tick => match self.current_screen {
                 Screen::Dashboard => self.dashboard.on_tick(),
                 Screen::Ec2Inventory => self.ec2.on_tick(),
