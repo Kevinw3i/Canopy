@@ -12,6 +12,7 @@
 | Security Groups | ALB 允許 443 入站；ECS task 只接受 ALB 流量 |
 | IAM Roles | Task Execution（拉 image、讀 secret）+ Task（呼叫 AWS API） |
 | Secrets Manager | JWT signing secret |
+| DynamoDB Table | MCP session 跨 task 共享狀態（`mcp_session_store = dynamodb` 時建立；TTL 欄位 `expires_at_epoch` 自動清理過期 session） |
 | CloudWatch Log Group | 容器日誌 |
 | Route 53 Record | DNS 指向 ALB（可選） |
 
@@ -285,6 +286,7 @@ encrypt        = true
 | `desired_count` | No | 預設 2（跨 AZ）；必須是非負整數 |
 | `mcp_session_store` | No | 預設 `dynamodb`；`desired_count > 1` 時必須使用 durable store，避免 MCP guidance/session 跨 task 遺失 |
 | `mcp_session_table_name` | No | 預設 `<project>-mcp-sessions`；DynamoDB on-demand table，TTL 欄位為 `expires_at_epoch` |
+| `allow_multi_task_memory_mcp_session_store` | No | 預設 `false`；緊急除錯用的不安全 override，允許 `desired_count > 1` 搭配 memory store。正式環境必須保持 `false`，否則 MCP guidance/session 會在 task 間遺失 |
 | `alb_internal` | No | 預設 `true`（內部 ALB） |
 | `allow_public_alb_world_cidr` | No | 預設 `false`；只有 public ALB 必須允許全網段時才設為 `true` |
 | `sts_external_id` | No | 預設 `canopy`，跨帳號 AssumeRole 的 ExternalId；必須符合 STS ExternalId 格式限制 |

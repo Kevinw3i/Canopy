@@ -193,6 +193,36 @@ Common MCP metadata can include:
 - `client_version`
 - `product_phase`
 
+MCP session/guidance gate outcomes are shared by every guidance-gated tool
+(`cloudwatch_discovery` / `cloudwatch_preflight` / `cloudwatch_search` /
+`cloudwatch_insights`, `database_scope_list` / `database_query`). When a
+request fails the session or guidance check, `mcp_outcome_kind` is one of the
+following (these mirror `McpGuidanceDenial` in
+`apps/control-plane/src/routes/mcp.rs` — keep this list in sync):
+
+- `mcp_session_required` — no `canopy_mcp_session_id` / `local_secret_generation`
+  was supplied. HTTP 403.
+- `mcp_session_not_found` — the session id is unknown to the store (never
+  registered, or already evicted/expired out). HTTP 404.
+- `mcp_session_actor_mismatch` — the session belongs to a different actor than
+  the authenticated caller. HTTP 403.
+- `mcp_session_generation_mismatch` — the supplied `local_secret_generation`
+  does not match the session. HTTP 403.
+- `mcp_session_expired` — the session is past its `expires_at`. HTTP 403.
+- `guidance_required` — the session is valid but the required guidance has not
+  been delivered for gating. HTTP 403. (Not emitted by `mcp_guidance_sync`.)
+
+`mcp_guidance_sync` emits the same session-validity reasons
+(`mcp_session_actor_mismatch` / `mcp_session_generation_mismatch` /
+`mcp_session_expired`) when the target session is invalid for the caller.
+
+`mcp_session_store_unavailable` is intentionally **not** an audit outcome: a
+session-store backend failure returns HTTP 503 and is deliberately **not**
+written as a `Denied` event, so an infrastructure outage does not pollute the
+denial trail or trip denial-based alerting. Detect store outages via service
+logs/metrics (look for `DynamoDB MCP session store operation failed` warnings),
+not the audit trail.
+
 MCP CloudWatch discovery metadata can include:
 
 - `mcp_event_kind`: `cloudwatch_discovery`

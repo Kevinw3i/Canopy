@@ -434,6 +434,8 @@ No shared state -- survives restarts and multi-replica routing.
 | `aws.session_duration_seconds` | `3600` | STS AssumeRole duration |
 | `audit_export.cloudwatch_logs.*` | disabled | Optional direct audit export to CloudWatch Logs |
 | `audit_export.s3.*` | disabled | Optional direct audit export to S3 |
+| `mcp.session_store` | `memory` | MCP session store backend: `memory` (process-local; dev/single-task) or `dynamodb` (durable; shared across multi-task ECS) |
+| `mcp.session_table_name` | -- | DynamoDB table name; required when `mcp.session_store = dynamodb` |
 | `control_plane_url` | -- | (TUI) Control plane URL |
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |
