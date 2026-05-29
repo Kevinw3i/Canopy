@@ -1542,6 +1542,7 @@ mod tests {
             mfa_secret_key: None,
             audit_log: None,
             audit_export: Default::default(),
+            mcp: crate::config::McpConfig::default(),
             cors_allowed_origins: vec![],
         };
         let oidc_client = crate::services::oidc::OidcClient::new(config.oidc.clone());
@@ -1569,7 +1570,7 @@ mod tests {
                 ),
             ),
             database_executor: Arc::new(crate::services::database::MySqlDatabaseExecutor::new()),
-            mcp_sessions: dashmap::DashMap::new(),
+            mcp_sessions: Arc::new(crate::services::MemoryMcpSessionStore::new()),
             ready: std::sync::atomic::AtomicBool::new(true),
             db_connection_ready: dashmap::DashMap::new(),
             db_connection_next_probe: dashmap::DashMap::new(),

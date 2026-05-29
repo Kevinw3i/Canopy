@@ -5,10 +5,11 @@ pub mod database;
 pub mod ec2;
 pub mod ecs;
 pub mod entitlements;
+pub mod mcp_sessions;
 pub mod oidc;
 pub mod step_up;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, McpSessionStoreKind};
 use crate::models::entitlements::EntitlementStore;
 use crate::models::mfa::MfaStore;
 use aws_config::SdkConfig;
@@ -21,6 +22,8 @@ use database::{
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+pub use mcp_sessions::{DynamoMcpSessionStore, McpSessionStore, MemoryMcpSessionStore};
 
 /// Tracks who started a Logs Insights query and which log groups were approved.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -46,6 +49,17 @@ pub struct McpSessionRecord {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl McpSessionRecord {
+    /// Whether the session has expired as of `now`, evaluated at **second**
+    /// precision. Every expiry decision keys on epoch seconds — the read-time
+    /// gates in `routes::mcp`, both store backends' `mark_guidance_delivered`,
+    /// and the DynamoDB `expires_at_epoch` TTL/condition — so sub-second jitter
+    /// cannot make one path admit a session that another path would reject.
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.timestamp() < now.timestamp()
+    }
 }
 
 /// Encode query authorization into a signed token that can survive restarts.
@@ -111,7 +125,7 @@ pub struct AppState {
     pub base_aws_config: SdkConfig,
     pub database_secret_provider: Arc<dyn DatabaseSecretProvider>,
     pub database_executor: Arc<dyn DatabaseExecutor>,
-    pub mcp_sessions: DashMap<String, McpSessionRecord>,
+    pub mcp_sessions: Arc<dyn McpSessionStore>,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     /// This is the **global** readiness signal (drives `/health`); a failed database
     /// connection does NOT clear it (Codex round 30 HIGH — one bad DB scope should not
@@ -178,6 +192,38 @@ impl AppState {
             .load()
             .await;
         let secrets_client = aws_sdk_secretsmanager::Client::new(&base_aws_config);
+        let mcp_sessions: Arc<dyn McpSessionStore> = match config.mcp.session_store {
+            McpSessionStoreKind::Memory => {
+                // The in-memory store is process-local: sessions registered on
+                // one task are invisible to others. Terraform guards against
+                // `desired_count > 1` + memory, but that only covers the
+                // Terraform path — warn unconditionally so any deployment
+                // (manual `docker run`, other orchestrators) surfaces the
+                // unsafe choice in its logs rather than silently losing
+                // sessions across tasks.
+                tracing::warn!(
+                    "MCP session store is in-memory: sessions are NOT shared across tasks. \
+                     Safe only for local/dev or single-task deployments — multi-task \
+                     deployments must set mcp.session_store = \"dynamodb\"."
+                );
+                Arc::new(MemoryMcpSessionStore::new())
+            }
+            McpSessionStoreKind::Dynamodb => {
+                // AppConfig::validate already guarantees session_table_name is
+                // present and non-empty for the dynamodb store, so this is an
+                // invariant, not a second validation (which would duplicate the
+                // check and error message in config.rs).
+                let table_name = config
+                    .mcp
+                    .session_table_name
+                    .clone()
+                    .expect("session_table_name is validated by AppConfig::validate for dynamodb");
+                Arc::new(DynamoMcpSessionStore::new(
+                    aws_sdk_dynamodb::Client::new(&base_aws_config),
+                    table_name,
+                ))
+            }
+        };
 
         if entitlement_store.has_organization_account_placeholders() {
             tracing::info!("Discovering AWS Organizations accounts for entitlement expansion");
@@ -217,7 +263,7 @@ impl AppState {
                 secrets_client,
             )),
             database_executor: Arc::new(MySqlDatabaseExecutor::new()),
-            mcp_sessions: DashMap::new(),
+            mcp_sessions,
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
             db_connection_next_probe: DashMap::new(),
@@ -739,6 +785,7 @@ mod tests {
             mfa_secret_key: None,
             audit_log: None,
             audit_export: crate::config::AuditExportConfig::default(),
+            mcp: crate::config::McpConfig::default(),
             cors_allowed_origins: vec![],
         };
         config.database_connections.insert(
@@ -787,7 +834,7 @@ mod tests {
             base_aws_config,
             database_secret_provider: provider,
             database_executor: Arc::new(UnreachableExecutor),
-            mcp_sessions: DashMap::new(),
+            mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
             db_connection_next_probe: DashMap::new(),

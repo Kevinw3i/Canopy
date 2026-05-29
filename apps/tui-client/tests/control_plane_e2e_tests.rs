@@ -2,14 +2,14 @@
 //! router running with mock AWS data.
 
 use axum::{middleware as axum_mw, Router};
-use control_plane::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
+use control_plane::config::{AppConfig, AwsConfig, JwtConfig, McpConfig, OidcConfig};
 use control_plane::middleware;
 use control_plane::models::entitlements::EntitlementStore;
 use control_plane::routes;
 use control_plane::services::audit::AuditService;
 use control_plane::services::database::{DatabaseSecret, DatabaseSecretProvider};
 use control_plane::services::oidc::OidcClient;
-use control_plane::services::AppState;
+use control_plane::services::{AppState, MemoryMcpSessionStore};
 use shared::dto::cloudwatch::{FilterLogEventsRequest, LogGroupsRequest, StartLiveTailRequest};
 use shared::dto::ec2::Ec2ListRequest;
 use shared::dto::ecs::{EcsTasksRequest, DEV_MOCK_CLUSTER_NAME};
@@ -67,6 +67,7 @@ fn dev_config() -> AppConfig {
         mfa_secret_key: None,
         audit_log: None,
         audit_export: Default::default(),
+        mcp: McpConfig::default(),
         cors_allowed_origins: vec![],
     }
 }
@@ -96,7 +97,7 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
         base_aws_config,
         database_secret_provider,
         database_executor,
-        mcp_sessions: Default::default(),
+        mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready: Default::default(),
         db_connection_next_probe: Default::default(),

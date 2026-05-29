@@ -29,7 +29,8 @@ use axum::{
     middleware as axum_mw, Router,
 };
 use control_plane::config::{
-    AppConfig, AwsConfig, DatabaseConnectionConfig, DatabaseEngine, JwtConfig, OidcConfig,
+    AppConfig, AwsConfig, DatabaseConnectionConfig, DatabaseEngine, JwtConfig, McpConfig,
+    OidcConfig,
 };
 use control_plane::middleware;
 use control_plane::routes;
@@ -39,7 +40,7 @@ use control_plane::services::database::{
     DatabaseExecutor, DatabaseSecret, DatabaseSecretProvider, MySqlDatabaseExecutor,
 };
 use control_plane::services::oidc::OidcClient;
-use control_plane::services::AppState;
+use control_plane::services::{AppState, MemoryMcpSessionStore};
 use http_body_util::BodyExt;
 use mysql_async::prelude::Queryable;
 use serde_json::{json, Value};
@@ -249,6 +250,7 @@ fn config_with_testcontainers(port: u16, audit_log_path: &std::path::Path) -> Ap
         mfa_secret_key: None,
         audit_log: Some(audit_log_path.to_string_lossy().into_owned()),
         audit_export: Default::default(),
+        mcp: McpConfig::default(),
         cors_allowed_origins: vec![],
     };
     cfg.database_connections.insert(
@@ -329,7 +331,7 @@ fn build_state(
             password: READONLY_PASSWORD.into(),
         }),
         database_executor: executor,
-        mcp_sessions: dashmap::DashMap::new(),
+        mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),

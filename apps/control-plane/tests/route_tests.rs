@@ -31,7 +31,8 @@ use tower::ServiceExt;
 
 // ── Re-use crate internals via the library-style paths ──────────────────
 use control_plane::config::{
-    AppConfig, AwsConfig, DatabaseConnectionConfig, DatabaseEngine, JwtConfig, OidcConfig,
+    AppConfig, AwsConfig, DatabaseConnectionConfig, DatabaseEngine, JwtConfig, McpConfig,
+    OidcConfig,
 };
 use control_plane::middleware;
 use control_plane::routes;
@@ -42,7 +43,7 @@ use control_plane::services::database::{
     DatabaseSecretProvider, QueryRows, TableType, TableTypeQuery, ViewCheckedQueryOutcome,
 };
 use control_plane::services::oidc::OidcClient;
-use control_plane::services::AppState;
+use control_plane::services::{AppState, McpSessionStore, MemoryMcpSessionStore};
 use shared::dto::database::{ExplainSummary, ExplainTableSummary};
 
 const TEST_MFA_SECRET_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -86,6 +87,7 @@ fn dev_config() -> AppConfig {
         mfa_secret_key: None,
         audit_log: None,
         audit_export: Default::default(),
+        mcp: McpConfig::default(),
         cors_allowed_origins: vec![],
     }
 }
@@ -95,6 +97,18 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
 }
 
 fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService) -> Arc<AppState> {
+    build_state_with_audit_service_and_mcp_store(
+        config,
+        audit_service,
+        Arc::new(MemoryMcpSessionStore::new()),
+    )
+}
+
+fn build_state_with_audit_service_and_mcp_store(
+    config: AppConfig,
+    audit_service: AuditService,
+    mcp_sessions: Arc<dyn McpSessionStore>,
+) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
     let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
@@ -127,7 +141,7 @@ fn build_state_with_audit_service(config: AppConfig, audit_service: AuditService
         base_aws_config,
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),
-        mcp_sessions: dashmap::DashMap::new(),
+        mcp_sessions,
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -192,7 +206,7 @@ fn build_state_with_database_and_allow_views(
         base_aws_config,
         database_secret_provider: secret_provider,
         database_executor: executor,
-        mcp_sessions: dashmap::DashMap::new(),
+        mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -1199,8 +1213,8 @@ async fn mcp_guidance_sync_rejects_stale_local_secret_generation_with_403() {
     assert_eq!(event["action"], "mcp_guidance_sync");
     assert_eq!(event["outcome"], "denied");
     assert_eq!(
-        event["metadata"]["mcp_outcome_kind"], "denied",
-        "stale-secret denial uses the generic `denied` outcome kind (distinct from unknown_guidance / mcp_session_not_found)",
+        event["metadata"]["mcp_outcome_kind"], "mcp_session_generation_mismatch",
+        "stale-secret denial must stay distinct from unknown_guidance / mcp_session_not_found",
     );
     // The submitted (tampered) generation must be present in the audit
     // so an operator reviewing the trail can see what was tried.
@@ -1284,6 +1298,10 @@ async fn mcp_guidance_sync_rejects_cross_actor_session_access_with_403() {
         .expect("guidance sync audit event");
     assert_eq!(event["action"], "mcp_guidance_sync");
     assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "mcp_session_actor_mismatch"
+    );
     // Most importantly: the audit subject is the *attempting* user,
     // not the legitimate session owner — operators must be able to
     // tell who tried this.
@@ -1306,29 +1324,32 @@ async fn mcp_guidance_sync_rejects_expired_session_with_403() {
     let token = issue_test_token(&config);
     let state = build_state_with_audit_file(config, &audit.path);
 
-    // Manually insert an already-expired session for `dev-admin`.
-    // We bypass register_session so we have explicit control over
-    // expires_at.
+    // Manually create an already-expired session for `dev-admin`.
+    // We bypass register_session so we have explicit control over expires_at.
     let now = chrono::Utc::now();
     let session_id = "mcp_expired_for_test".to_string();
-    state.mcp_sessions.insert(
-        session_id.clone(),
-        control_plane::services::McpSessionRecord {
-            actor: "dev-admin".into(),
-            actor_email: "dev-admin@dev.local".into(),
-            local_secret_generation: "lsg_for_expired_test".into(),
-            forwarding_key: "fk_does_not_matter".into(),
-            protocol_version: "2025-06-18".into(),
-            client_name: "route-test".into(),
-            client_version: "0.1.0".into(),
-            product_phase: "phase_3_data_tools".into(),
-            guidance_delivered: Default::default(),
-            // Expired one hour ago.
-            expires_at: now - Duration::hours(1),
-            created_at: now - Duration::hours(9),
-            updated_at: now - Duration::hours(9),
-        },
-    );
+    state
+        .mcp_sessions
+        .create_session(
+            session_id.clone(),
+            control_plane::services::McpSessionRecord {
+                actor: "dev-admin".into(),
+                actor_email: "dev-admin@dev.local".into(),
+                local_secret_generation: "lsg_for_expired_test".into(),
+                forwarding_key: "fk_does_not_matter".into(),
+                protocol_version: "2025-06-18".into(),
+                client_name: "route-test".into(),
+                client_version: "0.1.0".into(),
+                product_phase: "phase_3_data_tools".into(),
+                guidance_delivered: Default::default(),
+                // Expired one hour ago.
+                expires_at: now - Duration::hours(1),
+                created_at: now - Duration::hours(9),
+                updated_at: now - Duration::hours(9),
+            },
+        )
+        .await
+        .unwrap();
 
     let app = build_app(state);
 
@@ -1360,8 +1381,402 @@ async fn mcp_guidance_sync_rejects_expired_session_with_403() {
         .rfind(|event| event["metadata"]["mcp_event_kind"] == "guidance_sync")
         .expect("guidance sync audit event");
     assert_eq!(event["outcome"], "denied");
-    // Same denial path as cross-actor / stale-lsg — they share an arm.
-    assert_eq!(event["metadata"]["mcp_outcome_kind"], "denied");
+    assert_eq!(event["metadata"]["mcp_outcome_kind"], "mcp_session_expired");
+}
+
+struct FailingMarkGuidanceStore {
+    inner: MemoryMcpSessionStore,
+}
+
+#[async_trait::async_trait]
+impl McpSessionStore for FailingMarkGuidanceStore {
+    async fn sweep_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner.sweep_expired(now).await
+    }
+
+    async fn create_session(
+        &self,
+        session_id: String,
+        record: control_plane::services::McpSessionRecord,
+    ) -> Result<(), control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner.create_session(session_id, record).await
+    }
+
+    async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<control_plane::services::McpSessionRecord>,
+        control_plane::services::mcp_sessions::McpSessionStoreError,
+    > {
+        self.inner.get_session(session_id).await
+    }
+
+    async fn mark_guidance_delivered(
+        &self,
+        _session_id: &str,
+        _actor: &str,
+        _local_secret_generation: &str,
+        _guidance_key: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, control_plane::services::mcp_sessions::McpSessionStoreError> {
+        Err(
+            control_plane::services::mcp_sessions::McpSessionStoreError::Backend(
+                "forced guidance persistence failure".into(),
+            ),
+        )
+    }
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_store_failure_does_not_report_delivered_for_gating() {
+    let audit = AuditFile::new("mcp-guidance-store-failure");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_service_and_mcp_store(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(FailingMarkGuidanceStore {
+            inner: MemoryMcpSessionStore::new(),
+        }),
+    );
+    let app = build_app(state);
+
+    let register_body = json!({
+        "local_secret_generation": "lsg_store_failure",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_3_data_tools"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), StatusCode::OK);
+    let register_json = body_json(register_resp.into_body()).await;
+    let session_id = register_json["canopy_mcp_session_id"].as_str().unwrap();
+
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_store_failure",
+        "guidance_id": "security_boundaries",
+        "guidance_version": "2026-05-13"
+    });
+    let guidance_resp = app
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guidance_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let json = body_json(guidance_resp.into_body()).await;
+    assert_eq!(json["code"], "SERVICE_UNAVAILABLE");
+}
+
+/// A session store whose `get_session` always fails, simulating a transient
+/// DynamoDB outage on the guidance-gated read path. All other methods delegate
+/// to an inner memory store so registration still succeeds.
+struct FailingGetSessionStore {
+    inner: MemoryMcpSessionStore,
+}
+
+#[async_trait::async_trait]
+impl McpSessionStore for FailingGetSessionStore {
+    async fn sweep_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner.sweep_expired(now).await
+    }
+
+    async fn create_session(
+        &self,
+        session_id: String,
+        record: control_plane::services::McpSessionRecord,
+    ) -> Result<(), control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner.create_session(session_id, record).await
+    }
+
+    async fn get_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<
+        Option<control_plane::services::McpSessionRecord>,
+        control_plane::services::mcp_sessions::McpSessionStoreError,
+    > {
+        Err(
+            control_plane::services::mcp_sessions::McpSessionStoreError::Backend(
+                "forced get_session failure".into(),
+            ),
+        )
+    }
+
+    async fn mark_guidance_delivered(
+        &self,
+        session_id: &str,
+        actor: &str,
+        local_secret_generation: &str,
+        guidance_key: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner
+            .mark_guidance_delivered(session_id, actor, local_secret_generation, guidance_key, now)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn mcp_guidance_gate_store_failure_returns_503_without_denial_audit() {
+    // A session-store outage is an infrastructure failure, not an authorization
+    // denial. The guidance-gated endpoints must surface it as 503 and must NOT
+    // write a `Denied` audit event — that would pollute the security trail and
+    // can trip denial-based alerting. This mirrors how sync_guidance already
+    // treats a get_session error (503, no denial event).
+    let audit = AuditFile::new("mcp-guidance-gate-store-failure");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_service_and_mcp_store(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(FailingGetSessionStore {
+            inner: MemoryMcpSessionStore::new(),
+        }),
+    );
+    let app = build_app(state);
+
+    // Register first: create_session is delegated to the inner memory store so
+    // this succeeds and seeds a baseline (success) audit event. Only the later
+    // get_session on the gated path fails.
+    let register_body = json!({
+        "local_secret_generation": "lsg_gate_store_failure",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_3_data_tools"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), StatusCode::OK);
+    let session_id = body_json(register_resp.into_body()).await["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A guidance-gated endpoint: require_mcp_guidance calls get_session, which
+    // fails -> reason "mcp_session_store_unavailable".
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_gate_store_failure",
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "ERROR",
+        "start_time": 1000,
+        "end_time": 2000,
+        "limit": 2
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // The store outage must not have produced any denial audit event.
+    let events = read_audit_events(&audit.path);
+    assert!(
+        events
+            .iter()
+            .all(|e| e["metadata"]["mcp_outcome_kind"] != "mcp_session_store_unavailable"),
+        "store outage must not be recorded as a denial; events: {events:#?}"
+    );
+    assert!(
+        events.iter().all(|e| e["outcome"] != "denied"),
+        "no denial event should be written for a store outage; events: {events:#?}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_register_rejects_empty_client_fields_with_400() {
+    // Empty client-supplied fields write fine to DynamoDB but fail to decode on
+    // read (required_s rejects empty strings), which would brick the session on
+    // the DynamoDB backend. Registration must reject them up front so both
+    // store backends behave identically.
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let app = build_app(build_state(config));
+
+    for field in [
+        "local_secret_generation",
+        "client_name",
+        "client_version",
+        "product_phase",
+    ] {
+        let mut body = json!({
+            "local_secret_generation": "lsg_ok",
+            "protocol_version": "2025-06-18",
+            "client_name": "route-test",
+            "client_version": "0.1.0",
+            "product_phase": "phase_3_data_tools"
+        });
+        body[field] = json!("");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/mcp/session/register")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "empty `{field}` must be rejected at registration"
+        );
+    }
+}
+
+/// A store that reports a persist conflict: `get_session` returns a valid
+/// session (so the pre-persist validity checks pass), but `mark_guidance_
+/// delivered` returns `Ok(false)`, simulating the session being concurrently
+/// removed or mutated between the read and the conditional write.
+struct ConflictingMarkStore {
+    inner: MemoryMcpSessionStore,
+}
+
+#[async_trait::async_trait]
+impl McpSessionStore for ConflictingMarkStore {
+    async fn sweep_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner.sweep_expired(now).await
+    }
+
+    async fn create_session(
+        &self,
+        session_id: String,
+        record: control_plane::services::McpSessionRecord,
+    ) -> Result<(), control_plane::services::mcp_sessions::McpSessionStoreError> {
+        self.inner.create_session(session_id, record).await
+    }
+
+    async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<control_plane::services::McpSessionRecord>,
+        control_plane::services::mcp_sessions::McpSessionStoreError,
+    > {
+        self.inner.get_session(session_id).await
+    }
+
+    async fn mark_guidance_delivered(
+        &self,
+        _session_id: &str,
+        _actor: &str,
+        _local_secret_generation: &str,
+        _guidance_key: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, control_plane::services::mcp_sessions::McpSessionStoreError> {
+        Ok(false)
+    }
+}
+
+#[tokio::test]
+async fn mcp_guidance_sync_persist_conflict_returns_409_not_success() {
+    // If the session is concurrently removed/mutated between the get_session
+    // read and the conditional persist, mark_guidance_delivered returns false.
+    // sync_guidance must then fail closed with 409 — it must NOT report the
+    // guidance as delivered, or a client could gate protected tools it can no
+    // longer actually authorize. This locks in the fail-closed branch.
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_service_and_mcp_store(
+        config,
+        AuditService::new(),
+        Arc::new(ConflictingMarkStore {
+            inner: MemoryMcpSessionStore::new(),
+        }),
+    );
+    let app = build_app(state);
+
+    let register_body = json!({
+        "local_secret_generation": "lsg_conflict",
+        "protocol_version": "2025-06-18",
+        "client_name": "route-test",
+        "client_version": "0.1.0",
+        "product_phase": "phase_3_data_tools"
+    });
+    let register_resp = app
+        .clone()
+        .oneshot(
+            Request::post("/api/mcp/session/register")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(register_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), StatusCode::OK);
+    let session_id = body_json(register_resp.into_body()).await["canopy_mcp_session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let guidance_body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": "lsg_conflict",
+        "guidance_id": "security_boundaries",
+        "guidance_version": "2026-05-13"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/guidance/delivered")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(guidance_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["code"], "MCP_SESSION_STATE_CONFLICT");
 }
 
 // ── Live-tail WebSocket route registration + dev-mode gate ─────────
@@ -3673,6 +4088,110 @@ async fn mcp_cloudwatch_preflight_issues_search_token_and_audits_success() {
 }
 
 #[tokio::test]
+async fn mcp_cloudwatch_guidance_survives_cross_task_shared_session_store() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let shared_store: Arc<dyn McpSessionStore> = Arc::new(MemoryMcpSessionStore::new());
+    let app_a = build_app(build_state_with_audit_service_and_mcp_store(
+        config.clone(),
+        AuditService::new(),
+        shared_store.clone(),
+    ));
+    let app_b = build_app(build_state_with_audit_service_and_mcp_store(
+        config,
+        AuditService::new(),
+        shared_store,
+    ));
+
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app_a,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "ERROR",
+        "start_time": 1000,
+        "end_time": 2000,
+        "limit": 2
+    });
+    let resp = app_b
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a second control-plane task using the same durable session store must see guidance delivered by the first task"
+    );
+}
+
+#[tokio::test]
+async fn mcp_cloudwatch_preflight_reproduces_old_isolated_memory_store_failure() {
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let app_a = build_app(build_state(config.clone()));
+    let app_b = build_app(build_state(config));
+
+    let (session_id, local_secret_generation) = register_database_guidance_ids(
+        &app_a,
+        &token,
+        &[
+            "security_boundaries",
+            "cloudwatch_search_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await;
+
+    let body = json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "tool_name": "canopy_search_logs",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "log_group_name": "/app/web-service",
+        "filter_pattern": "ERROR",
+        "start_time": 1000,
+        "end_time": 2000,
+        "limit": 2
+    });
+    let resp = app_b
+        .oneshot(
+            Request::post("/api/mcp/cloudwatch/preflight")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["code"], "NOT_FOUND");
+    assert_eq!(json["message"], "MCP session not found");
+}
+
+#[tokio::test]
 async fn mcp_cloudwatch_search_uses_preflight_then_cursor_and_audits() {
     let audit = AuditFile::new("mcp-cloudwatch-search-preflight-cursor");
     let config = dev_config();
@@ -4135,6 +4654,38 @@ async fn mcp_database_scope_list_requires_guidance_session() {
         "mcp_session_required"
     );
     assert_eq!(event["metadata"]["db_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_database_scope_list_unknown_session_returns_404_not_403() {
+    // SessionNotFound maps to 404 (not the legacy blanket 403) consistently
+    // across every guidance-gated endpoint, because McpGuidanceDenial::
+    // http_response is the single source of that mapping. Complements the
+    // cloudwatch preflight 404 test by covering a database endpoint.
+    let audit = AuditFile::new("mcp-db-scope-unknown-session-404");
+    let config = with_orders_database(dev_config());
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+
+    let body = json!({
+        "canopy_mcp_session_id": "mcp_never_registered",
+        "local_secret_generation": "lsg_does_not_exist"
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/mcp/database/scopes")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["message"], "MCP session not found");
 }
 
 #[tokio::test]
@@ -7604,7 +8155,7 @@ fn build_state_not_ready(config: AppConfig) -> Arc<AppState> {
         base_aws_config,
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),
-        mcp_sessions: dashmap::DashMap::new(),
+        mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         ready: std::sync::atomic::AtomicBool::new(false),
         // Global readiness gate fails-closed here; db_connection_ready
         // is irrelevant in this scenario (the global gate fires first).

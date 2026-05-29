@@ -241,7 +241,7 @@ impl AuthService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
+    use crate::config::{AppConfig, AwsConfig, JwtConfig, McpConfig, OidcConfig};
     use std::collections::HashMap;
 
     fn test_config(dev_mode: bool) -> AppConfig {
@@ -281,6 +281,7 @@ mod tests {
             mfa_secret_key: None,
             audit_log: None,
             audit_export: Default::default(),
+            mcp: McpConfig::default(),
             cors_allowed_origins: vec![],
         }
     }

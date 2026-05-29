@@ -198,6 +198,7 @@ mod tests {
             mfa_secret_key: None,
             audit_log: None,
             audit_export: Default::default(),
+            mcp: crate::config::McpConfig::default(),
             cors_allowed_origins: vec![],
         }
     }
@@ -219,7 +220,7 @@ mod tests {
             base_aws_config,
             database_secret_provider: Arc::new(TestDatabaseSecretProvider),
             database_executor: Arc::new(TestDatabaseExecutor),
-            mcp_sessions: dashmap::DashMap::new(),
+            mcp_sessions: Arc::new(crate::services::MemoryMcpSessionStore::new()),
             ready: std::sync::atomic::AtomicBool::new(true),
             db_connection_ready: dashmap::DashMap::new(),
             db_connection_next_probe: dashmap::DashMap::new(),

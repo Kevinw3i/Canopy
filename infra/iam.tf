@@ -155,6 +155,20 @@ resource "aws_iam_role_policy" "task_permissions" {
         )
       }] : [],
 
+      var.mcp_session_store == "dynamodb" ? [{
+        Sid    = "McpSessionDynamoDb"
+        Effect = "Allow"
+        # No DeleteItem: expired sessions are reaped by DynamoDB TTL, not by the
+        # application (sweep_expired is a no-op on the DynamoDB store), so the
+        # task role stays at least privilege.
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = aws_dynamodb_table.mcp_sessions[0].arn
+      }] : [],
+
       # STS GetCallerIdentity is always needed for preflight health check
       [{
         Sid      = "StsIdentity"

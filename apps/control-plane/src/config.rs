@@ -57,6 +57,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub audit_export: AuditExportConfig,
 
+    /// MCP runtime state storage. Local/dev defaults to memory; ECS
+    /// deployments with more than one task should use DynamoDB.
+    #[serde(default)]
+    pub mcp: McpConfig,
+
     /// Allowed CORS origins. If empty and dev_mode is true, all origins are
     /// allowed. In production, list the exact origins that need access
     /// (e.g. ["http://localhost:9876"]).
@@ -162,6 +167,40 @@ pub struct DatabaseConnectionConfig {
     /// the control-plane connects to.
     #[serde(default)]
     pub skip_tls_hostname_verification: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub session_store: McpSessionStoreKind,
+    #[serde(default)]
+    pub session_table_name: Option<String>,
+}
+
+impl McpConfig {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.session_store == McpSessionStoreKind::Dynamodb
+            && self
+                .session_table_name
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            anyhow::bail!(
+                "mcp.session_table_name is required when mcp.session_store = \"dynamodb\""
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpSessionStoreKind {
+    #[default]
+    Memory,
+    Dynamodb,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -388,6 +427,7 @@ impl AppConfig {
             mfa_secret_key: None,
             audit_log: None,
             audit_export: AuditExportConfig::default(),
+            mcp: McpConfig::default(),
             cors_allowed_origins: vec![],
         }
     }
@@ -400,6 +440,7 @@ impl AppConfig {
     fn validate(&self) -> anyhow::Result<()> {
         self.validate_database_tls()?;
         self.audit_export.validate()?;
+        self.mcp.validate()?;
         validate_optional_32_byte_base64_key("mfa_secret_key", self.mfa_secret_key.as_deref())?;
         Ok(())
     }
@@ -500,6 +541,10 @@ mod tests {
             session_duration_seconds = 1800
             sts_external_id = "custom-id"
 
+            [mcp]
+            session_store = "dynamodb"
+            session_table_name = "canopy-mcp-sessions"
+
             [database_connections.orders_prod]
             engine = "mysql"
             host = "orders-prod.example.internal"
@@ -547,6 +592,11 @@ mod tests {
         assert_eq!(config.oidc.required_amr_values, vec!["mfa"]);
         assert_eq!(config.aws.default_region.as_deref(), Some("eu-west-1"));
         assert_eq!(config.aws.sts_external_id.as_deref(), Some("custom-id"));
+        assert_eq!(config.mcp.session_store, McpSessionStoreKind::Dynamodb);
+        assert_eq!(
+            config.mcp.session_table_name.as_deref(),
+            Some("canopy-mcp-sessions")
+        );
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);
         let db = config.database_connections.get("orders_prod").unwrap();
         assert_eq!(db.engine, DatabaseEngine::Mysql);
@@ -596,6 +646,26 @@ mod tests {
         )
         .unwrap();
         assert!(empty_bucket.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_dynamodb_store_requires_table_name() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [oidc]
+            issuer_url = "x"
+            client_id = "x"
+            [jwt]
+            secret = "x"
+            [aws]
+            [mcp]
+            session_store = "dynamodb"
+        "#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.session_table_name"));
     }
 
     #[test]

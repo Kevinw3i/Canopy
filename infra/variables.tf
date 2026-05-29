@@ -177,6 +177,41 @@ variable "desired_count" {
   }
 }
 
+variable "mcp_session_store" {
+  description = "MCP session state backend. Use dynamodb for ECS services with desired_count > 1; memory is only safe for local/dev or single-task deployments."
+  type        = string
+  default     = "dynamodb"
+
+  validation {
+    condition     = contains(["memory", "dynamodb"], var.mcp_session_store)
+    error_message = "mcp_session_store must be either memory or dynamodb."
+  }
+}
+
+variable "mcp_session_table_name" {
+  description = "Optional DynamoDB table name for MCP session state. Defaults to <project>-mcp-sessions when mcp_session_store = dynamodb."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.mcp_session_table_name == "" ||
+      (
+        length(var.mcp_session_table_name) >= 3 &&
+        length(var.mcp_session_table_name) <= 255 &&
+        can(regex("^[A-Za-z0-9_.-]+$", var.mcp_session_table_name))
+      )
+    )
+    error_message = "mcp_session_table_name must be empty or a valid DynamoDB table name."
+  }
+}
+
+variable "allow_multi_task_memory_mcp_session_store" {
+  description = "Explicit unsafe override for desired_count > 1 with memory MCP sessions. Intended only for emergency debugging; production should keep this false."
+  type        = bool
+  default     = false
+}
+
 variable "create_service" {
   description = "Whether to create the ECS service. Set to false on first deploy to create ECR first, push image, then re-apply with true."
   type        = bool

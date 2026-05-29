@@ -104,10 +104,34 @@ assert data["jwt"]["expiry_seconds"] == 7200
 assert data["aws"]["default_region"] == "ap-northeast-1"
 assert data["aws"]["session_duration_seconds"] == 1800
 assert data["aws"]["sts_external_id"] == 'canopy"external'
+assert data["mcp"]["session_store"] == "memory"
+assert data["mcp"]["session_table_name"] == ""
 assert data["cors_allowed_origins"] == [
     "https://one.example",
     'https://two.example/path?x="y"',
 ]
+PY
+
+MCP_CONFIG_OUT="$TMP_DIR/generated-mcp.toml"
+env \
+  PATH="$TMP_DIR:$PATH" \
+  GENERATE_CONFIG=1 \
+  JWT_SECRET='jwt-secret' \
+  OIDC_ISSUER_URL='https://issuer.example' \
+  OIDC_CLIENT_ID='client-id' \
+  MCP_SESSION_STORE='dynamodb' \
+  MCP_SESSION_TABLE_NAME='canopy-mcp-sessions' \
+  sh "$ENTRYPOINT" > "$MCP_CONFIG_OUT"
+
+python3 - <<'PY' "$MCP_CONFIG_OUT"
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as f:
+    data = tomllib.load(f)
+
+assert data["mcp"]["session_store"] == "dynamodb"
+assert data["mcp"]["session_table_name"] == "canopy-mcp-sessions"
 PY
 
 DB_CONFIG_OUT="$TMP_DIR/generated-db.toml"

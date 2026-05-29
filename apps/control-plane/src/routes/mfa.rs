@@ -793,7 +793,7 @@ fn provider_step_up_controls_configured(config: &crate::config::AppConfig) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, AwsConfig, JwtConfig, OidcConfig};
+    use crate::config::{AppConfig, AwsConfig, JwtConfig, McpConfig, OidcConfig};
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -832,6 +832,7 @@ mod tests {
             mfa_secret_key: None,
             audit_log: None,
             audit_export: Default::default(),
+            mcp: McpConfig::default(),
             cors_allowed_origins: vec![],
         }
     }

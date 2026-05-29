@@ -48,6 +48,14 @@ resource "aws_ecs_task_definition" "control_plane" {
       condition     = contains(local.fargate_cpu_memory_pairs, "${var.cpu}:${var.memory}")
       error_message = "cpu and memory must be a valid AWS Fargate Linux task size combination."
     }
+    precondition {
+      condition = (
+        var.desired_count <= 1 ||
+        var.mcp_session_store == "dynamodb" ||
+        var.allow_multi_task_memory_mcp_session_store
+      )
+      error_message = "desired_count > 1 requires mcp_session_store = \"dynamodb\" unless allow_multi_task_memory_mcp_session_store = true."
+    }
   }
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
@@ -88,6 +96,8 @@ resource "aws_ecs_task_definition" "control_plane" {
       { name = "AUDIT_S3_BUCKET", value = var.audit_export_s3_bucket },
       { name = "AUDIT_S3_PREFIX", value = var.audit_export_s3_prefix },
       { name = "AUDIT_EXPORT_QUEUE_SIZE", value = tostring(var.audit_export_queue_size) },
+      { name = "MCP_SESSION_STORE", value = var.mcp_session_store },
+      { name = "MCP_SESSION_TABLE_NAME", value = var.mcp_session_store == "dynamodb" ? local.mcp_session_table_name : "" },
     ]
 
     # Inject secrets via ECS-native secrets injection (uses execution role).

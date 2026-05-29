@@ -156,13 +156,60 @@ async fn register_session(
         ));
     }
 
+    // Reject empty client-supplied fields up front. The DynamoDB store
+    // persists these as string attributes and refuses to decode empty
+    // strings on read, so an empty value here would brick the session on the
+    // DynamoDB backend: the write succeeds (DynamoDB accepts empty non-key
+    // strings) but every later read fails to decode and returns 503. Fail
+    // loud with a 400 so behavior is identical across both store backends.
+    let empty_field = if req.local_secret_generation.is_empty() {
+        Some("local_secret_generation")
+    } else if req.client_name.is_empty() {
+        Some("client_name")
+    } else if req.client_version.is_empty() {
+        Some("client_version")
+    } else if req.product_phase.is_empty() {
+        Some("product_phase")
+    } else {
+        None
+    };
+    if let Some(field) = empty_field {
+        state
+            .audit_service
+            .event(
+                &claims.sub,
+                AuditAction::McpSessionRegister,
+                AuditOutcome::Failure,
+            )
+            .metadata(audit_ctx.metadata(serde_json::json!({
+                "client_type": "mcp",
+                "surface": "mcp",
+                "mcp_event_kind": "mcp_session_register_failed",
+                "mcp_outcome_kind": "bad_request",
+                "aws_execution_attempted": false,
+                "missing_field": field
+            })))
+            .commit_best_effort();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::bad_request(
+                "MCP session registration requires non-empty client fields",
+            )),
+        ));
+    }
+
     // Sweep expired sessions opportunistically so a long-running process
     // does not accumulate `McpSessionRecord` instances indefinitely.
     // the previous unbounded growth could accumulate stale sessions.
     let now = Utc::now();
-    state
-        .mcp_sessions
-        .retain(|_, record| record.expires_at >= now);
+    state.mcp_sessions.sweep_expired(now).await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP session store unavailable",
+            )),
+        )
+    })?;
 
     let expires_at = now + Duration::hours(8);
     let canopy_mcp_session_id = format!("mcp_{}", Uuid::new_v4().as_simple());
@@ -203,23 +250,34 @@ async fn register_session(
         })?;
 
     // Audit is durable. Now record the session.
-    state.mcp_sessions.insert(
-        canopy_mcp_session_id.clone(),
-        McpSessionRecord {
-            actor: claims.sub.clone(),
-            actor_email: claims.email.clone(),
-            local_secret_generation: req.local_secret_generation.clone(),
-            forwarding_key: forwarding_key.clone(),
-            protocol_version: req.protocol_version.clone(),
-            client_name: req.client_name.clone(),
-            client_version: req.client_version.clone(),
-            product_phase: req.product_phase.clone(),
-            guidance_delivered: BTreeSet::new(),
-            expires_at,
-            created_at: now,
-            updated_at: now,
-        },
-    );
+    state
+        .mcp_sessions
+        .create_session(
+            canopy_mcp_session_id.clone(),
+            McpSessionRecord {
+                actor: claims.sub.clone(),
+                actor_email: claims.email.clone(),
+                local_secret_generation: req.local_secret_generation.clone(),
+                forwarding_key: forwarding_key.clone(),
+                protocol_version: req.protocol_version.clone(),
+                client_name: req.client_name.clone(),
+                client_version: req.client_version.clone(),
+                product_phase: req.product_phase.clone(),
+                guidance_delivered: BTreeSet::new(),
+                expires_at,
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP session store unavailable",
+                )),
+            )
+        })?;
 
     Ok(Json(McpRegisterSessionResponse {
         canopy_mcp_session_id,
@@ -242,7 +300,19 @@ async fn sync_guidance(
     }
 
     let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
-    let Some(session) = state.mcp_sessions.get(&req.canopy_mcp_session_id) else {
+    let session = state
+        .mcp_sessions
+        .get_session(&req.canopy_mcp_session_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP session store unavailable",
+                )),
+            )
+        })?;
+    let Some(session) = session else {
         state
             .audit_service
             .event(
@@ -267,10 +337,16 @@ async fn sync_guidance(
         ));
     };
 
-    if session.actor != claims.sub
-        || session.local_secret_generation != req.local_secret_generation
-        || session.expires_at < Utc::now()
-    {
+    let invalid_reason = if session.actor != claims.sub {
+        Some(McpGuidanceDenial::ActorMismatch)
+    } else if session.local_secret_generation != req.local_secret_generation {
+        Some(McpGuidanceDenial::GenerationMismatch)
+    } else if session.is_expired_at(Utc::now()) {
+        Some(McpGuidanceDenial::SessionExpired)
+    } else {
+        None
+    };
+    if let Some(denial) = invalid_reason {
         state
             .audit_service
             .event(
@@ -283,7 +359,7 @@ async fn sync_guidance(
                 "client_type": "mcp",
                 "surface": "mcp",
                 "mcp_event_kind": "guidance_sync",
-                "mcp_outcome_kind": "denied",
+                "mcp_outcome_kind": denial.audit_outcome_kind(),
                 "aws_execution_attempted": false,
                 "guidance_id": req.guidance_id,
                 "guidance_version": req.guidance_version,
@@ -291,12 +367,7 @@ async fn sync_guidance(
                 "local_secret_generation": req.local_secret_generation
             })))
             .commit_best_effort();
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "MCP session is not valid for this user",
-            )),
-        ));
+        return Err(denial.http_response("MCP session is not valid for this user"));
     }
 
     // The control-plane — not the client — is the authority on which guidance
@@ -336,11 +407,6 @@ async fn sync_guidance(
 
     let guidance_key = format!("{}@{}", req.guidance_id, req.guidance_version);
 
-    // Drop the DashMap write guard before doing any audit I/O. We re-acquire
-    // it only after the audit is durably committed, so a failed audit cannot
-    // leave the session in a "guidance delivered" state.
-    drop(session);
-
     state
         .audit_service
         .event(
@@ -372,11 +438,35 @@ async fn sync_guidance(
         })?;
 
     // Audit landed durably — now record the delivery. If the session was
-    // garbage-collected in the meantime (TTL hit), we report success without
-    // mutation because the audit already proves the issuance.
-    if let Some(mut session) = state.mcp_sessions.get_mut(&req.canopy_mcp_session_id) {
-        session.guidance_delivered.insert(guidance_key.clone());
-        session.updated_at = Utc::now();
+    // concurrently removed or no longer matches this actor/generation, fail
+    // closed so clients cannot receive a "delivered for gating" response that
+    // later cannot authorize protected tools.
+    let persisted = state
+        .mcp_sessions
+        .mark_guidance_delivered(
+            &req.canopy_mcp_session_id,
+            &claims.sub,
+            &req.local_secret_generation,
+            &guidance_key,
+            Utc::now(),
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP session store unavailable",
+                )),
+            )
+        })?;
+    if !persisted {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::new(
+                "MCP_SESSION_STATE_CONFLICT",
+                "MCP session changed before guidance delivery could be persisted",
+            )),
+        ));
     }
 
     Ok(Json(McpGuidanceSyncResponse {
@@ -433,27 +523,27 @@ async fn list_allowed_log_groups(
         ));
     }
 
-    if let Err(reason) = require_mcp_guidance(
+    if let Err(denial) = require_mcp_guidance(
         &state,
         &claims,
         req.canopy_mcp_session_id.as_deref(),
         req.local_secret_generation.as_deref(),
         CLOUDWATCH_DISCOVERY_REQUIRED_GUIDANCE,
-    ) {
-        audit_cloudwatch_discovery_denied(
-            &state,
-            &claims.sub,
-            &audit_ctx,
-            &req,
-            "Required MCP CloudWatch guidance has not been completed",
-            reason,
-        )?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Required MCP CloudWatch guidance has not been completed",
-            )),
-        ));
+    )
+    .await
+    {
+        let message = "Required MCP CloudWatch guidance has not been completed";
+        if !denial.is_store_unavailable() {
+            audit_cloudwatch_discovery_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                message,
+                denial.audit_outcome_kind(),
+            )?;
+        }
+        return Err(denial.http_response(message));
     }
 
     let cursor = match req.discovery_cursor.as_deref() {
@@ -764,27 +854,27 @@ async fn preflight_cloudwatch_data(
         ));
     }
 
-    if let Err(reason) = require_mcp_guidance(
+    if let Err(denial) = require_mcp_guidance(
         &state,
         &claims,
         req.canopy_mcp_session_id.as_deref(),
         req.local_secret_generation.as_deref(),
         required_guidance,
-    ) {
-        audit_cloudwatch_preflight_denied(
-            &state,
-            &claims.sub,
-            &audit_ctx,
-            &req,
-            reason,
-            "Required MCP CloudWatch data guidance has not been completed",
-        )?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Required MCP CloudWatch data guidance has not been completed",
-            )),
-        ));
+    )
+    .await
+    {
+        let message = "Required MCP CloudWatch data guidance has not been completed";
+        if !denial.is_store_unavailable() {
+            audit_cloudwatch_preflight_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                denial.audit_outcome_kind(),
+                message,
+            )?;
+        }
+        return Err(denial.http_response(message));
     }
 
     let log_group_names = match validate_cloudwatch_preflight_shape(&req, &guardrails) {
@@ -960,28 +1050,28 @@ async fn search_logs(
     let entitlements = ent_service.evaluate(&claims).await;
     let guardrails = McpGuardrails::default();
 
-    if let Err(reason) = require_mcp_guidance(
+    if let Err(denial) = require_mcp_guidance(
         &state,
         &claims,
         req.canopy_mcp_session_id.as_deref(),
         req.local_secret_generation.as_deref(),
         CLOUDWATCH_SEARCH_REQUIRED_GUIDANCE,
-    ) {
-        audit_cloudwatch_search_denied(
-            &state,
-            &claims.sub,
-            &audit_ctx,
-            &req,
-            None,
-            reason,
-            "Required MCP CloudWatch search guidance has not been completed",
-        )?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Required MCP CloudWatch search guidance has not been completed",
-            )),
-        ));
+    )
+    .await
+    {
+        let message = "Required MCP CloudWatch search guidance has not been completed";
+        if !denial.is_store_unavailable() {
+            audit_cloudwatch_search_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                None,
+                denial.audit_outcome_kind(),
+                message,
+            )?;
+        }
+        return Err(denial.http_response(message));
     }
 
     let context = match cloudwatch_search_context_from_request(&state, &claims, &req, &guardrails) {
@@ -1197,28 +1287,28 @@ async fn run_insights_query(
     let entitlements = ent_service.evaluate(&claims).await;
     let guardrails = McpGuardrails::default();
 
-    if let Err(reason) = require_mcp_guidance(
+    if let Err(denial) = require_mcp_guidance(
         &state,
         &claims,
         req.canopy_mcp_session_id.as_deref(),
         req.local_secret_generation.as_deref(),
         CLOUDWATCH_INSIGHTS_REQUIRED_GUIDANCE,
-    ) {
-        audit_cloudwatch_insights_denied(
-            &state,
-            &claims.sub,
-            &audit_ctx,
-            &req,
-            None,
-            reason,
-            "Required MCP CloudWatch Insights guidance has not been completed",
-        )?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Required MCP CloudWatch Insights guidance has not been completed",
-            )),
-        ));
+    )
+    .await
+    {
+        let message = "Required MCP CloudWatch Insights guidance has not been completed";
+        if !denial.is_store_unavailable() {
+            audit_cloudwatch_insights_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                None,
+                denial.audit_outcome_kind(),
+                message,
+            )?;
+        }
+        return Err(denial.http_response(message));
     }
 
     match (req.preflight_token.as_deref(), req.query_token.as_deref()) {
@@ -1329,19 +1419,26 @@ async fn list_database_scopes(
         ));
     }
 
-    if let Err(reason) = require_mcp_guidance(
+    if let Err(denial) = require_mcp_guidance(
         &state,
         &claims,
         req.canopy_mcp_session_id.as_deref(),
         req.local_secret_generation.as_deref(),
         DATABASE_SCOPE_LIST_REQUIRED_GUIDANCE,
-    ) {
-        audit_database_scope_list_denied(&state, &claims.sub, &audit_ctx, &req, reason)?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Required MCP database guidance has not been completed",
-            )),
+    )
+    .await
+    {
+        if !denial.is_store_unavailable() {
+            audit_database_scope_list_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                denial.audit_outcome_kind(),
+            )?;
+        }
+        return Err(denial.http_response(
+            "Required MCP database guidance has not been completed",
         ));
     }
 
@@ -1415,19 +1512,27 @@ async fn query_database(
     // we never inspect raw SQL until guidance is confirmed (and the
     // `audit_database_denied` helper redacts SQL in every denial path
     // regardless, but ordering keeps the audit story consistent).
-    if let Err(reason) = require_mcp_guidance(
+    if let Err(denial) = require_mcp_guidance(
         &state,
         &claims,
         req.canopy_mcp_session_id.as_deref(),
         req.local_secret_generation.as_deref(),
         DATABASE_QUERY_REQUIRED_GUIDANCE,
-    ) {
-        audit_database_denied(&state, &claims.sub, &audit_ctx, &req, reason, None)?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(ApiError::forbidden(
-                "Required MCP database guidance has not been completed",
-            )),
+    )
+    .await
+    {
+        if !denial.is_store_unavailable() {
+            audit_database_denied(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                &req,
+                denial.audit_outcome_kind(),
+                None,
+            )?;
+        }
+        return Err(denial.http_response(
+            "Required MCP database guidance has not been completed",
         ));
     }
 
@@ -4261,37 +4366,123 @@ fn audit_cloudwatch_discovery_error(
         .map_err(|_| cloudwatch_discovery_audit_failure_response())
 }
 
-fn require_mcp_guidance(
+/// Why `require_mcp_guidance` (or `sync_guidance`'s session-validity check)
+/// rejected a request. Modeling these reasons as a type keeps the HTTP status
+/// and the audit `mcp_outcome_kind` in lockstep and lets the compiler enforce
+/// that every reason is handled — previously they were bare `&'static str`s
+/// shared untyped across the status mapping, the audit metadata, and the route
+/// tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpGuidanceDenial {
+    SessionRequired,
+    StoreUnavailable,
+    SessionNotFound,
+    SessionExpired,
+    ActorMismatch,
+    GenerationMismatch,
+    GuidanceRequired,
+}
+
+impl McpGuidanceDenial {
+    /// Stable `mcp_outcome_kind` audit value. These strings are a wire contract
+    /// — audit consumers and route tests key on them — so they must not change.
+    fn audit_outcome_kind(self) -> &'static str {
+        match self {
+            Self::SessionRequired => "mcp_session_required",
+            Self::StoreUnavailable => "mcp_session_store_unavailable",
+            Self::SessionNotFound => "mcp_session_not_found",
+            Self::SessionExpired => "mcp_session_expired",
+            Self::ActorMismatch => "mcp_session_actor_mismatch",
+            Self::GenerationMismatch => "mcp_session_generation_mismatch",
+            Self::GuidanceRequired => "guidance_required",
+        }
+    }
+
+    /// Store/backend unavailability is an infrastructure failure, not an
+    /// authorization decision: callers must surface it as 503 without writing a
+    /// `Denied` audit event (that would pollute the security trail and can trip
+    /// denial-based alerting). This mirrors how `sync_guidance` treats a
+    /// `get_session` error.
+    fn is_store_unavailable(self) -> bool {
+        matches!(self, Self::StoreUnavailable)
+    }
+
+    /// HTTP response for this denial. `guidance_required_message` is the
+    /// endpoint-specific text used only for `GuidanceRequired`; every other
+    /// reason carries a fixed message.
+    fn http_response(
+        self,
+        guidance_required_message: &'static str,
+    ) -> (StatusCode, Json<ApiError>) {
+        match self {
+            Self::StoreUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP session store unavailable",
+                )),
+            ),
+            Self::SessionRequired => (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden("MCP session is required")),
+            ),
+            Self::SessionNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::not_found("MCP session not found")),
+            ),
+            Self::SessionExpired => (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden("MCP session expired")),
+            ),
+            Self::ActorMismatch | Self::GenerationMismatch => (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(
+                    "MCP session is not valid for this user",
+                )),
+            ),
+            Self::GuidanceRequired => (
+                StatusCode::FORBIDDEN,
+                Json(ApiError::forbidden(guidance_required_message)),
+            ),
+        }
+    }
+}
+
+async fn require_mcp_guidance(
     state: &AppState,
     claims: &Claims,
     session_id: Option<&str>,
     local_secret_generation: Option<&str>,
     required_guidance: &[&str],
-) -> Result<(), &'static str> {
+) -> Result<(), McpGuidanceDenial> {
     let Some(session_id) = session_id else {
-        return Err("mcp_session_required");
+        return Err(McpGuidanceDenial::SessionRequired);
     };
     let Some(local_secret_generation) = local_secret_generation else {
-        return Err("mcp_session_required");
+        return Err(McpGuidanceDenial::SessionRequired);
     };
-    let Some(session) = state.mcp_sessions.get(session_id) else {
-        return Err("mcp_session_not_found");
+    let session = state
+        .mcp_sessions
+        .get_session(session_id)
+        .await
+        .map_err(|_| McpGuidanceDenial::StoreUnavailable)?;
+    let Some(session) = session else {
+        return Err(McpGuidanceDenial::SessionNotFound);
     };
 
     if session.actor != claims.sub {
-        return Err("mcp_session_actor_mismatch");
+        return Err(McpGuidanceDenial::ActorMismatch);
     }
     if session.local_secret_generation != local_secret_generation {
-        return Err("mcp_session_generation_mismatch");
+        return Err(McpGuidanceDenial::GenerationMismatch);
     }
-    if session.expires_at < Utc::now() {
-        return Err("mcp_session_expired");
+    if session.is_expired_at(Utc::now()) {
+        return Err(McpGuidanceDenial::SessionExpired);
     }
     if !required_guidance
         .iter()
         .all(|guidance| session.guidance_delivered.contains(*guidance))
     {
-        return Err("guidance_required");
+        return Err(McpGuidanceDenial::GuidanceRequired);
     }
 
     Ok(())

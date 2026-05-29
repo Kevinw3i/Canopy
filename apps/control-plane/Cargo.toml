@@ -33,6 +33,7 @@ aws-sdk-organizations.workspace = true
 aws-sdk-ssm.workspace = true
 aws-sdk-sts.workspace = true
 aws-sdk-iam.workspace = true
+aws-sdk-dynamodb.workspace = true
 aws-credential-types.workspace = true
 aws-types.workspace = true
 

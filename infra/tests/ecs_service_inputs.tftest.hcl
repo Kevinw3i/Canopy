@@ -27,6 +27,54 @@ run "accepts_zero_desired_count" {
   }
 }
 
+run "rejects_multi_task_memory_mcp_session_store" {
+  command = plan
+
+  variables {
+    create_service         = true
+    image_tag              = "cp-v0.1.0"
+    jwt_secret_version_id  = "00000000-0000-0000-0000-000000000000"
+    desired_count          = 2
+    mcp_session_store      = "memory"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
+run "accepts_single_task_memory_mcp_session_store" {
+  command = plan
+
+  variables {
+    create_service         = true
+    image_tag              = "cp-v0.1.0"
+    jwt_secret_version_id  = "00000000-0000-0000-0000-000000000000"
+    desired_count          = 1
+    mcp_session_store      = "memory"
+  }
+}
+
+run "accepts_custom_mcp_session_table_name" {
+  command = plan
+
+  variables {
+    mcp_session_table_name = "canopy-test-mcp-sessions"
+  }
+}
+
+run "rejects_invalid_mcp_session_store" {
+  command = plan
+
+  variables {
+    mcp_session_store = "redis"
+  }
+
+  expect_failures = [
+    var.mcp_session_store,
+  ]
+}
+
 run "rejects_negative_desired_count" {
   command = plan
 

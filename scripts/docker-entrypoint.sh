@@ -199,6 +199,11 @@ if [ ! -f "$CONFIG_PATH" ] || [ "${GENERATE_CONFIG:-0}" = "1" ]; then
   SAFE_OIDC_CLIENT_ID=$(escape_toml "$OIDC_CLIENT_ID")
   SAFE_AWS_DEFAULT_REGION=$(escape_toml "${AWS_DEFAULT_REGION:-ap-northeast-1}")
   SAFE_STS_EXTERNAL_ID=$(escape_toml "${STS_EXTERNAL_ID:-canopy}")
+  # In-memory is the local/dev default. Multi-task deployments MUST set
+  # MCP_SESSION_STORE=dynamodb (Terraform's mcp_session_store defaults to it);
+  # the control-plane also logs a startup warning when memory is selected.
+  SAFE_MCP_SESSION_STORE=$(escape_toml "${MCP_SESSION_STORE:-memory}")
+  SAFE_MCP_SESSION_TABLE_NAME=$(escape_toml "${MCP_SESSION_TABLE_NAME:-}")
   SAFE_JWT_EXPIRY_SECONDS=$(positive_int "JWT_EXPIRY_SECONDS" "${JWT_EXPIRY_SECONDS:-3600}")
   SAFE_AWS_SESSION_DURATION_SECONDS=$(
     bounded_int "AWS_SESSION_DURATION_SECONDS" "${AWS_SESSION_DURATION_SECONDS:-3600}" 900 43200
@@ -280,6 +285,10 @@ expiry_seconds = ${SAFE_JWT_EXPIRY_SECONDS}
 default_region           = "${SAFE_AWS_DEFAULT_REGION}"
 session_duration_seconds = ${SAFE_AWS_SESSION_DURATION_SECONDS}
 sts_external_id          = "${SAFE_STS_EXTERNAL_ID}"
+
+[mcp]
+session_store = "${SAFE_MCP_SESSION_STORE}"
+session_table_name = "${SAFE_MCP_SESSION_TABLE_NAME}"
 TOML
 
   if [ -n "$DATABASE_CONNECTIONS_TOML" ]; then

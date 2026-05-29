@@ -47,3 +47,8 @@ output "log_group_name" {
   description = "CloudWatch log group for container logs"
   value       = aws_cloudwatch_log_group.control_plane.name
 }
+
+output "mcp_session_table_name" {
+  description = "DynamoDB table used for MCP session state when enabled"
+  value       = var.mcp_session_store == "dynamodb" ? aws_dynamodb_table.mcp_sessions[0].name : ""
+}

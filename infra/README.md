@@ -283,6 +283,8 @@ encrypt        = true
 | `aws_region` | No | 預設 `ap-northeast-1` |
 | `cpu` / `memory` | No | 預設 512 / 1024；必須符合 AWS Fargate Linux task size 組合 |
 | `desired_count` | No | 預設 2（跨 AZ）；必須是非負整數 |
+| `mcp_session_store` | No | 預設 `dynamodb`；`desired_count > 1` 時必須使用 durable store，避免 MCP guidance/session 跨 task 遺失 |
+| `mcp_session_table_name` | No | 預設 `<project>-mcp-sessions`；DynamoDB on-demand table，TTL 欄位為 `expires_at_epoch` |
 | `alb_internal` | No | 預設 `true`（內部 ALB） |
 | `allow_public_alb_world_cidr` | No | 預設 `false`；只有 public ALB 必須允許全網段時才設為 `true` |
 | `sts_external_id` | No | 預設 `canopy`，跨帳號 AssumeRole 的 ExternalId；必須符合 STS ExternalId 格式限制 |
