@@ -20,6 +20,7 @@ use shared::dto::cloudwatch::LiveTailMessage;
 use shared::dto::entitlements::{
     AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, RuleMetadata,
 };
+use shared::dto::mcp::{lookup_mcp_guidance_by_id, MCP_GUIDANCE_CATALOG};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -910,6 +911,12 @@ async fn register_database_guidance(app: &Router, token: &str) -> (String, Strin
     .await
 }
 
+fn test_guidance_version(guidance_id: &str) -> &'static str {
+    lookup_mcp_guidance_by_id(guidance_id)
+        .unwrap_or_else(|| panic!("unknown test guidance id {guidance_id}"))
+        .version
+}
+
 async fn register_database_guidance_ids(
     app: &Router,
     token: &str,
@@ -946,7 +953,7 @@ async fn register_database_guidance_ids(
             "canopy_mcp_session_id": session_id,
             "local_secret_generation": local_secret_generation,
             "guidance_id": guidance_id,
-            "guidance_version": "2026-05-13"
+            "guidance_version": test_guidance_version(guidance_id)
         });
         let guidance_resp = app
             .clone()
@@ -1002,38 +1009,36 @@ async fn mcp_guidance_sync_returns_server_owned_content_on_success() {
         .unwrap()
         .to_string();
 
-    let guidance_body = json!({
-        "canopy_mcp_session_id": session_id,
-        "local_secret_generation": "lsg_test_server_content",
-        "guidance_id": "database_query_workflow",
-        "guidance_version": "2026-05-13"
-    });
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::post("/api/mcp/guidance/delivered")
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", token))
-                .body(Body::from(guidance_body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    for entry in MCP_GUIDANCE_CATALOG {
+        let guidance_body = json!({
+            "canopy_mcp_session_id": session_id,
+            "local_secret_generation": "lsg_test_server_content",
+            "guidance_id": entry.id,
+            "guidance_version": entry.version
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/mcp/guidance/delivered")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .body(Body::from(guidance_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
-    let body = body_json(resp.into_body()).await;
-    assert_eq!(body["guidance_id"], "database_query_workflow");
-    assert_eq!(body["guidance_version"], "2026-05-13");
-    assert_eq!(body["content_type"], "text/markdown");
-    let content = body["content"].as_str().expect("content field is required");
-    assert!(
-        !content.is_empty(),
-        "server-issued content must be non-empty"
-    );
-    assert!(
-        content.contains("canopy_list_database_scopes"),
-        "server content must come from the catalog, not a client echo: got {content}"
-    );
+        let body = body_json(resp.into_body()).await;
+        assert_eq!(body["guidance_id"], entry.id);
+        assert_eq!(body["guidance_version"], entry.version);
+        assert_eq!(body["title"], entry.title);
+        assert_eq!(body["content_type"], "text/markdown");
+        assert_eq!(
+            body["content"].as_str().expect("content field is required"),
+            entry.content
+        );
+    }
 }
 
 #[tokio::test]
@@ -1112,7 +1117,7 @@ async fn mcp_guidance_sync_unknown_session_is_audited() {
         "canopy_mcp_session_id": "mcp_missing",
         "local_secret_generation": "lsg_missing",
         "guidance_id": "database_query_workflow",
-        "guidance_version": "2026-05-13"
+        "guidance_version": test_guidance_version("database_query_workflow")
     });
     let resp = app
         .oneshot(
@@ -1187,7 +1192,7 @@ async fn mcp_guidance_sync_rejects_stale_local_secret_generation_with_403() {
         // ↓ doesn't match the registered "lsg_original"
         "local_secret_generation": "lsg_TAMPERED",
         "guidance_id": "database_query_workflow",
-        "guidance_version": "2026-05-13"
+        "guidance_version": test_guidance_version("database_query_workflow")
     });
     let resp = app
         .oneshot(
@@ -1273,7 +1278,7 @@ async fn mcp_guidance_sync_rejects_cross_actor_session_access_with_403() {
         "canopy_mcp_session_id": session_id,
         "local_secret_generation": "lsg_owner",
         "guidance_id": "database_query_workflow",
-        "guidance_version": "2026-05-13"
+        "guidance_version": test_guidance_version("database_query_workflow")
     });
     let resp = app
         .oneshot(
@@ -1357,7 +1362,7 @@ async fn mcp_guidance_sync_rejects_expired_session_with_403() {
         "canopy_mcp_session_id": session_id,
         "local_secret_generation": "lsg_for_expired_test",
         "guidance_id": "database_query_workflow",
-        "guidance_version": "2026-05-13"
+        "guidance_version": test_guidance_version("database_query_workflow")
     });
     let resp = app
         .oneshot(
@@ -1471,7 +1476,7 @@ async fn mcp_guidance_sync_store_failure_does_not_report_delivered_for_gating() 
         "canopy_mcp_session_id": session_id,
         "local_secret_generation": "lsg_store_failure",
         "guidance_id": "security_boundaries",
-        "guidance_version": "2026-05-13"
+        "guidance_version": test_guidance_version("security_boundaries")
     });
     let guidance_resp = app
         .oneshot(
@@ -1768,7 +1773,7 @@ async fn mcp_guidance_sync_persist_conflict_returns_409_not_success() {
         "canopy_mcp_session_id": session_id,
         "local_secret_generation": "lsg_conflict",
         "guidance_id": "security_boundaries",
-        "guidance_version": "2026-05-13"
+        "guidance_version": test_guidance_version("security_boundaries")
     });
     let resp = app
         .oneshot(
@@ -5870,7 +5875,7 @@ async fn cloudwatch_insights_start_audit_metadata_captures_query_string_and_log_
     // Audit-attribution: a successful StartQuery must record the
     // user-submitted query_string verbatim plus log group names so
     // SRE can correlate. (The query_string can leak PII — that is
-    // a documented design choice; see docs/AUDIT-SCHEMA.md.)
+    // a documented design choice; see docs/en/AUDIT-SCHEMA.md.)
     let config = dev_config();
     let token = issue_test_token(&config);
     let audit = AuditFile::new("insights-success-audit");

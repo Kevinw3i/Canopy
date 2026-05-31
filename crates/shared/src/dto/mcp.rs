@@ -28,31 +28,31 @@ pub const MCP_GUIDANCE_CATALOG: &[McpGuidanceCatalogEntry] = &[
         id: "security_boundaries",
         version: "2026-05-13",
         title: "Security Boundaries",
-        content: "Use only the tools exposed by Canopy MCP. Do not ask for AWS credentials, Canopy JWTs, local secrets, or raw Authorization headers. Treat returned scope and guardrails as hard limits.",
+        content: include_str!("mcp_guidance/security_boundaries.md"),
     },
     McpGuidanceCatalogEntry {
         id: MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID,
         version: MCP_CLOUDWATCH_SEARCH_GUIDANCE_VERSION,
         title: "CloudWatch Search Workflow",
-        content: "Before searching CloudWatch logs through MCP, call canopy_describe_capabilities, then use canopy_list_allowed_log_groups to select an authorized log group, then call canopy_preflight_request. Initial canopy_search_logs calls require preflight_token and no search_cursor; continuation calls require search_cursor and no preflight_token. Raw filter patterns are audited only after guidance and preflight gates pass.",
+        content: include_str!("mcp_guidance/cloudwatch_search_workflow.md"),
     },
     McpGuidanceCatalogEntry {
         id: MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID,
         version: MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_VERSION,
         title: "CloudWatch Insights Workflow",
-        content: "Logs Insights through MCP requires canopy_describe_capabilities, authorized log groups from canopy_list_allowed_log_groups, and canopy_preflight_request before canopy_run_insights_query. Initial calls require preflight_token and no query_token; polling calls require query_token and no preflight_token. Time windows, query text, response size, and concurrency are bounded by server guardrails.",
+        content: include_str!("mcp_guidance/cloudwatch_insights_workflow.md"),
     },
     McpGuidanceCatalogEntry {
         id: "privacy_and_audit_notice",
         version: "2026-05-13",
         title: "Privacy And Audit Notice",
-        content: "MCP tool calls are audited. **MCP Database v1 records the full raw SQL of every database query — including literal values, WHERE-clause comparisons, and any embedded comments — in the durable audit log.** Do not embed secrets, API keys, customer PII, passwords, or other sensitive material in SQL literals or filter patterns. Treat the audit log itself as sensitive operational data subject to the same access controls as the underlying database.",
+        content: include_str!("mcp_guidance/privacy_and_audit_notice.md"),
     },
     McpGuidanceCatalogEntry {
         id: MCP_DATABASE_GUIDANCE_ID,
         version: MCP_DATABASE_GUIDANCE_VERSION,
         title: "Database Query Workflow",
-        content: "Before issuing database queries: list scopes with canopy_list_database_scopes, then call canopy_query_database with a scope_name. SQL must be SELECT-only, single-statement, lowercase identifiers, and bounded by LIMIT. The control-plane enforces EXPLAIN, max_rows, and statement timeouts.",
+        content: include_str!("mcp_guidance/database_query_workflow.md"),
     },
 ];
 
@@ -68,6 +68,10 @@ pub fn lookup_mcp_guidance(id: &str, version: &str) -> Option<&'static McpGuidan
     MCP_GUIDANCE_CATALOG
         .iter()
         .find(|entry| entry.id == id && entry.version == version)
+}
+
+pub fn lookup_mcp_guidance_by_id(id: &str) -> Option<&'static McpGuidanceCatalogEntry> {
+    MCP_GUIDANCE_CATALOG.iter().find(|entry| entry.id == id)
 }
 
 pub fn is_known_mcp_guidance(id: &str, version: &str) -> bool {
@@ -321,6 +325,7 @@ pub struct McpRunInsightsQueryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn guardrails_default_is_bounded() {
@@ -352,18 +357,85 @@ mod tests {
     }
 
     #[test]
-    fn catalog_returns_server_owned_content_not_just_keys() {
-        // The catalog must carry actual content so the control-plane can
-        // return it from `sync_guidance`. A client cannot mark guidance
-        // delivered without the server having emitted this content.
-        let entry =
-            lookup_mcp_guidance(MCP_DATABASE_GUIDANCE_ID, MCP_DATABASE_GUIDANCE_VERSION).unwrap();
-        assert_eq!(entry.id, MCP_DATABASE_GUIDANCE_ID);
-        assert_eq!(entry.version, MCP_DATABASE_GUIDANCE_VERSION);
-        assert!(!entry.title.is_empty());
-        assert!(
-            !entry.content.is_empty(),
-            "guidance catalog must carry content, not just keys"
-        );
+    fn guidance_catalog_ids_and_versions_are_unique() {
+        let mut ids = BTreeSet::new();
+        let mut pairs = BTreeSet::new();
+        for entry in MCP_GUIDANCE_CATALOG {
+            assert!(ids.insert(entry.id), "duplicate guidance id {}", entry.id);
+            assert!(
+                pairs.insert((entry.id, entry.version)),
+                "duplicate guidance id/version {}@{}",
+                entry.id,
+                entry.version
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_catalog_round_trips_every_entry() {
+        for entry in MCP_GUIDANCE_CATALOG {
+            let by_pair = lookup_mcp_guidance(entry.id, entry.version)
+                .expect("catalog entry must be found by id/version");
+            assert_eq!(by_pair.id, entry.id);
+            assert_eq!(by_pair.version, entry.version);
+
+            let by_id =
+                lookup_mcp_guidance_by_id(entry.id).expect("catalog entry must be found by id");
+            assert_eq!(by_id.id, entry.id);
+            assert_eq!(by_id.version, entry.version);
+        }
+    }
+
+    #[test]
+    fn guidance_markdown_content_is_publishable() {
+        for entry in MCP_GUIDANCE_CATALOG {
+            let content = entry.content.trim();
+            assert!(
+                !entry.title.trim().is_empty(),
+                "{} title is empty",
+                entry.id
+            );
+            assert!(!content.is_empty(), "{} content is empty", entry.id);
+            assert!(
+                content.starts_with("# "),
+                "{} content must start with a markdown H1",
+                entry.id
+            );
+            assert!(
+                content.contains(entry.title),
+                "{} content must include the catalog title {:?}",
+                entry.id,
+                entry.title
+            );
+
+            let lower = content.to_ascii_lowercase();
+            assert!(
+                !lower.contains("todo"),
+                "{} content must not contain TODO",
+                entry.id
+            );
+            assert!(
+                !lower.contains("placeholder"),
+                "{} content must not contain placeholder text",
+                entry.id
+            );
+        }
+    }
+
+    #[test]
+    fn required_guidance_keys_exist_in_catalog() {
+        for key in [
+            MCP_SECURITY_BOUNDARIES_KEY,
+            MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
+            MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
+            MCP_DATABASE_GUIDANCE_KEY,
+            MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+        ] {
+            let (id, version) = key.split_once('@').expect("guidance key has version");
+            assert!(
+                lookup_mcp_guidance(id, version).is_some(),
+                "required guidance key {key} must exist in catalog"
+            );
+        }
     }
 }

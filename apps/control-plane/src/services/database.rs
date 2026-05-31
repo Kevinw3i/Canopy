@@ -318,7 +318,7 @@ const POOL_CLEANUP_HARD_CAP: Duration = Duration::from_secs(30);
 ///
 /// Codex round 25 (HIGH): an acquire-failure-induced orphan session
 /// will live as long as the role's `wait_timeout`. The repo operator
-/// docs (`docs/OPERATOR-SETUP.md`) MUST mandate that role-level
+/// docs (`docs/zh-TW/OPERATOR-SETUP.md`) MUST mandate that role-level
 /// `wait_timeout` be ≤ this constant; otherwise the helper releases
 /// the limiter slot before MySQL has reaped the orphan, and a retry
 /// can put us back over `max_connections`. The control plane is not
@@ -338,7 +338,7 @@ const PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS: u64 = 30;
 /// that the server-side `@@session.wait_timeout` is at or below
 /// `PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS`.
 ///
-/// Codex round 26 (HIGH): the operator doc `docs/OPERATOR-SETUP.md`
+/// Codex round 26 (HIGH): the operator doc `docs/zh-TW/OPERATOR-SETUP.md`
 /// declares the invariant
 ///   role-level `wait_timeout` ≤ 30 s
 /// but documentation cannot enforce a runtime guarantee — an operator
@@ -490,7 +490,7 @@ pub async fn preflight_session_safety(
              A connection that fails before our `OptsBuilder::init` runs inherits @@global, \
              so a low @@session.wait_timeout via init_connect is NOT enough on its own. \
              Fix the upstream via parameter group (RDS/Aurora) or `SET GLOBAL/SET PERSIST \
-             wait_timeout = 25`; see docs/OPERATOR-SETUP.md.",
+             wait_timeout = 25`; see docs/zh-TW/OPERATOR-SETUP.md.",
             connection.host,
             connection.database,
             ceiling = PREFLIGHT_WAIT_TIMEOUT_CEILING_SECS,
@@ -644,7 +644,7 @@ async fn release_conn_bounded_cleanup(
 /// - If init SQL ran, server-side `wait_timeout` is 25 s
 ///   (`mysql_opts_for_conn`).
 /// - If init SQL did NOT run, the orphan lives as long as the
-///   **role-level** `wait_timeout` — which `docs/OPERATOR-SETUP.md`
+///   **role-level** `wait_timeout` — which `docs/zh-TW/OPERATOR-SETUP.md`
 ///   now mandates be ≤ 30 s.
 ///
 /// We can't actively `KILL CONNECTION` here because we don't have the
@@ -761,7 +761,7 @@ fn permit_hold_after_acquire_failure(permit: OwnedSemaphorePermit, context: &'st
         "connection acquire failed; holding limiter permit for ACQUIRE_FAILURE_PERMIT_HOLD \
          so a half-built upstream session does not put us over max_connections before the \
          server's role-level `wait_timeout` reaps it (operators: confirm role `wait_timeout` \
-         is ≤ 30 s — see docs/OPERATOR-SETUP.md)"
+         is ≤ 30 s — see docs/zh-TW/OPERATOR-SETUP.md)"
     );
     tokio::spawn(async move {
         let _held = permit;

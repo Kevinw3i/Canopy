@@ -109,12 +109,15 @@ Canopy/
 │   └── docker-entrypoint.sh   ← Container startup + Secrets Manager injection
 │
 └── docs/
-    ├── PRD.md                 ← Product requirements (中文)
-    ├── ARCHITECTURE.md        ← Full architecture reference
-    ├── ECS_FARGATE_DEPLOYMENT.md ← ECS deployment (manual / Terraform)
-    ├── COGNITO-SETUP.md       ← AWS Cognito OIDC setup
-    ├── OPERATOR-SETUP.md      ← TUI distribution to operators
-    └── RELEASING.md           ← Release workflow & CI
+    ├── en/
+    │   ├── ARCHITECTURE.md    ← Full architecture reference
+    │   └── AUDIT-SCHEMA.md    ← Audit event schema
+    └── zh-TW/
+        ├── PRD.md             ← Product requirements
+        ├── ECS_FARGATE_DEPLOYMENT.md ← ECS deployment (manual / Terraform)
+        ├── COGNITO-SETUP.md   ← AWS Cognito OIDC setup
+        ├── OPERATOR-SETUP.md  ← TUI distribution to operators
+        └── RELEASING.md       ← Release workflow & CI
 ```
 
 ---
@@ -265,7 +268,7 @@ max_examined_rows = 10000
 allow_full_table_scan = false
 # default-deny VIEW reads. Flip to `true` only after the operator has
 # reviewed the view's DEFINER and base-table reach — see entitlements.sample.toml
-# and docs/OPERATOR-SETUP.md for the full opt-in checklist.
+# and docs/zh-TW/OPERATOR-SETUP.md for the full opt-in checklist.
 allow_views = false
 
 [[rules.allowed_accounts]]
@@ -460,7 +463,8 @@ MCP permissions are intentionally separate from the normal TUI permissions:
 - MCP CloudWatch raw filter/query audit values are encrypted by default; set `can_view_mcp_raw_audit_plaintext = true` only on the same rule that authorizes the exact account/region/log-group scope.
 - `can_use_mcp_database` enables MCP database tools only when a matching `[[rules.database_scopes]]` grants a specific connection/schema/table scope.
 - Product Phase 3 exposes MCP foundation tools (`canopy_describe_capabilities`, `canopy_get_guidance`), CloudWatch discovery (`canopy_list_allowed_log_groups`), and preflight-gated CloudWatch data tools (`canopy_preflight_request`, `canopy_search_logs`, `canopy_run_insights_query`) when MCP CloudWatch is enabled, plus MCP Database v1 when explicitly enabled. Initial CloudWatch search/Insights calls require a server-issued preflight token; continuation/poll calls require the returned cursor/token.
-- MCP Database v1 exposes `canopy_list_database_scopes` and `canopy_query_database` for MySQL read-only `SELECT` queries. The control-plane enforces SQL validation, table scope, `LIMIT`, Secrets Manager credentials, and `EXPLAIN FORMAT=JSON` before executing the query. MCP responses never include DB host, secret ARN, username, or password. The view-guard is **default-deny**: every referenced object is verified as `BASE TABLE` under MDL inside the same transaction that runs EXPLAIN and the SELECT; scopes can opt into reading views by setting `allow_views = true` after reviewing the view's DEFINER and base-table reach. Connection-pool saturation surfaces as HTTP 503 (`connection_queue_full` / `database_connection_unavailable`), not 500 — see `docs/OPERATOR-SETUP.md` for the operator hardening checklist.
+- MCP guidance content is a server-owned source asset under `crates/shared/src/dto/mcp_guidance/` and is compiled into the binary through `MCP_GUIDANCE_CATALOG`; it is not loaded from local Codex skills or runtime operator files.
+- MCP Database v1 exposes `canopy_list_database_scopes` and `canopy_query_database` for MySQL read-only `SELECT` queries. The control-plane enforces SQL validation, table scope, `LIMIT`, Secrets Manager credentials, and `EXPLAIN FORMAT=JSON` before executing the query. MCP responses never include DB host, secret ARN, username, or password. The view-guard is **default-deny**: every referenced object is verified as `BASE TABLE` under MDL inside the same transaction that runs EXPLAIN and the SELECT; scopes can opt into reading views by setting `allow_views = true` after reviewing the view's DEFINER and base-table reach. Connection-pool saturation surfaces as HTTP 503 (`connection_queue_full` / `database_connection_unavailable`), not 500 — see `docs/zh-TW/OPERATOR-SETUP.md` for the operator hardening checklist.
 
 ### Step 4: Set up your OIDC provider
 
@@ -470,7 +474,7 @@ The control-plane supports any OpenID Connect provider. Common choices:
 |----------|------------|-------|
 | Google | `https://accounts.google.com` | Create OAuth client in Google Cloud Console |
 | AWS IAM Identity Center | `https://your-sso-portal.awsapps.com/start` | Enable OIDC application |
-| **AWS Cognito** | `https://cognito-idp.{region}.amazonaws.com/{user-pool-id}` | **Recommended for AWS users.** See [docs/COGNITO-SETUP.md](docs/COGNITO-SETUP.md) |
+| **AWS Cognito** | `https://cognito-idp.{region}.amazonaws.com/{user-pool-id}` | **Recommended for AWS users.** See [docs/zh-TW/COGNITO-SETUP.md](docs/zh-TW/COGNITO-SETUP.md) |
 | Okta | `https://{your-domain}.okta.com` | Create OIDC application |
 | Azure AD | `https://login.microsoftonline.com/{tenant-id}/v2.0` | Register application |
 
@@ -612,7 +616,7 @@ The script automatically:
 5. Removes macOS Gatekeeper quarantine flag if needed
 6. Runs a full verification check
 
-See [docs/OPERATOR-SETUP.md](docs/OPERATOR-SETUP.md) for the complete operator guide and troubleshooting.
+See [docs/zh-TW/OPERATOR-SETUP.md](docs/zh-TW/OPERATOR-SETUP.md) for the complete operator guide and troubleshooting.
 
 ---
 
@@ -651,7 +655,7 @@ Every action is logged with structured tracing **and** to a durable JSON-lines f
 
 Audit schema changes are additive. New top-level fields are optional and omitted
 when absent; strict downstream schemas should be migrated before relying on new
-fields such as `target_resource_name`. See [Audit Log Schema](docs/AUDIT-SCHEMA.md).
+fields such as `target_resource_name`. See [Audit Log Schema](docs/en/AUDIT-SCHEMA.md).
 
 When the durable audit file is configured and a write fails, the API returns 503 (fail-closed).
 

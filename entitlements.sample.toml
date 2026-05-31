@@ -207,7 +207,7 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 #
 # 觸發每次 power action 都會寫一筆 `ec2_power` audit log，含
 # previous_state / requested_state / power_action / confirmation_present
-# （詳見 docs/AUDIT-SCHEMA.md）。
+# （詳見 docs/en/AUDIT-SCHEMA.md）。
 #
 # control-plane `/api/ec2/power` 會用這個獨立 rule 的 account / region /
 # tag selector scope 做二次授權，通過後才會呼叫 AWS power API。

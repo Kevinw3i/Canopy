@@ -1,7 +1,7 @@
 # Control-Plane 部署到 AWS ECS Fargate
 
 > **推薦方式**：專案已提供 Terraform IaC，可一鍵建立以下所有基礎設施。
-> 詳見 [`infra/README.md`](../infra/README.md)。
+> 詳見 [`infra/README.md`](../../infra/README.md)。
 >
 > 以下手動 AWS CLI 步驟保留作為參考，適用於無法使用 Terraform 的環境或需要理解各資源細節的場景。
 
@@ -187,7 +187,7 @@ Terraform state、或 baked config file。Task definition 設定 `GENERATE_CONFI
 `/tmp/canopy-config.toml` 產生啟動設定。
 
 > **注意**：正式 ECS 部署建議使用 repo 內建的
-> [`scripts/docker-entrypoint.sh`](../scripts/docker-entrypoint.sh)。Dockerfile
+> [`scripts/docker-entrypoint.sh`](../../scripts/docker-entrypoint.sh)。Dockerfile
 > 會把這個 entrypoint 放進 image；Terraform task definition 會用
 > ECS-native `secrets` 注入 `JWT_SECRET` / `OIDC_CLIENT_SECRET`，並設定
 > `GENERATE_CONFIG=1` 讓 entrypoint 在 `/tmp/canopy-config.toml` 產生啟動設定。

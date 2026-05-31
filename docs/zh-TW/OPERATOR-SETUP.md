@@ -140,6 +140,40 @@ can_use_mcp = true
 - `canopy_search_logs`
 - `canopy_run_insights_query`
 
+#### MCP guidance source assets
+
+`canopy_get_guidance` 回傳的是 control-plane 發出的 server-owned guidance。
+目前 guidance 內容放在 `crates/shared/src/dto/mcp_guidance/*.md`，
+再由 `crates/shared/src/dto/mcp.rs` 的 `MCP_GUIDANCE_CATALOG` 用
+`include_str!()` 編譯進 binary。這代表 guidance 不是 runtime config，
+也不是從使用者機器上的 Codex skills 目錄讀取；部署後改磁碟檔不會改變
+已編譯 binary 會發出的 guidance。
+
+目前內建 guidance：
+
+- `security_boundaries`
+- `cloudwatch_search_workflow`
+- `cloudwatch_insights_workflow`
+- `privacy_and_audit_notice`
+- `database_query_workflow`
+
+若要新增或調整 MCP guidance：
+
+1. 在 `crates/shared/src/dto/mcp_guidance/` 新增或修改 Markdown 檔；
+   檔案需以 H1 標題開頭，且標題需對應 catalog title。
+2. 在 `MCP_GUIDANCE_CATALOG` 新增或更新 `id`、`version`、`title` 與
+   `content: include_str!(...)`。
+3. 若該 guidance 是某個工具的強制前置條件，需同步更新
+   `apps/control-plane/src/routes/mcp.rs` 的 required-guidance list。
+   例如 MCP Database query 仍由 `DATABASE_QUERY_REQUIRED_GUIDANCE` gate。
+4. 確認 `canopy_get_guidance` 的 schema enum、TUI forward version、以及
+   control-plane `/api/mcp/guidance/delivered` response 都仍由 shared catalog
+   驅動，而不是各自硬寫。
+
+Guidance 只負責提供查詢規則、工作流程、表格語意與安全提醒；權限、
+table scope、`LIMIT`、SQL validation、`EXPLAIN` 與 preflight token 仍必須由
+control-plane server-side enforcement 強制執行。
+
 若要讓 AI 能把「WS168 正式環境」這類描述解析成可授權查詢的
 `account_id + region`，可在同一條 MCP CloudWatch rule 加
 Business Scopes：
@@ -356,7 +390,7 @@ EXPLAIN 評估、SELECT 在同一個 transaction），只是不會在 informatio
 
 ### 5. Audit 監控訊號
 
-關鍵 `mcp_outcome_kind` 值（更多請看 `docs/AUDIT-SCHEMA.md`）：
+關鍵 `mcp_outcome_kind` 值（更多請看 [docs/en/AUDIT-SCHEMA.md](../en/AUDIT-SCHEMA.md)）：
 
 | Outcome kind | HTTP | 應對 |
 |---|---|---|

@@ -12,14 +12,12 @@ use serde_json::{json, Value};
 use shared::dto::database::{ListDatabaseScopesRequest, QueryDatabaseRequest};
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
-    McpCloudwatchPreflightRequest, McpDescribeCapabilitiesResponse, McpGuardrails,
-    McpGuidanceResponse, McpGuidanceSyncRequest, McpListAllowedLogGroupsRequest,
+    lookup_mcp_guidance_by_id, McpCloudwatchPreflightRequest, McpDescribeCapabilitiesResponse,
+    McpGuardrails, McpGuidanceResponse, McpGuidanceSyncRequest, McpListAllowedLogGroupsRequest,
     McpRegisterSessionRequest, McpRunInsightsQueryRequest, McpSearchLogsRequest,
-    McpToolAvailability, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
-    MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID, MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
-    MCP_DATABASE_GUIDANCE_ID, MCP_DATABASE_GUIDANCE_KEY, MCP_DATABASE_GUIDANCE_VERSION,
-    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION,
-    MCP_SECURITY_BOUNDARIES_KEY,
+    McpToolAvailability, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY, MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
+    MCP_DATABASE_GUIDANCE_KEY, MCP_GUIDANCE_CATALOG, MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+    MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,7 +31,6 @@ use crate::build_info;
 const DEFAULT_STABLE_PORT: u16 = 9877;
 const SESSION_FILE_VERSION: u8 = 1;
 const SERVER_NAME: &str = "canopy-local-mcp";
-const GUIDANCE_VERSION: &str = "2026-05-13";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionFile {
@@ -420,6 +417,10 @@ async fn initialize(state: Arc<McpServerState>, req: JsonRpcRequest) -> Response
 }
 
 fn tools_list(entitlements: &UserEntitlements) -> Value {
+    let guidance_ids = MCP_GUIDANCE_CATALOG
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
     let mut tools = vec![
         json!({
             "name": "canopy_describe_capabilities",
@@ -438,13 +439,7 @@ fn tools_list(entitlements: &UserEntitlements) -> Value {
                 "properties": {
                     "guidance_id": {
                         "type": "string",
-                        "enum": [
-                            "security_boundaries",
-                            "cloudwatch_search_workflow",
-                            "cloudwatch_insights_workflow",
-                            "database_query_workflow",
-                            "privacy_and_audit_notice"
-                        ]
+                        "enum": guidance_ids
                     }
                 },
                 "required": ["guidance_id"],
@@ -573,16 +568,14 @@ async fn tools_call(state: Arc<McpServerState>, req: JsonRpcRequest) -> Response
             let Some(guidance_id) = arguments.get("guidance_id").and_then(Value::as_str) else {
                 return json_rpc_error(req.id, -32602, "missing guidance_id");
             };
-            let local_version = if guidance_id == MCP_DATABASE_GUIDANCE_ID {
-                MCP_DATABASE_GUIDANCE_VERSION
-            } else {
-                GUIDANCE_VERSION
+            let Some(entry) = lookup_mcp_guidance_by_id(guidance_id) else {
+                return json_rpc_error(req.id, -32602, "unknown guidance_id");
             };
             let sync = McpGuidanceSyncRequest {
                 canopy_mcp_session_id: state.canopy_mcp_session_id.clone(),
                 local_secret_generation: state.local_secret_generation.clone(),
                 guidance_id: guidance_id.into(),
-                guidance_version: local_version.into(),
+                guidance_version: entry.version.into(),
             };
             match state.api.sync_mcp_guidance(&sync).await {
                 Ok(resp) => {
@@ -912,46 +905,6 @@ fn tool(
         required_guidance: guidance.into_iter().map(str::to_string).collect(),
         requires_preflight,
     }
-}
-
-fn guidance_for(id: &str) -> Option<McpGuidanceResponse> {
-    let (title, content) = match id {
-        "security_boundaries" => (
-            "Security Boundaries",
-            "Use only the tools exposed by Canopy MCP. Do not ask for AWS credentials, Canopy JWTs, local secrets, or raw Authorization headers. Treat returned scope and guardrails as hard limits.",
-        ),
-        MCP_CLOUDWATCH_SEARCH_GUIDANCE_ID => (
-            "CloudWatch Search Workflow",
-            "Before searching CloudWatch logs through MCP, call canopy_describe_capabilities, then use canopy_list_allowed_log_groups to select an authorized log group, then call canopy_preflight_request. Initial canopy_search_logs calls require preflight_token and no search_cursor; continuation calls require search_cursor and no preflight_token.",
-        ),
-        MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_ID => (
-            "CloudWatch Insights Workflow",
-            "Logs Insights through MCP requires canopy_describe_capabilities, authorized log groups from canopy_list_allowed_log_groups, and canopy_preflight_request before canopy_run_insights_query. Initial calls require preflight_token and no query_token; polling calls require query_token and no preflight_token.",
-        ),
-        MCP_DATABASE_GUIDANCE_ID => (
-            "Database Query Workflow",
-            "Use canopy_list_database_scopes first. Only query listed scopes. Submit read-only SELECT statements only. Canopy will run SQL validation and EXPLAIN preflight before execution; rejected plans must be rewritten instead of bypassed.",
-        ),
-        "privacy_and_audit_notice" => (
-            "Privacy And Audit Notice",
-            "MCP tool calls are audited. Database SQL is recorded in full. Do not include secrets, tokens, or unnecessary personal data in prompts or SQL literals.",
-        ),
-        _ => return None,
-    };
-
-    Some(McpGuidanceResponse {
-        id: id.into(),
-        version: if id == MCP_DATABASE_GUIDANCE_ID {
-            MCP_DATABASE_GUIDANCE_VERSION.into()
-        } else {
-            GUIDANCE_VERSION.into()
-        },
-        title: title.into(),
-        guidance_type: "guidance".into(),
-        required: true,
-        content_type: "text/markdown".into(),
-        content: content.into(),
-    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1333,14 +1286,68 @@ mod tests {
     #[test]
     fn tools_list_returns_foundation_tools_without_cloudwatch_entitlement() {
         let tools = tools_list(&minimal_entitlements());
-        let names = tools["tools"]
-            .as_array()
-            .unwrap()
+        let tool_list = tools["tools"].as_array().unwrap();
+        let names = tool_list
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
         assert!(names.contains(&"canopy_describe_capabilities"));
         assert!(names.contains(&"canopy_get_guidance"));
+
+        let guidance_tool = tool_list
+            .iter()
+            .find(|tool| tool["name"] == "canopy_get_guidance")
+            .expect("canopy_get_guidance tool is listed");
+        let guidance_enum = guidance_tool["inputSchema"]["properties"]["guidance_id"]["enum"]
+            .as_array()
+            .expect("guidance enum is present");
+        assert!(!guidance_enum.is_empty());
+    }
+
+    #[test]
+    fn guidance_tool_schema_enum_matches_catalog() {
+        let tools = tools_list(&minimal_entitlements());
+        let tool_list = tools["tools"].as_array().unwrap();
+        let guidance_tool = tool_list
+            .iter()
+            .find(|tool| tool["name"] == "canopy_get_guidance")
+            .expect("canopy_get_guidance tool is listed");
+
+        let actual = guidance_tool["inputSchema"]["properties"]["guidance_id"]["enum"]
+            .as_array()
+            .expect("guidance enum is present")
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected = MCP_GUIDANCE_CATALOG
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn unknown_guidance_id_returns_invalid_params_before_forward() {
+        let req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "canopy_get_guidance",
+                "arguments": {
+                    "guidance_id": "i_made_this_up"
+                }
+            })),
+        };
+
+        let response = tools_call(Arc::new(test_state("secret")), req).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], -32602);
+        assert_eq!(payload["error"]["message"], "unknown guidance_id");
     }
 
     #[test]

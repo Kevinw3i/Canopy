@@ -1590,7 +1590,7 @@ async fn query_database(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiError::service_unavailable(format!(
                 "database connection '{}' is not ready: its @@session/@@global.wait_timeout \
-                 preflight has not passed (see GET /health and docs/OPERATOR-SETUP.md)",
+                 preflight has not passed (see GET /health and docs/zh-TW/OPERATOR-SETUP.md)",
                 scope.connection
             ))),
         ));

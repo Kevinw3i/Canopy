@@ -45,5 +45,5 @@ Please allow maintainers reasonable time to investigate, fix, and deploy mitigat
 For fixes that change user-facing behavior or operator steps, maintainers may also update:
 
 - `README.md`
-- deployment docs under `docs/`
+- deployment docs under `docs/en/` and `docs/zh-TW/`
 - release notes or migration guidance

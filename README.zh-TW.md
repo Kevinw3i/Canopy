@@ -108,12 +108,15 @@ Canopy/
 │   └── docker-entrypoint.sh   ← 容器啟動 + Secrets Manager 注入
 │
 └── docs/
-    ├── PRD.md                 ← 產品需求文件
-    ├── ARCHITECTURE.md        ← 完整架構參考
-    ├── ECS_FARGATE_DEPLOYMENT.md ← ECS 部署（手動 / Terraform）
-    ├── COGNITO-SETUP.md       ← AWS Cognito OIDC 設定
-    ├── OPERATOR-SETUP.md      ← TUI 分發給維運人員
-    └── RELEASING.md           ← 發版流程與 CI
+    ├── en/
+    │   ├── ARCHITECTURE.md    ← 完整架構參考
+    │   └── AUDIT-SCHEMA.md    ← 稽核事件 schema
+    └── zh-TW/
+        ├── PRD.md             ← 產品需求文件
+        ├── ECS_FARGATE_DEPLOYMENT.md ← ECS 部署（手動 / Terraform）
+        ├── COGNITO-SETUP.md   ← AWS Cognito OIDC 設定
+        ├── OPERATOR-SETUP.md  ← TUI 分發給維運人員
+        └── RELEASING.md       ← 發版流程與 CI
 ```
 
 ---
@@ -262,7 +265,7 @@ require_explain = true
 max_examined_rows = 10000
 allow_full_table_scan = false
 # 預設拒絕 VIEW。要設 true 之前，operator 必須完成 review checklist —
-# 詳見 entitlements.sample.toml 與 docs/OPERATOR-SETUP.md。
+# 詳見 entitlements.sample.toml 與 docs/zh-TW/OPERATOR-SETUP.md。
 allow_views = false
 
 [[rules.allowed_accounts]]
@@ -456,7 +459,8 @@ MCP 權限刻意和一般 TUI 權限分開：
 - MCP CloudWatch raw filter/query audit 預設加密保存；只有同一條 rule 同時授權該 account / region / log group scope 時，才應設定 `can_view_mcp_raw_audit_plaintext = true`。
 - `can_use_mcp_database` 只是在 MCP 開 DB tools；真正能查哪些 DB / schema / table，要看同一條 matching rule 裡的 `[[rules.database_scopes]]`。
 - Product Phase 3 提供 MCP 基礎工具（`canopy_describe_capabilities`、`canopy_get_guidance`），並在 MCP CloudWatch 啟用時提供 CloudWatch discovery（`canopy_list_allowed_log_groups`）與 preflight-gated CloudWatch data tools（`canopy_preflight_request`、`canopy_search_logs`、`canopy_run_insights_query`），也可在明確啟用時提供 MCP Database v1。CloudWatch search / Insights 初始呼叫必須使用 control-plane 發出的 preflight token；續頁 / polling 則必須使用 response 回傳的 cursor/token。
-- MCP Database v1 提供 `canopy_list_database_scopes` 與 `canopy_query_database`，只允許 MySQL read-only `SELECT`。control-plane 會在執行前強制檢查 SQL、table scope、`LIMIT`、Secrets Manager 憑證與 `EXPLAIN FORMAT=JSON`。MCP response 不會回傳 DB host、secret ARN、username 或 password。view-guard **預設拒絕 VIEW**：所有 query 都會在 MDL-protected transaction 內把 EXPLAIN、type re-check、SELECT 跑在同一條 connection；要允許 VIEW 需在 scope 設 `allow_views = true` 並完成 DEFINER / base-table review。Connection 池飽和會回 HTTP 503（`connection_queue_full` / `database_connection_unavailable`），不是 500 — operator 加固 checklist 請見 `docs/OPERATOR-SETUP.md`。
+- MCP guidance 內容是 server-owned source asset，放在 `crates/shared/src/dto/mcp_guidance/`，並透過 `MCP_GUIDANCE_CATALOG` 編譯進 binary；它不是從本機 Codex skills 或 runtime operator 檔案讀取。
+- MCP Database v1 提供 `canopy_list_database_scopes` 與 `canopy_query_database`，只允許 MySQL read-only `SELECT`。control-plane 會在執行前強制檢查 SQL、table scope、`LIMIT`、Secrets Manager 憑證與 `EXPLAIN FORMAT=JSON`。MCP response 不會回傳 DB host、secret ARN、username 或 password。view-guard **預設拒絕 VIEW**：所有 query 都會在 MDL-protected transaction 內把 EXPLAIN、type re-check、SELECT 跑在同一條 connection；要允許 VIEW 需在 scope 設 `allow_views = true` 並完成 DEFINER / base-table review。Connection 池飽和會回 HTTP 503（`connection_queue_full` / `database_connection_unavailable`），不是 500 — operator 加固 checklist 請見 `docs/zh-TW/OPERATOR-SETUP.md`。
 
 ### 第四步：設定 OIDC 提供者
 
@@ -466,7 +470,7 @@ Control Plane 支援任何 OpenID Connect 提供者：
 |--------|------------|------|
 | Google | `https://accounts.google.com` | 在 Google Cloud Console 建立 OAuth 客戶端 |
 | AWS IAM Identity Center | `https://your-sso-portal.awsapps.com/start` | 啟用 OIDC 應用程式 |
-| **AWS Cognito** | `https://cognito-idp.{region}.amazonaws.com/{pool-id}` | **推薦 AWS 使用者。** 見 [docs/COGNITO-SETUP.md](docs/COGNITO-SETUP.md) |
+| **AWS Cognito** | `https://cognito-idp.{region}.amazonaws.com/{pool-id}` | **推薦 AWS 使用者。** 見 [docs/zh-TW/COGNITO-SETUP.md](docs/zh-TW/COGNITO-SETUP.md) |
 | Okta | `https://{your-domain}.okta.com` | 建立 OIDC 應用程式 |
 | Azure AD | `https://login.microsoftonline.com/{tenant-id}/v2.0` | 註冊應用程式 |
 
@@ -605,7 +609,7 @@ dist/
 5. 移除 macOS Gatekeeper 隔離標記（如適用）
 6. 跑完整驗證檢查
 
-詳細說明與疑難排解見 [docs/OPERATOR-SETUP.md](docs/OPERATOR-SETUP.md)。
+詳細說明與疑難排解見 [docs/zh-TW/OPERATOR-SETUP.md](docs/zh-TW/OPERATOR-SETUP.md)。
 
 ---
 
@@ -646,7 +650,7 @@ TUI                     Control Plane              OIDC 提供者
 
 每筆記錄包含：event_id、actor、timestamp、account、region、target、outcome。
 
-稽核 schema 採用 additive 方式演進。新增 top-level 欄位會是 optional，沒有值時會省略；如果下游有嚴格 schema（例如 Athena table 或 SIEM mapping），在使用 `target_resource_name` 這類新欄位前需要先做 schema migration。詳細欄位見 [Audit Log Schema](docs/AUDIT-SCHEMA.md)。
+稽核 schema 採用 additive 方式演進。新增 top-level 欄位會是 optional，沒有值時會省略；如果下游有嚴格 schema（例如 Athena table 或 SIEM mapping），在使用 `target_resource_name` 這類新欄位前需要先做 schema migration。詳細欄位見 [Audit Log Schema](docs/en/AUDIT-SCHEMA.md)。
 
 當持久化稽核檔案寫入失敗時，API 會回傳 503（fail-closed 策略）。
 

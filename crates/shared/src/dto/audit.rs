@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Audit JSON-lines event.
 ///
-/// Keep this enum and event shape in sync with `docs/AUDIT-SCHEMA.md`.
+/// Keep this enum and event shape in sync with `docs/en/AUDIT-SCHEMA.md`.
 ///
 /// Schema evolution is additive: new fields should be optional and skipped
 /// when absent so flexible downstream consumers keep working. Strict log

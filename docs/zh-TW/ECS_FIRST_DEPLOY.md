@@ -3,7 +3,7 @@
 > 本文件是從零開始的完整部署教學。
 > 假設你的 AWS 環境已有 VPC 和其他服務在運行，但尚未建立任何 Canopy 相關資源。
 >
-> 基礎設施定義在 [`infra/`](../infra/) 目錄，所有資源由 Terraform 管理。
+> 基礎設施定義在 [`infra/`](../../infra/) 目錄，所有資源由 Terraform 管理。
 
 ---
 
@@ -205,7 +205,7 @@ oidc_client_id  = "your-google-client-id"
 image_tag = ""
 ```
 
-完整變數說明見 [`infra/README.md`](../infra/README.md)。
+完整變數說明見 [`infra/README.md`](../../infra/README.md)。
 
 ---
 
@@ -240,7 +240,7 @@ cp entitlements.sample.toml entitlements.toml
 ```
 
 編輯 `entitlements.toml`，設定你的使用者、帳號、區域對應關係。
-格式說明見 [`entitlements.sample.toml`](../entitlements.sample.toml)。
+格式說明見 [`entitlements.sample.toml`](../../entitlements.sample.toml)。
 
 Phase 1 還沒有 image，部署前先用 `create_service=false` 確認 Terraform
 變數本身有效，並確認 entitlements 與 Terraform 變數一致：
@@ -469,7 +469,7 @@ aws ecs describe-tasks --cluster canopy --tasks <TASK_ARN> \
 
 ## 相關文件
 
-- [`infra/README.md`](../infra/README.md) — Terraform 變數說明、日常操作指令
-- [`docs/ECS_FARGATE_DEPLOYMENT.md`](ECS_FARGATE_DEPLOYMENT.md) — 手動 AWS CLI 部署參考（不使用 Terraform 時）
-- [`config.sample.toml`](../config.sample.toml) — 設定檔範本
-- [`entitlements.sample.toml`](../entitlements.sample.toml) — 權限規則範本
+- [`infra/README.md`](../../infra/README.md) — Terraform 變數說明、日常操作指令
+- [`ECS_FARGATE_DEPLOYMENT.md`](ECS_FARGATE_DEPLOYMENT.md) — 手動 AWS CLI 部署參考（不使用 Terraform 時）
+- [`config.sample.toml`](../../config.sample.toml) — 設定檔範本
+- [`entitlements.sample.toml`](../../entitlements.sample.toml) — 權限規則範本

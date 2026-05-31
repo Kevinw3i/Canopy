@@ -18,6 +18,7 @@
 
 use serde_json::{json, Value};
 use shared::dto::entitlements::{FeatureFlags, UserEntitlements};
+use shared::dto::mcp::lookup_mcp_guidance_by_id;
 use std::time::Duration;
 use tui_client::api_client::ApiClient;
 use tui_client::mcp::McpRuntime;
@@ -143,6 +144,8 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         expected_lsg.starts_with("lsg_"),
         "runtime local_secret_generation should look like 'lsg_<uuid>': {expected_lsg}"
     );
+    let database_guidance =
+        lookup_mcp_guidance_by_id("database_query_workflow").expect("database guidance exists");
 
     // Codex round 20+21 (MED): every upstream mock requires the bearer
     // header AND a JSON body containing the session id, the
@@ -163,17 +166,17 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .and(body_partial_json(json!({
             "canopy_mcp_session_id": expected_sid,
             "local_secret_generation": expected_lsg,
-            "guidance_id": "database_query_workflow",
-            "guidance_version": "2026-05-13"
+            "guidance_id": database_guidance.id,
+            "guidance_version": database_guidance.version
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "guidance_issued": true,
             "guidance_delivered_for_gating": true,
-            "guidance_id": "database_query_workflow",
-            "guidance_version": "2026-05-13",
-            "title": "Database Query Workflow",
+            "guidance_id": database_guidance.id,
+            "guidance_version": database_guidance.version,
+            "title": database_guidance.title,
             "content_type": "text/markdown",
-            "content": "Before issuing database queries: ..."
+            "content": database_guidance.content
         })))
         .expect(1)
         .mount(&mock)
@@ -539,7 +542,7 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": {
                 "name": "canopy_get_guidance",
-                "arguments": {"guidance_id": "database_query_workflow"}
+                "arguments": {"guidance_id": database_guidance.id}
             }
         }))
         .send()
@@ -551,8 +554,15 @@ async fn tui_mcp_server_protocol_compliance_end_to_end() {
         .as_str()
         .expect("content[0].text on get_guidance");
     let payload: Value = serde_json::from_str(payload_text).unwrap();
-    assert_eq!(payload["id"], "database_query_workflow");
-    assert_eq!(payload["version"], "2026-05-13");
+    assert_eq!(payload["id"], database_guidance.id);
+    assert_eq!(payload["version"], database_guidance.version);
+    assert_eq!(payload["content_type"], "text/markdown");
+    assert!(
+        payload["content"]
+            .as_str()
+            .is_some_and(|content| !content.trim().is_empty()),
+        "guidance content must be non-empty"
+    );
 
     // 3.10 tools/call canopy_list_allowed_log_groups → forwards to mock
     //      control-plane; it is discovery and does not require

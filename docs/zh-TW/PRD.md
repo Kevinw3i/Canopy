@@ -641,7 +641,7 @@ ECS 部署不需要 commit 或掛載生產 `config.toml`。Terraform task defini
 會設定 `GENERATE_CONFIG=1`，container entrypoint 會從環境變數與
 ECS-native secrets 在啟動時產生 control-plane 設定。
 
-> 詳細操作見 `docs/OPERATOR-SETUP.md`
+> 詳細操作見 [docs/zh-TW/OPERATOR-SETUP.md](OPERATOR-SETUP.md)
 
 ### 11.3 自動更新
 
