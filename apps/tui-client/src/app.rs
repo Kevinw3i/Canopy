@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::{Buffer, Line, Rect, Span, Widget};
 use shared::dto::cloudwatch::FilterLogEventsRequest;
 use shared::dto::ec2::{ConnectMethod, ConnectRequest, Ec2ListRequest, Ec2PowerRequest};
-use shared::dto::ecs::{EcsExecRequest, EcsTasksRequest};
+use shared::dto::ecs::{EcsExecRequest, EcsTask, EcsTasksRequest};
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::pty_spawn::PtySpawnSpec;
 use std::{
@@ -232,32 +232,6 @@ fn set_session_countdown_title(instance_id: &str, max_secs: u64, elapsed_secs: u
 /// primary job is enforcing and showing the remaining session time.
 fn wrapper_session_limit(max_session_seconds: Option<u64>) -> Option<u64> {
     max_session_seconds.filter(|secs| *secs > 0)
-}
-
-fn ecs_tasks_warning_messages(
-    failed_scopes: &[String],
-    task_count: usize,
-    total_count: usize,
-    truncated: bool,
-) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if !failed_scopes.is_empty() {
-        warnings.push(format!(
-            "Some ECS scopes failed to respond:\n{}",
-            failed_scopes.join("\n")
-        ));
-    }
-    if truncated {
-        let count_text = if total_count > task_count {
-            format!("showing {task_count} of at least {total_count}")
-        } else {
-            format!("showing {task_count}; additional results may exist")
-        };
-        warnings.push(format!(
-            "ECS task results were truncated: {count_text}. Narrow the account or region filter."
-        ));
-    }
-    warnings
 }
 
 struct ConnectTarget<'a> {
@@ -1368,6 +1342,30 @@ impl App {
         Action::LaunchMcpAiClientConfirmed
     }
 
+    fn apply_ecs_tasks_loaded(
+        &mut self,
+        tasks: Vec<EcsTask>,
+        failed_scopes: Vec<String>,
+        total_count: usize,
+        truncated: bool,
+        generation: u64,
+    ) {
+        if generation != self.ec2.fetch_generation {
+            return;
+        }
+
+        let failed_scope_count = failed_scopes.len();
+        if failed_scope_count > 0 {
+            self.error_modal.show(format!(
+                "Some ECS scopes failed to respond:\n{}",
+                failed_scopes.join("\n")
+            ));
+        }
+
+        self.ec2
+            .set_ecs_task_results(tasks, Some(total_count), truncated, failed_scope_count);
+    }
+
     async fn handle_action(&mut self, action: Action, terminal: &mut Tui) {
         match action {
             Action::Quit => {
@@ -1525,21 +1523,12 @@ impl App {
                 truncated,
                 generation,
             } => {
-                if generation != self.ec2.fetch_generation {
-                    return;
-                }
-                let task_count = tasks.len();
-                let failed_scope_count = failed_scopes.len();
-                let warnings =
-                    ecs_tasks_warning_messages(&failed_scopes, task_count, total_count, truncated);
-                if !warnings.is_empty() {
-                    self.error_modal.show(warnings.join("\n\n"));
-                }
-                self.ec2.set_ecs_task_results(
+                self.apply_ecs_tasks_loaded(
                     tasks,
-                    Some(total_count),
+                    failed_scopes,
+                    total_count,
                     truncated,
-                    failed_scope_count,
+                    generation,
                 );
             }
             Action::EcsTasksFetchFailed(err, generation) => {
@@ -4142,6 +4131,24 @@ mod tests {
         }
     }
 
+    fn mock_ecs_task(task_id: &str) -> EcsTask {
+        EcsTask {
+            task_arn: format!("arn:aws:ecs:us-east-1:111111111111:task/app/{task_id}"),
+            cluster_arn: "arn:aws:ecs:us-east-1:111111111111:cluster/app".into(),
+            cluster_name: "app".into(),
+            account_id: "111111111111".into(),
+            region: "us-east-1".into(),
+            family: Some("web".into()),
+            task_id: Some(task_id.into()),
+            launch_type: "FARGATE".into(),
+            last_status: "RUNNING".into(),
+            desired_status: "RUNNING".into(),
+            enable_execute_command: true,
+            containers: vec![],
+            tags: HashMap::new(),
+        }
+    }
+
     fn mock_instance() -> Ec2Instance {
         Ec2Instance {
             instance_id: "i-abc123".into(),
@@ -5060,22 +5067,38 @@ mod tests {
         assert_eq!(wrapper_session_limit(None), None);
     }
 
-    #[test]
-    fn ecs_tasks_warning_messages_reports_partial_and_truncated_results() {
-        let warnings =
-            ecs_tasks_warning_messages(&["account-a us-east-1 failed".into()], 200, 250, true);
+    #[tokio::test]
+    async fn ecs_tasks_loaded_keeps_truncation_non_modal() {
+        let mut app = test_app().await;
 
-        assert_eq!(warnings.len(), 2);
-        assert!(warnings[0].contains("Some ECS scopes failed"));
-        assert!(warnings[1].contains("showing 200 of at least 250"));
+        app.apply_ecs_tasks_loaded(vec![mock_ecs_task("abc123")], vec![], 50, true, 0);
+
+        assert!(!app.error_modal.is_visible());
+        assert_eq!(app.ec2.tasks.len(), 1);
+        assert!(app.ec2.error.is_none());
+        assert!(!app.ec2.loading);
     }
 
-    #[test]
-    fn ecs_tasks_warning_messages_handles_aws_side_truncation_without_exact_total() {
-        let warnings = ecs_tasks_warning_messages(&[], 50, 50, true);
+    #[tokio::test]
+    async fn ecs_tasks_loaded_shows_partial_scope_failure_modal() {
+        let mut app = test_app().await;
 
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("additional results may exist"));
+        app.apply_ecs_tasks_loaded(
+            vec![mock_ecs_task("abc123")],
+            vec!["111111111111 us-east-1 failed".into()],
+            1,
+            false,
+            0,
+        );
+
+        assert!(app.error_modal.is_visible());
+        assert!(app
+            .error_modal
+            .message()
+            .is_some_and(|message| message.contains("111111111111 us-east-1 failed")));
+        assert_eq!(app.ec2.tasks.len(), 1);
+        assert!(app.ec2.error.is_none());
+        assert!(!app.ec2.loading);
     }
 
     // ── Logout resets state ─────────────────────────────────
