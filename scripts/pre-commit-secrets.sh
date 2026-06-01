@@ -31,7 +31,7 @@ SAFE_PATTERNS="111111111111|222222222222|333333333333|999999999999|123456789012|
 
 staged_diff=$(git diff --cached --diff-filter=ACMR -U0)
 
-for acct in "${REAL_ACCOUNT_IDS[@]}"; do
+for acct in ${REAL_ACCOUNT_IDS[@]+"${REAL_ACCOUNT_IDS[@]}"}; do
   if echo "$staged_diff" | grep -qE "^\+" | head -0; then true; fi
   matches=$(echo "$staged_diff" | grep -n "^\+.*${acct}" || true)
   if [ -n "$matches" ]; then
@@ -51,7 +51,7 @@ if [ -n "$real_keys" ]; then
 fi
 
 # ── 3. AWS profile names that look private ──────────────────────
-for prof in "${PRIVATE_PROFILES[@]}"; do
+for prof in ${PRIVATE_PROFILES[@]+"${PRIVATE_PROFILES[@]}"}; do
   matches=$(echo "$staged_diff" | grep -inE "^\+.*(profile|AWS_PROFILE).*${prof}" || true)
   if [ -n "$matches" ]; then
     echo -e "${RED}BLOCKED:${NC} Private AWS profile ${YELLOW}${prof}${NC} found in staged changes:"
