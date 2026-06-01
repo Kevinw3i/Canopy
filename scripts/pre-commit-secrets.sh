@@ -32,7 +32,6 @@ SAFE_PATTERNS="111111111111|222222222222|333333333333|999999999999|123456789012|
 staged_diff=$(git diff --cached --diff-filter=ACMR -U0)
 
 for acct in ${REAL_ACCOUNT_IDS[@]+"${REAL_ACCOUNT_IDS[@]}"}; do
-  if echo "$staged_diff" | grep -qE "^\+" | head -0; then true; fi
   matches=$(echo "$staged_diff" | grep -n "^\+.*${acct}" || true)
   if [ -n "$matches" ]; then
     echo -e "${RED}BLOCKED:${NC} Real AWS account ID ${YELLOW}${acct}${NC} found in staged changes:"
