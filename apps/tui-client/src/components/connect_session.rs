@@ -525,7 +525,7 @@ impl ConnectSessionScreen {
         }
 
         self.clear_selection();
-        let bytes = bracketed_paste_bytes(text);
+        let bytes = paste_bytes(text, self.parser.screen().bracketed_paste());
         if let Err(e) = self.write_to_pty(&bytes) {
             return Action::ConnectSessionFailure(e);
         }
@@ -1464,9 +1464,13 @@ fn instance_label(instance_id: &str, instance_name: Option<&str>) -> String {
     }
 }
 
-fn bracketed_paste_bytes(text: &str) -> Vec<u8> {
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     let payload = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut bytes = Vec::with_capacity(payload.len() + "\x1b[200~\x1b[201~".len());
+    if !bracketed {
+        return payload.into_bytes();
+    }
+
+    let mut bytes = Vec::with_capacity(payload.len() + b"\x1b[200~\x1b[201~".len());
     bytes.extend_from_slice(b"\x1b[200~");
     bytes.extend_from_slice(payload.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
@@ -2220,9 +2224,17 @@ mod tests {
     }
 
     #[test]
-    fn paste_payload_is_forwarded_with_bracketed_paste_markers() {
+    fn paste_payload_is_forwarded_plain_when_remote_bracketed_paste_is_off() {
         assert_eq!(
-            bracketed_paste_bytes("echo one\nls\r\npwd"),
+            paste_bytes("echo one\nls\r\npwd", false),
+            b"echo one\nls\npwd".to_vec()
+        );
+    }
+
+    #[test]
+    fn paste_payload_is_wrapped_when_remote_bracketed_paste_is_on() {
+        assert_eq!(
+            paste_bytes("echo one\nls\r\npwd", true),
             b"\x1b[200~echo one\nls\npwd\x1b[201~".to_vec()
         );
     }
