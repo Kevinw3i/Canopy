@@ -101,6 +101,24 @@ expect_failure \
   "$TMP_DIR/gov.tfvars" \
   "entitlements TOML parse failed"
 
+cat > "$TMP_DIR/misplaced-session-duration-entitlements.toml" <<EOF
+[[rules]]
+id = "misplaced-session-duration"
+group = "platform-engineering"
+allowed_regions = ["ap-northeast-1"]
+session_duration_seconds = 14400
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "$GOV_ROLE"
+EOF
+expect_failure \
+  "misplaced-session-duration" \
+  "$TMP_DIR/misplaced-session-duration-entitlements.toml" \
+  "$TMP_DIR/gov.tfvars" \
+  "use max_session_seconds"
+
 ORG_ROLE_TEMPLATE="arn:aws:iam::{account_id}:role/CanopyRole"
 ORG_ROLE_PATTERN="arn:aws:iam::*:role/CanopyRole"
 cat > "$TMP_DIR/org-discovery-entitlements.toml" <<EOF

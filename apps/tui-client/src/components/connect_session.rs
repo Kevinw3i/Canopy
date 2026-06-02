@@ -540,9 +540,7 @@ impl ConnectSessionScreen {
         {
             return Action::Noop;
         }
-        if self.selection.is_some_and(|selection| selection.dragging) {
-            return Action::Noop;
-        }
+        self.clear_selection();
 
         let current = self.parser.screen().scrollback();
         let target = match direction {
@@ -552,7 +550,6 @@ impl ConnectSessionScreen {
         };
 
         if let Some(target) = target {
-            self.clear_selection();
             self.parser.screen_mut().set_scrollback(target);
         }
 
@@ -2475,10 +2472,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mouse_wheel_is_noop_during_drag_and_resumes_after_mouse_up() {
+    fn mouse_wheel_cancels_dragging_selection_and_scrolls() {
         let mut session = spawn_sleeping_session();
-        let clipboard = Arc::new(FakeClipboard::default());
-        session.clipboard = clipboard;
         feed_enough_scrollback_lines(&mut session);
 
         assert_eq!(session.parser.screen().scrollback(), 0);
@@ -2491,11 +2486,20 @@ mod tests {
             session.handle_mouse_scroll(MouseScrollDirection::Up),
             Action::Noop
         ));
-        assert_eq!(session.parser.screen().scrollback(), 0);
-        assert!(session
-            .selection
-            .is_some_and(|selection| selection.dragging));
+        assert_eq!(session.parser.screen().scrollback(), 1);
+        assert!(session.selection.is_none());
+        cleanup_session(session);
+    }
 
+    #[cfg(unix)]
+    #[test]
+    fn mouse_wheel_scrolls_after_completed_selection_copy() {
+        let mut session = spawn_sleeping_session();
+        let clipboard = Arc::new(FakeClipboard::default());
+        session.clipboard = clipboard;
+        feed_enough_scrollback_lines(&mut session);
+
+        let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftDown, 0, STATUS_BAR_HEIGHT));
         let _ = session.handle_mouse_input(mouse(MouseInputKind::LeftUp, 0, STATUS_BAR_HEIGHT));
         assert!(session
             .selection

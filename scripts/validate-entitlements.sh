@@ -138,6 +138,31 @@ if grep -Eq '<[^>]+>|REPLACE(_ME)?|example\.com' <<< "$ACTIVE_ENTITLEMENTS"; the
   ERRORS=$((ERRORS + 1))
 fi
 
+# Check 0b: per-rule connection caps must use max_session_seconds. The
+# similarly named session_duration_seconds belongs to control-plane AWS config
+# and controls STS duration, not TUI connect auto-disconnect.
+MISPLACED_SESSION_DURATION=$(
+  python3 - "$ENTITLEMENTS" <<'PY'
+import sys
+from pathlib import Path
+
+import tomllib
+
+path = Path(sys.argv[1])
+with path.open("rb") as f:
+    data = tomllib.load(f)
+
+for rule in data.get("rules", []):
+    if "session_duration_seconds" in rule:
+        print(rule.get("id", "<unnamed>"))
+PY
+)
+if [ -n "$MISPLACED_SESSION_DURATION" ]; then
+  echo "ERROR: entitlements rules must not set session_duration_seconds; use max_session_seconds for SSH/SSM/EIC/ECS connect caps." >&2
+  printf '%s\n' "$MISPLACED_SESSION_DURATION" | sed 's/^/  rule: /' >&2
+  ERRORS=$((ERRORS + 1))
+fi
+
 # Check 1: direct access (only in uncommented lines)
 if grep -qE "role_arn[[:space:]]*=[[:space:]]*['\"]direct['\"]" <<< "$ACTIVE_ENTITLEMENTS"; then
   if ! strip_comments "$TFVARS" | grep -qE 'enable_direct_access\s*=\s*true'; then
