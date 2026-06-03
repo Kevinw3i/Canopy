@@ -225,6 +225,9 @@ mod tests {
             mcp_ec2_diagnostic_commands: Arc::new(
                 crate::services::MemoryMcpEc2DiagnosticCommandStore::new(),
             ),
+            mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
+                crate::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
+            ),
             ready: std::sync::atomic::AtomicBool::new(true),
             db_connection_ready: dashmap::DashMap::new(),
             db_connection_next_probe: dashmap::DashMap::new(),

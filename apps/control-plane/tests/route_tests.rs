@@ -154,6 +154,9 @@ fn build_state_with_audit_service_and_mcp_store(
         database_executor: Arc::new(NullDatabaseExecutor),
         mcp_sessions,
         mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
+            control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
+        ),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -220,6 +223,9 @@ fn build_state_with_database_and_allow_views(
         database_executor: executor,
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
+            control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
+        ),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -8827,6 +8833,9 @@ fn build_state_not_ready(config: AppConfig) -> Arc<AppState> {
         database_executor: Arc::new(NullDatabaseExecutor),
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
+            control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
+        ),
         ready: std::sync::atomic::AtomicBool::new(false),
         // Global readiness gate fails-closed here; db_connection_ready
         // is irrelevant in this scenario (the global gate fires first).

@@ -14,6 +14,7 @@ use shared::dto::mcp::{
     McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::config::McpConfig;
 
@@ -826,6 +827,98 @@ pub enum McpEc2DiagnosticSsmDispatcherError {
     MissingCommandId,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum McpEc2DiagnosticSsmTargetConfigError {
+    #[error("MCP EC2 diagnostics target account id is invalid")]
+    InvalidAccountId,
+    #[error("MCP EC2 diagnostics target region is invalid")]
+    InvalidRegion,
+    #[error("MCP EC2 diagnostics resolved account id is invalid")]
+    InvalidResolvedAccountId,
+    #[error("MCP EC2 diagnostics resolved region is invalid")]
+    InvalidResolvedRegion,
+    #[error("MCP EC2 diagnostics resolved account id does not match requested target")]
+    AccountMismatch,
+    #[error("MCP EC2 diagnostics resolved region does not match requested target")]
+    RegionMismatch,
+}
+
+pub struct McpEc2DiagnosticSsmTargetConfig<'a> {
+    account_id: &'a str,
+    region: &'a str,
+    resolved_account_id: &'a str,
+    resolved_region: &'a str,
+    aws_config: &'a aws_config::SdkConfig,
+}
+
+impl std::fmt::Debug for McpEc2DiagnosticSsmTargetConfig<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpEc2DiagnosticSsmTargetConfig")
+            .field("account_id", &self.account_id)
+            .field("region", &self.region)
+            .field("resolved_account_id", &self.resolved_account_id)
+            .field("resolved_region", &self.resolved_region)
+            .field("aws_config", &"[redacted]")
+            .finish()
+    }
+}
+
+impl<'a> McpEc2DiagnosticSsmTargetConfig<'a> {
+    pub fn new(
+        account_id: &'a str,
+        region: &'a str,
+        resolved_account_id: &'a str,
+        resolved_region: &'a str,
+        aws_config: &'a aws_config::SdkConfig,
+    ) -> Result<Self, McpEc2DiagnosticSsmTargetConfigError> {
+        if !mcp_ec2_account_id_shape_is_allowed(account_id) {
+            return Err(McpEc2DiagnosticSsmTargetConfigError::InvalidAccountId);
+        }
+        if !mcp_ec2_region_shape_is_allowed(region) {
+            return Err(McpEc2DiagnosticSsmTargetConfigError::InvalidRegion);
+        }
+        if !mcp_ec2_account_id_shape_is_allowed(resolved_account_id) {
+            return Err(McpEc2DiagnosticSsmTargetConfigError::InvalidResolvedAccountId);
+        }
+        if !mcp_ec2_region_shape_is_allowed(resolved_region) {
+            return Err(McpEc2DiagnosticSsmTargetConfigError::InvalidResolvedRegion);
+        }
+        if account_id != resolved_account_id {
+            return Err(McpEc2DiagnosticSsmTargetConfigError::AccountMismatch);
+        }
+        if region != resolved_region {
+            return Err(McpEc2DiagnosticSsmTargetConfigError::RegionMismatch);
+        }
+        Ok(Self {
+            account_id,
+            region,
+            resolved_account_id,
+            resolved_region,
+            aws_config,
+        })
+    }
+
+    pub fn account_id(&self) -> &str {
+        self.account_id
+    }
+
+    pub fn region(&self) -> &str {
+        self.region
+    }
+
+    pub fn resolved_account_id(&self) -> &str {
+        self.resolved_account_id
+    }
+
+    pub fn resolved_region(&self) -> &str {
+        self.resolved_region
+    }
+
+    pub fn aws_config(&self) -> &aws_config::SdkConfig {
+        self.aws_config
+    }
+}
+
 #[async_trait]
 pub trait McpEc2DiagnosticSsmDispatcher: Send + Sync {
     async fn dispatch(
@@ -862,6 +955,62 @@ impl McpEc2DiagnosticSsmDispatcher for AwsMcpEc2DiagnosticSsmDispatcher {
     }
 }
 
+pub trait McpEc2DiagnosticSsmDispatcherFactory: Send + Sync {
+    fn uses_live_aws_backend(&self) -> bool;
+
+    fn dispatcher_for_target_config(
+        &self,
+        target_config: &McpEc2DiagnosticSsmTargetConfig<'_>,
+    ) -> Arc<dyn McpEc2DiagnosticSsmDispatcher>;
+}
+
+#[derive(Debug, Default)]
+pub struct AwsMcpEc2DiagnosticSsmDispatcherFactory;
+
+impl McpEc2DiagnosticSsmDispatcherFactory for AwsMcpEc2DiagnosticSsmDispatcherFactory {
+    fn uses_live_aws_backend(&self) -> bool {
+        true
+    }
+
+    fn dispatcher_for_target_config(
+        &self,
+        target_config: &McpEc2DiagnosticSsmTargetConfig<'_>,
+    ) -> Arc<dyn McpEc2DiagnosticSsmDispatcher> {
+        Arc::new(AwsMcpEc2DiagnosticSsmDispatcher::new(
+            aws_sdk_ssm::Client::new(target_config.aws_config()),
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FailClosedMcpEc2DiagnosticSsmDispatcherFactory;
+
+impl McpEc2DiagnosticSsmDispatcherFactory for FailClosedMcpEc2DiagnosticSsmDispatcherFactory {
+    fn uses_live_aws_backend(&self) -> bool {
+        false
+    }
+
+    fn dispatcher_for_target_config(
+        &self,
+        _target_config: &McpEc2DiagnosticSsmTargetConfig<'_>,
+    ) -> Arc<dyn McpEc2DiagnosticSsmDispatcher> {
+        Arc::new(FailClosedMcpEc2DiagnosticSsmDispatcher)
+    }
+}
+
+#[derive(Debug)]
+struct FailClosedMcpEc2DiagnosticSsmDispatcher;
+
+#[async_trait]
+impl McpEc2DiagnosticSsmDispatcher for FailClosedMcpEc2DiagnosticSsmDispatcher {
+    async fn dispatch(
+        &self,
+        _input: &McpEc2DiagnosticSsmSendCommandInput,
+    ) -> Result<String, McpEc2DiagnosticSsmDispatcherError> {
+        Err(McpEc2DiagnosticSsmDispatcherError::Backend)
+    }
+}
+
 fn mcp_ec2_dispatch_document_version_is_pinned(version: &str) -> bool {
     !version.is_empty()
         && version != "$LATEST"
@@ -877,6 +1026,21 @@ fn mcp_ec2_command_id_shape_is_allowed(command_id: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn mcp_ec2_account_id_shape_is_allowed(account_id: &str) -> bool {
+    account_id.len() == 12 && account_id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn mcp_ec2_region_shape_is_allowed(region: &str) -> bool {
+    let bytes = region.as_bytes();
+    (3..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        && bytes.contains(&b'-')
 }
 
 fn mcp_ec2_instance_id_shape_is_allowed(instance_id: &str) -> bool {
@@ -2529,6 +2693,123 @@ mod tests {
         assert!(!parameters_debug.contains("/tmp/canopy-safe/app.log"));
         assert!(!parameters_debug.contains("request-id"));
         assert!(!parameters_debug.contains("grep_log"));
+    }
+
+    #[test]
+    fn ssm_target_config_validates_target_and_redacts_sdk_config() {
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("ap-northeast-1"))
+            .build();
+        let target_config = McpEc2DiagnosticSsmTargetConfig::new(
+            "123456789012",
+            "ap-northeast-1",
+            "123456789012",
+            "ap-northeast-1",
+            &sdk_config,
+        )
+        .unwrap();
+
+        assert_eq!(target_config.account_id(), "123456789012");
+        assert_eq!(target_config.region(), "ap-northeast-1");
+        assert_eq!(
+            target_config.resolved_account_id(),
+            target_config.account_id()
+        );
+        assert_eq!(target_config.resolved_region(), target_config.region());
+        assert_eq!(
+            McpEc2DiagnosticSsmTargetConfig::new(
+                "12345678901",
+                "ap-northeast-1",
+                "123456789012",
+                "ap-northeast-1",
+                &sdk_config,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticSsmTargetConfigError::InvalidAccountId
+        );
+        assert_eq!(
+            McpEc2DiagnosticSsmTargetConfig::new(
+                "123456789012",
+                "us_east_1",
+                "123456789012",
+                "ap-northeast-1",
+                &sdk_config,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticSsmTargetConfigError::InvalidRegion
+        );
+        assert_eq!(
+            McpEc2DiagnosticSsmTargetConfig::new(
+                "123456789012",
+                "ap-northeast-1",
+                "210987654321",
+                "ap-northeast-1",
+                &sdk_config,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticSsmTargetConfigError::AccountMismatch
+        );
+        assert_eq!(
+            McpEc2DiagnosticSsmTargetConfig::new(
+                "123456789012",
+                "ap-northeast-1",
+                "123456789012",
+                "us-east-1",
+                &sdk_config,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticSsmTargetConfigError::RegionMismatch
+        );
+
+        let target_debug = format!("{target_config:?}");
+        assert!(target_debug.contains("123456789012"));
+        assert!(target_debug.contains("ap-northeast-1"));
+        assert!(target_debug.contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_ssm_dispatcher_factory_rejects_dispatch_without_command_id() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
+            "spec-ref-key",
+            &command_spec_ref,
+            &spec_ref_binding(now, &claim),
+        )
+        .unwrap();
+        let dispatch_request = build_mcp_ec2_diagnostic_ssm_dispatch_request(
+            &ssm_dispatch_config(),
+            "mcp-ec2-cmd-1",
+            "i-0123456789abcdef0",
+            &verified_command_spec_ref,
+        )
+        .unwrap();
+        let input = build_mcp_ec2_diagnostic_ssm_send_command_input(&dispatch_request).unwrap();
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("ap-northeast-1"))
+            .build();
+        let target_config = McpEc2DiagnosticSsmTargetConfig::new(
+            "123456789012",
+            "ap-northeast-1",
+            "123456789012",
+            "ap-northeast-1",
+            &sdk_config,
+        )
+        .unwrap();
+        let dispatcher = FailClosedMcpEc2DiagnosticSsmDispatcherFactory
+            .dispatcher_for_target_config(&target_config);
+
+        assert!(!FailClosedMcpEc2DiagnosticSsmDispatcherFactory.uses_live_aws_backend());
+        assert_eq!(
+            dispatcher.dispatch(&input).await,
+            Err(McpEc2DiagnosticSsmDispatcherError::Backend)
+        );
+        assert!(AwsMcpEc2DiagnosticSsmDispatcherFactory.uses_live_aws_backend());
     }
 
     #[test]

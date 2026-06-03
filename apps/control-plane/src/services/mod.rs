@@ -25,9 +25,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub use mcp_ec2_diagnostics::{
-    DynamoMcpEc2DiagnosticCommandStore, McpEc2DiagnosticCommandCompletion,
+    AwsMcpEc2DiagnosticSsmDispatcherFactory, DynamoMcpEc2DiagnosticCommandStore,
+    FailClosedMcpEc2DiagnosticSsmDispatcherFactory, McpEc2DiagnosticCommandCompletion,
     McpEc2DiagnosticCommandRecord, McpEc2DiagnosticCommandStore,
-    MemoryMcpEc2DiagnosticCommandStore,
+    McpEc2DiagnosticSsmDispatcherFactory, McpEc2DiagnosticSsmTargetConfig,
+    McpEc2DiagnosticSsmTargetConfigError, MemoryMcpEc2DiagnosticCommandStore,
 };
 pub use mcp_sessions::{DynamoMcpSessionStore, McpSessionStore, MemoryMcpSessionStore};
 
@@ -133,6 +135,7 @@ pub struct AppState {
     pub database_executor: Arc<dyn DatabaseExecutor>,
     pub mcp_sessions: Arc<dyn McpSessionStore>,
     pub mcp_ec2_diagnostic_commands: Arc<dyn McpEc2DiagnosticCommandStore>,
+    pub mcp_ec2_diagnostic_ssm_dispatchers: Arc<dyn McpEc2DiagnosticSsmDispatcherFactory>,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     /// This is the **global** readiness signal (drives `/health`); a failed database
     /// connection does NOT clear it (Codex round 30 HIGH — one bad DB scope should not
@@ -284,6 +287,12 @@ impl AppState {
             &config.audit_export,
             &base_aws_config,
         )?;
+        let mcp_ec2_diagnostic_ssm_dispatchers: Arc<dyn McpEc2DiagnosticSsmDispatcherFactory> =
+            if config.use_mock_aws() {
+                Arc::new(FailClosedMcpEc2DiagnosticSsmDispatcherFactory)
+            } else {
+                Arc::new(AwsMcpEc2DiagnosticSsmDispatcherFactory)
+            };
 
         Ok(Self {
             config,
@@ -299,6 +308,7 @@ impl AppState {
             database_executor: Arc::new(MySqlDatabaseExecutor::new()),
             mcp_sessions,
             mcp_ec2_diagnostic_commands,
+            mcp_ec2_diagnostic_ssm_dispatchers,
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
             db_connection_next_probe: DashMap::new(),
@@ -873,10 +883,68 @@ mod tests {
             database_executor: Arc::new(UnreachableExecutor),
             mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
             mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+            mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
+                FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
+            ),
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
             db_connection_next_probe: DashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn appstate_uses_fail_closed_mcp_ec2_dispatcher_when_mock_aws_enabled() {
+        let config = crate::config::AppConfig {
+            bind_address: "127.0.0.1:0".into(),
+            oidc: crate::config::OidcConfig {
+                issuer_url: "https://placeholder.example.com".into(),
+                client_id: "test".into(),
+                client_secret: None,
+                scopes: vec![],
+                group_claim_name: "cognito:groups".into(),
+                acr_values: vec![],
+                prompt: None,
+                max_age_seconds: None,
+                required_acr_values: vec![],
+                required_amr_values: vec![],
+                authorization_endpoint: None,
+                token_endpoint: None,
+                device_authorization_endpoint: None,
+                userinfo_endpoint: None,
+                jwks_uri: None,
+            },
+            jwt: crate::config::JwtConfig {
+                secret: "test-secret-at-least-32-chars-long-12345".into(),
+                expiry_seconds: 3600,
+            },
+            aws: crate::config::AwsConfig {
+                default_region: Some("us-east-1".into()),
+                session_duration_seconds: Some(3600),
+                sts_external_id: Some("test".into()),
+            },
+            database_connections: std::collections::HashMap::new(),
+            dev_mode: true,
+            mock_aws_data: Some(true),
+            entitlements_file: None,
+            entitlements_database_url: None,
+            mfa_database_url: None,
+            mfa_secret_key: None,
+            audit_log: None,
+            audit_export: crate::config::AuditExportConfig::default(),
+            mcp: crate::config::McpConfig::default(),
+            cors_allowed_origins: vec![],
+        };
+
+        let state = AppState::new(config)
+            .await
+            .expect("dev mock AppState should initialize");
+
+        assert!(
+            !state
+                .mcp_ec2_diagnostic_ssm_dispatchers
+                .uses_live_aws_backend(),
+            "mock AWS mode must not install a live SSM dispatcher"
+        );
     }
 
     /// Codex round 35 (HIGH): secret-provider failures must NOT
