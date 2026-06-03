@@ -125,6 +125,10 @@ env \
   MCP_SESSION_TABLE_NAME='canopy-mcp-sessions' \
   MCP_EC2_DIAGNOSTIC_COMMAND_STORE='dynamodb' \
   MCP_EC2_DIAGNOSTIC_COMMAND_TABLE_NAME='canopy-mcp-ec2-diagnostic-commands' \
+  MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME='Canopy-Ec2Diagnostics' \
+  MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_VERSION='7' \
+  MCP_EC2_DIAGNOSTIC_HELPER_VERSION='2026-06-04.1' \
+  MCP_EC2_DIAGNOSTIC_COMMAND_SPEC_KEY='test-only-command-spec-key-material-32' \
   sh "$ENTRYPOINT" > "$MCP_CONFIG_OUT"
 
 python3 - <<'PY' "$MCP_CONFIG_OUT"
@@ -138,6 +142,10 @@ assert data["mcp"]["session_store"] == "dynamodb"
 assert data["mcp"]["session_table_name"] == "canopy-mcp-sessions"
 assert data["mcp"]["ec2_diagnostic_command_store"] == "dynamodb"
 assert data["mcp"]["ec2_diagnostic_command_table_name"] == "canopy-mcp-ec2-diagnostic-commands"
+assert data["mcp"]["ec2_diagnostic_ssm_document_name"] == "Canopy-Ec2Diagnostics"
+assert data["mcp"]["ec2_diagnostic_ssm_document_version"] == "7"
+assert data["mcp"]["ec2_diagnostic_helper_version"] == "2026-06-04.1"
+assert data["mcp"]["ec2_diagnostic_command_spec_key"] == "test-only-command-spec-key-material-32"
 PY
 
 DB_CONFIG_OUT="$TMP_DIR/generated-db.toml"

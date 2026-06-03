@@ -438,6 +438,10 @@ No shared state -- survives restarts and multi-replica routing.
 | `mcp.session_table_name` | -- | DynamoDB table name; required when `mcp.session_store = dynamodb` |
 | `mcp.ec2_diagnostic_command_store` | `memory` | MCP EC2 diagnostics command metadata backend: `memory` for dev/testing or `dynamodb` for production ownership/status records |
 | `mcp.ec2_diagnostic_command_table_name` | -- | DynamoDB table name; required when `mcp.ec2_diagnostic_command_store = dynamodb` |
+| `mcp.ec2_diagnostic_ssm_document_name` | disabled | SSM dispatch document name; must be `Canopy-Ec2Diagnostics` and configured with a pinned version and command-spec key |
+| `mcp.ec2_diagnostic_ssm_document_version` | disabled | Numeric pinned SSM document version; `$LATEST` / `$DEFAULT` are rejected |
+| `mcp.ec2_diagnostic_helper_version` | `2026-06-04.1` | Expected EC2 diagnostics helper contract version |
+| `mcp.ec2_diagnostic_command_spec_key` | -- | Secret key material used to encrypt opaque command specs; required only when SSM dispatch is enabled and should be injected from Secrets Manager |
 | `control_plane_url` | -- | (TUI) Control plane URL |
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |

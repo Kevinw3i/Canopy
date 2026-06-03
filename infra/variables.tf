@@ -235,6 +235,61 @@ variable "mcp_ec2_diagnostic_command_table_name" {
   }
 }
 
+variable "mcp_ec2_diagnostic_ssm_document_name" {
+  description = "Pinned SSM document name for MCP EC2 diagnostics dispatch. Leave empty to keep dispatch disabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.mcp_ec2_diagnostic_ssm_document_name == "" || var.mcp_ec2_diagnostic_ssm_document_name == "Canopy-Ec2Diagnostics"
+    error_message = "mcp_ec2_diagnostic_ssm_document_name must be empty or Canopy-Ec2Diagnostics."
+  }
+}
+
+variable "mcp_ec2_diagnostic_ssm_document_version" {
+  description = "Pinned numeric SSM document version for MCP EC2 diagnostics dispatch. Leave empty to keep dispatch disabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.mcp_ec2_diagnostic_ssm_document_version == "" || can(regex("^[1-9][0-9]*$", var.mcp_ec2_diagnostic_ssm_document_version))
+    error_message = "mcp_ec2_diagnostic_ssm_document_version must be empty or a positive numeric document version."
+  }
+}
+
+variable "mcp_ec2_diagnostic_helper_version" {
+  description = "Expected canopy-ec2-diagnostics helper contract version. Leave empty to use the control-plane default."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.mcp_ec2_diagnostic_helper_version == "" || var.mcp_ec2_diagnostic_helper_version == "2026-06-04.1"
+    error_message = "mcp_ec2_diagnostic_helper_version must be empty or 2026-06-04.1."
+  }
+}
+
+variable "mcp_ec2_diagnostic_command_spec_key_secret_id" {
+  description = "Optional Secrets Manager ARN for the MCP EC2 diagnostics command-spec encryption key. Required when SSM dispatch is enabled."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.mcp_ec2_diagnostic_command_spec_key_secret_id == "" || can(regex("^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$", var.mcp_ec2_diagnostic_command_spec_key_secret_id))
+    error_message = "mcp_ec2_diagnostic_command_spec_key_secret_id must be empty or a concrete Secrets Manager secret ARN."
+  }
+}
+
+variable "mcp_ec2_diagnostic_command_spec_key_secret_version_id" {
+  description = "Secrets Manager version ID for the MCP EC2 diagnostics command-spec key. Required when mcp_ec2_diagnostic_command_spec_key_secret_id is set."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.mcp_ec2_diagnostic_command_spec_key_secret_version_id == "" || can(regex("^[A-Za-z0-9-]{32,64}$", var.mcp_ec2_diagnostic_command_spec_key_secret_version_id))
+    error_message = "mcp_ec2_diagnostic_command_spec_key_secret_version_id must be empty or a Secrets Manager version ID."
+  }
+}
+
 variable "allow_multi_task_memory_mcp_session_store" {
   description = "Explicit unsafe override for desired_count > 1 with memory MCP sessions. Intended only for emergency debugging; production should keep this false."
   type        = bool

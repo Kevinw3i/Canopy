@@ -178,7 +178,7 @@ pub struct DatabaseConnectionConfig {
     pub skip_tls_hostname_verification: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct McpConfig {
     #[serde(default)]
     pub session_store: McpSessionStoreKind,
@@ -194,6 +194,44 @@ pub struct McpConfig {
     pub ec2_diagnostic_ssm_document_version: Option<String>,
     #[serde(default)]
     pub ec2_diagnostic_helper_version: Option<String>,
+    #[serde(default)]
+    pub ec2_diagnostic_command_spec_key: Option<String>,
+}
+
+impl std::fmt::Debug for McpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConfig")
+            .field("session_store", &self.session_store)
+            .field("session_table_name", &self.session_table_name)
+            .field(
+                "ec2_diagnostic_command_store",
+                &self.ec2_diagnostic_command_store,
+            )
+            .field(
+                "ec2_diagnostic_command_table_name",
+                &self.ec2_diagnostic_command_table_name,
+            )
+            .field(
+                "ec2_diagnostic_ssm_document_name",
+                &self.ec2_diagnostic_ssm_document_name,
+            )
+            .field(
+                "ec2_diagnostic_ssm_document_version",
+                &self.ec2_diagnostic_ssm_document_version,
+            )
+            .field(
+                "ec2_diagnostic_helper_version",
+                &self.ec2_diagnostic_helper_version,
+            )
+            .field(
+                "ec2_diagnostic_command_spec_key",
+                &self
+                    .ec2_diagnostic_command_spec_key
+                    .as_ref()
+                    .map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl McpConfig {
@@ -231,6 +269,10 @@ impl McpConfig {
             .ec2_diagnostic_ssm_document_version
             .as_deref()
             .map(str::trim);
+        let command_spec_key = self
+            .ec2_diagnostic_command_spec_key
+            .as_deref()
+            .map(str::trim);
         match (document_name, document_version) {
             (Some(""), _) => {
                 anyhow::bail!("mcp.ec2_diagnostic_ssm_document_name must not be empty");
@@ -250,6 +292,30 @@ impl McpConfig {
             (Some(_), Some(version)) if !is_pinned_ssm_document_version(version) => {
                 anyhow::bail!(
                     "mcp.ec2_diagnostic_ssm_document_version must be a numeric pinned version"
+                );
+            }
+            _ => {}
+        }
+        let dispatch_document_configured =
+            matches!((document_name, document_version), (Some(_), Some(_)));
+        match command_spec_key {
+            Some("") => {
+                anyhow::bail!("mcp.ec2_diagnostic_command_spec_key must not be empty");
+            }
+            Some(key) if key.len() < 32 => {
+                anyhow::bail!("mcp.ec2_diagnostic_command_spec_key must be at least 32 characters");
+            }
+            Some(_) if !dispatch_document_configured => {
+                anyhow::bail!(
+                    "mcp.ec2_diagnostic_command_spec_key requires \
+                     mcp.ec2_diagnostic_ssm_document_name and \
+                     mcp.ec2_diagnostic_ssm_document_version"
+                );
+            }
+            None if dispatch_document_configured => {
+                anyhow::bail!(
+                    "mcp.ec2_diagnostic_command_spec_key is required when \
+                     MCP EC2 diagnostics SSM dispatch is configured"
                 );
             }
             _ => {}
@@ -639,6 +705,7 @@ mod tests {
             ec2_diagnostic_ssm_document_name = "Canopy-Ec2Diagnostics"
             ec2_diagnostic_ssm_document_version = "7"
             ec2_diagnostic_helper_version = "2026-06-04.1"
+            ec2_diagnostic_command_spec_key = "test-only-command-spec-key-material-32"
 
             [database_connections.orders_prod]
             engine = "mysql"
@@ -712,6 +779,10 @@ mod tests {
         assert_eq!(
             config.mcp.ec2_diagnostic_helper_version.as_deref(),
             Some("2026-06-04.1")
+        );
+        assert_eq!(
+            config.mcp.ec2_diagnostic_command_spec_key.as_deref(),
+            Some("test-only-command-spec-key-material-32")
         );
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);
         let db = config.database_connections.get("orders_prod").unwrap();
@@ -845,12 +916,47 @@ mod tests {
             let mut config = AppConfig::dev_defaults();
             config.mcp.ec2_diagnostic_ssm_document_name = name.map(str::to_string);
             config.mcp.ec2_diagnostic_ssm_document_version = version.map(str::to_string);
+            config.mcp.ec2_diagnostic_command_spec_key =
+                Some("test-only-command-spec-key-material-32".into());
             let err = config.validate().unwrap_err().to_string();
             assert!(
                 err.contains(expected),
                 "expected {expected:?} in validation error {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_ssm_dispatch_requires_command_spec_key() {
+        let mut config = AppConfig::dev_defaults();
+        config.mcp.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+        config.mcp.ec2_diagnostic_ssm_document_version = Some("7".into());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ec2_diagnostic_command_spec_key"));
+
+        config.mcp.ec2_diagnostic_command_spec_key = Some("short".into());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("at least 32 characters"));
+
+        config.mcp.ec2_diagnostic_command_spec_key =
+            Some("test-only-command-spec-key-material-32".into());
+        config.validate().unwrap();
+
+        config.mcp.ec2_diagnostic_ssm_document_name = None;
+        config.mcp.ec2_diagnostic_ssm_document_version = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("requires"));
+    }
+
+    #[test]
+    fn mcp_config_debug_redacts_ec2_command_spec_key() {
+        let mut config = McpConfig::default();
+        config.ec2_diagnostic_command_spec_key =
+            Some("test-only-command-spec-key-material-32".into());
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("test-only-command-spec-key-material-32"));
+        assert!(debug.contains("[redacted]"));
     }
 
     #[test]

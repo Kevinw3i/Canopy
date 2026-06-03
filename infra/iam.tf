@@ -34,6 +34,7 @@ resource "aws_iam_role_policy" "task_execution_secrets" {
         Resource = compact([
           data.aws_secretsmanager_secret.jwt_secret.arn,
           var.oidc_client_secret_arn != "" ? var.oidc_client_secret_arn : "",
+          var.mcp_ec2_diagnostic_command_spec_key_secret_id != "" ? var.mcp_ec2_diagnostic_command_spec_key_secret_id : "",
         ])
       }],
       length(var.secrets_kms_key_arns) > 0 ? [{
