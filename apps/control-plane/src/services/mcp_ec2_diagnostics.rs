@@ -5,6 +5,7 @@ use aes_gcm::{
 use async_trait::async_trait;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_ssm::types::CommandInvocationStatus;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -40,6 +41,7 @@ pub struct McpEc2DiagnosticCommandRecord {
     pub command_type: McpEc2DiagnosticCommandType,
     pub allowlist_rule_id: String,
     pub command_scope_id: String,
+    pub authorization_fingerprint: Option<String>,
     pub status: McpEc2DiagnosticCommandStatus,
     pub aws_ssm_command_id: Option<String>,
     pub submitted_at: DateTime<Utc>,
@@ -1020,6 +1022,70 @@ impl<'a> McpEc2DiagnosticSsmTargetConfig<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpEc2DiagnosticSsmInvocationStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl McpEc2DiagnosticSsmInvocationStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpEc2DiagnosticSsmInvocation {
+    status: McpEc2DiagnosticSsmInvocationStatus,
+    stdout: String,
+    stderr: String,
+    response_code: Option<i32>,
+}
+
+impl McpEc2DiagnosticSsmInvocation {
+    pub fn new(
+        status: McpEc2DiagnosticSsmInvocationStatus,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+        response_code: Option<i32>,
+    ) -> Self {
+        Self {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            response_code,
+        }
+    }
+
+    pub fn status(&self) -> &McpEc2DiagnosticSsmInvocationStatus {
+        &self.status
+    }
+
+    pub fn stdout(&self) -> &str {
+        &self.stdout
+    }
+
+    pub fn stderr(&self) -> &str {
+        &self.stderr
+    }
+
+    pub fn response_code(&self) -> Option<i32> {
+        self.response_code
+    }
+}
+
+impl std::fmt::Debug for McpEc2DiagnosticSsmInvocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpEc2DiagnosticSsmInvocation")
+            .field("status", &self.status)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .field("response_code", &self.response_code)
+            .finish()
+    }
+}
+
 #[async_trait]
 pub trait McpEc2DiagnosticSsmDispatcher: Send + Sync {
     async fn dispatch(
@@ -1031,6 +1097,12 @@ pub trait McpEc2DiagnosticSsmDispatcher: Send + Sync {
         &self,
         aws_ssm_command_id: &str,
     ) -> Result<(), McpEc2DiagnosticSsmDispatcherError>;
+
+    async fn get_invocation(
+        &self,
+        aws_ssm_command_id: &str,
+        instance_id: &str,
+    ) -> Result<McpEc2DiagnosticSsmInvocation, McpEc2DiagnosticSsmDispatcherError>;
 }
 
 pub struct AwsMcpEc2DiagnosticSsmDispatcher {
@@ -1071,6 +1143,44 @@ impl McpEc2DiagnosticSsmDispatcher for AwsMcpEc2DiagnosticSsmDispatcher {
             .await
             .map_err(|_| McpEc2DiagnosticSsmDispatcherError::Backend)?;
         Ok(())
+    }
+
+    async fn get_invocation(
+        &self,
+        aws_ssm_command_id: &str,
+        instance_id: &str,
+    ) -> Result<McpEc2DiagnosticSsmInvocation, McpEc2DiagnosticSsmDispatcherError> {
+        let output = self
+            .client
+            .get_command_invocation()
+            .command_id(aws_ssm_command_id)
+            .instance_id(instance_id)
+            .send()
+            .await
+            .map_err(|_| McpEc2DiagnosticSsmDispatcherError::Backend)?;
+        let status = match output.status() {
+            Some(
+                CommandInvocationStatus::Pending
+                | CommandInvocationStatus::InProgress
+                | CommandInvocationStatus::Delayed
+                | CommandInvocationStatus::Cancelling,
+            ) => McpEc2DiagnosticSsmInvocationStatus::Running,
+            Some(CommandInvocationStatus::Success) => {
+                McpEc2DiagnosticSsmInvocationStatus::Succeeded
+            }
+            Some(
+                CommandInvocationStatus::Cancelled
+                | CommandInvocationStatus::Failed
+                | CommandInvocationStatus::TimedOut,
+            ) => McpEc2DiagnosticSsmInvocationStatus::Failed,
+            Some(_) | None => return Err(McpEc2DiagnosticSsmDispatcherError::Backend),
+        };
+        Ok(McpEc2DiagnosticSsmInvocation::new(
+            status,
+            output.standard_output_content().unwrap_or_default(),
+            output.standard_error_content().unwrap_or_default(),
+            Some(output.response_code()),
+        ))
     }
 }
 
@@ -1213,6 +1323,14 @@ impl McpEc2DiagnosticSsmDispatcher for FailClosedMcpEc2DiagnosticSsmDispatcher {
         &self,
         _aws_ssm_command_id: &str,
     ) -> Result<(), McpEc2DiagnosticSsmDispatcherError> {
+        Err(McpEc2DiagnosticSsmDispatcherError::Backend)
+    }
+
+    async fn get_invocation(
+        &self,
+        _aws_ssm_command_id: &str,
+        _instance_id: &str,
+    ) -> Result<McpEc2DiagnosticSsmInvocation, McpEc2DiagnosticSsmDispatcherError> {
         Err(McpEc2DiagnosticSsmDispatcherError::Backend)
     }
 }
@@ -1475,17 +1593,45 @@ fn contains_sensitive_assignment(lower_line: &str) -> bool {
         "password",
         "passwd",
         "api_key",
+        "api-key",
         "apikey",
+        "x-api-key",
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "access_token",
+        "access-token",
+        "refresh_token",
+        "refresh-token",
+        "id_token",
+        "id-token",
+        "auth_token",
+        "auth-token",
+        "bearer_token",
+        "bearer-token",
+        "token",
+        "secret",
         "client_secret",
+        "clientsecret",
         "secret_key",
+        "secretkey",
         "session_token",
+        "sessiontoken",
         "aws_access_key_id",
+        "awsaccesskeyid",
+        "access_key_id",
+        "accesskeyid",
         "aws_secret_access_key",
+        "awssecretaccesskey",
+        "secret_access_key",
+        "secretaccesskey",
     ] {
         let mut search_from = 0;
         while let Some(relative) = lower_line[search_from..].find(key) {
             let start = search_from + relative;
-            let after = lower_line[start + key.len()..].trim_start();
+            let after = lower_line[start + key.len()..]
+                .trim_start_matches(|ch| ch == '"' || ch == '\'' || ch == '\\')
+                .trim_start();
             if after.starts_with('=') || after.starts_with(':') {
                 return true;
             }
@@ -1791,6 +1937,9 @@ impl DynamoMcpEc2DiagnosticCommandStore {
             "command_scope_id".into(),
             AttributeValue::S(record.command_scope_id),
         );
+        if let Some(value) = record.authorization_fingerprint {
+            item.insert("authorization_fingerprint".into(), AttributeValue::S(value));
+        }
         item.insert(
             "status".into(),
             AttributeValue::S(status_to_s(&record.status).into()),
@@ -1858,6 +2007,7 @@ impl DynamoMcpEc2DiagnosticCommandStore {
             command_type: command_type_from_s(&required_s(item, "command_type")?)?,
             allowlist_rule_id: required_s(item, "allowlist_rule_id")?,
             command_scope_id: required_s(item, "command_scope_id")?,
+            authorization_fingerprint: optional_s(item, "authorization_fingerprint")?,
             status: status_from_s(&required_s(item, "status")?)?,
             aws_ssm_command_id: optional_s(item, "aws_ssm_command_id")?,
             submitted_at: required_time(item, "submitted_at")?,
@@ -2292,6 +2442,7 @@ mod tests {
             command_type: McpEc2DiagnosticCommandType::TailLog,
             allowlist_rule_id: "rule-1".into(),
             command_scope_id: "scope-1".into(),
+            authorization_fingerprint: Some("test-authorization-fingerprint".into()),
             status: McpEc2DiagnosticCommandStatus::Queued,
             aws_ssm_command_id: None,
             submitted_at: now,
@@ -3035,11 +3186,20 @@ mod tests {
     #[test]
     fn formatter_wraps_prefixes_strips_controls_and_redacts_sensitive_output() {
         let raw = format!(
-            "\x1b[31mERROR\x1b[0m\r\n{} {}\n{}super-secret\naws_access_key_id={}\n{}\nbody\n-----END PRIVATE KEY-----",
+            "\x1b[31mERROR\x1b[0m\r\n{} {}\n{}super-secret\naws_access_key_id={}\n{{\"{}\":\"json-secret\"}}\n{{\"{}\":\"hyphen-secret\"}}\n{{\"{}\":\"token-secret\"}}\n{{\\\"{}\\\":\\\"refresh-secret\\\"}}\n{{\"{}\":\"auth-secret\"}}\n{{\"{}\":\"cookie-secret\"}}\n{{\"{}\":\"camel-secret\"}}\n{{\\\"{}\\\":\\\"aws-camel-secret\\\"}}\n{{\\\"{}\\\":\\\"json-escaped-secret\\\"}}\n{}\nbody\n-----END PRIVATE KEY-----",
             concat!("Author", "ization:"),
             concat!("Bearer", " eyJhbGciOiJIUzI1NiJ9.payload.signature"),
             concat!("pass", "word="),
             concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            concat!("api", "_key"),
+            "x-api-key",
+            concat!("access", "_token"),
+            concat!("refresh", "_token"),
+            concat!("author", "ization"),
+            "cookie",
+            "secretKey",
+            concat!("aws", "Secret", "Access", "Key"),
+            concat!("client", "_secret"),
             concat!("-----BEGIN ", "PRIVATE KEY-----"),
         );
 
@@ -3058,6 +3218,15 @@ mod tests {
         assert!(formatted.output_text.contains("| [REDACTED PRIVATE KEY]"));
         assert!(!formatted.output_text.contains('\x1b'));
         assert!(!formatted.output_text.contains("super-secret"));
+        assert!(!formatted.output_text.contains("json-secret"));
+        assert!(!formatted.output_text.contains("hyphen-secret"));
+        assert!(!formatted.output_text.contains("token-secret"));
+        assert!(!formatted.output_text.contains("refresh-secret"));
+        assert!(!formatted.output_text.contains("auth-secret"));
+        assert!(!formatted.output_text.contains("cookie-secret"));
+        assert!(!formatted.output_text.contains("camel-secret"));
+        assert!(!formatted.output_text.contains("aws-camel-secret"));
+        assert!(!formatted.output_text.contains("json-escaped-secret"));
         assert!(!formatted.output_text.contains("eyJhbGci"));
         assert!(!formatted.output_text.contains("AKIA"));
         assert!(!formatted.output_text.contains("PRIVATE KEY-----\n| body"));

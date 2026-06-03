@@ -29,7 +29,8 @@ pub use mcp_ec2_diagnostics::{
     DynamoMcpEc2DiagnosticCommandStore, FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
     McpEc2DiagnosticAwsConfigResolver, McpEc2DiagnosticCommandCompletion,
     McpEc2DiagnosticCommandRecord, McpEc2DiagnosticCommandStore, McpEc2DiagnosticResolvedAwsConfig,
-    McpEc2DiagnosticSsmDispatcherFactory, McpEc2DiagnosticSsmTargetConfig,
+    McpEc2DiagnosticSsmDispatcherFactory, McpEc2DiagnosticSsmInvocation,
+    McpEc2DiagnosticSsmInvocationStatus, McpEc2DiagnosticSsmTargetConfig,
     McpEc2DiagnosticSsmTargetConfigError, MemoryMcpEc2DiagnosticCommandStore,
 };
 pub use mcp_sessions::{DynamoMcpSessionStore, McpSessionStore, MemoryMcpSessionStore};
