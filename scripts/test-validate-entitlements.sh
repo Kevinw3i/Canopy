@@ -63,12 +63,46 @@ expect_failure() {
   grep -qF -- "$expected" "$TMP_DIR/$name.out"
 }
 
+expect_command_success() {
+  local name="$1"
+  shift
+
+  if ! "$@" > "$TMP_DIR/$name.out" 2>&1; then
+    cat "$TMP_DIR/$name.out" >&2
+    echo "ERROR: expected $name to pass." >&2
+    exit 1
+  fi
+}
+
+expect_command_success_with_output() {
+  local name="$1"
+  local expected="$2"
+  shift 2
+
+  expect_command_success "$name" "$@"
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
+}
+
 expect_command_failure() {
   local name="$1"
   local expected="$2"
   shift 2
 
   if "$SCRIPT_DIR/validate-entitlements.sh" "$@" > "$TMP_DIR/$name.out" 2>&1; then
+    cat "$TMP_DIR/$name.out" >&2
+    echo "ERROR: expected $name to fail." >&2
+    exit 1
+  fi
+
+  grep -qF -- "$expected" "$TMP_DIR/$name.out"
+}
+
+expect_raw_command_failure() {
+  local name="$1"
+  local expected="$2"
+  shift 2
+
+  if "$@" > "$TMP_DIR/$name.out" 2>&1; then
     cat "$TMP_DIR/$name.out" >&2
     echo "ERROR: expected $name to fail." >&2
     exit 1
@@ -341,6 +375,224 @@ expect_failure \
   "enable_direct_access is not true"
 
 expect_success "direct-enabled" "$TMP_DIR/direct-entitlements.toml" "$TMP_DIR/direct-enabled.tfvars"
+
+cat > "$TMP_DIR/group-mapping-entitlements.toml" <<'EOF'
+memberships = []
+
+[[group_mappings]]
+external_group = "CognitoPlatform"
+canopy_group = "platform-engineering"
+
+[[rules]]
+id = "platform"
+group = "platform-engineering"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_success \
+  "group-mapping-without-local-membership" \
+  "$TMP_DIR/group-mapping-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars"
+
+FAKE_AWS_DIR="$TMP_DIR/fake-aws-bin"
+mkdir -p "$FAKE_AWS_DIR"
+cat > "$FAKE_AWS_DIR/aws" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "cognito-idp" ] && [ "${2:-}" = "list-groups" ]; then
+  printf 'CognitoPlatform\tcanopy-unmapped\n'
+  exit 0
+fi
+
+echo "unexpected aws command: $*" >&2
+exit 2
+EOF
+chmod +x "$FAKE_AWS_DIR/aws"
+
+cat > "$TMP_DIR/cognito.tfvars" <<'EOF'
+enable_direct_access = true
+assumable_role_arns = []
+aws_region = "us-east-1"
+oidc_issuer_url = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_AbCdEfGhI"
+EOF
+
+expect_command_success_with_output \
+  "cognito-online-warns-for-unmapped-canopy-group" \
+  "WARNING: Cognito group 'canopy-unmapped' has canopy-* prefix but no group_mappings entry" \
+  env PATH="$FAKE_AWS_DIR:$PATH" \
+  "$SCRIPT_DIR/validate-entitlements.sh" \
+  --cognito-online \
+  "$TMP_DIR/group-mapping-entitlements.toml" \
+  "$TMP_DIR/cognito.tfvars"
+
+sed 's/CognitoPlatform/MissingGroup/' "$TMP_DIR/group-mapping-entitlements.toml" \
+  > "$TMP_DIR/missing-cognito-group-entitlements.toml"
+expect_raw_command_failure \
+  "cognito-online-missing-external-group" \
+  "external_group 'MissingGroup' does not exist in Cognito User Pool" \
+  env PATH="$FAKE_AWS_DIR:$PATH" \
+  "$SCRIPT_DIR/validate-entitlements.sh" \
+  --cognito-user-pool-id us-east-1_AbCdEfGhI \
+  --cognito-region us-east-1 \
+  "$TMP_DIR/missing-cognito-group-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars"
+
+expect_raw_command_failure \
+  "cognito-online-strict-unmapped-canopy-group" \
+  "Cognito group 'canopy-unmapped' has canopy-* prefix but no group_mappings entry" \
+  env PATH="$FAKE_AWS_DIR:$PATH" \
+  "$SCRIPT_DIR/validate-entitlements.sh" \
+  --cognito-online \
+  --strict-cognito-groups \
+  "$TMP_DIR/group-mapping-entitlements.toml" \
+  "$TMP_DIR/cognito.tfvars"
+
+expect_raw_command_failure \
+  "cognito-online-strict-env-implies-online-check" \
+  "Cognito group 'canopy-unmapped' has canopy-* prefix but no group_mappings entry" \
+  env PATH="$FAKE_AWS_DIR:$PATH" CANOPY_COGNITO_STRICT_GROUPS=1 \
+  "$SCRIPT_DIR/validate-entitlements.sh" \
+  "$TMP_DIR/group-mapping-entitlements.toml" \
+  "$TMP_DIR/cognito.tfvars"
+
+cat > "$TMP_DIR/rule-group-without-source-entitlements.toml" <<'EOF'
+[[rules]]
+id = "platform"
+group = "platform-engineering"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "rule-group-without-source" \
+  "$TMP_DIR/rule-group-without-source-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "rule group 'platform-engineering' has no source"
+
+cat > "$TMP_DIR/empty-group-mapping-entitlements.toml" <<'EOF'
+memberships = []
+
+[[group_mappings]]
+external_group = ""
+canopy_group = "platform-engineering"
+
+[[rules]]
+id = "platform"
+group = "platform-engineering"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "empty-group-mapping" \
+  "$TMP_DIR/empty-group-mapping-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "external_group must not be empty"
+
+cat > "$TMP_DIR/duplicate-group-mapping-entitlements.toml" <<'EOF'
+memberships = []
+
+[[group_mappings]]
+external_group = "CognitoPlatform"
+canopy_group = "platform-engineering"
+
+[[group_mappings]]
+external_group = "CognitoPlatform"
+canopy_group = "platform-engineering"
+
+[[rules]]
+id = "platform"
+group = "platform-engineering"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "duplicate-group-mapping" \
+  "$TMP_DIR/duplicate-group-mapping-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "external_group 'CognitoPlatform' is duplicated"
+
+cat > "$TMP_DIR/group-mapping-missing-rule-entitlements.toml" <<'EOF'
+memberships = []
+
+[[group_mappings]]
+external_group = "CognitoPlatform"
+canopy_group = "platform-engineering"
+
+[[rules]]
+id = "readonly"
+group = "readonly-ops"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "group-mapping-missing-rule" \
+  "$TMP_DIR/group-mapping-missing-rule-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "with no matching rule group"
+
+cat > "$TMP_DIR/membership-missing-rule-entitlements.toml" <<'EOF'
+[[memberships]]
+user_id = "alice"
+group = "platform-engineering"
+
+[[rules]]
+id = "readonly"
+group = "readonly-ops"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "membership-missing-rule" \
+  "$TMP_DIR/membership-missing-rule-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "membership user_id 'alice' points to group 'platform-engineering' with no matching rule group"
+
+cat > "$TMP_DIR/orphan-rule-group-entitlements.toml" <<'EOF'
+[[memberships]]
+user_id = "alice"
+group = "platform-engineering"
+
+[[rules]]
+id = "platform"
+group = "platform-engineering"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+
+[[rules]]
+id = "readonly"
+group = "readonly-ops"
+
+[[rules.allowed_accounts]]
+account_id = "123456789012"
+account_name = "prod"
+role_arn = "direct"
+EOF
+expect_failure \
+  "orphan-rule-group" \
+  "$TMP_DIR/orphan-rule-group-entitlements.toml" \
+  "$TMP_DIR/direct-enabled.tfvars" \
+  "rule group 'readonly-ops' has no source"
 
 cat > "$TMP_DIR/metadata-scopes-entitlements.toml" <<EOF
 [[rules]]

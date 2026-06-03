@@ -49,7 +49,12 @@ async fn dev_login(
     }
 
     let auth_service = AuthService::new(state.config.clone());
-    match auth_service.dev_login(&req) {
+    let email = format!("{}@dev.local", req.username);
+    let groups = {
+        let store = state.entitlement_store.read().await;
+        store.resolve_groups(&[], &req.username, &email, true)
+    };
+    match auth_service.dev_login(&req, groups) {
         Ok(resp) => {
             state
                 .audit_service
@@ -111,11 +116,17 @@ async fn pkce_exchange(
     if state.config.dev_mode {
         // Dev mode: skip OIDC exchange, issue a token directly
         let auth_service = AuthService::new(state.config.clone());
+        let user_id = "pkce-user";
+        let email = "pkce-user@dev.local";
+        let groups = {
+            let store = state.entitlement_store.read().await;
+            store.resolve_groups(&[], user_id, email, true)
+        };
         let identity = UserIdentity {
-            user_id: "pkce-user".into(),
-            email: "pkce-user@dev.local".into(),
+            user_id: user_id.into(),
+            email: email.into(),
             display_name: "PKCE Dev User".into(),
-            groups: vec!["platform-engineering".into()],
+            groups,
             email_verified: true,
         };
         return auth_service.issue_token(&identity).map(Json).map_err(|e| {
@@ -238,11 +249,17 @@ async fn device_code_poll(
     if state.config.dev_mode {
         // Dev mode: auto-approve on first poll
         let auth_service = AuthService::new(state.config.clone());
+        let user_id = "device-user";
+        let email = "device-user@dev.local";
+        let groups = {
+            let store = state.entitlement_store.read().await;
+            store.resolve_groups(&[], user_id, email, true)
+        };
         let identity = UserIdentity {
-            user_id: "device-user".into(),
-            email: "device-user@dev.local".into(),
+            user_id: user_id.into(),
+            email: email.into(),
             display_name: "Device Dev User".into(),
-            groups: vec!["platform-engineering".into()],
+            groups,
             email_verified: true,
         };
         return match auth_service.issue_token(&identity) {
@@ -304,17 +321,18 @@ async fn device_code_poll(
                         )
                     })?;
 
-                let email = oidc_claims
-                    .email
-                    .clone()
-                    .unwrap_or_else(|| format!("{}@unknown", oidc_claims.sub));
-                let name = oidc_claims
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| oidc_claims.sub.clone());
-                let email_verified = oidc_claims.email_verified.unwrap_or(false);
-                let ent = store.evaluate(&oidc_claims.sub, &email, &name, email_verified);
-                let identity = AuthService::identity_from_oidc_claims(&oidc_claims, ent.groups);
+                let groups =
+                    AuthService::resolve_oidc_groups(&state.oidc_client, &oidc_claims, &store)
+                        .map_err(|e| {
+                            (
+                                axum::http::StatusCode::BAD_GATEWAY,
+                                Json(ApiError::internal(format!(
+                                    "Failed to parse id_token groups: {}",
+                                    e
+                                ))),
+                            )
+                        })?;
+                let identity = AuthService::identity_from_oidc_claims(&oidc_claims, groups);
 
                 let token = auth_service
                     .issue_token_with_refresh(&identity, oidc_tokens.refresh_token)
@@ -419,17 +437,17 @@ async fn refresh_token(
             })?;
 
         let store = state.entitlement_store.read().await;
-        let email = oidc_claims
-            .email
-            .clone()
-            .unwrap_or_else(|| format!("{}@unknown", oidc_claims.sub));
-        let name = oidc_claims
-            .name
-            .clone()
-            .unwrap_or_else(|| oidc_claims.sub.clone());
-        let email_verified = oidc_claims.email_verified.unwrap_or(false);
-        let ent = store.evaluate(&oidc_claims.sub, &email, &name, email_verified);
-        let identity = AuthService::identity_from_oidc_claims(&oidc_claims, ent.groups);
+        let groups = AuthService::resolve_oidc_groups(&state.oidc_client, &oidc_claims, &store)
+            .map_err(|e| {
+                (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    Json(ApiError::internal(format!(
+                        "Failed to parse refreshed id_token groups: {}",
+                        e
+                    ))),
+                )
+            })?;
+        let identity = AuthService::identity_from_oidc_claims(&oidc_claims, groups);
 
         // Keep the caller's refresh token if the IdP didn't rotate it
         let effective_refresh = oidc_tokens

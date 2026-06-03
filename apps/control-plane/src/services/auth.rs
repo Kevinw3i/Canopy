@@ -83,8 +83,12 @@ impl AuthService {
         Ok(token_data.claims)
     }
 
-    /// Dev-mode login: creates a token for a local dev user
-    pub fn dev_login(&self, req: &DevLoginRequest) -> anyhow::Result<DevLoginResponse> {
+    /// Dev-mode login: creates a token for a local dev user.
+    pub fn dev_login(
+        &self,
+        req: &DevLoginRequest,
+        resolved_groups: Vec<String>,
+    ) -> anyhow::Result<DevLoginResponse> {
         if !self.config.dev_mode {
             anyhow::bail!("Dev login is only available in dev mode");
         }
@@ -93,7 +97,7 @@ impl AuthService {
             user_id: req.username.clone(),
             email: format!("{}@dev.local", req.username),
             display_name: req.username.clone(),
-            groups: vec!["platform-engineering".into()],
+            groups: resolved_groups,
             email_verified: true, // dev mode — always trusted
         };
 
@@ -195,6 +199,20 @@ impl AuthService {
         }
     }
 
+    pub fn resolve_oidc_groups(
+        oidc_client: &OidcClient,
+        claims: &IdTokenClaims,
+        entitlement_store: &crate::models::entitlements::EntitlementStore,
+    ) -> anyhow::Result<Vec<String>> {
+        let email = claims
+            .email
+            .clone()
+            .unwrap_or_else(|| format!("{}@unknown", claims.sub));
+        let email_verified = claims.email_verified.unwrap_or(false);
+        let external_groups = oidc_client.external_groups_from_claims(claims)?;
+        Ok(entitlement_store.resolve_groups(&external_groups, &claims.sub, &email, email_verified))
+    }
+
     /// Exchange an OIDC code for an internal token.
     /// Calls the OIDC provider, extracts identity from the id_token,
     /// looks up groups from the entitlement store, and issues an internal JWT.
@@ -217,22 +235,9 @@ impl AuthService {
 
         let oidc_claims = oidc_client.decode_and_validate_id_token(id_token).await?;
 
-        // Look up groups from entitlement store
-        let display_name = oidc_claims
-            .name
-            .clone()
-            .or_else(|| oidc_claims.preferred_username.clone())
-            .unwrap_or_else(|| oidc_claims.sub.clone());
-        let email = oidc_claims
-            .email
-            .clone()
-            .unwrap_or_else(|| format!("{}@unknown", oidc_claims.sub));
+        let groups = Self::resolve_oidc_groups(oidc_client, &oidc_claims, entitlement_store)?;
 
-        let email_verified = oidc_claims.email_verified.unwrap_or(false);
-        let ent =
-            entitlement_store.evaluate(&oidc_claims.sub, &email, &display_name, email_verified);
-
-        let identity = Self::identity_from_oidc_claims(&oidc_claims, ent.groups);
+        let identity = Self::identity_from_oidc_claims(&oidc_claims, groups);
 
         self.issue_token_with_refresh(&identity, oidc_resp.refresh_token)
     }
@@ -252,6 +257,7 @@ mod tests {
                 client_id: "test-client".into(),
                 client_secret: None,
                 scopes: vec!["openid".into()],
+                group_claim_name: "cognito:groups".into(),
                 acr_values: vec![],
                 prompt: None,
                 max_age_seconds: None,
@@ -367,7 +373,9 @@ mod tests {
         let req = DevLoginRequest {
             username: "dev-admin".into(),
         };
-        let resp = svc.dev_login(&req).unwrap();
+        let resp = svc
+            .dev_login(&req, vec!["platform-engineering".into()])
+            .unwrap();
         assert_eq!(resp.identity.user_id, "dev-admin");
         assert_eq!(resp.identity.email, "dev-admin@dev.local");
         assert_eq!(resp.identity.groups, vec!["platform-engineering"]);
@@ -382,7 +390,7 @@ mod tests {
         let req = DevLoginRequest {
             username: "hacker".into(),
         };
-        assert!(svc.dev_login(&req).is_err());
+        assert!(svc.dev_login(&req, vec![]).is_err());
     }
 
     #[test]
@@ -458,6 +466,7 @@ mod tests {
             acr: None,
             amr: vec![],
             auth_time: None,
+            extra_claims: HashMap::new(),
         };
         let id = AuthService::identity_from_oidc_claims(&claims, vec!["ops".into()]);
         assert_eq!(id.user_id, "sub-123");
@@ -480,6 +489,7 @@ mod tests {
             acr: None,
             amr: vec![],
             auth_time: None,
+            extra_claims: HashMap::new(),
         };
         let id = AuthService::identity_from_oidc_claims(&claims, vec![]);
         assert_eq!(id.email, "sub-456@unknown");

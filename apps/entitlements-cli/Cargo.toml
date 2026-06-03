@@ -1,0 +1,17 @@
+[package]
+name = "canopy-entitlements"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "canopy-entitlements"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+entitlements = { path = "../../crates/entitlements" }
+serde.workspace = true
+serde_json.workspace = true
+shared = { path = "../../crates/shared" }
+toml = "0.8"

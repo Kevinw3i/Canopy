@@ -92,6 +92,7 @@ Try logging in as `dev-readonly` to see how the UI hides features the user doesn
 Canopy/
 ├── config.sample.toml         ← Control-plane config (production template)
 ├── entitlements.sample.toml   ← Permission rules template
+├── entitlements.catalog.sample.toml ← Catalog authoring template
 ├── .env.example               ← Environment variables reference
 ├── Cargo.toml                 ← Workspace root
 │
@@ -314,6 +315,57 @@ group = "readonly-ops"
 
 **Merge rule**: If a user belongs to multiple groups, feature flags are merged additively — if *any* group grants a feature, the user has it. ECS account, region, cluster, task tag, and sidecar denylist checks are evaluated rule-locally by the control-plane to avoid cross-group scope splicing.
 
+### Catalog-managed entitlements
+
+For larger deployments, keep the hand-edited source in `entitlements.catalog.toml` and generate the low-level runtime file that the control-plane loads:
+
+```bash
+cp entitlements.catalog.sample.toml entitlements.catalog.toml
+cargo run -p canopy-entitlements -- generate \
+  --catalog entitlements.catalog.toml \
+  --output entitlements.generated.toml
+```
+
+Validate the catalog, generated runtime, and deploy-time Terraform consistency before rollout:
+
+```bash
+CANOPY_VALIDATE_ENTITLEMENTS_SCRIPT=./scripts/validate-entitlements.sh \
+  cargo run -p canopy-entitlements -- validate \
+    --catalog entitlements.catalog.toml \
+    --runtime-file entitlements.generated.toml \
+    --tfvars infra/terraform.tfvars
+```
+
+Useful review commands:
+
+```bash
+cargo run -p canopy-entitlements -- preview \
+  --catalog entitlements.catalog.toml \
+  --group platform-engineering
+
+cargo run -p canopy-entitlements -- diff \
+  --old entitlements.catalog.before.toml \
+  --new entitlements.catalog.toml
+
+cargo run -p canopy-entitlements -- explain \
+  --catalog entitlements.catalog.toml \
+  --sub user-sub-uuid \
+  --email alice@company.internal \
+  --email-verified \
+  --external-group canopy-platform-engineering
+
+cargo run -p canopy-entitlements -- dry-run \
+  --catalog entitlements.catalog.toml \
+  --operation cloudwatch-search \
+  --sub user-sub-uuid \
+  --external-group canopy-platform-engineering \
+  --account 123456789012 \
+  --region ap-northeast-1 \
+  --log-group-arn arn:aws:logs:ap-northeast-1:123456789012:log-group:/aws/ecs/prod-api
+```
+
+When using the catalog path, do not hand-edit `entitlements.generated.toml`; regenerate it from the catalog and deploy that generated file. Set `entitlements_file = "entitlements.generated.toml"` in `config.toml`, and pass the same path through `--entitlements` or `ENTITLEMENTS_FILE` when running deployment scripts. Cognito mappings belong in the catalog's `[[group_mappings]]`; the generated runtime carries them forward for login and refresh authorization.
+
 ### TUI client config
 
 Prefer the setup script so the config is written to the OS-specific path the
@@ -440,7 +492,7 @@ session_duration_seconds = 3600
 
 ### Step 3: Create `entitlements.toml`
 
-Copy and edit the sample file as a starting point:
+Small deployments can copy and edit the runtime file directly:
 
 ```bash
 cp entitlements.sample.toml entitlements.toml
@@ -453,6 +505,22 @@ Change:
 - `allowed_regions` → your real regions
 - `allowed_log_group_arns` → your real log group patterns
 - `can_use_mcp` → enable the TUI `MCP / AI Tools` page for local Codex/Claude MCP access
+
+Larger deployments should use the catalog authoring path instead:
+
+```bash
+cp entitlements.catalog.sample.toml entitlements.catalog.toml
+cargo run -p canopy-entitlements -- generate \
+  --catalog entitlements.catalog.toml \
+  --output entitlements.generated.toml
+CANOPY_VALIDATE_ENTITLEMENTS_SCRIPT=./scripts/validate-entitlements.sh \
+  cargo run -p canopy-entitlements -- validate \
+    --catalog entitlements.catalog.toml \
+    --runtime-file entitlements.generated.toml \
+    --tfvars infra/terraform.tfvars
+```
+
+If you use the generated file, set `entitlements_file = "entitlements.generated.toml"` in `config.toml` and deploy that same file with `scripts/deploy-control-plane-local.sh --entitlements entitlements.generated.toml` or `ENTITLEMENTS_FILE=entitlements.generated.toml`.
 
 MCP permissions are intentionally separate from the normal TUI permissions:
 

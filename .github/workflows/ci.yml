@@ -57,6 +57,8 @@ jobs:
           bash -n scripts/validate-entitlements.sh
           bash -n scripts/test-validate-entitlements.sh
           scripts/test-validate-entitlements.sh
+          bash -n scripts/test-canopy-entitlements-cli.sh
+          scripts/test-canopy-entitlements-cli.sh
           bash -n scripts/validate-terraform-tfvars.sh
           bash -n scripts/test-validate-terraform-tfvars.sh
           scripts/test-validate-terraform-tfvars.sh

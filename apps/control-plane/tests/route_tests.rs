@@ -16,6 +16,7 @@ use http_body_util::BodyExt;
 use passkey_auth::{CosePublicKey, CredentialId, PasskeyCredential};
 use rusqlite::params;
 use serde_json::{json, Value};
+use shared::dto::auth::PkceAuthRequest;
 use shared::dto::cloudwatch::LiveTailMessage;
 use shared::dto::entitlements::{
     AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, RuleMetadata,
@@ -36,6 +37,7 @@ use control_plane::config::{
     OidcConfig,
 };
 use control_plane::middleware;
+use control_plane::models::entitlements::GroupMapping;
 use control_plane::routes;
 use control_plane::services::audit::AuditService;
 use control_plane::services::auth::AuthService;
@@ -43,7 +45,7 @@ use control_plane::services::database::{
     evaluate_explain, ConnectionQueueFull, DatabaseExecutor, DatabaseSecret,
     DatabaseSecretProvider, QueryRows, TableType, TableTypeQuery, ViewCheckedQueryOutcome,
 };
-use control_plane::services::oidc::OidcClient;
+use control_plane::services::oidc::{OidcClient, OidcEndpoints};
 use control_plane::services::{AppState, McpSessionStore, MemoryMcpSessionStore};
 use shared::dto::database::{ExplainSummary, ExplainTableSummary};
 
@@ -59,6 +61,7 @@ fn dev_config() -> AppConfig {
             client_id: "test-client".into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            group_claim_name: "cognito:groups".into(),
             acr_values: vec![],
             prompt: None,
             max_age_seconds: None,
@@ -778,13 +781,18 @@ fn route_test_now_secs() -> u64 {
         .as_secs()
 }
 
-fn sign_route_test_id_token(issuer: &str, sub: &str, email: &str) -> String {
+fn sign_route_test_id_token_with_extra(
+    issuer: &str,
+    sub: &str,
+    email: &str,
+    extra_claim: Option<(&str, Value)>,
+) -> String {
     let header = jsonwebtoken::Header {
         alg: jsonwebtoken::Algorithm::RS256,
         kid: Some("route-test-key-1".into()),
         ..Default::default()
     };
-    let claims = json!({
+    let mut claims = json!({
         "iss": issuer,
         "aud": "test-client",
         "sub": sub,
@@ -793,6 +801,12 @@ fn sign_route_test_id_token(issuer: &str, sub: &str, email: &str) -> String {
         "name": "Dev Admin",
         "exp": route_test_now_secs() + 600
     });
+    if let Some((name, value)) = extra_claim {
+        claims
+            .as_object_mut()
+            .expect("route test claims are an object")
+            .insert(name.into(), value);
+    }
     let key = jsonwebtoken::EncodingKey::from_rsa_pem(&ROUTE_TEST_OIDC_KEY.pem).unwrap();
     jsonwebtoken::encode(&header, &claims, &key).unwrap()
 }
@@ -870,11 +884,28 @@ async fn mock_oidc_token(
 }
 
 async fn start_mock_oidc() -> String {
+    start_mock_oidc_with_token_subject("dev-admin", "dev-admin@dev.local", None).await
+}
+
+async fn start_mock_oidc_with_group_claim(
+    sub: &str,
+    email: &str,
+    claim_name: &str,
+    claim_value: Value,
+) -> String {
+    start_mock_oidc_with_token_subject(sub, email, Some((claim_name, claim_value))).await
+}
+
+async fn start_mock_oidc_with_token_subject(
+    sub: &str,
+    email: &str,
+    extra_claim: Option<(&str, Value)>,
+) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let issuer = format!("http://{addr}");
     let state = MockOidcState {
-        id_token: sign_route_test_id_token(&issuer, "dev-admin", "dev-admin@dev.local"),
+        id_token: sign_route_test_id_token_with_extra(&issuer, sub, email, extra_claim),
     };
     let app = Router::new()
         .route("/jwks", axum::routing::get(mock_oidc_jwks))
@@ -2384,6 +2415,47 @@ async fn device_code_poll_complete_response_includes_oidc_refresh_token() {
 }
 
 #[tokio::test]
+async fn device_code_poll_resolves_cognito_group_mapping_without_local_membership() {
+    let issuer = start_mock_oidc_with_group_claim(
+        "cognito-only",
+        "cognito-only@example.com",
+        "cognito:groups",
+        json!(["CognitoPlatform"]),
+    )
+    .await;
+    let config = prod_config_with_mock_oidc(&issuer);
+    let state = build_state(config.clone());
+    {
+        let mut store = state.entitlement_store.write().await;
+        store.group_mappings.push(GroupMapping {
+            external_group: "CognitoPlatform".into(),
+            canopy_group: "platform-engineering".into(),
+        });
+    }
+    let app = build_app(state);
+
+    let body = json!({"device_code": "device-valid", "client_id": "test"});
+    let resp = app
+        .oneshot(
+            Request::post("/auth/device-code/poll")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let auth = AuthService::new(config);
+    let claims = auth
+        .validate_token(json["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.sub, "cognito-only");
+    assert_eq!(claims.groups, vec!["platform-engineering"]);
+}
+
+#[tokio::test]
 async fn refresh_token_rejected_in_dev_mode() {
     let state = build_state(dev_config());
     let app = build_app(state);
@@ -2440,6 +2512,78 @@ async fn refresh_endpoint_accepts_valid_refresh_token_and_audits_without_secret(
         !audit_contents.contains("valid-refresh") && !audit_contents.contains("rotated-refresh"),
         "refresh token values must not be written to audit log: {audit_contents}"
     );
+}
+
+#[tokio::test]
+async fn refresh_endpoint_recomputes_groups_from_cognito_group_claim() {
+    let issuer = start_mock_oidc_with_group_claim(
+        "cognito-only",
+        "cognito-only@example.com",
+        "cognito:groups",
+        json!(["CognitoPlatform"]),
+    )
+    .await;
+    let config = prod_config_with_mock_oidc(&issuer);
+    let state = build_state(config.clone());
+    {
+        let mut store = state.entitlement_store.write().await;
+        store.group_mappings.push(GroupMapping {
+            external_group: "CognitoPlatform".into(),
+            canopy_group: "platform-engineering".into(),
+        });
+    }
+    let app = build_app(state);
+
+    let body = json!({"refresh_token": "valid-refresh"});
+    let resp = app
+        .oneshot(
+            Request::post("/auth/refresh")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let auth = AuthService::new(config);
+    let claims = auth
+        .validate_token(json["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.sub, "cognito-only");
+    assert_eq!(claims.groups, vec!["platform-engineering"]);
+}
+
+#[tokio::test]
+async fn refresh_endpoint_rejects_malformed_group_claim() {
+    let issuer = start_mock_oidc_with_group_claim(
+        "cognito-only",
+        "cognito-only@example.com",
+        "cognito:groups",
+        json!("CognitoPlatform"),
+    )
+    .await;
+    let state = build_state(prod_config_with_mock_oidc(&issuer));
+    let app = build_app(state);
+
+    let body = json!({"refresh_token": "valid-refresh"});
+    let resp = app
+        .oneshot(
+            Request::post("/auth/refresh")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let json = body_json(resp.into_body()).await;
+    assert!(json["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("group claim"));
 }
 
 #[tokio::test]
@@ -6736,6 +6880,67 @@ async fn pkce_exchange_prod_mode_uses_mock_oidc_and_audits_without_secrets() {
             && !audit_contents.contains("auth-code-refresh"),
         "PKCE secrets must not be written to audit log: {audit_contents}"
     );
+}
+
+#[tokio::test]
+async fn pkce_exchange_resolves_cognito_group_mapping_without_local_membership() {
+    let issuer = start_mock_oidc_with_group_claim(
+        "cognito-only",
+        "cognito-only@example.com",
+        "cognito:groups",
+        json!(["CognitoPlatform"]),
+    )
+    .await;
+    let config = prod_config_with_mock_oidc(&issuer);
+    let state = build_state(config.clone());
+    {
+        let mut store = state.entitlement_store.write().await;
+        store.group_mappings.push(GroupMapping {
+            external_group: "CognitoPlatform".into(),
+            canopy_group: "platform-engineering".into(),
+        });
+    }
+    let app = build_app(state);
+    let auth = AuthService::new(config.clone());
+    let redirect_uri = "http://localhost:9876/callback";
+    let code_verifier = "valid-verifier-abcdefghijklmnopqrstuvwxyz0123456789";
+    let pkce = auth.build_pkce_auth_url(
+        &PkceAuthRequest {
+            code_verifier: code_verifier.into(),
+            redirect_uri: redirect_uri.into(),
+        },
+        &OidcEndpoints {
+            authorization_endpoint: format!("{issuer}/authorize"),
+            token_endpoint: format!("{issuer}/token"),
+            userinfo_endpoint: None,
+            device_authorization_endpoint: None,
+            jwks_uri: Some(format!("{issuer}/jwks")),
+        },
+    );
+
+    let exchange_body = json!({
+        "code": "valid-code",
+        "code_verifier": code_verifier,
+        "state": pkce.state,
+        "redirect_uri": redirect_uri
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/auth/pkce/exchange")
+                .header("Content-Type", "application/json")
+                .body(Body::from(exchange_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    let claims = auth
+        .validate_token(json["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.sub, "cognito-only");
+    assert_eq!(claims.groups, vec!["platform-engineering"]);
 }
 
 #[tokio::test]

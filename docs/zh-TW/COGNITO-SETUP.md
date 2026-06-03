@@ -203,7 +203,32 @@ USERS
 
 ## 第五步：更新 entitlements.toml
 
-`[[memberships]]` 裡的 `user_id` 要對應 Cognito 使用者的 **sub**（UUID）或 **email**。
+建議用 Cognito User Pool Group 管理成員，再在 Canopy 只維護 Cognito group 到 Canopy group 的 mapping：
+
+```toml
+[[group_mappings]]
+external_group = "canopy-platform-engineering"
+canopy_group = "platform-engineering"
+
+[[rules]]
+id = "platform-engineering-ec2"
+group = "platform-engineering"
+allowed_regions = ["ap-northeast-1"]
+```
+
+Cognito 的 `id_token` 預設會帶 `cognito:groups` claim。Canopy 會把這個 claim 裡的 Cognito group 透過 `[[group_mappings]]` 解析成 internal JWT 的 Canopy groups。
+
+若採用 catalog 流程，請把 `[[group_mappings]]` 寫在 `entitlements.catalog.toml`，再產生 runtime 檔；不要手改 generated 檔：
+
+```bash
+cargo run -p canopy-entitlements -- generate \
+  --catalog entitlements.catalog.toml \
+  --output entitlements.generated.toml
+```
+
+部署時讓 `config.toml` 的 `entitlements_file` 與部署腳本都指向同一個 generated runtime，例如 `entitlements.generated.toml`。
+
+`[[memberships]]` 仍可作為本機 fallback。`user_id` 要對應 Cognito 使用者的 **sub**（UUID）或 **email**。
 
 Cognito 的 `id_token` 預設包含 `sub`（UUID 格式如 `a1b2c3d4-e5f6-7890-abcd-ef1234567890`）和 `email`。我們的 Control Plane 用 `sub` 作為 user_id。
 
@@ -244,7 +269,36 @@ group = "platform-engineering"
 
 ---
 
-## 第六步：測試
+## 第六步：可選的 Cognito online preflight
+
+一般驗證不會呼叫 AWS。若要在部署前確認 `[[group_mappings]].external_group` 都存在於 Cognito User Pool，可啟用 opt-in online check：
+
+```bash
+CANOPY_COGNITO_ONLINE_CHECK=1 \
+CANOPY_COGNITO_USER_POOL_ID=us-east-1_AbCdEfGhI \
+CANOPY_COGNITO_REGION=us-east-1 \
+./scripts/validate-entitlements.sh entitlements.toml infra/terraform.tfvars
+```
+
+也可以用參數：
+
+```bash
+./scripts/validate-entitlements.sh \
+  --cognito-online \
+  --cognito-user-pool-id us-east-1_AbCdEfGhI \
+  --cognito-region us-east-1 \
+  entitlements.toml infra/terraform.tfvars
+```
+
+Online check 會：
+
+- 找不到已 mapping 的 Cognito group 時失敗。
+- 對 Cognito 裡未 mapping 的 `canopy-*` group 顯示 warning。
+- 加上 `--strict-cognito-groups` 時，未 mapping 的 `canopy-*` warning 會轉成失敗。
+
+---
+
+## 第七步：測試
 
 1. 啟動 Control Plane（`dev_mode = false`）
 2. 啟動 TUI（`dev_mode = false`）

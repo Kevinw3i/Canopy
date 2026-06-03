@@ -91,6 +91,7 @@ DEV_MODE=1 cargo run -p tui-client
 Canopy/
 ├── config.sample.toml         ← Control Plane 設定（生產環境範本）
 ├── entitlements.sample.toml   ← 權限規則範本
+├── entitlements.catalog.sample.toml ← Catalog 編輯範本
 ├── .env.example               ← 環境變數參考
 ├── Cargo.toml                 ← Workspace 根設定
 │
@@ -311,6 +312,57 @@ group = "platform-engineering"
 - `excluded_tag_selectors` — 聯集（任一群組排除即排除）
 - ECS 的 account、region、cluster、task tag、sidecar denylist 由 control-plane 以 rule-local scope 評估，避免跨群組 scope 被拼接成未授權組合
 
+### Catalog 管理的權限規則
+
+較大的部署建議把人工維護的來源放在 `entitlements.catalog.toml`，再產生 control-plane 實際載入的低階 runtime 檔：
+
+```bash
+cp entitlements.catalog.sample.toml entitlements.catalog.toml
+cargo run -p canopy-entitlements -- generate \
+  --catalog entitlements.catalog.toml \
+  --output entitlements.generated.toml
+```
+
+部署前驗證 catalog、產生出的 runtime，以及 Terraform 部署設定是否一致：
+
+```bash
+CANOPY_VALIDATE_ENTITLEMENTS_SCRIPT=./scripts/validate-entitlements.sh \
+  cargo run -p canopy-entitlements -- validate \
+    --catalog entitlements.catalog.toml \
+    --runtime-file entitlements.generated.toml \
+    --tfvars infra/terraform.tfvars
+```
+
+常用 review 指令：
+
+```bash
+cargo run -p canopy-entitlements -- preview \
+  --catalog entitlements.catalog.toml \
+  --group platform-engineering
+
+cargo run -p canopy-entitlements -- diff \
+  --old entitlements.catalog.before.toml \
+  --new entitlements.catalog.toml
+
+cargo run -p canopy-entitlements -- explain \
+  --catalog entitlements.catalog.toml \
+  --sub user-sub-uuid \
+  --email alice@company.internal \
+  --email-verified \
+  --external-group canopy-platform-engineering
+
+cargo run -p canopy-entitlements -- dry-run \
+  --catalog entitlements.catalog.toml \
+  --operation cloudwatch-search \
+  --sub user-sub-uuid \
+  --external-group canopy-platform-engineering \
+  --account 123456789012 \
+  --region ap-northeast-1 \
+  --log-group-arn arn:aws:logs:ap-northeast-1:123456789012:log-group:/aws/ecs/prod-api
+```
+
+使用 catalog 流程時，不要手改 `entitlements.generated.toml`；要從 catalog 重新產生並部署 generated runtime。`config.toml` 的 `entitlements_file` 要設成 `entitlements.generated.toml`，部署腳本也要用同一個檔案，例如 `--entitlements` 或 `ENTITLEMENTS_FILE`。Cognito mapping 應寫在 catalog 的 `[[group_mappings]]`，generated runtime 會保留它們供登入與 refresh 授權使用。
+
 ### TUI 客戶端設定
 
 建議用腳本建立設定檔，避免不同作業系統路徑不一致。腳本接受位置參數、
@@ -436,7 +488,7 @@ session_duration_seconds = 3600
 
 ### 第三步：建立 `entitlements.toml`
 
-以範本檔為起點：
+小型部署可以直接複製並編輯 runtime 檔：
 
 ```bash
 cp entitlements.sample.toml entitlements.toml
@@ -449,6 +501,22 @@ cp entitlements.sample.toml entitlements.toml
 - `allowed_regions` → 真實的 AWS 區域
 - `allowed_log_group_arns` → 真實的 Log Group ARN 樣式
 - `can_use_mcp` → 開啟 TUI 的 `MCP / AI Tools` 頁面，讓使用者用本機 Codex/Claude 連到 Canopy MCP
+
+較大的部署建議改用 catalog 流程：
+
+```bash
+cp entitlements.catalog.sample.toml entitlements.catalog.toml
+cargo run -p canopy-entitlements -- generate \
+  --catalog entitlements.catalog.toml \
+  --output entitlements.generated.toml
+CANOPY_VALIDATE_ENTITLEMENTS_SCRIPT=./scripts/validate-entitlements.sh \
+  cargo run -p canopy-entitlements -- validate \
+    --catalog entitlements.catalog.toml \
+    --runtime-file entitlements.generated.toml \
+    --tfvars infra/terraform.tfvars
+```
+
+若使用 generated 檔，`config.toml` 的 `entitlements_file` 要設成 `entitlements.generated.toml`，部署時也要用同一個檔案，例如 `scripts/deploy-control-plane-local.sh --entitlements entitlements.generated.toml` 或 `ENTITLEMENTS_FILE=entitlements.generated.toml`。
 
 MCP 權限刻意和一般 TUI 權限分開：
 

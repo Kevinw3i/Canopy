@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Validates that an entitlements file is consistent with Terraform variables.
-# Usage: ./scripts/validate-entitlements.sh <entitlements.toml> <terraform.tfvars>
+# Usage: ./scripts/validate-entitlements.sh [options] <entitlements.toml> <terraform.tfvars>
 #
 # Checks:
 #   0. Active sample placeholders are rejected before production image builds
@@ -13,10 +13,24 @@
 #   6. ECS Exec must imply ECS view, ECS access rules need allowed_clusters,
 #      and broad ECS cluster wildcards require explicit opt-in
 #   7. SSM access rules need explicit allowed_os_users
+#   8. group_mappings, memberships, and rule groups must wire together
+#   9. Optional online Cognito check validates mapped group existence
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <entitlements.toml> <terraform.tfvars>" >&2
+  cat >&2 <<EOF
+Usage: $0 [options] <entitlements.toml> <terraform.tfvars>
+
+Options:
+  --cognito-online                 Run opt-in live Cognito group checks
+  --cognito-user-pool-id <id>      Cognito User Pool ID for live checks
+  --cognito-region <region>        AWS region for live checks
+  --strict-cognito-groups          Fail on unmapped Cognito canopy-* groups
+
+Environment equivalents:
+  CANOPY_COGNITO_ONLINE_CHECK, CANOPY_COGNITO_USER_POOL_ID,
+  CANOPY_COGNITO_REGION, CANOPY_COGNITO_STRICT_GROUPS
+EOF
 }
 
 fail() {
@@ -24,23 +38,79 @@ fail() {
   exit 1
 }
 
-if [ "$#" -ne 2 ]; then
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+COGNITO_ONLINE_CHECK="${CANOPY_COGNITO_ONLINE_CHECK:-}"
+COGNITO_USER_POOL_ID="${CANOPY_COGNITO_USER_POOL_ID:-}"
+COGNITO_REGION="${CANOPY_COGNITO_REGION:-${AWS_REGION:-${TF_VAR_aws_region:-}}}"
+COGNITO_STRICT_GROUPS="${CANOPY_COGNITO_STRICT_GROUPS:-}"
+
+POSITIONAL_ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cognito-online)
+      COGNITO_ONLINE_CHECK=1
+      shift
+      ;;
+    --cognito-user-pool-id)
+      COGNITO_USER_POOL_ID="${2:-}"
+      [ -n "$COGNITO_USER_POOL_ID" ] || fail "--cognito-user-pool-id requires a value"
+      COGNITO_ONLINE_CHECK=1
+      shift 2
+      ;;
+    --cognito-region)
+      COGNITO_REGION="${2:-}"
+      [ -n "$COGNITO_REGION" ] || fail "--cognito-region requires a value"
+      shift 2
+      ;;
+    --strict-cognito-groups)
+      COGNITO_STRICT_GROUPS=1
+      COGNITO_ONLINE_CHECK=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --*)
+      fail "Unknown option: $1"
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ "${#POSITIONAL_ARGS[@]}" -ne 2 ]; then
   usage
   exit 1
 fi
 
-ENTITLEMENTS="$1"
-TFVARS="$2"
+ENTITLEMENTS="${POSITIONAL_ARGS[0]}"
+TFVARS="${POSITIONAL_ARGS[1]}"
+PYTHON_BIN="${PYTHON_BIN:-${PYTHON:-python3}}"
 
 [ -f "$ENTITLEMENTS" ] || fail "Entitlements file not found: $ENTITLEMENTS"
 [ -f "$TFVARS" ] || fail "Terraform tfvars not found: $TFVARS"
-command -v python3 >/dev/null 2>&1 \
-  || fail "python3 with tomllib (Python 3.11+) is required to parse entitlements TOML"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 \
+  || fail "$PYTHON_BIN with tomllib (Python 3.11+) is required to parse entitlements TOML"
+if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import tomllib
+PY
+then
+  fail "$PYTHON_BIN with tomllib (Python 3.11+) is required to parse entitlements TOML"
+fi
 
 ERRORS=0
 
 if ! TOML_PARSE_OUTPUT=$(
-  python3 - "$ENTITLEMENTS" <<'PY' 2>&1
+  "$PYTHON_BIN" - "$ENTITLEMENTS" <<'PY' 2>&1
 import sys
 from pathlib import Path
 
@@ -67,6 +137,41 @@ fi
 # Strip comments from both files before matching
 strip_comments() {
   sed 's/#.*$//' "$1"
+}
+
+extract_tfvar_string() {
+  local key="$1"
+  strip_comments "$TFVARS" | awk -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      sub(/^[[:space:]]*/, "", value)
+      if (value ~ /^"/) {
+        sub(/^"/, "", value)
+        sub(/".*$/, "", value)
+        print value
+        exit
+      }
+      if (value ~ /^\047/) {
+        sub(/^\047/, "", value)
+        sub(/\047.*$/, "", value)
+        print value
+        exit
+      }
+    }
+  '
+}
+
+derive_cognito_user_pool_id_from_issuer() {
+  local issuer="$1"
+  if [[ "$issuer" =~ ^https://cognito-idp\.([a-z0-9-]+)\.amazonaws\.com(\.cn)?/([A-Za-z0-9_-]+)$ ]]; then
+    if [ -z "$COGNITO_REGION" ]; then
+      COGNITO_REGION="${BASH_REMATCH[1]}"
+    fi
+    COGNITO_USER_POOL_ID="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
 }
 
 extract_assumable_role_arns() {
@@ -142,7 +247,7 @@ fi
 # similarly named session_duration_seconds belongs to control-plane AWS config
 # and controls STS duration, not TUI connect auto-disconnect.
 MISPLACED_SESSION_DURATION=$(
-  python3 - "$ENTITLEMENTS" <<'PY'
+  "$PYTHON_BIN" - "$ENTITLEMENTS" <<'PY'
 import sys
 from pathlib import Path
 
@@ -161,6 +266,168 @@ if [ -n "$MISPLACED_SESSION_DURATION" ]; then
   echo "ERROR: entitlements rules must not set session_duration_seconds; use max_session_seconds for SSH/SSM/EIC/ECS connect caps." >&2
   printf '%s\n' "$MISPLACED_SESSION_DURATION" | sed 's/^/  rule: /' >&2
   ERRORS=$((ERRORS + 1))
+fi
+
+# Check 8: catch Cognito/Canopy group wiring mistakes before image build.
+if ! GROUP_WIRING_OUTPUT=$(
+  "$PYTHON_BIN" - "$ENTITLEMENTS" <<'PY' 2>&1
+import sys
+from pathlib import Path
+
+import tomllib
+
+path = Path(sys.argv[1])
+with path.open("rb") as f:
+    data = tomllib.load(f)
+
+rules = data.get("rules") or []
+group_mappings = data.get("group_mappings") or []
+memberships = data.get("memberships") or []
+
+rule_groups = {
+    rule.get("group")
+    for rule in rules
+    if isinstance(rule, dict) and isinstance(rule.get("group"), str) and rule.get("group")
+}
+mapped_canopy_groups = set()
+membership_groups = set()
+seen_external_groups = set()
+errors = []
+
+for mapping in group_mappings:
+    if not isinstance(mapping, dict):
+        continue
+    external_group = mapping.get("external_group")
+    canopy_group = mapping.get("canopy_group")
+    if not isinstance(external_group, str) or not external_group.strip():
+        errors.append("group_mappings external_group must not be empty")
+        continue
+    if external_group in seen_external_groups:
+        errors.append(f"group_mappings external_group '{external_group}' is duplicated")
+    seen_external_groups.add(external_group)
+    if not isinstance(canopy_group, str) or not canopy_group.strip():
+        errors.append(f"group_mappings external_group '{external_group}' has an empty canopy_group")
+        continue
+    if isinstance(canopy_group, str) and canopy_group:
+        mapped_canopy_groups.add(canopy_group)
+        if canopy_group not in rule_groups:
+            errors.append(
+                f"group_mappings external_group '{external_group}' points to canopy_group "
+                f"'{canopy_group}' with no matching rule group"
+            )
+
+for membership in memberships:
+    if not isinstance(membership, dict):
+        continue
+    group = membership.get("group")
+    if isinstance(group, str) and group:
+        membership_groups.add(group)
+        if group not in rule_groups:
+            user_id = membership.get("user_id", "<unknown>")
+            errors.append(
+                f"membership user_id '{user_id}' points to group '{group}' with no matching rule group"
+            )
+
+source_groups = mapped_canopy_groups | membership_groups
+for group in sorted(rule_groups):
+    if group not in source_groups:
+        errors.append(f"rule group '{group}' has no source from group_mappings or memberships")
+
+if errors:
+    for error in errors:
+        print(f"ERROR: {error}")
+    sys.exit(1)
+PY
+); then
+  printf '%s\n' "$GROUP_WIRING_OUTPUT"
+  ERRORS=$((ERRORS + 1))
+fi
+
+# Check 9: optional live Cognito smoke check. Normal CI and deployment
+# validation skip this unless explicitly enabled because it requires AWS
+# credentials and a reachable User Pool.
+if truthy "$COGNITO_ONLINE_CHECK" || [ -n "$COGNITO_USER_POOL_ID" ] || truthy "$COGNITO_STRICT_GROUPS"; then
+  if [ -z "$COGNITO_USER_POOL_ID" ]; then
+    OIDC_ISSUER_URL="$(extract_tfvar_string oidc_issuer_url)"
+    if [ -n "$OIDC_ISSUER_URL" ]; then
+      derive_cognito_user_pool_id_from_issuer "$OIDC_ISSUER_URL" || true
+    fi
+  fi
+
+  if [ -z "$COGNITO_USER_POOL_ID" ]; then
+    echo "ERROR: Cognito online check requires --cognito-user-pool-id or a Cognito oidc_issuer_url in $TFVARS"
+    ERRORS=$((ERRORS + 1))
+  fi
+
+  if [ -z "$COGNITO_REGION" ]; then
+    COGNITO_REGION="$(extract_tfvar_string aws_region)"
+    COGNITO_REGION="${COGNITO_REGION:-ap-northeast-1}"
+  fi
+
+  if [ -n "$COGNITO_USER_POOL_ID" ]; then
+    command -v aws >/dev/null 2>&1 || fail "aws CLI is required for Cognito online checks"
+
+    MAPPED_EXTERNAL_GROUPS="$(
+      "$PYTHON_BIN" - "$ENTITLEMENTS" <<'PY'
+import sys
+from pathlib import Path
+
+import tomllib
+
+path = Path(sys.argv[1])
+with path.open("rb") as f:
+    data = tomllib.load(f)
+
+groups = []
+for mapping in data.get("group_mappings") or []:
+    if isinstance(mapping, dict) and isinstance(mapping.get("external_group"), str):
+        group = mapping["external_group"].strip()
+        if group:
+            groups.append(group)
+
+for group in sorted(set(groups)):
+    print(group)
+PY
+    )"
+
+    if ! COGNITO_GROUPS_RAW="$(
+      aws cognito-idp list-groups \
+        --user-pool-id "$COGNITO_USER_POOL_ID" \
+        --region "$COGNITO_REGION" \
+        --query 'Groups[].GroupName' \
+        --output text 2>&1
+    )"; then
+      echo "ERROR: Cognito online check failed to list groups for user pool '$COGNITO_USER_POOL_ID' in region '$COGNITO_REGION'"
+      printf '%s\n' "$COGNITO_GROUPS_RAW"
+      ERRORS=$((ERRORS + 1))
+    else
+      COGNITO_GROUPS="$(printf '%s\n' "$COGNITO_GROUPS_RAW" | tr '\t' '\n' | sed '/^[[:space:]]*$/d' | sort -u)"
+
+      while IFS= read -r external_group; do
+        [ -n "$external_group" ] || continue
+        if ! grep -qxF "$external_group" <<< "$COGNITO_GROUPS"; then
+          echo "ERROR: group_mappings external_group '$external_group' does not exist in Cognito User Pool '$COGNITO_USER_POOL_ID'"
+          ERRORS=$((ERRORS + 1))
+        fi
+      done <<< "$MAPPED_EXTERNAL_GROUPS"
+
+      while IFS= read -r cognito_group; do
+        [ -n "$cognito_group" ] || continue
+        case "$cognito_group" in
+          canopy-*)
+            if ! grep -qxF "$cognito_group" <<< "$MAPPED_EXTERNAL_GROUPS"; then
+              if truthy "$COGNITO_STRICT_GROUPS"; then
+                echo "ERROR: Cognito group '$cognito_group' has canopy-* prefix but no group_mappings entry"
+                ERRORS=$((ERRORS + 1))
+              else
+                echo "WARNING: Cognito group '$cognito_group' has canopy-* prefix but no group_mappings entry"
+              fi
+            fi
+            ;;
+        esac
+      done <<< "$COGNITO_GROUPS"
+    fi
+  fi
 fi
 
 # Check 1: direct access (only in uncommented lines)

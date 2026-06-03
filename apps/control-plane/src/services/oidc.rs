@@ -99,6 +99,52 @@ pub struct IdTokenClaims {
     pub amr: Vec<String>,
     #[serde(default)]
     pub auth_time: Option<u64>,
+    #[serde(flatten)]
+    pub extra_claims: HashMap<String, serde_json::Value>,
+}
+
+impl IdTokenClaims {
+    /// Extract external IdP groups from a configured id_token claim.
+    ///
+    /// Missing claim means "no external groups" so local entitlement
+    /// memberships can still act as fallback. Present-but-malformed claims
+    /// fail closed because they indicate an IdP or configuration mismatch.
+    pub fn external_groups_from_claim(&self, claim_name: &str) -> anyhow::Result<Vec<String>> {
+        let claim_name = claim_name.trim();
+        if claim_name.is_empty() {
+            anyhow::bail!("oidc.group_claim_name must not be empty");
+        }
+
+        let Some(value) = self.extra_claims.get(claim_name) else {
+            return Ok(vec![]);
+        };
+
+        let Some(values) = value.as_array() else {
+            anyhow::bail!(
+                "id_token group claim '{}' must be an array of strings",
+                claim_name
+            );
+        };
+
+        values
+            .iter()
+            .map(|value| {
+                let group = value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "id_token group claim '{}' must be an array of strings",
+                        claim_name
+                    )
+                })?;
+                if group.trim().is_empty() {
+                    anyhow::bail!(
+                        "id_token group claim '{}' contains an empty group name",
+                        claim_name
+                    );
+                }
+                Ok(group.to_string())
+            })
+            .collect()
+    }
 }
 
 /// OIDC device authorization response
@@ -149,6 +195,13 @@ impl OidcClient {
             endpoints: OnceCell::new(),
             jwks_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn external_groups_from_claims(
+        &self,
+        claims: &IdTokenClaims,
+    ) -> anyhow::Result<Vec<String>> {
+        claims.external_groups_from_claim(&self.config.group_claim_name)
     }
 
     /// Resolve endpoints. If all required endpoints are configured, skips
@@ -694,6 +747,7 @@ mod tests {
             client_id: TEST_CLIENT_ID.into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            group_claim_name: "cognito:groups".into(),
             acr_values: vec![],
             prompt: None,
             max_age_seconds: None,
@@ -944,6 +998,7 @@ mod tests {
             client_id: "cid".into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            group_claim_name: "cognito:groups".into(),
             acr_values: vec![],
             prompt: None,
             max_age_seconds: None,
@@ -983,6 +1038,7 @@ mod tests {
             client_id: "cid".into(),
             client_secret: None,
             scopes: vec![],
+            group_claim_name: "cognito:groups".into(),
             acr_values: vec![],
             prompt: None,
             max_age_seconds: None,
@@ -1011,6 +1067,7 @@ mod tests {
             client_id: "cid".into(),
             client_secret: None,
             scopes: vec![],
+            group_claim_name: "cognito:groups".into(),
             acr_values: vec![],
             prompt: None,
             max_age_seconds: None,
@@ -1203,7 +1260,8 @@ mod tests {
             "exp": 1700000000_u64,
             "acr": "urn:mfa",
             "amr": ["pwd", "mfa"],
-            "auth_time": 1699999900_u64
+            "auth_time": 1699999900_u64,
+            "cognito:groups": ["canopy-readonly-ops", "canopy-ecs-exec"]
         }))
         .unwrap();
         assert_eq!(claims.sub, "user-123");
@@ -1214,6 +1272,10 @@ mod tests {
         assert_eq!(claims.acr.as_deref(), Some("urn:mfa"));
         assert_eq!(claims.amr, vec!["pwd", "mfa"]);
         assert_eq!(claims.auth_time, Some(1699999900));
+        assert_eq!(
+            claims.external_groups_from_claim("cognito:groups").unwrap(),
+            vec!["canopy-readonly-ops", "canopy-ecs-exec"]
+        );
     }
 
     #[test]
@@ -1238,6 +1300,82 @@ mod tests {
         assert!(claims.acr.is_none());
         assert!(claims.amr.is_empty());
         assert!(claims.auth_time.is_none());
+        assert!(claims.extra_claims.is_empty());
+        assert!(claims
+            .external_groups_from_claim("cognito:groups")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn id_token_group_claim_parser_supports_custom_claim_name() {
+        let claims: IdTokenClaims = serde_json::from_value(serde_json::json!({
+            "sub": "u",
+            "groups": ["platform", "readonly"]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            claims.external_groups_from_claim("groups").unwrap(),
+            vec!["platform", "readonly"]
+        );
+        assert!(claims
+            .external_groups_from_claim("cognito:groups")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn id_token_group_claim_parser_fails_closed_for_malformed_claims() {
+        let non_array: IdTokenClaims = serde_json::from_value(serde_json::json!({
+            "sub": "u",
+            "cognito:groups": "platform"
+        }))
+        .unwrap();
+        let err = non_array
+            .external_groups_from_claim("cognito:groups")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("array of strings"));
+
+        let non_string_member: IdTokenClaims = serde_json::from_value(serde_json::json!({
+            "sub": "u",
+            "cognito:groups": ["platform", 123]
+        }))
+        .unwrap();
+        let err = non_string_member
+            .external_groups_from_claim("cognito:groups")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("array of strings"));
+
+        let empty_member: IdTokenClaims = serde_json::from_value(serde_json::json!({
+            "sub": "u",
+            "cognito:groups": ["platform", ""]
+        }))
+        .unwrap();
+        let err = empty_member
+            .external_groups_from_claim("cognito:groups")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty group name"));
+    }
+
+    #[test]
+    fn oidc_client_extracts_groups_using_configured_claim_name() {
+        let mut config = test_config();
+        config.group_claim_name = "groups".into();
+        let client = OidcClient::new(config);
+        let claims: IdTokenClaims = serde_json::from_value(serde_json::json!({
+            "sub": "u",
+            "groups": ["platform"]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            client.external_groups_from_claims(&claims).unwrap(),
+            vec!["platform"]
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════

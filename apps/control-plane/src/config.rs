@@ -81,6 +81,8 @@ pub struct OidcConfig {
     pub client_secret: Option<String>,
     #[serde(default = "default_scopes")]
     pub scopes: Vec<String>,
+    #[serde(default = "default_group_claim_name")]
+    pub group_claim_name: String,
     /// Optional OIDC auth request controls for provider-enforced MFA.
     #[serde(default)]
     pub acr_values: Vec<String>,
@@ -109,6 +111,10 @@ pub struct OidcConfig {
 
 fn default_scopes() -> Vec<String> {
     vec!["openid".into(), "profile".into(), "email".into()]
+}
+
+fn default_group_claim_name() -> String {
+    "cognito:groups".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -398,6 +404,7 @@ impl AppConfig {
                 client_id: "dev-client-id".into(),
                 client_secret: None,
                 scopes: default_scopes(),
+                group_claim_name: default_group_claim_name(),
                 acr_values: vec![],
                 prompt: None,
                 max_age_seconds: None,
@@ -438,6 +445,9 @@ impl AppConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        if self.oidc.group_claim_name.trim().is_empty() {
+            anyhow::bail!("oidc.group_claim_name must not be empty");
+        }
         self.validate_database_tls()?;
         self.audit_export.validate()?;
         self.mcp.validate()?;
@@ -485,6 +495,7 @@ mod tests {
         assert!(!config.dev_mode); // default false
         assert_eq!(config.jwt.expiry_seconds, 3600); // default
         assert_eq!(config.oidc.scopes, vec!["openid", "profile", "email"]); // default
+        assert_eq!(config.oidc.group_claim_name, "cognito:groups"); // default
         assert_eq!(
             config.aws.sts_external_id.as_deref(),
             Some("canopy") // default
@@ -526,6 +537,7 @@ mod tests {
             client_id = "cid"
             client_secret = "csecret"
             scopes = ["openid"]
+            group_claim_name = "groups"
             acr_values = ["urn:mfa"]
             prompt = "login"
             max_age_seconds = 300
@@ -585,6 +597,7 @@ mod tests {
         assert_eq!(s3.prefix, "prod/");
         assert_eq!(config.jwt.expiry_seconds, 7200);
         assert_eq!(config.oidc.client_secret.as_deref(), Some("csecret"));
+        assert_eq!(config.oidc.group_claim_name, "groups");
         assert_eq!(config.oidc.acr_values, vec!["urn:mfa"]);
         assert_eq!(config.oidc.prompt.as_deref(), Some("login"));
         assert_eq!(config.oidc.max_age_seconds, Some(300));
@@ -622,6 +635,25 @@ mod tests {
         .unwrap();
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_empty_oidc_group_claim_name() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [oidc]
+            issuer_url = "x"
+            client_id = "x"
+            group_claim_name = " "
+            [jwt]
+            secret = "x"
+            [aws]
+        "#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("group_claim_name"));
     }
 
     #[test]

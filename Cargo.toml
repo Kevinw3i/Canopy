@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "apps/tui-client",
     "apps/control-plane",
+    "apps/entitlements-cli",
+    "crates/entitlements",
     "crates/shared",
 ]
 
@@ -19,6 +21,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1"
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }

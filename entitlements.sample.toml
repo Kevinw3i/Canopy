@@ -6,8 +6,9 @@
 #   編輯後填入你的 AWS 帳號、區域、Role ARN
 #
 # 結構：
-#   [[rules]]       — 每個群組一組權限規則
-#   [[memberships]] — 使用者 ID 到群組的對應
+#   [[rules]]          — 每個 Canopy 群組一組權限規則
+#   [[group_mappings]] — 外部 IdP/Cognito 群組到 Canopy 群組的對應
+#   [[memberships]]    — 本地使用者 ID 到 Canopy 群組的對應（fallback / dev）
 #
 # ── role_arn 三種模式 ────────────────────────────────
 #
@@ -302,10 +303,25 @@ role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyRole"  # ← 改成你的 Role 
 # role_arn = "arn:aws:iam::<ACCOUNT_ID>:role/CanopyReadOnly"
 
 
-# ── 使用者 → 群組對應 ────────────────────────────────
+# ── Cognito / IdP 群組 → Canopy 群組對應 ─────────────
+#
+# production 建議用 Cognito User Pool group 管理成員，再在這裡
+# 對應到 Canopy 授權群組。external_group 大小寫敏感。
+
+# [[group_mappings]]
+# external_group = "CanopyPlatformEngineering"
+# canopy_group = "platform-engineering"
+
+# [[group_mappings]]
+# external_group = "CanopyReadonlyOps"
+# canopy_group = "readonly-ops"
+
+
+# ── 本地使用者 → Canopy 群組對應 ─────────────────────
 #
 # user_id 對應 OIDC 的 sub 或 email claim（production 模式）
-# 或 dev-login 的 username（dev 模式）
+# 或 dev-login 的 username（dev 模式）。production 逐步遷移到
+# [[group_mappings]] 後，這裡可保留作 fallback / break-glass。
 
 [[memberships]]
 user_id = "admin@example.com"                  # ← 改成你的 OIDC email

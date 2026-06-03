@@ -37,6 +37,7 @@ fn dev_config() -> AppConfig {
             issuer_url: "https://example.com".into(),
             client_id: "test-client".into(),
             client_secret: None,
+            group_claim_name: "cognito:groups".into(),
             scopes: vec!["openid".into()],
             acr_values: vec![],
             prompt: None,

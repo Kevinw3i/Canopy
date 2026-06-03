@@ -1,0 +1,147 @@
+# ============================================================
+# Entitlement catalog sample
+#
+# Use this file when you want a higher-level source of truth for
+# accounts, reusable scopes, packages, group bindings, Cognito group
+# mappings, and fallback memberships.
+#
+# Typical workflow:
+#   cp entitlements.catalog.sample.toml entitlements.catalog.toml
+#   cargo run -p canopy-entitlements -- generate \
+#     --catalog entitlements.catalog.toml \
+#     --output entitlements.generated.toml
+#
+# The control-plane still loads the generated runtime file. Set
+# `entitlements_file = "entitlements.generated.toml"` in config.toml
+# and pass the same file to deployment scripts.
+# ============================================================
+
+[[accounts]]
+id = "prod"
+account_id = "123456789012"
+name = "production"
+
+[[accounts]]
+id = "staging"
+account_id = "234567890123"
+name = "staging"
+
+[[roles]]
+id = "canopy-readonly"
+role_arn = "arn:aws:iam::{account_id}:role/CanopyReadOnlyRole"
+
+[[roles]]
+id = "canopy-operator"
+role_arn = "arn:aws:iam::{account_id}:role/CanopyOperatorRole"
+
+[[scopes]]
+id = "prod-observability"
+accounts = ["prod"]
+regions = ["ap-northeast-1"]
+log_group_arns = [
+    "arn:aws:logs:ap-northeast-1:123456789012:log-group:/aws/ecs/prod-*",
+]
+clusters = ["prod-*"]
+os_users = ["ec2-user", "ubuntu"]
+excluded_container_names = ["envoy", "otel-collector"]
+
+[scopes.metadata]
+description = "Production ECS, EC2, CloudWatch, and database scope"
+
+[[scopes.metadata.scopes]]
+platform = "core-platform"
+environment = "production"
+aliases = ["prod", "正式環境"]
+
+[[scopes.instance_tag_selectors]]
+[scopes.instance_tag_selectors.tags]
+Environment = ["production"]
+
+[[scopes.task_tag_selectors]]
+[scopes.task_tag_selectors.tags]
+Environment = ["production"]
+
+[[scopes.excluded_task_tag_selectors]]
+[scopes.excluded_task_tag_selectors.tags]
+Sensitivity = ["restricted"]
+
+[[scopes.database_scopes]]
+name = "orders_prod_readonly"
+connection = "orders_prod"
+environment = "production"
+allowed_schemas = ["orders"]
+allowed_tables = ["orders", "order_items"]
+allowed_actions = ["select"]
+max_rows = 100
+statement_timeout_ms = 5000
+require_explain = true
+max_examined_rows = 10000
+allow_full_table_scan = false
+allow_views = false
+
+[[scopes]]
+id = "staging-readonly"
+accounts = ["staging"]
+regions = ["us-west-2"]
+log_group_arns = [
+    "arn:aws:logs:us-west-2:234567890123:log-group:/aws/ecs/staging-*",
+]
+clusters = ["staging-*"]
+
+[[packages]]
+id = "prod-observability"
+features = [
+    "ec2:view",
+    "ecs:view",
+    "cloudwatch:search",
+    "cloudwatch:tail",
+    "mcp:use",
+    "mcp:cloudwatch",
+    "mcp:database",
+]
+scope = "prod-observability"
+role = "canopy-readonly"
+max_session_seconds = 3600
+
+[[packages]]
+id = "prod-ecs-exec"
+features = ["ecs:view", "ecs:exec"]
+scope = "prod-observability"
+role = "canopy-operator"
+max_session_seconds = 1800
+
+[[packages]]
+id = "staging-readonly"
+features = ["ec2:view", "ecs:view", "cloudwatch:search"]
+scope = "staging-readonly"
+role = "canopy-readonly"
+
+[[bindings]]
+group = "platform-engineering"
+package = "prod-observability"
+
+[[bindings]]
+group = "platform-engineering"
+package = "prod-ecs-exec"
+
+[[bindings]]
+group = "readonly-ops"
+package = "staging-readonly"
+
+[[group_mappings]]
+external_group = "canopy-platform-engineering"
+canopy_group = "platform-engineering"
+
+[[group_mappings]]
+external_group = "canopy-readonly-ops"
+canopy_group = "readonly-ops"
+
+# Fallback / break-glass memberships. Production users normally arrive
+# through Cognito group_mappings instead.
+[[memberships]]
+user_id = "break-glass@company.internal"
+group = "platform-engineering"
+
+[[memberships]]
+user_id = "auditor@company.internal"
+group = "readonly-ops"

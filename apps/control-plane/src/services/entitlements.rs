@@ -3,8 +3,10 @@ use shared::dto::entitlements::{AllowedAccount, FeatureFlags, UserEntitlements};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::models::entitlements::EntitlementStore;
 use crate::services::auth::Claims;
+use entitlements::EntitlementStore;
+
+pub use entitlements::arn_matches_pattern;
 
 pub struct EntitlementService {
     store: Arc<RwLock<EntitlementStore>>,
@@ -18,12 +20,7 @@ impl EntitlementService {
     /// Evaluate entitlements for authenticated user from JWT claims
     pub async fn evaluate(&self, claims: &Claims) -> UserEntitlements {
         let store = self.store.read().await;
-        store.evaluate(
-            &claims.sub,
-            &claims.email,
-            &claims.name,
-            claims.email_verified,
-        )
+        store.evaluate_for_groups(&claims.groups, &claims.sub, &claims.email, &claims.name)
     }
 
     /// Scope-aware feature check: verifies that at least one single rule
@@ -39,10 +36,8 @@ impl EntitlementService {
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> bool {
         let store = self.store.read().await;
-        store.has_feature_for_scope(
-            &claims.sub,
-            &claims.email,
-            claims.email_verified,
+        store.has_feature_for_scope_for_groups(
+            &claims.groups,
             account_id,
             region,
             log_group_arn,
@@ -62,13 +57,8 @@ impl EntitlementService {
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> Vec<String> {
         let store = self.store.read().await;
-        let rules = store.matching_rules_for_scope(
-            &claims.sub,
-            &claims.email,
-            claims.email_verified,
-            account_id,
-            feature_check,
-        );
+        let rules =
+            store.matching_rules_for_scope_for_groups(&claims.groups, account_id, feature_check);
         let mut arns = Vec::new();
         for rule in rules {
             // Only include patterns from rules that also grant this region
@@ -97,10 +87,8 @@ impl EntitlementService {
         log_group_names: &[String],
     ) -> bool {
         let store = self.store.read().await;
-        store.mcp_cloudwatch_raw_audit_plaintext_allowed(
-            &claims.sub,
-            &claims.email,
-            claims.email_verified,
+        store.mcp_cloudwatch_raw_audit_plaintext_allowed_for_groups(
+            &claims.groups,
             account_id,
             region,
             log_group_names,
@@ -118,13 +106,8 @@ impl EntitlementService {
         feature_check: impl Fn(&FeatureFlags) -> bool,
     ) -> Vec<AllowedAccount> {
         let store = self.store.read().await;
-        let rules = store.matching_rules_for_scope(
-            &claims.sub,
-            &claims.email,
-            claims.email_verified,
-            account_id,
-            feature_check,
-        );
+        let rules =
+            store.matching_rules_for_scope_for_groups(&claims.groups, account_id, feature_check);
         let mut accounts = Vec::new();
 
         for rule in rules {
@@ -169,14 +152,7 @@ impl EntitlementService {
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> Vec<(shared::dto::entitlements::AllowedAccount, Vec<String>)> {
         let store = self.store.read().await;
-        let user_groups: Vec<String> = store
-            .memberships
-            .iter()
-            .filter(|m| {
-                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
-            })
-            .map(|m| m.group.clone())
-            .collect();
+        let user_groups = &claims.groups;
 
         let mut result = Vec::new();
         for rule in &store.rules {
@@ -209,14 +185,7 @@ impl EntitlementService {
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> Vec<crate::services::ec2::RuleScope> {
         let store = self.store.read().await;
-        let user_groups: Vec<String> = store
-            .memberships
-            .iter()
-            .filter(|m| {
-                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
-            })
-            .map(|m| m.group.clone())
-            .collect();
+        let user_groups = &claims.groups;
 
         store
             .rules
@@ -248,14 +217,7 @@ impl EntitlementService {
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> Vec<AllowedAccount> {
         let store = self.store.read().await;
-        let user_groups: Vec<String> = store
-            .memberships
-            .iter()
-            .filter(|m| {
-                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
-            })
-            .map(|m| m.group.clone())
-            .collect();
+        let user_groups = &claims.groups;
 
         let mut result = Vec::new();
         for rule in &store.rules {
@@ -311,14 +273,7 @@ impl EntitlementService {
         feature_check: impl Fn(&shared::dto::entitlements::FeatureFlags) -> bool,
     ) -> Vec<crate::services::ecs::EcsRuleScope> {
         let store = self.store.read().await;
-        let user_groups: Vec<String> = store
-            .memberships
-            .iter()
-            .filter(|m| {
-                m.user_id == claims.sub || (claims.email_verified && m.user_id == claims.email)
-            })
-            .map(|m| m.group.clone())
-            .collect();
+        let user_groups = &claims.groups;
 
         store
             .rules
@@ -409,38 +364,6 @@ impl EntitlementService {
             .iter()
             .any(|pattern| arn_matches_pattern(pattern, log_group_arn))
     }
-}
-
-/// Simple ARN pattern matcher supporting * wildcards
-pub fn arn_matches_pattern(pattern: &str, arn: &str) -> bool {
-    let pattern_parts: Vec<&str> = pattern.split('*').collect();
-    if pattern_parts.len() == 1 {
-        return pattern == arn;
-    }
-
-    let mut remaining = arn;
-    for (i, part) in pattern_parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            if !remaining.starts_with(part) {
-                return false;
-            }
-            remaining = &remaining[part.len()..];
-        } else if i == pattern_parts.len() - 1 {
-            if !remaining.ends_with(part) {
-                return false;
-            }
-            return true;
-        } else {
-            match remaining.find(part) {
-                Some(pos) => remaining = &remaining[pos + part.len()..],
-                None => return false,
-            }
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -537,11 +460,17 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn test_claims(sub: &str, email: &str) -> Claims {
+        let groups = match sub {
+            "alice" => vec!["eng".into()],
+            "bob" => vec!["ops".into()],
+            "charlie" => vec!["eng".into(), "ops".into()],
+            _ => vec![],
+        };
         Claims {
             sub: sub.into(),
             email: email.into(),
             name: sub.into(),
-            groups: vec![],
+            groups,
             exp: 9999999999,
             iat: 0,
             jti: "test-token".into(),
@@ -615,6 +544,7 @@ mod tests {
                     database_scopes: vec![],
                 },
             ],
+            group_mappings: vec![],
             memberships: vec![
                 GroupMembership {
                     user_id: "alice".into(),
@@ -651,6 +581,20 @@ mod tests {
         assert!(!ent.features.can_use_ssm, "eng group should not have SSM");
         assert_eq!(ent.allowed_accounts.len(), 1);
         assert_eq!(ent.allowed_accounts[0].account_id, "111");
+    }
+
+    #[tokio::test]
+    async fn evaluate_uses_claim_groups_instead_of_local_memberships() {
+        let svc = make_service();
+        let mut claims = test_claims("alice", "alice@example.com");
+        claims.groups = vec!["ops".into()];
+
+        let ent = svc.evaluate(&claims).await;
+
+        assert_eq!(ent.groups, vec!["ops"]);
+        assert!(ent.features.can_use_ssm, "ops group should grant SSM");
+        assert!(ent.allowed_accounts.iter().any(|a| a.account_id == "222"));
+        assert!(!ent.allowed_accounts.iter().any(|a| a.account_id == "111"));
     }
 
     #[tokio::test]

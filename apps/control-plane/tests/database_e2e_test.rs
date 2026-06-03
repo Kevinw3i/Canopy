@@ -221,6 +221,7 @@ fn config_with_testcontainers(port: u16, audit_log_path: &std::path::Path) -> Ap
             client_id: "test".into(),
             client_secret: None,
             scopes: vec!["openid".into()],
+            group_claim_name: "cognito:groups".into(),
             acr_values: vec![],
             prompt: None,
             max_age_seconds: None,

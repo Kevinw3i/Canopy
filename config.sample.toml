@@ -51,6 +51,7 @@ issuer_url = "https://accounts.google.com"   # OIDC Provider 的 issuer URL
 client_id = "your-client-id"                 # 從 OIDC Provider 取得
 # client_secret = "<oidc-client-secret>"     # 公開 PKCE 客戶端可省略
 scopes = ["openid", "profile", "email"]
+# group_claim_name = "cognito:groups"        # 預設；其他 IdP 可改成 "groups" 等 claim
 
 # 可選：要求 OIDC Provider 執行 MFA / re-auth。
 # 實際 MFA 方式由 Provider（Okta、Azure AD、Cognito 等）與其 policy 決定。

@@ -1389,7 +1389,7 @@ async fn list_database_scopes(
 
     let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
     let store = state.entitlement_store.read().await;
-    let scopes = store.database_scopes_for_user(&claims.sub, &claims.email, claims.email_verified);
+    let scopes = store.database_scopes_for_groups(&claims.groups);
     let has_database_feature = !scopes.is_empty();
 
     if !has_database_feature {
@@ -1533,10 +1533,8 @@ async fn query_database(
     }
 
     let store = state.entitlement_store.read().await;
-    let Some(scope) = store.matching_database_scope(
-        &claims.sub,
-        &claims.email,
-        claims.email_verified,
+    let Some(scope) = store.matching_database_scope_for_groups(
+        &claims.groups,
         &req.scope,
         req.connection.as_deref(),
         req.environment.as_deref(),
