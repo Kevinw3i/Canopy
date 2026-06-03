@@ -1299,8 +1299,87 @@ async fn mcp_ec2_diagnostics_scope_passes_but_dispatch_backend_fails_closed() {
         event["metadata"]["allowlist_rule_id"],
         "allow-nginx-error-v1"
     );
+    assert_eq!(event["metadata"]["authorized_account_id"], "111111111111");
+    assert_eq!(event["metadata"]["authorized_account_name"], "production");
+    assert_eq!(
+        event["metadata"]["authorized_credential_mode"],
+        "assume_role"
+    );
+    assert!(event["metadata"].get("role_arn").is_none());
     assert_eq!(event["metadata"]["raw_command_recorded"], false);
     assert_eq!(event["metadata"]["remote_output_recorded"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_rejects_cross_rule_account_ambiguity_without_dispatch() {
+    let audit = AuditFile::new("mcp-ec2-account-ambiguous");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    grant_mcp_ec2_diagnostics(&state).await;
+    {
+        let mut store = state.entitlement_store.write().await;
+        store.rules.push(EntitlementRule {
+            id: "rule-mcp-ec2-diagnostics-direct-duplicate".into(),
+            group: "platform-engineering".into(),
+            metadata: RuleMetadata::default(),
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_ec2: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![AllowedAccount {
+                account_id: "111111111111".into(),
+                account_name: "production-direct".into(),
+                role_arn: "direct".into(),
+            }],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![mcp_ec2_diagnostic_scope()],
+        });
+    }
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/error.log",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "ambiguous_target_account"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert!(event["metadata"].get("authorized_account_id").is_none());
+    assert!(event["metadata"]
+        .get("authorized_credential_mode")
+        .is_none());
+    assert!(event["metadata"].get("role_arn").is_none());
 }
 
 #[tokio::test]
@@ -1389,6 +1468,67 @@ async fn mcp_ec2_diagnostics_result_rejects_command_owned_by_other_actor() {
         event["metadata"]["mcp_ec2_command_id"],
         "cmd_owned_by_other"
     );
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_result_owned_command_does_not_fabricate_account_metadata() {
+    let audit = AuditFile::new("mcp-ec2-result-owned-backend-unavailable");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state.clone());
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    state
+        .mcp_ec2_diagnostic_commands
+        .create_command(
+            "cmd_owned_by_actor".into(),
+            mcp_ec2_command_record("dev-admin", &session_id, &local_secret_generation),
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/mcp/ec2/diagnostics/cmd_owned_by_actor?canopy_mcp_session_id={session_id}&local_secret_generation={local_secret_generation}&max_bytes=1024"
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_result")
+        .unwrap();
+    assert_eq!(event["outcome"], "failure");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "result_backend_unavailable"
+    );
+    assert_eq!(
+        event["metadata"]["mcp_ec2_command_id"],
+        "cmd_owned_by_actor"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert_eq!(
+        event["metadata"]["allowlist_rule_id"],
+        "allow-nginx-error-v1"
+    );
+    assert_eq!(event["metadata"]["command_scope_id"], "nginx-error-tail");
+    assert!(event["metadata"].get("authorized_account_id").is_none());
+    assert!(event["metadata"].get("authorized_account_name").is_none());
+    assert!(event["metadata"]
+        .get("authorized_credential_mode")
+        .is_none());
+    assert!(event["metadata"].get("role_arn").is_none());
 }
 
 #[test]

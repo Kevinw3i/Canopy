@@ -19,7 +19,8 @@ use shared::dto::database::{
     QueryDatabaseResponse,
 };
 use shared::dto::entitlements::{
-    McpEc2DiagnosticScope, McpEc2DnsRecordType as EntitlementDnsRecordType, McpEc2HttpQueryPolicy,
+    AllowedAccount, McpEc2DiagnosticScope, McpEc2DnsRecordType as EntitlementDnsRecordType,
+    McpEc2HttpQueryPolicy,
 };
 use shared::dto::mcp::{
     lookup_mcp_guidance, McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse,
@@ -1630,6 +1631,7 @@ async fn get_ec2_diagnostic_result(
 
     let authorization = AuthorizedMcpEc2DiagnosticCommand {
         entitlement_rule_id: String::new(),
+        account: None,
         allowlist_rule_id: record.allowlist_rule_id.clone(),
         command_scope_id: record.command_scope_id.clone(),
         command_type: record.command_type.clone(),
@@ -4785,6 +4787,7 @@ async fn require_mcp_guidance(
 #[derive(Debug, Clone)]
 struct AuthorizedMcpEc2DiagnosticCommand {
     entitlement_rule_id: String,
+    account: Option<AllowedAccount>,
     allowlist_rule_id: String,
     command_scope_id: String,
     command_type: McpEc2DiagnosticCommandType,
@@ -4833,6 +4836,9 @@ async fn authorize_mcp_ec2_diagnostic_command(
     if grants.is_empty() {
         return Err("no_matching_rule_scope");
     }
+    if mcp_ec2_grants_have_ambiguous_account_identity(&grants) {
+        return Err("ambiguous_target_account");
+    }
 
     let mut metadata_required_candidate = None;
     for grant in grants {
@@ -4848,6 +4854,17 @@ async fn authorize_mcp_ec2_diagnostic_command(
     metadata_required_candidate.ok_or("command_scope_denied")
 }
 
+fn mcp_ec2_grants_have_ambiguous_account_identity(grants: &[McpEc2DiagnosticScopeGrant]) -> bool {
+    let Some(first) = grants.first() else {
+        return false;
+    };
+    grants.iter().any(|grant| {
+        grant.account.account_id != first.account.account_id
+            || grant.account.account_name != first.account.account_name
+            || grant.account.role_arn != first.account.role_arn
+    })
+}
+
 fn authorize_mcp_ec2_command_for_grant(
     grant: &McpEc2DiagnosticScopeGrant,
     command: &McpEc2DiagnosticCommand,
@@ -4857,6 +4874,7 @@ fn authorize_mcp_ec2_command_for_grant(
     }
     Some(AuthorizedMcpEc2DiagnosticCommand {
         entitlement_rule_id: grant.entitlement_rule_id.clone(),
+        account: Some(grant.account.clone()),
         allowlist_rule_id: grant.scope.allowlist_rule_id.clone(),
         command_scope_id: grant.scope.id.clone(),
         command_type: mcp_ec2_command_type(command),
@@ -5029,6 +5047,12 @@ fn audit_mcp_ec2_diagnostics(
     if let Some(authorization) = authorization {
         metadata["entitlement_rule_id"] =
             serde_json::json!(authorization.entitlement_rule_id.as_str());
+        if let Some(account) = authorization.account.as_ref() {
+            metadata["authorized_account_id"] = serde_json::json!(account.account_id.as_str());
+            metadata["authorized_account_name"] = serde_json::json!(account.account_name.as_str());
+            metadata["authorized_credential_mode"] =
+                serde_json::json!(mcp_ec2_credential_mode(account));
+        }
         metadata["allowlist_rule_id"] = serde_json::json!(authorization.allowlist_rule_id.as_str());
         metadata["command_scope_id"] = serde_json::json!(authorization.command_scope_id.as_str());
         metadata["authorized_command_type"] =
@@ -5050,6 +5074,48 @@ fn audit_mcp_ec2_diagnostics(
                 )),
             )
         })
+}
+
+fn mcp_ec2_credential_mode(account: &AllowedAccount) -> &'static str {
+    if account.role_arn == "direct" {
+        "direct"
+    } else if account.role_arn.starts_with("profile:") {
+        "profile"
+    } else {
+        "assume_role"
+    }
+}
+
+#[cfg(test)]
+mod mcp_ec2_diagnostic_tests {
+    use super::*;
+
+    fn account_with_role(role_arn: &str) -> AllowedAccount {
+        AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "test".into(),
+            role_arn: role_arn.into(),
+        }
+    }
+
+    #[test]
+    fn mcp_ec2_credential_mode_classifies_without_exposing_role_arn() {
+        assert_eq!(
+            mcp_ec2_credential_mode(&account_with_role("direct")),
+            "direct"
+        );
+        assert_eq!(
+            mcp_ec2_credential_mode(&account_with_role("profile:ops")),
+            "profile"
+        );
+        assert_eq!(
+            mcp_ec2_credential_mode(&account_with_role(concat!(
+                "arn:aws:iam::111111111111",
+                ":role/CanopyMcpEc2Diagnostics"
+            ),)),
+            "assume_role"
+        );
+    }
 }
 
 fn audit_database_scope_list_denied(
