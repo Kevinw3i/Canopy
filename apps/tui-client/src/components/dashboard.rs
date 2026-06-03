@@ -6,6 +6,7 @@ use ratatui::{
 use shared::dto::entitlements::UserEntitlements;
 
 use super::Component;
+use crate::build_info;
 use crate::event::{Action, Screen};
 use crate::keybindings::{DashboardShortcut, KeyBindings};
 use crate::theme::Theme;
@@ -286,7 +287,7 @@ impl Component for DashboardScreen {
             ])
             .split(inner);
 
-        // Info bar (time + optional IP)
+        // Info bar (time + optional IP + TUI version)
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let info_line = if self.show_public_ip {
             let ip_display = self.public_ip.as_deref().unwrap_or("fetching...");
@@ -302,7 +303,35 @@ impl Component for DashboardScreen {
                 Span::styled(&now, Style::default().fg(self.theme.accent)),
             ])
         };
-        Paragraph::new(info_line).render(chunks[0], buf);
+        let version_label = format!("TUI v{}", build_info::version());
+        let version_width = version_label.chars().count() as u16;
+        let info_gap = 2;
+        let left_width = chunks[0]
+            .width
+            .saturating_sub(version_width.saturating_add(info_gap));
+        let left_area = Rect {
+            width: left_width,
+            ..chunks[0]
+        };
+        let right_width = chunks[0].width.saturating_sub(left_width);
+        let right_area = Rect {
+            x: chunks[0].x + left_width,
+            width: right_width,
+            ..chunks[0]
+        };
+
+        Paragraph::new(info_line).render(left_area, buf);
+        if right_width >= version_width {
+            Paragraph::new(Line::from(vec![
+                Span::styled("TUI ", Style::default().fg(self.theme.muted)),
+                Span::styled(
+                    format!("v{}", build_info::version()),
+                    Style::default().fg(self.theme.accent),
+                ),
+            ]))
+            .alignment(Alignment::Right)
+            .render(right_area, buf);
+        }
 
         // Welcome message
         let welcome_text = if let Some(ref ent) = self.entitlements {
@@ -488,6 +517,14 @@ mod tests {
         let mut buf = Buffer::empty(area);
         screen.render(area, &mut buf);
         buf
+    }
+
+    fn rendered_row(buf: &Buffer, row: usize) -> String {
+        let width = usize::from(buf.area.width);
+        buf.content[row * width..(row + 1) * width]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     fn mcp_sweep_peak_index(buf: &Buffer) -> Option<usize> {
@@ -751,6 +788,23 @@ mod tests {
             .content
             .iter()
             .any(|cell| cell.symbol() != " " && cell.bg == Color::LightGreen));
+    }
+
+    #[test]
+    fn render_info_bar_shows_tui_version_on_right() {
+        let mut screen = DashboardScreen::new(false, true, KeyBindings::default(), test_theme());
+        screen.public_ip = Some("1.2.3.4".into());
+
+        let buf = rendered_buffer(&mut screen);
+        let info_row = rendered_row(&buf, 1);
+        let version_label = format!("TUI v{}", crate::build_info::version());
+
+        assert!(info_row.contains("IP: 1.2.3.4"));
+        assert!(info_row.contains(&version_label));
+        assert!(info_row
+            .trim_end_matches('│')
+            .trim_end()
+            .ends_with(&version_label));
     }
 
     #[test]
