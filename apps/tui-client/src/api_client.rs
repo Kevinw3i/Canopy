@@ -4,6 +4,7 @@ use reqwest::{
     RequestBuilder, StatusCode,
 };
 use serde::de::DeserializeOwned;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -15,10 +16,12 @@ use shared::dto::ec2::*;
 use shared::dto::ecs::*;
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
-    McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse, McpGuidanceSyncRequest,
+    McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse,
+    McpGetEc2DiagnosticResultRequest, McpGetEc2DiagnosticResultResponse, McpGuidanceSyncRequest,
     McpGuidanceSyncResponse, McpListAllowedLogGroupsRequest, McpListAllowedLogGroupsResponse,
-    McpRegisterSessionRequest, McpRegisterSessionResponse, McpRunInsightsQueryRequest,
-    McpRunInsightsQueryResponse, McpSearchLogsRequest, McpSearchLogsResponse,
+    McpRegisterSessionRequest, McpRegisterSessionResponse, McpRunEc2DiagnosticCommandRequest,
+    McpRunEc2DiagnosticCommandResponse, McpRunInsightsQueryRequest, McpRunInsightsQueryResponse,
+    McpSearchLogsRequest, McpSearchLogsResponse,
 };
 use shared::errors::ApiError;
 use shared::headers;
@@ -776,6 +779,71 @@ impl ApiClient {
         let resp = req.send().await?;
         Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
     }
+
+    pub async fn run_mcp_ec2_diagnostic_command(
+        &self,
+        request: &McpRunEc2DiagnosticCommandRequest,
+    ) -> ApiResult<McpRunEc2DiagnosticCommandResponse> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/mcp/ec2/diagnostics/run", self.base_url))
+            .json(request);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+
+    pub async fn get_mcp_ec2_diagnostic_result(
+        &self,
+        request: &McpGetEc2DiagnosticResultRequest,
+    ) -> ApiResult<McpGetEc2DiagnosticResultResponse> {
+        let command_id = encode_path_segment(&request.mcp_ec2_command_id);
+        let query = McpGetEc2DiagnosticResultQuery {
+            canopy_mcp_session_id: request.canopy_mcp_session_id.as_deref(),
+            local_secret_generation: request.local_secret_generation.as_deref(),
+            max_bytes: request.max_bytes,
+        };
+        let mut req = self
+            .client
+            .get(format!(
+                "{}/api/mcp/ec2/diagnostics/{}",
+                self.base_url, command_id
+            ))
+            .query(&query);
+
+        if let Some(ref auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+
+        let resp = req.send().await?;
+        Self::decode_response(resp, AuthBehavior::TreatUnauthorizedAsExpired).await
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct McpGetEc2DiagnosticResultQuery<'a> {
+    canopy_mcp_session_id: Option<&'a str>,
+    local_secret_generation: Option<&'a str>,
+    max_bytes: u64,
+}
+
+fn encode_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => {
+                write!(&mut out, "%{byte:02X}").expect("writing to a string cannot fail");
+            }
+        }
+    }
+    out
 }
 
 /// Generate a random RFC 7636 code verifier (43–128 unreserved characters).

@@ -9,7 +9,9 @@ use control_plane::routes;
 use control_plane::services::audit::AuditService;
 use control_plane::services::database::{DatabaseSecret, DatabaseSecretProvider};
 use control_plane::services::oidc::OidcClient;
-use control_plane::services::{AppState, MemoryMcpSessionStore};
+use control_plane::services::{
+    AppState, MemoryMcpEc2DiagnosticCommandStore, MemoryMcpSessionStore,
+};
 use shared::dto::cloudwatch::{FilterLogEventsRequest, LogGroupsRequest, StartLiveTailRequest};
 use shared::dto::ec2::Ec2ListRequest;
 use shared::dto::ecs::{EcsTasksRequest, DEV_MOCK_CLUSTER_NAME};
@@ -99,6 +101,7 @@ fn build_state(config: AppConfig) -> Arc<AppState> {
         database_secret_provider,
         database_executor,
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
+        mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready: Default::default(),
         db_connection_next_probe: Default::default(),

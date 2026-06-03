@@ -80,7 +80,7 @@ pub struct FeatureFlags {
     /// values encrypted-only in durable audit metadata.
     #[serde(default)]
     pub can_view_mcp_raw_audit_plaintext: bool,
-    /// Reserved for future MCP EC2 tools. Product Phase 3 does not expose EC2 MCP tools.
+    /// Allows scoped MCP EC2 diagnostics when combined with `can_use_mcp`.
     #[serde(default)]
     pub can_use_mcp_ec2: bool,
     /// Allows MCP database tools. The control-plane still enforces

@@ -13,11 +13,13 @@ use shared::dto::database::{ListDatabaseScopesRequest, QueryDatabaseRequest};
 use shared::dto::entitlements::UserEntitlements;
 use shared::dto::mcp::{
     lookup_mcp_guidance_by_id, McpCloudwatchPreflightRequest, McpDescribeCapabilitiesResponse,
-    McpGuardrails, McpGuidanceResponse, McpGuidanceSyncRequest, McpListAllowedLogGroupsRequest,
-    McpRegisterSessionRequest, McpRunInsightsQueryRequest, McpSearchLogsRequest,
-    McpToolAvailability, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY, MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
-    MCP_DATABASE_GUIDANCE_KEY, MCP_GUIDANCE_CATALOG, MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
-    MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
+    McpGetEc2DiagnosticResultRequest, McpGuardrails, McpGuidanceResponse, McpGuidanceSyncRequest,
+    McpListAllowedLogGroupsRequest, McpRegisterSessionRequest, McpRunEc2DiagnosticCommandRequest,
+    McpRunInsightsQueryRequest, McpSearchLogsRequest, McpToolAvailability,
+    MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY, MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
+    MCP_DATABASE_GUIDANCE_KEY, MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY, MCP_GUIDANCE_CATALOG,
+    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PRODUCT_PHASE, MCP_PROTOCOL_VERSION,
+    MCP_SECURITY_BOUNDARIES_KEY,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -534,6 +536,103 @@ fn tools_list(entitlements: &UserEntitlements) -> Value {
             }
         }));
     }
+    if ec2_diagnostics_enabled(entitlements) {
+        tools.push(json!({
+            "name": "canopy_run_ec2_diagnostic_command",
+            "description": "Submit an allowlisted, non-interactive EC2 diagnostic command through Canopy MCP. Requires EC2 diagnostics guidance first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instance_id": { "type": "string" },
+                    "account_id": { "type": "string" },
+                    "region": { "type": "string" },
+                    "command": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "const": "tail_log" },
+                                    "path": { "type": "string" },
+                                    "lines": { "type": "integer", "minimum": 1, "maximum": 500 }
+                                },
+                                "required": ["type", "path", "lines"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "const": "grep_log" },
+                                    "path": { "type": "string" },
+                                    "literal_pattern": { "type": "string" },
+                                    "case_insensitive": { "type": "boolean" },
+                                    "max_matches": { "type": "integer", "minimum": 1, "maximum": 500 }
+                                },
+                                "required": ["type", "path", "literal_pattern", "max_matches"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "const": "journalctl_unit" },
+                                    "unit": { "type": "string" },
+                                    "since": { "type": "string" },
+                                    "lines": { "type": "integer", "minimum": 1, "maximum": 500 }
+                                },
+                                "required": ["type", "unit", "since", "lines"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "const": "http_head" },
+                                    "url": { "type": "string" },
+                                    "max_time_seconds": { "type": "integer", "minimum": 1, "maximum": 30 }
+                                },
+                                "required": ["type", "url", "max_time_seconds"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "const": "tcp_probe" },
+                                    "host": { "type": "string" },
+                                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                                    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 }
+                                },
+                                "required": ["type", "host", "port", "timeout_seconds"],
+                                "additionalProperties": false
+                            },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "const": "dns_lookup" },
+                                    "host": { "type": "string" },
+                                    "record_type": { "type": "string", "enum": ["A", "AAAA", "CNAME"] }
+                                },
+                                "required": ["type", "host", "record_type"],
+                                "additionalProperties": false
+                            }
+                        ]
+                    }
+                },
+                "required": ["instance_id", "account_id", "region", "command"],
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "canopy_get_ec2_diagnostic_result",
+            "description": "Fetch bounded, redacted, untrusted output for a previously submitted EC2 diagnostic command.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "mcp_ec2_command_id": { "type": "string" },
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": 65536 }
+                },
+                "required": ["mcp_ec2_command_id", "max_bytes"],
+                "additionalProperties": false
+            }
+        }));
+    }
 
     json!({ "tools": tools })
 }
@@ -761,6 +860,66 @@ async fn tools_call(state: Arc<McpServerState>, req: JsonRpcRequest) -> Response
                 }
             }
         }
+        "canopy_run_ec2_diagnostic_command" => {
+            if !ec2_diagnostics_enabled(&state.entitlements) {
+                return json_rpc_error(req.id, -32003, "MCP EC2 diagnostics is not enabled");
+            }
+            let mut request: McpRunEc2DiagnosticCommandRequest =
+                match serde_json::from_value(arguments) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        return json_rpc_error(
+                            req.id,
+                            -32602,
+                            &format!("invalid EC2 diagnostic run arguments: {err}"),
+                        )
+                    }
+                };
+            request.canopy_mcp_session_id = Some(state.canopy_mcp_session_id.clone());
+            request.local_secret_generation = Some(state.local_secret_generation.clone());
+            match state.api.run_mcp_ec2_diagnostic_command(&request).await {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(text) => json_rpc_result(req.id, text_content(text)),
+                    Err(_) => {
+                        json_rpc_error(req.id, -32603, "failed to serialize EC2 diagnostic run")
+                    }
+                },
+                Err(err) => {
+                    json_rpc_error(req.id, -32002, &format!("EC2 diagnostic run failed: {err}"))
+                }
+            }
+        }
+        "canopy_get_ec2_diagnostic_result" => {
+            if !ec2_diagnostics_enabled(&state.entitlements) {
+                return json_rpc_error(req.id, -32003, "MCP EC2 diagnostics is not enabled");
+            }
+            let mut request: McpGetEc2DiagnosticResultRequest =
+                match serde_json::from_value(arguments) {
+                    Ok(request) => request,
+                    Err(err) => {
+                        return json_rpc_error(
+                            req.id,
+                            -32602,
+                            &format!("invalid EC2 diagnostic result arguments: {err}"),
+                        )
+                    }
+                };
+            request.canopy_mcp_session_id = Some(state.canopy_mcp_session_id.clone());
+            request.local_secret_generation = Some(state.local_secret_generation.clone());
+            match state.api.get_mcp_ec2_diagnostic_result(&request).await {
+                Ok(response) => match serde_json::to_string_pretty(&response) {
+                    Ok(text) => json_rpc_result(req.id, text_content(text)),
+                    Err(_) => {
+                        json_rpc_error(req.id, -32603, "failed to serialize EC2 diagnostic result")
+                    }
+                },
+                Err(err) => json_rpc_error(
+                    req.id,
+                    -32002,
+                    &format!("EC2 diagnostic result failed: {err}"),
+                ),
+            }
+        }
         _ => json_rpc_error(req.id, -32601, "unknown tool"),
     }
 }
@@ -770,6 +929,7 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
         entitlements.features.can_use_mcp && entitlements.features.can_use_mcp_cloudwatch;
     let database_enabled =
         entitlements.features.can_use_mcp && entitlements.features.can_use_mcp_database;
+    let ec2_diagnostics_enabled = ec2_diagnostics_enabled(entitlements);
     McpDescribeCapabilitiesResponse {
         mcp_product_phase: MCP_PRODUCT_PHASE.into(),
         scope_disclosure: if cloudwatch_enabled {
@@ -857,6 +1017,30 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
                 ],
                 false,
             ),
+            tool(
+                "canopy_run_ec2_diagnostic_command",
+                ec2_diagnostics_enabled,
+                (!ec2_diagnostics_enabled).then_some("entitlement_disabled"),
+                "phase_1_ec2_diagnostics_v1",
+                vec![
+                    MCP_SECURITY_BOUNDARIES_KEY,
+                    MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY,
+                    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+                ],
+                false,
+            ),
+            tool(
+                "canopy_get_ec2_diagnostic_result",
+                ec2_diagnostics_enabled,
+                (!ec2_diagnostics_enabled).then_some("entitlement_disabled"),
+                "phase_1_ec2_diagnostics_v1",
+                vec![
+                    MCP_SECURITY_BOUNDARIES_KEY,
+                    MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY,
+                    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+                ],
+                false,
+            ),
         ],
         business_scopes: if cloudwatch_enabled {
             entitlements.business_scopes.clone()
@@ -864,12 +1048,43 @@ fn describe_capabilities(entitlements: &UserEntitlements) -> McpDescribeCapabili
             vec![]
         },
         guardrails: McpGuardrails::default(),
-        message: if cloudwatch_enabled {
-            "CloudWatch MCP discovery and data tools are enabled. Use canopy_preflight_request before canopy_search_logs or canopy_run_insights_query."
-                .into()
-        } else {
-            "CloudWatch MCP tools are disabled for this user.".into()
-        },
+        message: capabilities_message(
+            cloudwatch_enabled,
+            database_enabled,
+            ec2_diagnostics_enabled,
+        ),
+    }
+}
+
+fn ec2_diagnostics_enabled(entitlements: &UserEntitlements) -> bool {
+    entitlements.features.can_use_mcp && entitlements.features.can_use_mcp_ec2
+}
+
+fn capabilities_message(
+    cloudwatch_enabled: bool,
+    database_enabled: bool,
+    ec2_diagnostics_enabled: bool,
+) -> String {
+    let mut messages = Vec::new();
+    if cloudwatch_enabled {
+        messages.push(
+            "CloudWatch MCP discovery and data tools are enabled. Use canopy_preflight_request before canopy_search_logs or canopy_run_insights_query.",
+        );
+    }
+    if database_enabled {
+        messages.push(
+            "Database MCP tools are enabled. Use canopy_get_guidance before canopy_query_database.",
+        );
+    }
+    if ec2_diagnostics_enabled {
+        messages.push(
+            "EC2 diagnostics MCP tools are enabled for allowlisted non-interactive diagnostics only.",
+        );
+    }
+    if messages.is_empty() {
+        "No MCP data tools are enabled for this user.".into()
+    } else {
+        messages.join(" ")
     }
 }
 
@@ -1205,6 +1420,12 @@ mod tests {
         }
     }
 
+    fn ec2_diagnostics_entitlements() -> UserEntitlements {
+        let mut entitlements = minimal_entitlements();
+        entitlements.features.can_use_mcp_ec2 = true;
+        entitlements
+    }
+
     fn test_state(secret: &str) -> McpServerState {
         McpServerState {
             api: ApiClient::new("http://127.0.0.1").unwrap(),
@@ -1293,6 +1514,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"canopy_describe_capabilities"));
         assert!(names.contains(&"canopy_get_guidance"));
+        assert!(!names.contains(&"canopy_run_ec2_diagnostic_command"));
+        assert!(!names.contains(&"canopy_get_ec2_diagnostic_result"));
 
         let guidance_tool = tool_list
             .iter()
@@ -1302,6 +1525,51 @@ mod tests {
             .as_array()
             .expect("guidance enum is present");
         assert!(!guidance_enum.is_empty());
+    }
+
+    #[test]
+    fn tools_list_includes_ec2_diagnostics_only_with_master_and_ec2_entitlement() {
+        let tools = tools_list(&ec2_diagnostics_entitlements());
+        let tool_list = tools["tools"].as_array().unwrap();
+        let names = tool_list
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"canopy_run_ec2_diagnostic_command"));
+        assert!(names.contains(&"canopy_get_ec2_diagnostic_result"));
+
+        let run_tool = tool_list
+            .iter()
+            .find(|tool| tool["name"] == "canopy_run_ec2_diagnostic_command")
+            .expect("run EC2 diagnostic tool is listed");
+        assert_eq!(
+            run_tool["inputSchema"]["properties"]["command"]["oneOf"]
+                .as_array()
+                .expect("EC2 command variants are listed")
+                .len(),
+            6
+        );
+
+        let result_tool = tool_list
+            .iter()
+            .find(|tool| tool["name"] == "canopy_get_ec2_diagnostic_result")
+            .expect("get EC2 diagnostic result tool is listed");
+        assert_eq!(
+            result_tool["inputSchema"]["properties"]["max_bytes"]["maximum"],
+            65_536
+        );
+
+        let mut missing_master = ec2_diagnostics_entitlements();
+        missing_master.features.can_use_mcp = false;
+        let tools = tools_list(&missing_master);
+        let names = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"canopy_run_ec2_diagnostic_command"));
+        assert!(!names.contains(&"canopy_get_ec2_diagnostic_result"));
     }
 
     #[test]
@@ -1391,6 +1659,69 @@ mod tests {
         assert!(!json.contains("local_secret_generation"));
         assert!(!json.contains("secret_key"));
         assert!(!json.contains("token"));
+    }
+
+    #[test]
+    fn describe_capabilities_reports_ec2_diagnostics_entitlement_gate() {
+        let hidden = describe_capabilities(&minimal_entitlements());
+        let hidden_run = hidden
+            .available_tools
+            .iter()
+            .find(|tool| tool.name == "canopy_run_ec2_diagnostic_command")
+            .expect("EC2 diagnostic run capability is described");
+        assert!(!hidden_run.enabled);
+        assert_eq!(
+            hidden_run.disabled_reason.as_deref(),
+            Some("entitlement_disabled")
+        );
+
+        let visible = describe_capabilities(&ec2_diagnostics_entitlements());
+        let visible_run = visible
+            .available_tools
+            .iter()
+            .find(|tool| tool.name == "canopy_run_ec2_diagnostic_command")
+            .expect("EC2 diagnostic run capability is described");
+        assert!(visible_run.enabled);
+        assert_eq!(
+            visible_run.required_guidance,
+            vec![
+                MCP_SECURITY_BOUNDARIES_KEY.to_string(),
+                MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY.to_string(),
+                MCP_PRIVACY_AND_AUDIT_NOTICE_KEY.to_string(),
+            ]
+        );
+        let visible_result = visible
+            .available_tools
+            .iter()
+            .find(|tool| tool.name == "canopy_get_ec2_diagnostic_result")
+            .expect("EC2 diagnostic result capability is described");
+        assert!(visible_result.enabled);
+        assert!(visible.message.contains("EC2 diagnostics MCP tools"));
+        assert!(visible.message.contains("non-interactive diagnostics only"));
+    }
+
+    #[tokio::test]
+    async fn ec2_diagnostic_tool_call_without_entitlement_is_denied_locally() {
+        let req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "canopy_run_ec2_diagnostic_command",
+                "arguments": {}
+            })),
+        };
+
+        let response = tools_call(Arc::new(test_state("secret")), req).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], -32003);
+        assert_eq!(
+            payload["error"]["message"],
+            "MCP EC2 diagnostics is not enabled"
+        );
     }
 
     #[tokio::test]
