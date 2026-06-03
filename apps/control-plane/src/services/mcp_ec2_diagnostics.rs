@@ -13,7 +13,9 @@ use sha2::{Digest, Sha256};
 use shared::dto::mcp::{
     McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+use crate::config::McpConfig;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpEc2DiagnosticCommandStoreError {
@@ -128,7 +130,9 @@ impl McpEc2DiagnosticCommandStoreClaim {
 pub const MCP_EC2_COMMAND_SPEC_REF_PREFIX: &str = "canopy-ec2-spec:v1:";
 pub const MCP_EC2_COMMAND_SPEC_REF_MAX_LEN: usize = 4036;
 pub const MCP_EC2_COMMAND_SPEC_HELPER_VERSION: &str = "2026-06-04.1";
+pub const MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME: &str = "Canopy-Ec2Diagnostics";
 pub const MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS: i64 = 900;
+pub const MCP_EC2_DIAGNOSTIC_SSM_TIMEOUT_SECONDS: i32 = 120;
 const MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN: usize = 16;
 const MCP_EC2_COMMAND_SPEC_REF_CIPHERTEXT_MAX_LEN: usize = 4000;
 const MCP_EC2_COMMAND_SPEC_REF_MAX_CLOCK_SKEW_SECONDS: i64 = 60;
@@ -383,6 +387,55 @@ pub fn open_mcp_ec2_diagnostic_command_spec_ref(
     Ok(payload)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifiedMcpEc2DiagnosticCommandSpecRef {
+    command_spec_ref: String,
+    helper_version: String,
+    mcp_ec2_command_id: String,
+    instance_id: String,
+}
+
+impl VerifiedMcpEc2DiagnosticCommandSpecRef {
+    pub fn as_str(&self) -> &str {
+        &self.command_spec_ref
+    }
+
+    pub fn helper_version(&self) -> &str {
+        &self.helper_version
+    }
+
+    pub fn mcp_ec2_command_id(&self) -> &str {
+        &self.mcp_ec2_command_id
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
+impl std::fmt::Debug for VerifiedMcpEc2DiagnosticCommandSpecRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedMcpEc2DiagnosticCommandSpecRef")
+            .field("len", &self.command_spec_ref.len())
+            .finish()
+    }
+}
+
+pub fn verify_mcp_ec2_diagnostic_command_spec_ref(
+    key_material: &str,
+    command_spec_ref: &str,
+    binding: &McpEc2DiagnosticCommandSpecRefBinding<'_>,
+) -> Result<VerifiedMcpEc2DiagnosticCommandSpecRef, McpEc2DiagnosticCommandSpecRefError> {
+    let payload =
+        open_mcp_ec2_diagnostic_command_spec_ref(key_material, command_spec_ref, binding)?;
+    Ok(VerifiedMcpEc2DiagnosticCommandSpecRef {
+        command_spec_ref: command_spec_ref.to_string(),
+        helper_version: payload.helper_version,
+        mcp_ec2_command_id: payload.mcp_ec2_command_id,
+        instance_id: payload.instance_id,
+    })
+}
+
 fn open_mcp_ec2_diagnostic_command_spec_ref_unchecked(
     key_material: &str,
     command_spec_ref: &str,
@@ -446,6 +499,221 @@ fn mcp_ec2_command_spec_ref_shape_is_allowed(command_spec_ref: &str) -> bool {
 
 fn is_base64url_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum McpEc2DiagnosticDispatchError {
+    #[error("MCP EC2 diagnostics SSM dispatch is not configured")]
+    DispatchNotConfigured,
+    #[error("MCP EC2 diagnostics SSM document version must be pinned")]
+    UnpinnedDocumentVersion,
+    #[error("MCP EC2 diagnostics SSM dispatch input is invalid: {0}")]
+    InvalidInput(&'static str),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpEc2DiagnosticSsmDispatchRequest {
+    document_name: String,
+    document_version: String,
+    instance_id: String,
+    timeout_seconds: i32,
+    parameters: BTreeMap<String, Vec<String>>,
+    cloudwatch_output_enabled: bool,
+    s3_output_enabled: bool,
+}
+
+impl std::fmt::Debug for McpEc2DiagnosticSsmDispatchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpEc2DiagnosticSsmDispatchRequest")
+            .field("document_name", &self.document_name)
+            .field("document_version", &self.document_version)
+            .field("instance_id", &self.instance_id)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field(
+                "parameter_keys",
+                &self.parameters.keys().collect::<Vec<_>>(),
+            )
+            .field("cloudwatch_output_enabled", &self.cloudwatch_output_enabled)
+            .field("s3_output_enabled", &self.s3_output_enabled)
+            .finish()
+    }
+}
+
+impl McpEc2DiagnosticSsmDispatchRequest {
+    pub fn document_name(&self) -> &str {
+        &self.document_name
+    }
+
+    pub fn document_version(&self) -> &str {
+        &self.document_version
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn timeout_seconds(&self) -> i32 {
+        self.timeout_seconds
+    }
+
+    pub fn parameters(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.parameters
+    }
+
+    pub fn cloudwatch_output_enabled(&self) -> bool {
+        self.cloudwatch_output_enabled
+    }
+
+    pub fn s3_output_enabled(&self) -> bool {
+        self.s3_output_enabled
+    }
+
+    pub fn helper_version(&self) -> Option<&str> {
+        self.parameters
+            .get("helperVersion")
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+
+    pub fn command_spec_ref(&self) -> Option<&str> {
+        self.parameters
+            .get("commandSpecRef")
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    }
+}
+
+pub fn build_mcp_ec2_diagnostic_ssm_dispatch_request(
+    config: &McpConfig,
+    mcp_ec2_command_id: &str,
+    instance_id: &str,
+    command_spec_ref: &VerifiedMcpEc2DiagnosticCommandSpecRef,
+) -> Result<McpEc2DiagnosticSsmDispatchRequest, McpEc2DiagnosticDispatchError> {
+    let document_name = config
+        .ec2_diagnostic_ssm_document_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(McpEc2DiagnosticDispatchError::DispatchNotConfigured)?;
+    if document_name != MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("document_name"));
+    }
+    let document_version = config
+        .ec2_diagnostic_ssm_document_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(McpEc2DiagnosticDispatchError::DispatchNotConfigured)?;
+    if !mcp_ec2_dispatch_document_version_is_pinned(document_version) {
+        return Err(McpEc2DiagnosticDispatchError::UnpinnedDocumentVersion);
+    }
+    if !mcp_ec2_command_id_shape_is_allowed(mcp_ec2_command_id) {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+            "mcp_ec2_command_id",
+        ));
+    }
+    if mcp_ec2_command_id != command_spec_ref.mcp_ec2_command_id() {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+            "mcp_ec2_command_id",
+        ));
+    }
+    if !mcp_ec2_instance_id_shape_is_allowed(instance_id) {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("instance_id"));
+    }
+    if instance_id != command_spec_ref.instance_id() {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("instance_id"));
+    }
+    if !mcp_ec2_command_spec_ref_shape_is_allowed(command_spec_ref.as_str()) {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+            "command_spec_ref",
+        ));
+    }
+
+    let helper_version = match config.ec2_diagnostic_helper_version.as_deref() {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed != MCP_EC2_COMMAND_SPEC_HELPER_VERSION {
+                return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+                    "helper_version",
+                ));
+            }
+            trimmed
+        }
+        None => MCP_EC2_COMMAND_SPEC_HELPER_VERSION,
+    };
+    if !mcp_ec2_helper_version_shape_is_allowed(helper_version) {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+            "helper_version",
+        ));
+    }
+    if helper_version != command_spec_ref.helper_version() {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+            "helper_version",
+        ));
+    }
+    let mut parameters = BTreeMap::new();
+    parameters.insert(
+        "mcpEc2CommandId".into(),
+        vec![mcp_ec2_command_id.to_string()],
+    );
+    parameters.insert(
+        "commandSpecRef".into(),
+        vec![command_spec_ref.as_str().to_string()],
+    );
+    parameters.insert("helperVersion".into(), vec![helper_version.to_string()]);
+
+    Ok(McpEc2DiagnosticSsmDispatchRequest {
+        document_name: document_name.to_string(),
+        document_version: document_version.to_string(),
+        instance_id: instance_id.to_string(),
+        timeout_seconds: MCP_EC2_DIAGNOSTIC_SSM_TIMEOUT_SECONDS,
+        parameters,
+        cloudwatch_output_enabled: false,
+        s3_output_enabled: false,
+    })
+}
+
+fn mcp_ec2_dispatch_document_version_is_pinned(version: &str) -> bool {
+    !version.is_empty()
+        && version != "$LATEST"
+        && version != "$DEFAULT"
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+        && version != "0"
+}
+
+fn mcp_ec2_command_id_shape_is_allowed(command_id: &str) -> bool {
+    let bytes = command_id.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
+}
+
+fn mcp_ec2_instance_id_shape_is_allowed(instance_id: &str) -> bool {
+    let Some(hex) = instance_id.strip_prefix("i-") else {
+        return false;
+    };
+    matches!(hex.len(), 8 | 17) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn mcp_ec2_helper_version_shape_is_allowed(version: &str) -> bool {
+    let Some((date, suffix)) = version.split_once('.') else {
+        return mcp_ec2_is_yyyy_mm_dd(version);
+    };
+    mcp_ec2_is_yyyy_mm_dd(date)
+        && !suffix.is_empty()
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn mcp_ec2_is_yyyy_mm_dd(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
 }
 
 fn mcp_ec2_command_spec_ref_cipher(
@@ -1551,6 +1819,14 @@ mod tests {
         }
     }
 
+    fn ssm_dispatch_config() -> McpConfig {
+        let mut config = McpConfig::default();
+        config.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+        config.ec2_diagnostic_ssm_document_version = Some("7".into());
+        config.ec2_diagnostic_helper_version = Some(MCP_EC2_COMMAND_SPEC_HELPER_VERSION.into());
+        config
+    }
+
     #[test]
     fn command_spec_ref_round_trips_without_exposing_command_fields() {
         let now = Utc::now();
@@ -1708,6 +1984,264 @@ mod tests {
             seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &issued_in_future, now)
                 .unwrap_err(),
             McpEc2DiagnosticCommandSpecRefError::BindingMismatch("issued_at")
+        );
+    }
+
+    #[test]
+    fn command_spec_ref_verification_blocks_shape_valid_untrusted_refs_before_dispatch() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let binding = spec_ref_binding(now, &claim);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+
+        let shape_valid_untrusted = format!(
+            "{}{}.{}",
+            MCP_EC2_COMMAND_SPEC_REF_PREFIX,
+            "A".repeat(MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN),
+            "A".repeat(64)
+        );
+        assert!(mcp_ec2_command_spec_ref_shape_is_allowed(
+            &shape_valid_untrusted
+        ));
+        assert_eq!(
+            verify_mcp_ec2_diagnostic_command_spec_ref(
+                "spec-ref-key",
+                &shape_valid_untrusted,
+                &binding,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::AuthenticationFailed
+        );
+
+        let wrong_target = McpEc2DiagnosticCommandSpecRefBinding {
+            instance_id: "i-11111111111111111",
+            ..spec_ref_binding(now, &claim)
+        };
+        assert_eq!(
+            verify_mcp_ec2_diagnostic_command_spec_ref(
+                "spec-ref-key",
+                &command_spec_ref,
+                &wrong_target,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("instance_id")
+        );
+
+        let verified =
+            verify_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &command_spec_ref, &binding)
+                .unwrap();
+        assert_eq!(verified.as_str(), command_spec_ref.as_str());
+        assert_eq!(verified.mcp_ec2_command_id(), "mcp-ec2-cmd-1");
+        assert_eq!(verified.instance_id(), "i-0123456789abcdef0");
+        assert_eq!(
+            verified.helper_version(),
+            MCP_EC2_COMMAND_SPEC_HELPER_VERSION
+        );
+        assert!(!format!("{verified:?}").contains(&command_spec_ref));
+        assert!(!format!("{verified:?}").contains("/tmp/canopy-safe/app.log"));
+    }
+
+    #[test]
+    fn ssm_dispatch_request_uses_only_opaque_parameters_and_disabled_output_sinks() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
+            "spec-ref-key",
+            &command_spec_ref,
+            &spec_ref_binding(now, &claim),
+        )
+        .unwrap();
+        let request = build_mcp_ec2_diagnostic_ssm_dispatch_request(
+            &ssm_dispatch_config(),
+            "mcp-ec2-cmd-1",
+            "i-0123456789abcdef0",
+            &verified_command_spec_ref,
+        )
+        .unwrap();
+
+        assert_eq!(request.document_name(), "Canopy-Ec2Diagnostics");
+        assert_eq!(request.document_version(), "7");
+        assert_eq!(request.instance_id(), "i-0123456789abcdef0");
+        assert_eq!(
+            request.timeout_seconds(),
+            MCP_EC2_DIAGNOSTIC_SSM_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            request.parameters().keys().cloned().collect::<Vec<_>>(),
+            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
+        );
+        assert_eq!(request.command_spec_ref(), Some(command_spec_ref.as_str()));
+        assert_eq!(
+            request.helper_version(),
+            Some(MCP_EC2_COMMAND_SPEC_HELPER_VERSION)
+        );
+        assert!(!request.cloudwatch_output_enabled());
+        assert!(!request.s3_output_enabled());
+
+        let parameters = format!("{:?}", request.parameters());
+        assert!(!parameters.contains("/tmp/canopy-safe/app.log"));
+        assert!(!parameters.contains("request-id"));
+        assert!(!parameters.contains("grep_log"));
+
+        let request_debug = format!("{request:?}");
+        assert!(!request_debug.contains(&command_spec_ref));
+        assert!(!request_debug.contains("/tmp/canopy-safe/app.log"));
+        assert!(!request_debug.contains("request-id"));
+        assert!(!request_debug.contains("grep_log"));
+    }
+
+    #[test]
+    fn ssm_dispatch_request_fails_closed_without_pinned_config_or_valid_ref() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
+            "spec-ref-key",
+            &command_spec_ref,
+            &spec_ref_binding(now, &claim),
+        )
+        .unwrap();
+
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &McpConfig::default(),
+                "mcp-ec2-cmd-1",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::DispatchNotConfigured
+        );
+
+        let mut unpinned = ssm_dispatch_config();
+        unpinned.ec2_diagnostic_ssm_document_version = Some("$LATEST".into());
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &unpinned,
+                "mcp-ec2-cmd-1",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::UnpinnedDocumentVersion
+        );
+
+        let mut wrong_document = ssm_dispatch_config();
+        wrong_document.ec2_diagnostic_ssm_document_name = Some("OtherDocument".into());
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &wrong_document,
+                "mcp-ec2-cmd-1",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("document_name")
+        );
+
+        let mut invalid_helper = ssm_dispatch_config();
+        invalid_helper.ec2_diagnostic_helper_version = Some("latest".into());
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &invalid_helper,
+                "mcp-ec2-cmd-1",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("helper_version")
+        );
+
+        let mut blank_helper = ssm_dispatch_config();
+        blank_helper.ec2_diagnostic_helper_version = Some("   ".into());
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &blank_helper,
+                "mcp-ec2-cmd-1",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("helper_version")
+        );
+
+        let mut mismatched_helper = ssm_dispatch_config();
+        mismatched_helper.ec2_diagnostic_helper_version = Some("2026-06-04.2".into());
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &mismatched_helper,
+                "mcp-ec2-cmd-1",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("helper_version")
+        );
+
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &ssm_dispatch_config(),
+                "/tmp/canopy-safe/app.log",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("mcp_ec2_command_id")
+        );
+
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &ssm_dispatch_config(),
+                "mcp-ec2-cmd-1",
+                "/tmp/canopy-safe/app.log",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("instance_id")
+        );
+    }
+
+    #[test]
+    fn ssm_dispatch_request_rejects_verified_ref_target_mismatch() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
+            "spec-ref-key",
+            &command_spec_ref,
+            &spec_ref_binding(now, &claim),
+        )
+        .unwrap();
+
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &ssm_dispatch_config(),
+                "mcp-ec2-cmd-2",
+                "i-0123456789abcdef0",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("mcp_ec2_command_id")
+        );
+
+        assert_eq!(
+            build_mcp_ec2_diagnostic_ssm_dispatch_request(
+                &ssm_dispatch_config(),
+                "mcp-ec2-cmd-1",
+                "i-11111111111111111",
+                &verified_command_spec_ref,
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticDispatchError::InvalidInput("instance_id")
         );
     }
 

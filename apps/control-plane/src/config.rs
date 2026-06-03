@@ -2,6 +2,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+const MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME: &str = "Canopy-Ec2Diagnostics";
+const MCP_EC2_DIAGNOSTIC_HELPER_VERSION: &str = "2026-06-04.1";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_bind")]
@@ -185,6 +188,12 @@ pub struct McpConfig {
     pub ec2_diagnostic_command_store: McpEc2DiagnosticCommandStoreKind,
     #[serde(default)]
     pub ec2_diagnostic_command_table_name: Option<String>,
+    #[serde(default)]
+    pub ec2_diagnostic_ssm_document_name: Option<String>,
+    #[serde(default)]
+    pub ec2_diagnostic_ssm_document_version: Option<String>,
+    #[serde(default)]
+    pub ec2_diagnostic_helper_version: Option<String>,
 }
 
 impl McpConfig {
@@ -214,8 +223,52 @@ impl McpConfig {
                  mcp.ec2_diagnostic_command_store = \"dynamodb\""
             );
         }
+        let document_name = self
+            .ec2_diagnostic_ssm_document_name
+            .as_deref()
+            .map(str::trim);
+        let document_version = self
+            .ec2_diagnostic_ssm_document_version
+            .as_deref()
+            .map(str::trim);
+        match (document_name, document_version) {
+            (Some(""), _) => {
+                anyhow::bail!("mcp.ec2_diagnostic_ssm_document_name must not be empty");
+            }
+            (_, Some("")) => {
+                anyhow::bail!("mcp.ec2_diagnostic_ssm_document_version must not be empty");
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "mcp.ec2_diagnostic_ssm_document_name and \
+                     mcp.ec2_diagnostic_ssm_document_version must be configured together"
+                );
+            }
+            (Some(name), Some(_)) if name != MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME => {
+                anyhow::bail!("mcp.ec2_diagnostic_ssm_document_name must be Canopy-Ec2Diagnostics");
+            }
+            (Some(_), Some(version)) if !is_pinned_ssm_document_version(version) => {
+                anyhow::bail!(
+                    "mcp.ec2_diagnostic_ssm_document_version must be a numeric pinned version"
+                );
+            }
+            _ => {}
+        }
+        if let Some(helper_version) = self.ec2_diagnostic_helper_version.as_deref().map(str::trim) {
+            if helper_version != MCP_EC2_DIAGNOSTIC_HELPER_VERSION {
+                anyhow::bail!("mcp.ec2_diagnostic_helper_version must be 2026-06-04.1");
+            }
+        }
         Ok(())
     }
+}
+
+fn is_pinned_ssm_document_version(version: &str) -> bool {
+    !version.is_empty()
+        && version != "$LATEST"
+        && version != "$DEFAULT"
+        && version.bytes().all(|byte| byte.is_ascii_digit())
+        && version != "0"
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -583,6 +636,9 @@ mod tests {
             session_table_name = "canopy-mcp-sessions"
             ec2_diagnostic_command_store = "dynamodb"
             ec2_diagnostic_command_table_name = "canopy-mcp-ec2-diagnostic-commands"
+            ec2_diagnostic_ssm_document_name = "Canopy-Ec2Diagnostics"
+            ec2_diagnostic_ssm_document_version = "7"
+            ec2_diagnostic_helper_version = "2026-06-04.1"
 
             [database_connections.orders_prod]
             engine = "mysql"
@@ -644,6 +700,18 @@ mod tests {
         assert_eq!(
             config.mcp.ec2_diagnostic_command_table_name.as_deref(),
             Some("canopy-mcp-ec2-diagnostic-commands")
+        );
+        assert_eq!(
+            config.mcp.ec2_diagnostic_ssm_document_name.as_deref(),
+            Some("Canopy-Ec2Diagnostics")
+        );
+        assert_eq!(
+            config.mcp.ec2_diagnostic_ssm_document_version.as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            config.mcp.ec2_diagnostic_helper_version.as_deref(),
+            Some("2026-06-04.1")
         );
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);
         let db = config.database_connections.get("orders_prod").unwrap();
@@ -753,6 +821,51 @@ mod tests {
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("mcp.ec2_diagnostic_command_table_name"));
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_ssm_dispatch_requires_pinned_document_pair() {
+        for (name, version, expected) in [
+            (Some("Canopy-Ec2Diagnostics"), None, "configured together"),
+            (None, Some("7"), "configured together"),
+            (Some("OtherDocument"), Some("7"), "Canopy-Ec2Diagnostics"),
+            (
+                Some("Canopy-Ec2Diagnostics"),
+                Some("$LATEST"),
+                "numeric pinned",
+            ),
+            (
+                Some("Canopy-Ec2Diagnostics"),
+                Some("$DEFAULT"),
+                "numeric pinned",
+            ),
+            (Some("Canopy-Ec2Diagnostics"), Some("0"), "numeric pinned"),
+            (Some("Canopy-Ec2Diagnostics"), Some("v7"), "numeric pinned"),
+        ] {
+            let mut config = AppConfig::dev_defaults();
+            config.mcp.ec2_diagnostic_ssm_document_name = name.map(str::to_string);
+            config.mcp.ec2_diagnostic_ssm_document_version = version.map(str::to_string);
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(expected),
+                "expected {expected:?} in validation error {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_helper_version_matches_current_contract() {
+        let mut config = AppConfig::dev_defaults();
+        config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04.1".into());
+        config.validate().unwrap();
+
+        config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04".into());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ec2_diagnostic_helper_version"));
+
+        config.mcp.ec2_diagnostic_helper_version = Some("latest".into());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ec2_diagnostic_helper_version"));
     }
 
     #[test]

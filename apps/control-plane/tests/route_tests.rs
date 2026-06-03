@@ -1405,6 +1405,8 @@ fn mcp_ec2_diagnostics_ssm_document_uses_only_opaque_env_parameters() {
     assert!(document.contains(
         "allowedPattern: '^canopy-ec2-spec:v1:[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{64,4000}$'"
     ));
+    assert!(document.contains("allowedPattern: '^2026-06-04[.]1$'"));
+    assert!(!document.contains("allowedPattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}([.][0-9]+)?$'"));
     assert!(!document.contains("allowedPattern: '^canopy-ec2-spec:[A-Za-z0-9_.:/+=-]{1,256}$'"));
 
     assert!(
