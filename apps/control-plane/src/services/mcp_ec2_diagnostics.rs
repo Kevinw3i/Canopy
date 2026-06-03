@@ -379,6 +379,85 @@ pub fn seal_mcp_ec2_diagnostic_command_spec_ref(
     Ok(command_spec_ref)
 }
 
+mod dispatch_command_spec_ref {
+    pub trait Sealed {}
+}
+
+pub trait McpEc2DiagnosticDispatchCommandSpecRef: dispatch_command_spec_ref::Sealed {
+    fn as_str(&self) -> &str;
+    fn helper_version(&self) -> &str;
+    fn mcp_ec2_command_id(&self) -> &str;
+    fn instance_id(&self) -> &str;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PreparedMcpEc2DiagnosticCommandSpecRef {
+    command_spec_ref: String,
+    helper_version: String,
+    mcp_ec2_command_id: String,
+    instance_id: String,
+}
+
+impl PreparedMcpEc2DiagnosticCommandSpecRef {
+    pub fn as_str(&self) -> &str {
+        &self.command_spec_ref
+    }
+
+    pub fn helper_version(&self) -> &str {
+        &self.helper_version
+    }
+
+    pub fn mcp_ec2_command_id(&self) -> &str {
+        &self.mcp_ec2_command_id
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
+impl std::fmt::Debug for PreparedMcpEc2DiagnosticCommandSpecRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedMcpEc2DiagnosticCommandSpecRef")
+            .field("len", &self.command_spec_ref.len())
+            .finish()
+    }
+}
+
+impl dispatch_command_spec_ref::Sealed for PreparedMcpEc2DiagnosticCommandSpecRef {}
+
+impl McpEc2DiagnosticDispatchCommandSpecRef for PreparedMcpEc2DiagnosticCommandSpecRef {
+    fn as_str(&self) -> &str {
+        &self.command_spec_ref
+    }
+
+    fn helper_version(&self) -> &str {
+        &self.helper_version
+    }
+
+    fn mcp_ec2_command_id(&self) -> &str {
+        &self.mcp_ec2_command_id
+    }
+
+    fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+}
+
+pub fn prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch(
+    key_material: &str,
+    payload: &McpEc2DiagnosticCommandSpecRefPayload,
+    now: DateTime<Utc>,
+) -> Result<PreparedMcpEc2DiagnosticCommandSpecRef, McpEc2DiagnosticCommandSpecRefError> {
+    let command_spec_ref = seal_mcp_ec2_diagnostic_command_spec_ref(key_material, payload, now)?;
+    Ok(PreparedMcpEc2DiagnosticCommandSpecRef {
+        command_spec_ref,
+        helper_version: payload.helper_version.clone(),
+        mcp_ec2_command_id: payload.mcp_ec2_command_id.clone(),
+        instance_id: payload.instance_id.clone(),
+    })
+}
+
 pub fn open_mcp_ec2_diagnostic_command_spec_ref(
     key_material: &str,
     command_spec_ref: &str,
@@ -421,6 +500,26 @@ impl std::fmt::Debug for VerifiedMcpEc2DiagnosticCommandSpecRef {
         f.debug_struct("VerifiedMcpEc2DiagnosticCommandSpecRef")
             .field("len", &self.command_spec_ref.len())
             .finish()
+    }
+}
+
+impl dispatch_command_spec_ref::Sealed for VerifiedMcpEc2DiagnosticCommandSpecRef {}
+
+impl McpEc2DiagnosticDispatchCommandSpecRef for VerifiedMcpEc2DiagnosticCommandSpecRef {
+    fn as_str(&self) -> &str {
+        &self.command_spec_ref
+    }
+
+    fn helper_version(&self) -> &str {
+        &self.helper_version
+    }
+
+    fn mcp_ec2_command_id(&self) -> &str {
+        &self.mcp_ec2_command_id
+    }
+
+    fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 }
 
@@ -594,7 +693,7 @@ pub fn build_mcp_ec2_diagnostic_ssm_dispatch_request(
     config: &McpConfig,
     mcp_ec2_command_id: &str,
     instance_id: &str,
-    command_spec_ref: &VerifiedMcpEc2DiagnosticCommandSpecRef,
+    command_spec_ref: &impl McpEc2DiagnosticDispatchCommandSpecRef,
 ) -> Result<McpEc2DiagnosticSsmDispatchRequest, McpEc2DiagnosticDispatchError> {
     let document_name = config
         .ec2_diagnostic_ssm_document_name
@@ -2397,23 +2496,40 @@ mod tests {
     }
 
     #[test]
+    fn prepared_command_spec_ref_supports_dispatch_before_ssm_command_id_exists() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let prepared =
+            prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch("spec-ref-key", &payload, now)
+                .unwrap();
+
+        assert!(prepared
+            .as_str()
+            .starts_with(MCP_EC2_COMMAND_SPEC_REF_PREFIX));
+        assert_eq!(prepared.mcp_ec2_command_id(), "mcp-ec2-cmd-1");
+        assert_eq!(prepared.instance_id(), "i-0123456789abcdef0");
+        assert_eq!(
+            prepared.helper_version(),
+            MCP_EC2_COMMAND_SPEC_HELPER_VERSION
+        );
+        assert!(!prepared.as_str().contains("/tmp/canopy-safe/app.log"));
+        assert!(!prepared.as_str().contains("request-id"));
+        assert!(!format!("{prepared:?}").contains(prepared.as_str()));
+        assert!(!format!("{prepared:?}").contains("/tmp/canopy-safe/app.log"));
+    }
+
+    #[test]
     fn ssm_dispatch_request_uses_only_opaque_parameters_and_disabled_output_sinks() {
         let now = Utc::now();
         let payload = spec_ref_payload(now);
-        let claim = spec_ref_claim(now);
-        let command_spec_ref =
-            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
-        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
-            "spec-ref-key",
-            &command_spec_ref,
-            &spec_ref_binding(now, &claim),
-        )
-        .unwrap();
+        let prepared_command_spec_ref =
+            prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch("spec-ref-key", &payload, now)
+                .unwrap();
         let request = build_mcp_ec2_diagnostic_ssm_dispatch_request(
             &ssm_dispatch_config(),
             "mcp-ec2-cmd-1",
             "i-0123456789abcdef0",
-            &verified_command_spec_ref,
+            &prepared_command_spec_ref,
         )
         .unwrap();
 
@@ -2428,7 +2544,10 @@ mod tests {
             request.parameters().keys().cloned().collect::<Vec<_>>(),
             vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
         );
-        assert_eq!(request.command_spec_ref(), Some(command_spec_ref.as_str()));
+        assert_eq!(
+            request.command_spec_ref(),
+            Some(prepared_command_spec_ref.as_str())
+        );
         assert_eq!(
             request.helper_version(),
             Some(MCP_EC2_COMMAND_SPEC_HELPER_VERSION)
@@ -2442,7 +2561,7 @@ mod tests {
         assert!(!parameters.contains("grep_log"));
 
         let request_debug = format!("{request:?}");
-        assert!(!request_debug.contains(&command_spec_ref));
+        assert!(!request_debug.contains(prepared_command_spec_ref.as_str()));
         assert!(!request_debug.contains("/tmp/canopy-safe/app.log"));
         assert!(!request_debug.contains("request-id"));
         assert!(!request_debug.contains("grep_log"));
@@ -2602,20 +2721,14 @@ mod tests {
     fn ssm_send_command_input_maps_to_single_target_pinned_document_and_disabled_sinks() {
         let now = Utc::now();
         let payload = spec_ref_payload(now);
-        let claim = spec_ref_claim(now);
-        let command_spec_ref =
-            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
-        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
-            "spec-ref-key",
-            &command_spec_ref,
-            &spec_ref_binding(now, &claim),
-        )
-        .unwrap();
+        let prepared_command_spec_ref =
+            prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch("spec-ref-key", &payload, now)
+                .unwrap();
         let dispatch_request = build_mcp_ec2_diagnostic_ssm_dispatch_request(
             &ssm_dispatch_config(),
             "mcp-ec2-cmd-1",
             "i-0123456789abcdef0",
-            &verified_command_spec_ref,
+            &prepared_command_spec_ref,
         )
         .unwrap();
         let input = build_mcp_ec2_diagnostic_ssm_send_command_input(&dispatch_request).unwrap();
@@ -2640,7 +2753,7 @@ mod tests {
         assert!(!input.s3_output_enabled());
 
         let input_debug = format!("{input:?}");
-        assert!(!input_debug.contains(&command_spec_ref));
+        assert!(!input_debug.contains(prepared_command_spec_ref.as_str()));
         assert!(!input_debug.contains("/tmp/canopy-safe/app.log"));
         assert!(!input_debug.contains("request-id"));
         assert!(!input_debug.contains("grep_log"));
