@@ -1,9 +1,18 @@
+use aes_gcm::{
+    aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
+    Aes256Gcm, Nonce,
+};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::operation::update_item::UpdateItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use shared::dto::mcp::{McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use shared::dto::mcp::{
+    McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
+};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -71,6 +80,396 @@ impl McpEc2DiagnosticCommandCompletion {
                 ))
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpEc2DiagnosticCommandStoreClaim {
+    command_id: String,
+    actor: String,
+    mcp_session_id: String,
+    local_secret_generation: String,
+    aws_ssm_command_id: String,
+    claimed_at: DateTime<Utc>,
+}
+
+impl McpEc2DiagnosticCommandStoreClaim {
+    fn new(
+        command_id: &str,
+        actor: &str,
+        mcp_session_id: &str,
+        local_secret_generation: &str,
+        aws_ssm_command_id: &str,
+        claimed_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            command_id: command_id.to_string(),
+            actor: actor.to_string(),
+            mcp_session_id: mcp_session_id.to_string(),
+            local_secret_generation: local_secret_generation.to_string(),
+            aws_ssm_command_id: aws_ssm_command_id.to_string(),
+            claimed_at,
+        }
+    }
+
+    pub fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    pub fn aws_ssm_command_id(&self) -> &str {
+        &self.aws_ssm_command_id
+    }
+
+    pub fn claimed_at(&self) -> DateTime<Utc> {
+        self.claimed_at
+    }
+}
+
+pub const MCP_EC2_COMMAND_SPEC_REF_PREFIX: &str = "canopy-ec2-spec:v1:";
+pub const MCP_EC2_COMMAND_SPEC_REF_MAX_LEN: usize = 4036;
+pub const MCP_EC2_COMMAND_SPEC_HELPER_VERSION: &str = "2026-06-04.1";
+pub const MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS: i64 = 900;
+const MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN: usize = 16;
+const MCP_EC2_COMMAND_SPEC_REF_CIPHERTEXT_MAX_LEN: usize = 4000;
+const MCP_EC2_COMMAND_SPEC_REF_MAX_CLOCK_SKEW_SECONDS: i64 = 60;
+const MCP_EC2_COMMAND_SPEC_REF_AAD: &[u8] = b"canopy:mcp:ec2-diagnostics:command-spec-ref:v1";
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum McpEc2DiagnosticCommandSpecRefError {
+    #[error("MCP EC2 diagnostic command spec key material is empty")]
+    EmptyKey,
+    #[error("MCP EC2 diagnostic command spec serialization failed")]
+    Serialize,
+    #[error("MCP EC2 diagnostic command spec encryption failed")]
+    Encrypt,
+    #[error("MCP EC2 diagnostic command spec reference exceeds the SSM parameter limit")]
+    TooLarge,
+    #[error("MCP EC2 diagnostic command spec reference format is invalid")]
+    InvalidFormat,
+    #[error("MCP EC2 diagnostic command spec reference encoding is invalid")]
+    InvalidEncoding,
+    #[error("MCP EC2 diagnostic command spec reference nonce is invalid")]
+    InvalidNonce,
+    #[error("MCP EC2 diagnostic command spec reference authentication failed")]
+    AuthenticationFailed,
+    #[error("MCP EC2 diagnostic command spec deserialization failed")]
+    Deserialize,
+    #[error("MCP EC2 diagnostic command spec version is unsupported")]
+    UnsupportedVersion,
+    #[error("MCP EC2 diagnostic command spec binding mismatch: {0}")]
+    BindingMismatch(&'static str),
+    #[error("MCP EC2 diagnostic command spec reference is expired")]
+    Expired,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2DiagnosticCommandSpecRefPayload {
+    pub version: u8,
+    pub helper_version: String,
+    pub mcp_ec2_command_id: String,
+    pub actor: String,
+    pub mcp_session_id: String,
+    pub local_secret_generation: String,
+    pub instance_id: String,
+    pub account_id: String,
+    pub region: String,
+    pub command_type: McpEc2DiagnosticCommandType,
+    pub command: McpEc2DiagnosticCommand,
+    pub one_time_command_store_claim_required: bool,
+    pub allowlist_rule_id: String,
+    pub command_scope_id: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+pub struct McpEc2DiagnosticCommandSpecRefBinding<'a> {
+    pub helper_version: &'a str,
+    pub mcp_ec2_command_id: &'a str,
+    pub actor: &'a str,
+    pub mcp_session_id: &'a str,
+    pub local_secret_generation: &'a str,
+    pub instance_id: &'a str,
+    pub account_id: &'a str,
+    pub region: &'a str,
+    pub allowlist_rule_id: &'a str,
+    pub command_scope_id: &'a str,
+    pub command_store_claim: &'a McpEc2DiagnosticCommandStoreClaim,
+    pub now: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for McpEc2DiagnosticCommandSpecRefPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpEc2DiagnosticCommandSpecRefPayload")
+            .field("version", &self.version)
+            .field("helper_version", &self.helper_version)
+            .field("mcp_ec2_command_id", &self.mcp_ec2_command_id)
+            .field("actor", &self.actor)
+            .field("mcp_session_id", &self.mcp_session_id)
+            .field("local_secret_generation", &self.local_secret_generation)
+            .field("instance_id", &self.instance_id)
+            .field("account_id", &self.account_id)
+            .field("region", &self.region)
+            .field("command_type", &self.command_type)
+            .field("command", &"[redacted]")
+            .field(
+                "one_time_command_store_claim_required",
+                &self.one_time_command_store_claim_required,
+            )
+            .field("allowlist_rule_id", &self.allowlist_rule_id)
+            .field("command_scope_id", &self.command_scope_id)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl McpEc2DiagnosticCommandSpecRefPayload {
+    pub fn validate_binding(
+        &self,
+        binding: &McpEc2DiagnosticCommandSpecRefBinding<'_>,
+    ) -> Result<(), McpEc2DiagnosticCommandSpecRefError> {
+        self.validate_common(binding.now)?;
+        if self.helper_version != binding.helper_version {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "helper_version",
+            ));
+        }
+        if self.mcp_ec2_command_id != binding.mcp_ec2_command_id {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "mcp_ec2_command_id",
+            ));
+        }
+        if self.actor != binding.actor {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "actor",
+            ));
+        }
+        if self.mcp_session_id != binding.mcp_session_id {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "mcp_session_id",
+            ));
+        }
+        if self.local_secret_generation != binding.local_secret_generation {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "local_secret_generation",
+            ));
+        }
+        if self.instance_id != binding.instance_id {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "instance_id",
+            ));
+        }
+        if self.account_id != binding.account_id {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "account_id",
+            ));
+        }
+        if self.region != binding.region {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "region",
+            ));
+        }
+        if self.allowlist_rule_id != binding.allowlist_rule_id {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "allowlist_rule_id",
+            ));
+        }
+        if self.command_scope_id != binding.command_scope_id {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "command_scope_id",
+            ));
+        }
+        if self.mcp_ec2_command_id != binding.command_store_claim.command_id
+            || self.actor != binding.command_store_claim.actor
+            || self.mcp_session_id != binding.command_store_claim.mcp_session_id
+            || self.local_secret_generation != binding.command_store_claim.local_secret_generation
+            || binding.command_store_claim.claimed_at.timestamp() < self.issued_at.timestamp()
+            || binding.command_store_claim.claimed_at.timestamp() > self.expires_at.timestamp()
+            || binding.command_store_claim.claimed_at.timestamp()
+                > (binding.now
+                    + chrono::Duration::seconds(MCP_EC2_COMMAND_SPEC_REF_MAX_CLOCK_SKEW_SECONDS))
+                .timestamp()
+        {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "one_time_command_store_claim",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_common(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(), McpEc2DiagnosticCommandSpecRefError> {
+        if self.version != 1 || self.helper_version != MCP_EC2_COMMAND_SPEC_HELPER_VERSION {
+            return Err(McpEc2DiagnosticCommandSpecRefError::UnsupportedVersion);
+        }
+        if self.command_type != mcp_ec2_command_type_for_spec_ref(&self.command) {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "command_type",
+            ));
+        }
+        if !self.one_time_command_store_claim_required {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "one_time_command_store_claim",
+            ));
+        }
+        if self.expires_at.timestamp() <= self.issued_at.timestamp() {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "expires_at",
+            ));
+        }
+        if self.expires_at.timestamp() - self.issued_at.timestamp()
+            > MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS
+        {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch("ttl"));
+        }
+        if self.issued_at.timestamp()
+            > (now + chrono::Duration::seconds(MCP_EC2_COMMAND_SPEC_REF_MAX_CLOCK_SKEW_SECONDS))
+                .timestamp()
+        {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "issued_at",
+            ));
+        }
+        if self.expires_at.timestamp() < now.timestamp() {
+            return Err(McpEc2DiagnosticCommandSpecRefError::Expired);
+        }
+        Ok(())
+    }
+}
+
+pub fn seal_mcp_ec2_diagnostic_command_spec_ref(
+    key_material: &str,
+    payload: &McpEc2DiagnosticCommandSpecRefPayload,
+    now: DateTime<Utc>,
+) -> Result<String, McpEc2DiagnosticCommandSpecRefError> {
+    payload.validate_common(now)?;
+    let cipher = mcp_ec2_command_spec_ref_cipher(key_material)?;
+    let plaintext =
+        serde_json::to_vec(payload).map_err(|_| McpEc2DiagnosticCommandSpecRefError::Serialize)?;
+    let mut nonce_bytes = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            aes_gcm::aead::Payload {
+                msg: plaintext.as_slice(),
+                aad: MCP_EC2_COMMAND_SPEC_REF_AAD,
+            },
+        )
+        .map_err(|_| McpEc2DiagnosticCommandSpecRefError::Encrypt)?;
+    let command_spec_ref = format!(
+        "{}{}.{}",
+        MCP_EC2_COMMAND_SPEC_REF_PREFIX,
+        URL_SAFE_NO_PAD.encode(nonce_bytes),
+        URL_SAFE_NO_PAD.encode(ciphertext),
+    );
+    if !mcp_ec2_command_spec_ref_shape_is_allowed(&command_spec_ref) {
+        return Err(McpEc2DiagnosticCommandSpecRefError::TooLarge);
+    }
+    Ok(command_spec_ref)
+}
+
+pub fn open_mcp_ec2_diagnostic_command_spec_ref(
+    key_material: &str,
+    command_spec_ref: &str,
+    binding: &McpEc2DiagnosticCommandSpecRefBinding<'_>,
+) -> Result<McpEc2DiagnosticCommandSpecRefPayload, McpEc2DiagnosticCommandSpecRefError> {
+    let payload =
+        open_mcp_ec2_diagnostic_command_spec_ref_unchecked(key_material, command_spec_ref)?;
+    payload.validate_binding(binding)?;
+    Ok(payload)
+}
+
+fn open_mcp_ec2_diagnostic_command_spec_ref_unchecked(
+    key_material: &str,
+    command_spec_ref: &str,
+) -> Result<McpEc2DiagnosticCommandSpecRefPayload, McpEc2DiagnosticCommandSpecRefError> {
+    let cipher = mcp_ec2_command_spec_ref_cipher(key_material)?;
+    if !mcp_ec2_command_spec_ref_shape_is_allowed(command_spec_ref) {
+        return Err(McpEc2DiagnosticCommandSpecRefError::InvalidFormat);
+    }
+    let encoded = command_spec_ref
+        .strip_prefix(MCP_EC2_COMMAND_SPEC_REF_PREFIX)
+        .ok_or(McpEc2DiagnosticCommandSpecRefError::InvalidFormat)?;
+    let (nonce_encoded, ciphertext_encoded) = encoded
+        .split_once('.')
+        .ok_or(McpEc2DiagnosticCommandSpecRefError::InvalidFormat)?;
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(nonce_encoded.as_bytes())
+        .map_err(|_| McpEc2DiagnosticCommandSpecRefError::InvalidEncoding)?;
+    if nonce_bytes.len() != 12 {
+        return Err(McpEc2DiagnosticCommandSpecRefError::InvalidNonce);
+    }
+    let ciphertext = URL_SAFE_NO_PAD
+        .decode(ciphertext_encoded.as_bytes())
+        .map_err(|_| McpEc2DiagnosticCommandSpecRefError::InvalidEncoding)?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            aes_gcm::aead::Payload {
+                msg: ciphertext.as_slice(),
+                aad: MCP_EC2_COMMAND_SPEC_REF_AAD,
+            },
+        )
+        .map_err(|_| McpEc2DiagnosticCommandSpecRefError::AuthenticationFailed)?;
+    let payload: McpEc2DiagnosticCommandSpecRefPayload = serde_json::from_slice(&plaintext)
+        .map_err(|_| McpEc2DiagnosticCommandSpecRefError::Deserialize)?;
+    if payload.version != 1 || payload.helper_version != MCP_EC2_COMMAND_SPEC_HELPER_VERSION {
+        return Err(McpEc2DiagnosticCommandSpecRefError::UnsupportedVersion);
+    }
+    if payload.command_type != mcp_ec2_command_type_for_spec_ref(&payload.command) {
+        return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+            "command_type",
+        ));
+    }
+    Ok(payload)
+}
+
+fn mcp_ec2_command_spec_ref_shape_is_allowed(command_spec_ref: &str) -> bool {
+    if command_spec_ref.len() > MCP_EC2_COMMAND_SPEC_REF_MAX_LEN {
+        return false;
+    }
+    let Some(encoded) = command_spec_ref.strip_prefix(MCP_EC2_COMMAND_SPEC_REF_PREFIX) else {
+        return false;
+    };
+    let Some((nonce, ciphertext)) = encoded.split_once('.') else {
+        return false;
+    };
+    nonce.len() == MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN
+        && (64..=MCP_EC2_COMMAND_SPEC_REF_CIPHERTEXT_MAX_LEN).contains(&ciphertext.len())
+        && nonce.bytes().all(is_base64url_byte)
+        && ciphertext.bytes().all(is_base64url_byte)
+}
+
+fn is_base64url_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
+fn mcp_ec2_command_spec_ref_cipher(
+    key_material: &str,
+) -> Result<Aes256Gcm, McpEc2DiagnosticCommandSpecRefError> {
+    if key_material.is_empty() {
+        return Err(McpEc2DiagnosticCommandSpecRefError::EmptyKey);
+    }
+    let digest = Sha256::digest(key_material.as_bytes());
+    Aes256Gcm::new_from_slice(&digest).map_err(|_| McpEc2DiagnosticCommandSpecRefError::Encrypt)
+}
+
+fn mcp_ec2_command_type_for_spec_ref(
+    command: &McpEc2DiagnosticCommand,
+) -> McpEc2DiagnosticCommandType {
+    match command {
+        McpEc2DiagnosticCommand::TailLog { .. } => McpEc2DiagnosticCommandType::TailLog,
+        McpEc2DiagnosticCommand::GrepLog { .. } => McpEc2DiagnosticCommandType::GrepLog,
+        McpEc2DiagnosticCommand::JournalctlUnit { .. } => {
+            McpEc2DiagnosticCommandType::JournalctlUnit
+        }
+        McpEc2DiagnosticCommand::HttpHead { .. } => McpEc2DiagnosticCommandType::HttpHead,
+        McpEc2DiagnosticCommand::TcpProbe { .. } => McpEc2DiagnosticCommandType::TcpProbe,
+        McpEc2DiagnosticCommand::DnsLookup { .. } => McpEc2DiagnosticCommandType::DnsLookup,
     }
 }
 
@@ -365,7 +764,7 @@ pub trait McpEc2DiagnosticCommandStore: Send + Sync {
         local_secret_generation: &str,
         aws_ssm_command_id: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, McpEc2DiagnosticCommandStoreError>;
+    ) -> Result<Option<McpEc2DiagnosticCommandStoreClaim>, McpEc2DiagnosticCommandStoreError>;
 
     async fn mark_terminal(
         &self,
@@ -453,9 +852,9 @@ impl McpEc2DiagnosticCommandStore for MemoryMcpEc2DiagnosticCommandStore {
         local_secret_generation: &str,
         aws_ssm_command_id: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+    ) -> Result<Option<McpEc2DiagnosticCommandStoreClaim>, McpEc2DiagnosticCommandStoreError> {
         let Some(mut record) = self.commands.get_mut(command_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if record.actor != actor
             || record.mcp_session_id != mcp_session_id
@@ -464,12 +863,19 @@ impl McpEc2DiagnosticCommandStore for MemoryMcpEc2DiagnosticCommandStore {
             || record.status != McpEc2DiagnosticCommandStatus::Queued
             || record.aws_ssm_command_id.is_some()
         {
-            return Ok(false);
+            return Ok(None);
         }
         record.aws_ssm_command_id = Some(aws_ssm_command_id.to_string());
         record.status = McpEc2DiagnosticCommandStatus::Running;
         record.updated_at = now;
-        Ok(true)
+        Ok(Some(McpEc2DiagnosticCommandStoreClaim::new(
+            command_id,
+            actor,
+            mcp_session_id,
+            local_secret_generation,
+            aws_ssm_command_id,
+            now,
+        )))
     }
 
     async fn mark_terminal(
@@ -884,7 +1290,7 @@ impl McpEc2DiagnosticCommandStore for DynamoMcpEc2DiagnosticCommandStore {
         local_secret_generation: &str,
         aws_ssm_command_id: &str,
         now: DateTime<Utc>,
-    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+    ) -> Result<Option<McpEc2DiagnosticCommandStoreClaim>, McpEc2DiagnosticCommandStoreError> {
         let result = self
             .client
             .update_item()
@@ -922,13 +1328,20 @@ impl McpEc2DiagnosticCommandStore for DynamoMcpEc2DiagnosticCommandStore {
             .await;
 
         match result {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(Some(McpEc2DiagnosticCommandStoreClaim::new(
+                command_id,
+                actor,
+                mcp_session_id,
+                local_secret_generation,
+                aws_ssm_command_id,
+                now,
+            ))),
             Err(err)
                 if err
                     .as_service_error()
                     .is_some_and(UpdateItemError::is_conditional_check_failed_exception) =>
             {
-                Ok(false)
+                Ok(None)
             }
             Err(err) => Err(dynamo_backend_error("mark_ec2_diagnostic_dispatched", err)),
         }
@@ -1081,6 +1494,223 @@ mod tests {
         }
     }
 
+    fn spec_ref_payload(now: DateTime<Utc>) -> McpEc2DiagnosticCommandSpecRefPayload {
+        McpEc2DiagnosticCommandSpecRefPayload {
+            version: 1,
+            helper_version: MCP_EC2_COMMAND_SPEC_HELPER_VERSION.into(),
+            mcp_ec2_command_id: "mcp-ec2-cmd-1".into(),
+            actor: "actor-1".into(),
+            mcp_session_id: "mcp-session-1".into(),
+            local_secret_generation: "lsg_1".into(),
+            instance_id: "i-0123456789abcdef0".into(),
+            account_id: "123456789012".into(),
+            region: "ap-northeast-1".into(),
+            command_type: McpEc2DiagnosticCommandType::GrepLog,
+            command: McpEc2DiagnosticCommand::GrepLog {
+                path: "/tmp/canopy-safe/app.log".into(),
+                literal_pattern: "request-id".into(),
+                case_insensitive: true,
+                max_matches: 10,
+            },
+            one_time_command_store_claim_required: true,
+            allowlist_rule_id: "allow-app-log-v1".into(),
+            command_scope_id: "app-log-grep".into(),
+            issued_at: now,
+            expires_at: now + Duration::minutes(5),
+        }
+    }
+
+    fn spec_ref_claim(now: DateTime<Utc>) -> McpEc2DiagnosticCommandStoreClaim {
+        McpEc2DiagnosticCommandStoreClaim::new(
+            "mcp-ec2-cmd-1",
+            "actor-1",
+            "mcp-session-1",
+            "lsg_1",
+            "ssm-command-1",
+            now,
+        )
+    }
+
+    fn spec_ref_binding<'a>(
+        now: DateTime<Utc>,
+        claim: &'a McpEc2DiagnosticCommandStoreClaim,
+    ) -> McpEc2DiagnosticCommandSpecRefBinding<'a> {
+        McpEc2DiagnosticCommandSpecRefBinding {
+            helper_version: MCP_EC2_COMMAND_SPEC_HELPER_VERSION,
+            mcp_ec2_command_id: "mcp-ec2-cmd-1",
+            actor: "actor-1",
+            mcp_session_id: "mcp-session-1",
+            local_secret_generation: "lsg_1",
+            instance_id: "i-0123456789abcdef0",
+            account_id: "123456789012",
+            region: "ap-northeast-1",
+            allowlist_rule_id: "allow-app-log-v1",
+            command_scope_id: "app-log-grep",
+            command_store_claim: claim,
+            now,
+        }
+    }
+
+    #[test]
+    fn command_spec_ref_round_trips_without_exposing_command_fields() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+
+        assert!(command_spec_ref.starts_with(MCP_EC2_COMMAND_SPEC_REF_PREFIX));
+        assert!(command_spec_ref.len() <= MCP_EC2_COMMAND_SPEC_REF_MAX_LEN);
+        assert!(mcp_ec2_command_spec_ref_shape_is_allowed(&command_spec_ref));
+        assert_eq!(
+            MCP_EC2_COMMAND_SPEC_REF_MAX_LEN,
+            MCP_EC2_COMMAND_SPEC_REF_PREFIX.len()
+                + MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN
+                + 1
+                + MCP_EC2_COMMAND_SPEC_REF_CIPHERTEXT_MAX_LEN
+        );
+        assert!(!command_spec_ref.contains("/tmp/canopy-safe/app.log"));
+        assert!(!command_spec_ref.contains("request-id"));
+        assert!(!command_spec_ref.contains("grep_log"));
+        assert!(!format!("{payload:?}").contains("/tmp/canopy-safe/app.log"));
+        assert!(!format!("{payload:?}").contains("request-id"));
+
+        let opened = open_mcp_ec2_diagnostic_command_spec_ref(
+            "spec-ref-key",
+            &command_spec_ref,
+            &spec_ref_binding(now, &claim),
+        )
+        .unwrap();
+        assert_eq!(opened, payload);
+    }
+
+    #[test]
+    fn command_spec_ref_rejects_tampering_wrong_key_and_binding_mismatch() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+
+        assert_eq!(
+            open_mcp_ec2_diagnostic_command_spec_ref(
+                "wrong-key",
+                &command_spec_ref,
+                &spec_ref_binding(now, &claim)
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::AuthenticationFailed
+        );
+
+        let mut tampered = command_spec_ref.clone();
+        let ciphertext_start =
+            MCP_EC2_COMMAND_SPEC_REF_PREFIX.len() + MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN + 1;
+        let replacement = if tampered.as_bytes()[ciphertext_start] == b'A' {
+            'B'
+        } else {
+            'A'
+        };
+        tampered.replace_range(
+            ciphertext_start..ciphertext_start + 1,
+            &replacement.to_string(),
+        );
+        assert_eq!(
+            open_mcp_ec2_diagnostic_command_spec_ref(
+                "spec-ref-key",
+                &tampered,
+                &spec_ref_binding(now, &claim)
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::AuthenticationFailed
+        );
+
+        let wrong_target = McpEc2DiagnosticCommandSpecRefBinding {
+            instance_id: "i-11111111111111111",
+            ..spec_ref_binding(now, &claim)
+        };
+        assert_eq!(
+            payload.validate_binding(&wrong_target).unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("instance_id")
+        );
+
+        let wrong_scope = McpEc2DiagnosticCommandSpecRefBinding {
+            command_scope_id: "different-scope",
+            ..spec_ref_binding(now, &claim)
+        };
+        assert_eq!(
+            payload.validate_binding(&wrong_scope).unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("command_scope_id")
+        );
+
+        let wrong_claim = McpEc2DiagnosticCommandStoreClaim::new(
+            "mcp-ec2-cmd-1",
+            "actor-1",
+            "other-session",
+            "lsg_1",
+            "ssm-command-1",
+            now,
+        );
+        let wrong_claim_binding = spec_ref_binding(now, &wrong_claim);
+        assert_eq!(
+            open_mcp_ec2_diagnostic_command_spec_ref(
+                "spec-ref-key",
+                &command_spec_ref,
+                &wrong_claim_binding
+            )
+            .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("one_time_command_store_claim")
+        );
+
+        let expired = McpEc2DiagnosticCommandSpecRefBinding {
+            now: now + Duration::minutes(10),
+            ..spec_ref_binding(now, &claim)
+        };
+        assert_eq!(
+            payload.validate_binding(&expired).unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::Expired
+        );
+    }
+
+    #[test]
+    fn command_spec_ref_seal_rejects_invalid_lifetime_and_unclaimed_payloads() {
+        let now = Utc::now();
+
+        let mut not_claim_required = spec_ref_payload(now);
+        not_claim_required.one_time_command_store_claim_required = false;
+        assert_eq!(
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &not_claim_required, now)
+                .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("one_time_command_store_claim")
+        );
+
+        let mut expires_before_issued = spec_ref_payload(now);
+        expires_before_issued.expires_at = now;
+        assert_eq!(
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &expires_before_issued, now)
+                .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("expires_at")
+        );
+
+        let mut too_long_ttl = spec_ref_payload(now);
+        too_long_ttl.expires_at =
+            now + Duration::seconds(MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS + 1);
+        assert_eq!(
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &too_long_ttl, now)
+                .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("ttl")
+        );
+
+        let mut issued_in_future = spec_ref_payload(now);
+        issued_in_future.issued_at = now + Duration::minutes(2);
+        issued_in_future.expires_at = issued_in_future.issued_at + Duration::minutes(1);
+        assert_eq!(
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &issued_in_future, now)
+                .unwrap_err(),
+            McpEc2DiagnosticCommandSpecRefError::BindingMismatch("issued_at")
+        );
+    }
+
     #[test]
     fn formatter_wraps_prefixes_strips_controls_and_redacts_sensitive_output() {
         let raw = format!(
@@ -1157,7 +1787,7 @@ mod tests {
             .unwrap();
         assert!(owned.is_some());
 
-        assert!(store
+        let claim = store
             .mark_dispatched(
                 "cmd-1",
                 "actor-1",
@@ -1167,7 +1797,11 @@ mod tests {
                 now + Duration::seconds(1),
             )
             .await
-            .unwrap());
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.command_id(), "cmd-1");
+        assert_eq!(claim.aws_ssm_command_id(), "ssm-command-1");
+        assert_eq!(claim.claimed_at(), now + Duration::seconds(1));
         let dispatched = store.get_command("cmd-1").await.unwrap().unwrap();
         assert_eq!(dispatched.status, McpEc2DiagnosticCommandStatus::Running);
         assert_eq!(
@@ -1212,7 +1846,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(!store
+        assert!(store
             .mark_dispatched(
                 "cmd-1",
                 "actor-1",
@@ -1222,8 +1856,9 @@ mod tests {
                 now,
             )
             .await
-            .unwrap());
-        assert!(!store
+            .unwrap()
+            .is_none());
+        assert!(store
             .mark_dispatched(
                 "cmd-1",
                 "actor-1",
@@ -1233,7 +1868,8 @@ mod tests {
                 now + Duration::minutes(16),
             )
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

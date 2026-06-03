@@ -9,7 +9,7 @@ parameters:
   commandSpecRef:
     type: String
     description: Opaque encrypted or short-lived command-spec reference. Must not contain raw paths, patterns, URLs, hosts, ports, or journal units.
-    allowedPattern: '^canopy-ec2-spec:[A-Za-z0-9_.:/+=-]{1,256}$'
+    allowedPattern: '^canopy-ec2-spec:v1:[A-Za-z0-9_-]{16}\.[A-Za-z0-9_-]{64,4000}$'
     interpolationType: ENV_VAR
   helperVersion:
     type: String

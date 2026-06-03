@@ -1402,6 +1402,10 @@ fn mcp_ec2_diagnostics_ssm_document_uses_only_opaque_env_parameters() {
             "{parameter} parameter missing"
         );
     }
+    assert!(document.contains(
+        "allowedPattern: '^canopy-ec2-spec:v1:[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{64,4000}$'"
+    ));
+    assert!(!document.contains("allowedPattern: '^canopy-ec2-spec:[A-Za-z0-9_.:/+=-]{1,256}$'"));
 
     assert!(
         !document.contains("{{") && !document.contains("}}"),
