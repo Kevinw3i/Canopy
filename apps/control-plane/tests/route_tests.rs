@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use shared::dto::auth::PkceAuthRequest;
 use shared::dto::cloudwatch::LiveTailMessage;
 use shared::dto::entitlements::{
-    AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, RuleMetadata,
+    AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, McpEc2DiagnosticScope,
+    McpEc2LogPathScope, RuleMetadata,
 };
 use shared::dto::mcp::{lookup_mcp_guidance_by_id, MCP_GUIDANCE_CATALOG};
 use std::collections::HashMap;
@@ -1005,6 +1006,296 @@ async fn register_database_guidance_ids(
     }
 
     (session_id, local_secret_generation)
+}
+
+async fn register_ec2_diagnostics_guidance(app: &Router, token: &str) -> (String, String) {
+    register_database_guidance_ids(
+        app,
+        token,
+        &[
+            "security_boundaries",
+            "ec2_diagnostics_workflow",
+            "privacy_and_audit_notice",
+        ],
+    )
+    .await
+}
+
+fn mcp_ec2_diagnostic_scope() -> McpEc2DiagnosticScope {
+    McpEc2DiagnosticScope {
+        id: "nginx-error-tail".into(),
+        allowed_log_paths: vec![McpEc2LogPathScope {
+            path_pattern: "/var/log/nginx/error.log".into(),
+            canonical_safe_prefix: "/var/log/nginx/".into(),
+            safe_for_mcp_output: true,
+        }],
+        allowed_journal_units: vec![],
+        allowed_http_urls: vec![],
+        allowed_tcp_targets: vec![],
+        allowed_dns_targets: vec![],
+        private_target_refs: vec![],
+        max_lines: 100,
+        max_since_seconds: 1800,
+        max_timeout_seconds: 30,
+        max_matches: 25,
+        connectivity_probe_budget_per_window: 10,
+        budget_window_seconds: 600,
+        denylist_version: "2026-06-04".into(),
+        allowlist_rule_id: "allow-nginx-error-v1".into(),
+    }
+}
+
+async fn grant_mcp_ec2_diagnostics(state: &Arc<AppState>) {
+    let mut store = state.entitlement_store.write().await;
+    store.rules.push(EntitlementRule {
+        id: "rule-mcp-ec2-diagnostics".into(),
+        group: "platform-engineering".into(),
+        metadata: RuleMetadata::default(),
+        features: FeatureFlags {
+            can_use_mcp: true,
+            can_use_mcp_ec2: true,
+            ..Default::default()
+        },
+        allowed_accounts: vec![AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "production".into(),
+            role_arn: "arn:aws:iam::111111111111:role/CanopyMcpEc2Diagnostics".into(),
+        }],
+        allowed_regions: vec!["us-east-1".into()],
+        allowed_log_group_arns: vec![],
+        instance_tag_selectors: vec![],
+        excluded_tag_selectors: vec![],
+        allowed_clusters: vec![],
+        task_tag_selectors: vec![],
+        excluded_task_tag_selectors: vec![],
+        excluded_container_names: vec![],
+        allow_broad_cluster_discovery: false,
+        allowed_os_users: vec![],
+        max_session_seconds: None,
+        database_scopes: vec![],
+        mcp_ec2_diagnostic_scopes: vec![mcp_ec2_diagnostic_scope()],
+    });
+}
+
+fn mcp_ec2_run_body(
+    session_id: Option<&str>,
+    local_secret_generation: Option<&str>,
+    path: &str,
+) -> Value {
+    let mut body = json!({
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "command": {
+            "type": "tail_log",
+            "path": path,
+            "lines": 50
+        }
+    });
+    if let Some(session_id) = session_id {
+        body["canopy_mcp_session_id"] = json!(session_id);
+    }
+    if let Some(local_secret_generation) = local_secret_generation {
+        body["local_secret_generation"] = json!(local_secret_generation);
+    }
+    body
+}
+
+async fn post_mcp_ec2_run(app: &Router, token: &str, body: Value) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::post("/api/mcp/ec2/diagnostics/run")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_requires_guidance_session() {
+    let audit = AuditFile::new("mcp-ec2-guidance-required");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    grant_mcp_ec2_diagnostics(&state).await;
+    let app = build_app(state);
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(None, None, "/var/log/nginx/error.log"),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(event["action"], "mcp_ec2_diagnostics");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "mcp_session_required"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_denies_without_ec2_entitlement() {
+    let audit = AuditFile::new("mcp-ec2-entitlement-denied");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/error.log",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "entitlement_disabled"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_rejects_out_of_scope_command_without_dispatch() {
+    let audit = AuditFile::new("mcp-ec2-scope-denied");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    grant_mcp_ec2_diagnostics(&state).await;
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/etc/passwd",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "command_scope_denied"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert_eq!(event["metadata"]["raw_command_recorded"], false);
+    assert!(event["metadata"].get("path").is_none());
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_scope_passes_but_dispatch_backend_fails_closed() {
+    let audit = AuditFile::new("mcp-ec2-backend-unavailable");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    grant_mcp_ec2_diagnostics(&state).await;
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/error.log",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(event["action"], "mcp_ec2_diagnostics");
+    assert_eq!(event["outcome"], "failure");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "dispatch_backend_unavailable"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert_eq!(event["metadata"]["command_scope_id"], "nginx-error-tail");
+    assert_eq!(
+        event["metadata"]["allowlist_rule_id"],
+        "allow-nginx-error-v1"
+    );
+    assert_eq!(event["metadata"]["raw_command_recorded"], false);
+    assert_eq!(event["metadata"]["remote_output_recorded"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_result_unknown_command_is_not_found_and_audited() {
+    let audit = AuditFile::new("mcp-ec2-result-unknown");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/mcp/ec2/diagnostics/cmd_missing?canopy_mcp_session_id={session_id}&local_secret_generation={local_secret_generation}&max_bytes=1024"
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_result")
+        .unwrap();
+    assert_eq!(event["action"], "mcp_ec2_diagnostics");
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "command_not_found_or_not_owned"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
 }
 
 #[tokio::test]

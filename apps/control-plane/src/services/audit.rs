@@ -695,6 +695,7 @@ mod tests {
             AuditAction::McpGuidanceSync,
             AuditAction::McpDatabaseScopeList,
             AuditAction::McpDatabaseQuery,
+            AuditAction::McpEc2Diagnostics,
         ];
         for action in &actions {
             svc.event("test", action.clone(), AuditOutcome::Success)

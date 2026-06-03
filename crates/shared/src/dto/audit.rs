@@ -88,6 +88,10 @@ pub enum AuditAction {
     /// Raw SQL may contain PII or secrets typed by the user; treat audit output
     /// as sensitive and redact at downstream audit/SIEM boundaries as needed.
     McpDatabaseQuery,
+    /// MCP EC2 diagnostics v1 command/result lifecycle. Metadata records only
+    /// command type, target identifiers, scope ids, status, and dispatch state;
+    /// raw command specs and remote output must not be placed in audit events.
+    McpEc2Diagnostics,
     /// Start or confirm local TOTP factor enrollment. Secret material and
     /// verification codes must never be placed in metadata.
     MfaTotpEnroll,
@@ -134,6 +138,7 @@ impl AuditAction {
             Self::McpCloudwatchInsights => "mcp_cloudwatch_insights",
             Self::McpDatabaseScopeList => "mcp_database_scope_list",
             Self::McpDatabaseQuery => "mcp_database_query",
+            Self::McpEc2Diagnostics => "mcp_ec2_diagnostics",
             Self::MfaTotpEnroll => "mfa_totp_enroll",
             Self::MfaTotpVerify => "mfa_totp_verify",
             Self::MfaRecoveryCodesGenerate => "mfa_recovery_codes_generate",
@@ -181,6 +186,7 @@ mod tests {
             AuditAction::McpCloudwatchInsights,
             AuditAction::McpDatabaseScopeList,
             AuditAction::McpDatabaseQuery,
+            AuditAction::McpEc2Diagnostics,
             AuditAction::MfaTotpEnroll,
             AuditAction::MfaTotpVerify,
             AuditAction::MfaRecoveryCodesGenerate,
@@ -219,6 +225,7 @@ mod tests {
             (AuditAction::McpGuidanceSync, "mcp_guidance_sync"),
             (AuditAction::McpDatabaseScopeList, "mcp_database_scope_list"),
             (AuditAction::McpDatabaseQuery, "mcp_database_query"),
+            (AuditAction::McpEc2Diagnostics, "mcp_ec2_diagnostics"),
         ] {
             let json = serde_json::to_value(&action).unwrap();
             assert_eq!(json, expected);

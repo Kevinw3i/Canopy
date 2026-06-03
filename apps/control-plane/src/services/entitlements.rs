@@ -1,5 +1,7 @@
 use shared::dto::ec2::Ec2Instance;
-use shared::dto::entitlements::{AllowedAccount, FeatureFlags, UserEntitlements};
+use shared::dto::entitlements::{
+    AllowedAccount, FeatureFlags, McpEc2DiagnosticScope, UserEntitlements,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -10,6 +12,13 @@ pub use entitlements::arn_matches_pattern;
 
 pub struct EntitlementService {
     store: Arc<RwLock<EntitlementStore>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpEc2DiagnosticScopeGrant {
+    pub entitlement_rule_id: String,
+    pub scope: McpEc2DiagnosticScope,
+    pub requires_instance_metadata: bool,
 }
 
 impl EntitlementService {
@@ -262,6 +271,52 @@ impl EntitlementService {
                 }) {
                     result.push(account.clone());
                 }
+            }
+        }
+        result
+    }
+
+    /// Return rule-local MCP EC2 diagnostic scopes for a target account/region.
+    /// Rules with tag selectors are surfaced as requiring instance metadata so
+    /// callers can fail closed until they have server-resolved EC2 tags.
+    pub async fn mcp_ec2_diagnostic_scope_grants_for_target(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+    ) -> Vec<McpEc2DiagnosticScopeGrant> {
+        let store = self.store.read().await;
+        let user_groups = &claims.groups;
+
+        let mut result = Vec::new();
+        for rule in &store.rules {
+            if !user_groups.contains(&rule.group)
+                || !rule.features.can_use_mcp
+                || !rule.features.can_use_mcp_ec2
+            {
+                continue;
+            }
+            if !rule
+                .allowed_accounts
+                .iter()
+                .any(|account| account.account_id == account_id)
+            {
+                continue;
+            }
+            if !rule.allowed_regions.is_empty()
+                && !rule.allowed_regions.contains(&region.to_string())
+            {
+                continue;
+            }
+
+            let requires_instance_metadata =
+                !rule.instance_tag_selectors.is_empty() || !rule.excluded_tag_selectors.is_empty();
+            for scope in &rule.mcp_ec2_diagnostic_scopes {
+                result.push(McpEc2DiagnosticScopeGrant {
+                    entitlement_rule_id: rule.id.clone(),
+                    scope: scope.clone(),
+                    requires_instance_metadata,
+                });
             }
         }
         result

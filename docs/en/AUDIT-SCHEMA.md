@@ -60,6 +60,7 @@ Current actions:
 - `mcp_cloudwatch_insights`
 - `mcp_database_scope_list`
 - `mcp_database_query`
+- `mcp_ec2_diagnostics`
 - `mfa_totp_enroll`
 - `mfa_totp_verify`
 - `mfa_recovery_codes_generate`
@@ -178,6 +179,7 @@ uses dedicated top-level MCP actions:
 - `mcp_cloudwatch_insights` for MCP CloudWatch Logs Insights start/poll lifecycle events.
 - `mcp_database_scope_list` for MCP Database v1 scope discovery.
 - `mcp_database_query` for MCP Database v1 query events.
+- `mcp_ec2_diagnostics` for MCP EC2 Diagnostics v1 command/result lifecycle metadata. Raw command specs and remote output are not audit fields.
 
 Common MCP metadata can include:
 
