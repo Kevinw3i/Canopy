@@ -225,6 +225,9 @@ mod tests {
             mcp_ec2_diagnostic_commands: Arc::new(
                 crate::services::MemoryMcpEc2DiagnosticCommandStore::new(),
             ),
+            mcp_ec2_diagnostic_aws_config_resolver: Arc::new(
+                crate::services::DefaultMcpEc2DiagnosticAwsConfigResolver,
+            ),
             mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
                 crate::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
             ),

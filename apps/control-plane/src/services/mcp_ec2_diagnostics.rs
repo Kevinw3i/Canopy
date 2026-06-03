@@ -10,12 +10,14 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use shared::dto::entitlements::AllowedAccount;
 use shared::dto::mcp::{
     McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use crate::aws::credentials::SessionContext;
 use crate::config::McpConfig;
 
 #[derive(Debug, thiserror::Error)]
@@ -1024,6 +1026,11 @@ pub trait McpEc2DiagnosticSsmDispatcher: Send + Sync {
         &self,
         input: &McpEc2DiagnosticSsmSendCommandInput,
     ) -> Result<String, McpEc2DiagnosticSsmDispatcherError>;
+
+    async fn cancel(
+        &self,
+        aws_ssm_command_id: &str,
+    ) -> Result<(), McpEc2DiagnosticSsmDispatcherError>;
 }
 
 pub struct AwsMcpEc2DiagnosticSsmDispatcher {
@@ -1052,6 +1059,19 @@ impl McpEc2DiagnosticSsmDispatcher for AwsMcpEc2DiagnosticSsmDispatcher {
             .map(str::to_string)
             .ok_or(McpEc2DiagnosticSsmDispatcherError::MissingCommandId)
     }
+
+    async fn cancel(
+        &self,
+        aws_ssm_command_id: &str,
+    ) -> Result<(), McpEc2DiagnosticSsmDispatcherError> {
+        self.client
+            .cancel_command()
+            .command_id(aws_ssm_command_id)
+            .send()
+            .await
+            .map_err(|_| McpEc2DiagnosticSsmDispatcherError::Backend)?;
+        Ok(())
+    }
 }
 
 pub trait McpEc2DiagnosticSsmDispatcherFactory: Send + Sync {
@@ -1061,6 +1081,86 @@ pub trait McpEc2DiagnosticSsmDispatcherFactory: Send + Sync {
         &self,
         target_config: &McpEc2DiagnosticSsmTargetConfig<'_>,
     ) -> Arc<dyn McpEc2DiagnosticSsmDispatcher>;
+}
+
+pub struct McpEc2DiagnosticResolvedAwsConfig {
+    aws_config: aws_config::SdkConfig,
+    resolved_account_id: String,
+    resolved_region: String,
+}
+
+impl McpEc2DiagnosticResolvedAwsConfig {
+    pub fn new(
+        aws_config: aws_config::SdkConfig,
+        resolved_account_id: impl Into<String>,
+        resolved_region: impl Into<String>,
+    ) -> Self {
+        Self {
+            aws_config,
+            resolved_account_id: resolved_account_id.into(),
+            resolved_region: resolved_region.into(),
+        }
+    }
+
+    pub fn aws_config(&self) -> &aws_config::SdkConfig {
+        &self.aws_config
+    }
+
+    pub fn resolved_account_id(&self) -> &str {
+        &self.resolved_account_id
+    }
+
+    pub fn resolved_region(&self) -> &str {
+        &self.resolved_region
+    }
+}
+
+impl std::fmt::Debug for McpEc2DiagnosticResolvedAwsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpEc2DiagnosticResolvedAwsConfig")
+            .field("aws_config", &"[redacted]")
+            .field("resolved_account_id", &self.resolved_account_id)
+            .field("resolved_region", &self.resolved_region)
+            .finish()
+    }
+}
+
+#[async_trait]
+pub trait McpEc2DiagnosticAwsConfigResolver: Send + Sync {
+    async fn resolve_config(
+        &self,
+        base_config: &aws_config::SdkConfig,
+        account: &AllowedAccount,
+        region: &str,
+        session_context: &SessionContext,
+    ) -> anyhow::Result<McpEc2DiagnosticResolvedAwsConfig>;
+}
+
+#[derive(Debug, Default)]
+pub struct DefaultMcpEc2DiagnosticAwsConfigResolver;
+
+#[async_trait]
+impl McpEc2DiagnosticAwsConfigResolver for DefaultMcpEc2DiagnosticAwsConfigResolver {
+    async fn resolve_config(
+        &self,
+        base_config: &aws_config::SdkConfig,
+        account: &AllowedAccount,
+        region: &str,
+        session_context: &SessionContext,
+    ) -> anyhow::Result<McpEc2DiagnosticResolvedAwsConfig> {
+        let aws_config = crate::aws::credentials::resolve_aws_config(
+            base_config,
+            account,
+            region,
+            session_context,
+        )
+        .await?;
+        Ok(McpEc2DiagnosticResolvedAwsConfig::new(
+            aws_config,
+            account.account_id.clone(),
+            region.to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1106,6 +1206,13 @@ impl McpEc2DiagnosticSsmDispatcher for FailClosedMcpEc2DiagnosticSsmDispatcher {
         &self,
         _input: &McpEc2DiagnosticSsmSendCommandInput,
     ) -> Result<String, McpEc2DiagnosticSsmDispatcherError> {
+        Err(McpEc2DiagnosticSsmDispatcherError::Backend)
+    }
+
+    async fn cancel(
+        &self,
+        _aws_ssm_command_id: &str,
+    ) -> Result<(), McpEc2DiagnosticSsmDispatcherError> {
         Err(McpEc2DiagnosticSsmDispatcherError::Backend)
     }
 }

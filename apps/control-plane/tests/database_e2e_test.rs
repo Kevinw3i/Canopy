@@ -336,6 +336,9 @@ fn build_state(
         database_executor: executor,
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        mcp_ec2_diagnostic_aws_config_resolver: Arc::new(
+            control_plane::services::DefaultMcpEc2DiagnosticAwsConfigResolver,
+        ),
         mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
             control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
         ),

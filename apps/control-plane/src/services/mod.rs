@@ -25,9 +25,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub use mcp_ec2_diagnostics::{
-    AwsMcpEc2DiagnosticSsmDispatcherFactory, DynamoMcpEc2DiagnosticCommandStore,
-    FailClosedMcpEc2DiagnosticSsmDispatcherFactory, McpEc2DiagnosticCommandCompletion,
-    McpEc2DiagnosticCommandRecord, McpEc2DiagnosticCommandStore,
+    AwsMcpEc2DiagnosticSsmDispatcherFactory, DefaultMcpEc2DiagnosticAwsConfigResolver,
+    DynamoMcpEc2DiagnosticCommandStore, FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
+    McpEc2DiagnosticAwsConfigResolver, McpEc2DiagnosticCommandCompletion,
+    McpEc2DiagnosticCommandRecord, McpEc2DiagnosticCommandStore, McpEc2DiagnosticResolvedAwsConfig,
     McpEc2DiagnosticSsmDispatcherFactory, McpEc2DiagnosticSsmTargetConfig,
     McpEc2DiagnosticSsmTargetConfigError, MemoryMcpEc2DiagnosticCommandStore,
 };
@@ -135,6 +136,7 @@ pub struct AppState {
     pub database_executor: Arc<dyn DatabaseExecutor>,
     pub mcp_sessions: Arc<dyn McpSessionStore>,
     pub mcp_ec2_diagnostic_commands: Arc<dyn McpEc2DiagnosticCommandStore>,
+    pub mcp_ec2_diagnostic_aws_config_resolver: Arc<dyn McpEc2DiagnosticAwsConfigResolver>,
     pub mcp_ec2_diagnostic_ssm_dispatchers: Arc<dyn McpEc2DiagnosticSsmDispatcherFactory>,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     /// This is the **global** readiness signal (drives `/health`); a failed database
@@ -308,6 +310,9 @@ impl AppState {
             database_executor: Arc::new(MySqlDatabaseExecutor::new()),
             mcp_sessions,
             mcp_ec2_diagnostic_commands,
+            mcp_ec2_diagnostic_aws_config_resolver: Arc::new(
+                DefaultMcpEc2DiagnosticAwsConfigResolver,
+            ),
             mcp_ec2_diagnostic_ssm_dispatchers,
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
@@ -883,6 +888,9 @@ mod tests {
             database_executor: Arc::new(UnreachableExecutor),
             mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
             mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+            mcp_ec2_diagnostic_aws_config_resolver: Arc::new(
+                DefaultMcpEc2DiagnosticAwsConfigResolver,
+            ),
             mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
                 FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
             ),

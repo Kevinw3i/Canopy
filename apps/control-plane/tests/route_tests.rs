@@ -20,7 +20,7 @@ use shared::dto::auth::PkceAuthRequest;
 use shared::dto::cloudwatch::LiveTailMessage;
 use shared::dto::entitlements::{
     AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, McpEc2DiagnosticScope,
-    McpEc2LogPathScope, RuleMetadata,
+    McpEc2JournalUnitScope, McpEc2LogPathScope, RuleMetadata,
 };
 use shared::dto::mcp::{
     lookup_mcp_guidance_by_id, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, LazyLock,
+    Arc, LazyLock, Mutex,
 };
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
@@ -49,9 +49,16 @@ use control_plane::services::database::{
     evaluate_explain, ConnectionQueueFull, DatabaseExecutor, DatabaseSecret,
     DatabaseSecretProvider, QueryRows, TableType, TableTypeQuery, ViewCheckedQueryOutcome,
 };
+use control_plane::services::mcp_ec2_diagnostics::{
+    McpEc2DiagnosticCommandStoreClaim, McpEc2DiagnosticCommandStoreError,
+    McpEc2DiagnosticSsmDispatcher, McpEc2DiagnosticSsmDispatcherError,
+    McpEc2DiagnosticSsmSendCommandInput, McpEc2DiagnosticSsmTargetConfig,
+};
 use control_plane::services::oidc::{OidcClient, OidcEndpoints};
 use control_plane::services::{
-    AppState, McpEc2DiagnosticCommandRecord, McpSessionStore, MemoryMcpEc2DiagnosticCommandStore,
+    AppState, McpEc2DiagnosticAwsConfigResolver, McpEc2DiagnosticCommandCompletion,
+    McpEc2DiagnosticCommandRecord, McpEc2DiagnosticCommandStore, McpEc2DiagnosticResolvedAwsConfig,
+    McpEc2DiagnosticSsmDispatcherFactory, McpSessionStore, MemoryMcpEc2DiagnosticCommandStore,
     MemoryMcpSessionStore,
 };
 use shared::dto::database::{ExplainSummary, ExplainTableSummary};
@@ -120,6 +127,24 @@ fn build_state_with_audit_service_and_mcp_store(
     audit_service: AuditService,
     mcp_sessions: Arc<dyn McpSessionStore>,
 ) -> Arc<AppState> {
+    build_state_with_audit_service_and_mcp_components(
+        config,
+        audit_service,
+        mcp_sessions,
+        Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        Arc::new(control_plane::services::DefaultMcpEc2DiagnosticAwsConfigResolver),
+        Arc::new(control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory),
+    )
+}
+
+fn build_state_with_audit_service_and_mcp_components(
+    config: AppConfig,
+    audit_service: AuditService,
+    mcp_sessions: Arc<dyn McpSessionStore>,
+    mcp_ec2_diagnostic_commands: Arc<dyn McpEc2DiagnosticCommandStore>,
+    mcp_ec2_diagnostic_aws_config_resolver: Arc<dyn McpEc2DiagnosticAwsConfigResolver>,
+    mcp_ec2_diagnostic_ssm_dispatchers: Arc<dyn McpEc2DiagnosticSsmDispatcherFactory>,
+) -> Arc<AppState> {
     let entitlement_store = control_plane::models::entitlements::EntitlementStore::dev_defaults();
     let oidc_client = OidcClient::new(config.oidc.clone());
     let mfa_store = control_plane::models::mfa::MfaStore::from_optional_config(
@@ -153,10 +178,9 @@ fn build_state_with_audit_service_and_mcp_store(
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),
         mcp_sessions,
-        mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
-        mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
-            control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
-        ),
+        mcp_ec2_diagnostic_commands,
+        mcp_ec2_diagnostic_aws_config_resolver,
+        mcp_ec2_diagnostic_ssm_dispatchers,
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -223,6 +247,9 @@ fn build_state_with_database_and_allow_views(
         database_executor: executor,
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        mcp_ec2_diagnostic_aws_config_resolver: Arc::new(
+            control_plane::services::DefaultMcpEc2DiagnosticAwsConfigResolver,
+        ),
         mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
             control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
         ),
@@ -1111,6 +1138,22 @@ fn mcp_ec2_run_body(
     body
 }
 
+fn mcp_ec2_journal_body(session_id: &str, local_secret_generation: &str, since: &str) -> Value {
+    json!({
+        "canopy_mcp_session_id": session_id,
+        "local_secret_generation": local_secret_generation,
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "command": {
+            "type": "journalctl_unit",
+            "unit": "nginx.service",
+            "since": since,
+            "lines": 50
+        }
+    })
+}
+
 fn mcp_ec2_command_record(
     actor: &str,
     session_id: &str,
@@ -1141,6 +1184,217 @@ fn mcp_ec2_command_record(
         expires_at: now + chrono::Duration::minutes(10),
         created_at: now,
         updated_at: now,
+    }
+}
+
+struct FakeMcpEc2AwsConfigResolver {
+    calls: AtomicUsize,
+    resolved_account_id: String,
+    resolved_region: String,
+}
+
+impl FakeMcpEc2AwsConfigResolver {
+    fn new(resolved_account_id: &str, resolved_region: &str) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            resolved_account_id: resolved_account_id.to_string(),
+            resolved_region: resolved_region.to_string(),
+        }
+    }
+}
+
+impl Default for FakeMcpEc2AwsConfigResolver {
+    fn default() -> Self {
+        Self::new("111111111111", "us-east-1")
+    }
+}
+
+#[async_trait::async_trait]
+impl McpEc2DiagnosticAwsConfigResolver for FakeMcpEc2AwsConfigResolver {
+    async fn resolve_config(
+        &self,
+        _base_config: &aws_config::SdkConfig,
+        account: &AllowedAccount,
+        region: &str,
+        session_context: &control_plane::aws::credentials::SessionContext,
+    ) -> anyhow::Result<McpEc2DiagnosticResolvedAwsConfig> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(account.account_id, "111111111111");
+        assert_eq!(region, "us-east-1");
+        assert_eq!(session_context.user_id, "dev-admin");
+        assert_eq!(session_context.team, "platform-engineering");
+        Ok(McpEc2DiagnosticResolvedAwsConfig::new(
+            aws_config::SdkConfig::builder()
+                .region(aws_types::region::Region::new(region.to_string()))
+                .build(),
+            self.resolved_account_id.clone(),
+            self.resolved_region.clone(),
+        ))
+    }
+}
+
+#[derive(Default)]
+struct RecordingMcpEc2SsmDispatcherFactory {
+    last_input: Arc<Mutex<Option<McpEc2DiagnosticSsmSendCommandInput>>>,
+    canceled_command_ids: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingMcpEc2SsmDispatcherFactory {
+    fn last_input(&self) -> Option<McpEc2DiagnosticSsmSendCommandInput> {
+        self.last_input.lock().unwrap().clone()
+    }
+
+    fn canceled_command_ids(&self) -> Vec<String> {
+        self.canceled_command_ids.lock().unwrap().clone()
+    }
+}
+
+impl McpEc2DiagnosticSsmDispatcherFactory for RecordingMcpEc2SsmDispatcherFactory {
+    fn uses_live_aws_backend(&self) -> bool {
+        true
+    }
+
+    fn dispatcher_for_target_config(
+        &self,
+        target_config: &McpEc2DiagnosticSsmTargetConfig<'_>,
+    ) -> Arc<dyn McpEc2DiagnosticSsmDispatcher> {
+        assert_eq!(target_config.account_id(), "111111111111");
+        assert_eq!(target_config.region(), "us-east-1");
+        assert_eq!(target_config.resolved_account_id(), "111111111111");
+        assert_eq!(target_config.resolved_region(), "us-east-1");
+        Arc::new(RecordingMcpEc2SsmDispatcher {
+            last_input: self.last_input.clone(),
+            canceled_command_ids: self.canceled_command_ids.clone(),
+        })
+    }
+}
+
+struct RecordingMcpEc2SsmDispatcher {
+    last_input: Arc<Mutex<Option<McpEc2DiagnosticSsmSendCommandInput>>>,
+    canceled_command_ids: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl McpEc2DiagnosticSsmDispatcher for RecordingMcpEc2SsmDispatcher {
+    async fn dispatch(
+        &self,
+        input: &McpEc2DiagnosticSsmSendCommandInput,
+    ) -> Result<String, McpEc2DiagnosticSsmDispatcherError> {
+        assert_eq!(input.document_name(), "Canopy-Ec2Diagnostics");
+        assert_eq!(input.document_version(), "7");
+        assert_eq!(input.instance_ids(), &["i-0123456789abcdef0".to_string()]);
+        assert_eq!(
+            input.parameter_keys(),
+            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId",]
+        );
+        assert_eq!(input.max_concurrency(), "1");
+        assert_eq!(input.max_errors(), "0");
+        assert!(!input.cloudwatch_output_enabled());
+        assert!(!input.s3_output_enabled());
+        *self.last_input.lock().unwrap() = Some(input.clone());
+        Ok("ssm-command-1".to_string())
+    }
+
+    async fn cancel(
+        &self,
+        aws_ssm_command_id: &str,
+    ) -> Result<(), McpEc2DiagnosticSsmDispatcherError> {
+        self.canceled_command_ids
+            .lock()
+            .unwrap()
+            .push(aws_ssm_command_id.to_string());
+        Ok(())
+    }
+}
+
+struct ClaimFailingMcpEc2CommandStore {
+    inner: MemoryMcpEc2DiagnosticCommandStore,
+}
+
+impl ClaimFailingMcpEc2CommandStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryMcpEc2DiagnosticCommandStore::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl McpEc2DiagnosticCommandStore for ClaimFailingMcpEc2CommandStore {
+    async fn sweep_expired(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), McpEc2DiagnosticCommandStoreError> {
+        self.inner.sweep_expired(now).await
+    }
+
+    async fn create_command(
+        &self,
+        command_id: String,
+        record: McpEc2DiagnosticCommandRecord,
+    ) -> Result<(), McpEc2DiagnosticCommandStoreError> {
+        self.inner.create_command(command_id, record).await
+    }
+
+    async fn get_command(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<McpEc2DiagnosticCommandRecord>, McpEc2DiagnosticCommandStoreError> {
+        self.inner.get_command(command_id).await
+    }
+
+    async fn get_owned_command(
+        &self,
+        command_id: &str,
+        actor: &str,
+        mcp_session_id: &str,
+        local_secret_generation: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<McpEc2DiagnosticCommandRecord>, McpEc2DiagnosticCommandStoreError> {
+        self.inner
+            .get_owned_command(
+                command_id,
+                actor,
+                mcp_session_id,
+                local_secret_generation,
+                now,
+            )
+            .await
+    }
+
+    async fn mark_dispatched(
+        &self,
+        _command_id: &str,
+        _actor: &str,
+        _mcp_session_id: &str,
+        _local_secret_generation: &str,
+        _aws_ssm_command_id: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<McpEc2DiagnosticCommandStoreClaim>, McpEc2DiagnosticCommandStoreError> {
+        Err(McpEc2DiagnosticCommandStoreError::Backend(
+            "forced claim failure".into(),
+        ))
+    }
+
+    async fn mark_terminal(
+        &self,
+        command_id: &str,
+        actor: &str,
+        mcp_session_id: &str,
+        local_secret_generation: &str,
+        completion: McpEc2DiagnosticCommandCompletion,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        self.inner
+            .mark_terminal(
+                command_id,
+                actor,
+                mcp_session_id,
+                local_secret_generation,
+                completion,
+                now,
+            )
+            .await
     }
 }
 
@@ -1308,6 +1562,350 @@ async fn mcp_ec2_diagnostics_scope_passes_but_dispatch_backend_fails_closed() {
     assert!(event["metadata"].get("role_arn").is_none());
     assert_eq!(event["metadata"]["raw_command_recorded"], false);
     assert_eq!(event["metadata"]["remote_output_recorded"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_live_dispatch_submits_ssm_and_marks_running() {
+    let audit = AuditFile::new("mcp-ec2-live-dispatch");
+    let mut config = dev_config();
+    config.mcp.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+    config.mcp.ec2_diagnostic_ssm_document_version = Some("7".into());
+    config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04.1".into());
+    config.mcp.ec2_diagnostic_command_spec_key =
+        Some("test-only-command-spec-key-material-32".into());
+    let token = issue_test_token(&config);
+    let command_store: Arc<dyn McpEc2DiagnosticCommandStore> =
+        Arc::new(MemoryMcpEc2DiagnosticCommandStore::new());
+    let resolver = Arc::new(FakeMcpEc2AwsConfigResolver::default());
+    let dispatcher_factory = Arc::new(RecordingMcpEc2SsmDispatcherFactory::default());
+    let state = build_state_with_audit_service_and_mcp_components(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(MemoryMcpSessionStore::new()),
+        command_store.clone(),
+        resolver.clone(),
+        dispatcher_factory.clone(),
+    );
+    grant_mcp_ec2_diagnostics(&state).await;
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/error.log",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let command_id = body["mcp_ec2_command_id"].as_str().unwrap();
+    assert!(command_id.starts_with("mcp-ec2-"));
+    assert_eq!(body["status"], "running");
+    assert_eq!(body["instance_id"], "i-0123456789abcdef0");
+    assert_eq!(body["account_id"], "111111111111");
+    assert_eq!(body["region"], "us-east-1");
+    assert_eq!(body["command_type"], "tail_log");
+
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    let sent_input = dispatcher_factory.last_input().unwrap();
+    let sent_input_debug = format!("{sent_input:?}");
+    assert!(!sent_input_debug.contains("/var/log/nginx/error.log"));
+    assert!(!sent_input_debug.contains("tail_log"));
+    assert!(!sent_input_debug.contains("canopy-ec2-spec:v1:"));
+
+    let record = command_store
+        .get_command(command_id)
+        .await
+        .unwrap()
+        .expect("command record exists");
+    assert_eq!(record.actor, "dev-admin");
+    assert_eq!(record.actor_email, "dev-admin@dev.local");
+    assert_eq!(record.mcp_session_id, session_id);
+    assert_eq!(record.local_secret_generation, local_secret_generation);
+    assert_eq!(record.command_type, McpEc2DiagnosticCommandType::TailLog);
+    assert_eq!(record.status, McpEc2DiagnosticCommandStatus::Running);
+    assert_eq!(record.aws_ssm_command_id.as_deref(), Some("ssm-command-1"));
+    assert_eq!(record.output_byte_count, 0);
+    assert_eq!(record.dropped_byte_count, 0);
+
+    let events = read_audit_events(&audit.path);
+    let serialized_events = serde_json::to_string(&events).unwrap();
+    assert!(!serialized_events.contains("canopy-ec2-spec:v1:"));
+    assert!(!serialized_events.contains("commandSpecRef"));
+    let run_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .collect();
+    assert_eq!(run_events.len(), 2);
+    let attempt = run_events
+        .iter()
+        .find(|event| event["metadata"]["mcp_outcome_kind"] == "attempt")
+        .unwrap();
+    assert_eq!(attempt["outcome"], "success");
+    assert_eq!(attempt["metadata"]["aws_execution_attempted"], false);
+    assert_eq!(attempt["metadata"]["mcp_ec2_command_id"], command_id);
+    let submitted = run_events
+        .iter()
+        .find(|event| event["metadata"]["mcp_outcome_kind"] == "dispatch_submitted")
+        .unwrap();
+    assert_eq!(submitted["outcome"], "success");
+    assert_eq!(submitted["metadata"]["aws_execution_attempted"], true);
+    assert_eq!(submitted["metadata"]["mcp_ec2_command_id"], command_id);
+    for event in run_events {
+        assert_eq!(event["metadata"]["raw_command_recorded"], false);
+        assert_eq!(event["metadata"]["remote_output_recorded"], false);
+        assert!(event["metadata"].get("path").is_none());
+        assert!(event["metadata"].get("role_arn").is_none());
+    }
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_live_dispatch_rejects_resolved_target_mismatch() {
+    let audit = AuditFile::new("mcp-ec2-resolved-target-mismatch");
+    let mut config = dev_config();
+    config.mcp.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+    config.mcp.ec2_diagnostic_ssm_document_version = Some("7".into());
+    config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04.1".into());
+    config.mcp.ec2_diagnostic_command_spec_key =
+        Some("test-only-command-spec-key-material-32".into());
+    let token = issue_test_token(&config);
+    let command_store: Arc<dyn McpEc2DiagnosticCommandStore> =
+        Arc::new(MemoryMcpEc2DiagnosticCommandStore::new());
+    let resolver = Arc::new(FakeMcpEc2AwsConfigResolver::new(
+        "222222222222",
+        "us-east-1",
+    ));
+    let dispatcher_factory = Arc::new(RecordingMcpEc2SsmDispatcherFactory::default());
+    let state = build_state_with_audit_service_and_mcp_components(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(MemoryMcpSessionStore::new()),
+        command_store.clone(),
+        resolver.clone(),
+        dispatcher_factory.clone(),
+    );
+    grant_mcp_ec2_diagnostics(&state).await;
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/error.log",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert!(dispatcher_factory.last_input().is_none());
+
+    let events = read_audit_events(&audit.path);
+    let run_events: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .collect();
+    let failure = run_events
+        .iter()
+        .find(|event| event["metadata"]["mcp_outcome_kind"] == "dispatch_target_config_invalid")
+        .unwrap();
+    assert_eq!(failure["outcome"], "failure");
+    assert_eq!(failure["metadata"]["aws_execution_attempted"], true);
+    let command_id = failure["metadata"]["mcp_ec2_command_id"].as_str().unwrap();
+    let record = command_store
+        .get_command(command_id)
+        .await
+        .unwrap()
+        .expect("queued command record exists for failed dispatch");
+    assert_eq!(record.status, McpEc2DiagnosticCommandStatus::Queued);
+    assert_eq!(record.aws_ssm_command_id, None);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_live_dispatch_rejects_traversal_log_path_before_dispatch() {
+    let audit = AuditFile::new("mcp-ec2-traversal-log-path");
+    let mut config = dev_config();
+    config.mcp.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+    config.mcp.ec2_diagnostic_ssm_document_version = Some("7".into());
+    config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04.1".into());
+    config.mcp.ec2_diagnostic_command_spec_key =
+        Some("test-only-command-spec-key-material-32".into());
+    let token = issue_test_token(&config);
+    let resolver = Arc::new(FakeMcpEc2AwsConfigResolver::default());
+    let dispatcher_factory = Arc::new(RecordingMcpEc2SsmDispatcherFactory::default());
+    let state = build_state_with_audit_service_and_mcp_components(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(MemoryMcpSessionStore::new()),
+        Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        resolver.clone(),
+        dispatcher_factory.clone(),
+    );
+    grant_mcp_ec2_diagnostics(&state).await;
+    {
+        let mut store = state.entitlement_store.write().await;
+        let scope = &mut store.rules.last_mut().unwrap().mcp_ec2_diagnostic_scopes[0];
+        scope.allowed_log_paths[0].path_pattern = "/var/log/nginx/*".into();
+    }
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/../../etc/shadow",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    assert!(dispatcher_factory.last_input().is_none());
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "command_scope_denied"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert!(event["metadata"].get("path").is_none());
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_live_dispatch_rejects_journal_since_over_scope_before_dispatch() {
+    let audit = AuditFile::new("mcp-ec2-journal-since-over-scope");
+    let mut config = dev_config();
+    config.mcp.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+    config.mcp.ec2_diagnostic_ssm_document_version = Some("7".into());
+    config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04.1".into());
+    config.mcp.ec2_diagnostic_command_spec_key =
+        Some("test-only-command-spec-key-material-32".into());
+    let token = issue_test_token(&config);
+    let resolver = Arc::new(FakeMcpEc2AwsConfigResolver::default());
+    let dispatcher_factory = Arc::new(RecordingMcpEc2SsmDispatcherFactory::default());
+    let state = build_state_with_audit_service_and_mcp_components(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(MemoryMcpSessionStore::new()),
+        Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        resolver.clone(),
+        dispatcher_factory.clone(),
+    );
+    grant_mcp_ec2_diagnostics(&state).await;
+    {
+        let mut store = state.entitlement_store.write().await;
+        let scope = &mut store.rules.last_mut().unwrap().mcp_ec2_diagnostic_scopes[0];
+        scope.allowed_journal_units.push(McpEc2JournalUnitScope {
+            unit: "nginx.service".into(),
+            safe_for_mcp_output: true,
+        });
+        scope.max_since_seconds = 1800;
+    }
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_journal_body(&session_id, &local_secret_generation, "3600s"),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    assert!(dispatcher_factory.last_input().is_none());
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_run")
+        .unwrap();
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "command_scope_denied"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_live_dispatch_cancels_ssm_when_store_claim_fails() {
+    let audit = AuditFile::new("mcp-ec2-claim-failure-cancel");
+    let mut config = dev_config();
+    config.mcp.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
+    config.mcp.ec2_diagnostic_ssm_document_version = Some("7".into());
+    config.mcp.ec2_diagnostic_helper_version = Some("2026-06-04.1".into());
+    config.mcp.ec2_diagnostic_command_spec_key =
+        Some("test-only-command-spec-key-material-32".into());
+    let token = issue_test_token(&config);
+    let command_store: Arc<dyn McpEc2DiagnosticCommandStore> =
+        Arc::new(ClaimFailingMcpEc2CommandStore::new());
+    let resolver = Arc::new(FakeMcpEc2AwsConfigResolver::default());
+    let dispatcher_factory = Arc::new(RecordingMcpEc2SsmDispatcherFactory::default());
+    let state = build_state_with_audit_service_and_mcp_components(
+        config,
+        AuditService::with_file(audit.path.to_str().unwrap()).unwrap(),
+        Arc::new(MemoryMcpSessionStore::new()),
+        command_store.clone(),
+        resolver,
+        dispatcher_factory.clone(),
+    );
+    grant_mcp_ec2_diagnostics(&state).await;
+    let app = build_app(state);
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    let resp = post_mcp_ec2_run(
+        &app,
+        &token,
+        mcp_ec2_run_body(
+            Some(&session_id),
+            Some(&local_secret_generation),
+            "/var/log/nginx/error.log",
+        ),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        dispatcher_factory.canceled_command_ids(),
+        vec!["ssm-command-1".to_string()]
+    );
+    let events = read_audit_events(&audit.path);
+    let failure = events
+        .iter()
+        .find(|event| event["metadata"]["mcp_outcome_kind"] == "command_store_claim_failed")
+        .unwrap();
+    assert_eq!(failure["outcome"], "failure");
+    assert_eq!(failure["metadata"]["aws_execution_attempted"], true);
+    assert_eq!(failure["metadata"]["aws_ssm_command_id"], "ssm-command-1");
+    assert_eq!(failure["metadata"]["aws_cancel_attempted"], true);
+    assert_eq!(failure["metadata"]["aws_cancel_succeeded"], true);
+    let command_id = failure["metadata"]["mcp_ec2_command_id"].as_str().unwrap();
+    let record = command_store
+        .get_command(command_id)
+        .await
+        .unwrap()
+        .expect("queued command record remains for incident correlation");
+    assert_eq!(record.status, McpEc2DiagnosticCommandStatus::Queued);
+    assert_eq!(record.aws_ssm_command_id, None);
 }
 
 #[tokio::test]
@@ -8973,6 +9571,9 @@ fn build_state_not_ready(config: AppConfig) -> Arc<AppState> {
         database_executor: Arc::new(NullDatabaseExecutor),
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
         mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
+        mcp_ec2_diagnostic_aws_config_resolver: Arc::new(
+            control_plane::services::DefaultMcpEc2DiagnosticAwsConfigResolver,
+        ),
         mcp_ec2_diagnostic_ssm_dispatchers: Arc::new(
             control_plane::services::FailClosedMcpEc2DiagnosticSsmDispatcherFactory,
         ),
