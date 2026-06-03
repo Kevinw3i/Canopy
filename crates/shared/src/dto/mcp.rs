@@ -16,6 +16,9 @@ pub const MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY: &str = "cloudwatch_insights_work
 pub const MCP_DATABASE_GUIDANCE_ID: &str = "database_query_workflow";
 pub const MCP_DATABASE_GUIDANCE_VERSION: &str = "2026-05-13";
 pub const MCP_DATABASE_GUIDANCE_KEY: &str = "database_query_workflow@2026-05-13";
+pub const MCP_EC2_DIAGNOSTICS_GUIDANCE_ID: &str = "ec2_diagnostics_workflow";
+pub const MCP_EC2_DIAGNOSTICS_GUIDANCE_VERSION: &str = "2026-06-04";
+pub const MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY: &str = "ec2_diagnostics_workflow@2026-06-04";
 pub const MCP_PRIVACY_AND_AUDIT_NOTICE_KEY: &str = "privacy_and_audit_notice@2026-05-13";
 
 /// Authoritative catalog of guidance documents the control-plane will issue.
@@ -54,6 +57,12 @@ pub const MCP_GUIDANCE_CATALOG: &[McpGuidanceCatalogEntry] = &[
         title: "Database Query Workflow",
         content: include_str!("mcp_guidance/database_query_workflow.md"),
     },
+    McpGuidanceCatalogEntry {
+        id: MCP_EC2_DIAGNOSTICS_GUIDANCE_ID,
+        version: MCP_EC2_DIAGNOSTICS_GUIDANCE_VERSION,
+        title: "EC2 Diagnostics Workflow",
+        content: include_str!("mcp_guidance/ec2_diagnostics_workflow.md"),
+    },
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +89,10 @@ pub fn is_known_mcp_guidance(id: &str, version: &str) -> bool {
 
 pub fn mcp_database_guidance_key() -> String {
     MCP_DATABASE_GUIDANCE_KEY.into()
+}
+
+pub fn mcp_ec2_diagnostics_guidance_key() -> String {
+    MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -322,6 +335,128 @@ pub struct McpRunInsightsQueryResponse {
     pub next_action_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpEc2DiagnosticCommandStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpEc2DiagnosticCommandType {
+    TailLog,
+    GrepLog,
+    JournalctlUnit,
+    HttpHead,
+    TcpProbe,
+    DnsLookup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE", deny_unknown_fields)]
+pub enum McpEc2DnsRecordType {
+    A,
+    Aaaa,
+    Cname,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpEc2DiagnosticCommand {
+    TailLog {
+        path: String,
+        lines: u16,
+    },
+    GrepLog {
+        path: String,
+        literal_pattern: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        case_insensitive: bool,
+        max_matches: u16,
+    },
+    JournalctlUnit {
+        unit: String,
+        since: String,
+        lines: u16,
+    },
+    HttpHead {
+        url: String,
+        max_time_seconds: u8,
+    },
+    TcpProbe {
+        host: String,
+        port: u16,
+        timeout_seconds: u8,
+    },
+    DnsLookup {
+        host: String,
+        record_type: McpEc2DnsRecordType,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRunEc2DiagnosticCommandRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canopy_mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_secret_generation: Option<String>,
+    pub instance_id: String,
+    pub account_id: String,
+    pub region: String,
+    pub command: McpEc2DiagnosticCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpRunEc2DiagnosticCommandResponse {
+    pub mcp_ec2_command_id: String,
+    pub status: McpEc2DiagnosticCommandStatus,
+    pub instance_id: String,
+    pub account_id: String,
+    pub region: String,
+    pub command_type: McpEc2DiagnosticCommandType,
+    pub submitted_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpGetEc2DiagnosticResultRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canopy_mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_secret_generation: Option<String>,
+    pub mcp_ec2_command_id: String,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpGetEc2DiagnosticResultResponse {
+    pub mcp_ec2_command_id: String,
+    pub status: McpEc2DiagnosticCommandStatus,
+    pub sequence_start: u64,
+    pub sequence_end: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_text: Option<String>,
+    pub untrusted_remote_output: bool,
+    pub output_bytes: u64,
+    pub dropped_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +564,7 @@ mod tests {
             MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY,
             MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
             MCP_DATABASE_GUIDANCE_KEY,
+            MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY,
             MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
         ] {
             let (id, version) = key.split_once('@').expect("guidance key has version");
@@ -437,5 +573,108 @@ mod tests {
                 "required guidance key {key} must exist in catalog"
             );
         }
+    }
+
+    #[test]
+    fn ec2_diagnostics_guidance_is_registered() {
+        let entry = lookup_mcp_guidance(
+            MCP_EC2_DIAGNOSTICS_GUIDANCE_ID,
+            MCP_EC2_DIAGNOSTICS_GUIDANCE_VERSION,
+        )
+        .expect("EC2 diagnostics guidance must be registered");
+
+        assert_eq!(entry.title, "EC2 Diagnostics Workflow");
+        assert_eq!(
+            mcp_ec2_diagnostics_guidance_key(),
+            MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY
+        );
+        assert!(entry.content.contains("EC2 Diagnostics Workflow"));
+        assert!(entry.content.contains("untrusted remote text"));
+    }
+
+    #[test]
+    fn ec2_diagnostic_command_round_trips_without_shell_fields() {
+        let command = McpEc2DiagnosticCommand::GrepLog {
+            path: "/var/log/nginx/error.log".into(),
+            literal_pattern: "upstream".into(),
+            case_insensitive: true,
+            max_matches: 25,
+        };
+
+        let value = serde_json::to_value(&command).expect("command serializes");
+        assert_eq!(value["type"], "grep_log");
+        assert!(value.get("shell").is_none());
+        assert!(value.get("send_input").is_none());
+
+        let back: McpEc2DiagnosticCommand =
+            serde_json::from_value(value).expect("command deserializes");
+        assert_eq!(back, command);
+    }
+
+    #[test]
+    fn ec2_diagnostic_dns_txt_is_not_a_v1_record_type() {
+        let aaaa = serde_json::json!({
+            "type": "dns_lookup",
+            "host": "internal.example",
+            "record_type": "AAAA"
+        });
+        let cname = serde_json::json!({
+            "type": "dns_lookup",
+            "host": "internal.example",
+            "record_type": "CNAME"
+        });
+        let txt = serde_json::json!({
+            "type": "dns_lookup",
+            "host": "internal.example",
+            "record_type": "TXT"
+        });
+
+        assert!(serde_json::from_value::<McpEc2DiagnosticCommand>(aaaa).is_ok());
+        assert!(serde_json::from_value::<McpEc2DiagnosticCommand>(cname).is_ok());
+        assert!(serde_json::from_value::<McpEc2DiagnosticCommand>(txt).is_err());
+    }
+
+    #[test]
+    fn ec2_diagnostic_http_head_rejects_verbose_or_header_options() {
+        let verbose = serde_json::json!({
+            "type": "http_head",
+            "url": "https://service.internal/health",
+            "max_time_seconds": 5,
+            "verbose": true
+        });
+        let headers = serde_json::json!({
+            "type": "http_head",
+            "url": "https://service.internal/health",
+            "max_time_seconds": 5,
+            "headers": { "X-Test": "blocked" }
+        });
+
+        assert!(serde_json::from_value::<McpEc2DiagnosticCommand>(verbose).is_err());
+        assert!(serde_json::from_value::<McpEc2DiagnosticCommand>(headers).is_err());
+    }
+
+    #[test]
+    fn ec2_diagnostic_result_dto_has_no_raw_bytes_opt_in() {
+        let response = McpGetEc2DiagnosticResultResponse {
+            mcp_ec2_command_id: "mcp-ec2-cmd-1".into(),
+            status: McpEc2DiagnosticCommandStatus::Succeeded,
+            sequence_start: 0,
+            sequence_end: 1,
+            output_text: Some(
+                "-----BEGIN CANOPY UNTRUSTED REMOTE OUTPUT-----\n| ok\n-----END CANOPY UNTRUSTED REMOTE OUTPUT-----"
+                    .into(),
+            ),
+            untrusted_remote_output: true,
+            output_bytes: 2,
+            dropped_bytes: 0,
+            exit_code: Some(0),
+            error: None,
+        };
+
+        let value = serde_json::to_value(response).expect("result serializes");
+        assert!(value.get("include_raw_bytes").is_none());
+        assert!(value.get("output_base64").is_none());
+        assert!(value.get("raw_output").is_none());
+        assert_eq!(value["untrusted_remote_output"], true);
     }
 }
