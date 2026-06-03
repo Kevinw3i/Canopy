@@ -74,6 +74,262 @@ impl McpEc2DiagnosticCommandCompletion {
     }
 }
 
+pub const MCP_EC2_UNTRUSTED_OUTPUT_BEGIN: &str = "-----BEGIN CANOPY UNTRUSTED REMOTE OUTPUT-----";
+pub const MCP_EC2_UNTRUSTED_OUTPUT_END: &str = "-----END CANOPY UNTRUSTED REMOTE OUTPUT-----";
+const MCP_EC2_REDACTED: &str = "[REDACTED]";
+const MCP_EC2_REDACTED_PRIVATE_KEY: &str = "[REDACTED PRIVATE KEY]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpEc2DiagnosticFormattedOutput {
+    pub output_text: String,
+    pub output_bytes: u64,
+    pub dropped_bytes: u64,
+    pub truncated: bool,
+}
+
+pub fn format_mcp_ec2_diagnostic_output(
+    remote_output_text: &str,
+    max_output_text_bytes: usize,
+) -> McpEc2DiagnosticFormattedOutput {
+    let sanitized = strip_terminal_control_sequences(remote_output_text);
+    let redacted = redact_mcp_ec2_sensitive_output(&sanitized);
+    let prefixed = prefix_untrusted_lines(&redacted);
+    let boundary_overhead =
+        MCP_EC2_UNTRUSTED_OUTPUT_BEGIN.len() + 1 + MCP_EC2_UNTRUSTED_OUTPUT_END.len() + 1;
+    let body_budget = max_output_text_bytes.saturating_sub(boundary_overhead);
+    let (mut body, dropped_bytes) = truncate_utf8(&prefixed, body_budget);
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+
+    let output_text =
+        format!("{MCP_EC2_UNTRUSTED_OUTPUT_BEGIN}\n{body}{MCP_EC2_UNTRUSTED_OUTPUT_END}");
+    McpEc2DiagnosticFormattedOutput {
+        output_bytes: output_text.len() as u64,
+        dropped_bytes: dropped_bytes as u64,
+        truncated: dropped_bytes > 0,
+        output_text,
+    }
+}
+
+fn prefix_untrusted_lines(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    for line in input.split('\n') {
+        output.push_str("| ");
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+fn truncate_utf8(input: &str, max_bytes: usize) -> (String, usize) {
+    if input.len() <= max_bytes {
+        return (input.to_string(), 0);
+    }
+    let mut end = max_bytes.min(input.len());
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    (input[..end].to_string(), input.len() - end)
+}
+
+fn strip_terminal_control_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            consume_escape_sequence(&mut chars);
+            continue;
+        }
+
+        if ch == '\r' {
+            if matches!(chars.peek(), Some('\n')) {
+                continue;
+            }
+            output.push('\n');
+            continue;
+        }
+
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            continue;
+        }
+
+        output.push(ch);
+    }
+
+    output
+}
+
+fn consume_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    let Some(kind) = chars.next() else {
+        return;
+    };
+
+    match kind {
+        '[' => {
+            for ch in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&ch) {
+                    break;
+                }
+            }
+        }
+        ']' => consume_until_string_terminator(chars),
+        'P' | 'X' | '^' | '_' => consume_until_string_terminator(chars),
+        _ => {}
+    }
+}
+
+fn consume_until_string_terminator<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(ch) = chars.next() {
+        if ch == '\u{7}' {
+            break;
+        }
+        if ch == '\x1b' && matches!(chars.peek(), Some('\\')) {
+            chars.next();
+            break;
+        }
+    }
+}
+
+fn redact_mcp_ec2_sensitive_output(input: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_private_key = false;
+
+    for line in input.split('\n') {
+        let lower = line.to_ascii_lowercase();
+        let starts_private_key =
+            lower.contains("-----begin ") && lower.contains("private key-----");
+        let ends_private_key = lower.contains("-----end ") && lower.contains("private key-----");
+
+        if starts_private_key {
+            lines.push(MCP_EC2_REDACTED_PRIVATE_KEY.to_string());
+            in_private_key = !ends_private_key;
+            continue;
+        }
+        if in_private_key {
+            if ends_private_key {
+                in_private_key = false;
+            }
+            continue;
+        }
+
+        lines.push(redact_sensitive_line(line));
+    }
+
+    lines.join("\n")
+}
+
+fn redact_sensitive_line(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("authorization:")
+        || lower.contains("set-cookie:")
+        || lower.contains("cookie:")
+        || contains_sensitive_assignment(&lower)
+    {
+        return MCP_EC2_REDACTED.to_string();
+    }
+
+    let line = redact_bearer_tokens(line);
+    redact_aws_access_key_tokens(&line)
+}
+
+fn contains_sensitive_assignment(lower_line: &str) -> bool {
+    for key in [
+        "password",
+        "passwd",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "secret_key",
+        "session_token",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+    ] {
+        let mut search_from = 0;
+        while let Some(relative) = lower_line[search_from..].find(key) {
+            let start = search_from + relative;
+            let after = lower_line[start + key.len()..].trim_start();
+            if after.starts_with('=') || after.starts_with(':') {
+                return true;
+            }
+            search_from = start + key.len();
+        }
+    }
+    false
+}
+
+fn redact_bearer_tokens(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut output = String::new();
+    let mut search_from = 0;
+    let marker = "bearer ";
+
+    while let Some(relative) = lower[search_from..].find(marker) {
+        let start = search_from + relative;
+        let token_start = start + marker.len();
+        output.push_str(&line[search_from..token_start]);
+
+        let token_end = line[token_start..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';'))
+            .map(|end| token_start + end)
+            .unwrap_or_else(|| line.len());
+        output.push_str(MCP_EC2_REDACTED);
+        search_from = token_end;
+    }
+
+    output.push_str(&line[search_from..]);
+    output
+}
+
+fn redact_aws_access_key_tokens(line: &str) -> String {
+    let mut output = String::new();
+    let mut token = String::new();
+
+    for ch in line.chars() {
+        if ch.is_ascii_alphanumeric() {
+            token.push(ch);
+            continue;
+        }
+
+        flush_redactable_token(&mut output, &mut token);
+        output.push(ch);
+    }
+
+    flush_redactable_token(&mut output, &mut token);
+    output
+}
+
+fn flush_redactable_token(output: &mut String, token: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    if is_aws_access_key_id(token) {
+        output.push_str(MCP_EC2_REDACTED);
+    } else {
+        output.push_str(token);
+    }
+    token.clear();
+}
+
+fn is_aws_access_key_id(token: &str) -> bool {
+    token.len() == 20
+        && (token.starts_with("AKIA") || token.starts_with("ASIA"))
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
 #[async_trait]
 pub trait McpEc2DiagnosticCommandStore: Send + Sync {
     async fn sweep_expired(
@@ -823,6 +1079,67 @@ mod tests {
             exit_status: Some(0),
             truncated: false,
         }
+    }
+
+    #[test]
+    fn formatter_wraps_prefixes_strips_controls_and_redacts_sensitive_output() {
+        let raw = format!(
+            "\x1b[31mERROR\x1b[0m\r\n{} {}\n{}super-secret\naws_access_key_id={}\n{}\nbody\n-----END PRIVATE KEY-----",
+            concat!("Author", "ization:"),
+            concat!("Bearer", " eyJhbGciOiJIUzI1NiJ9.payload.signature"),
+            concat!("pass", "word="),
+            concat!("AKIA", "IOSFODNN7EXAMPLE"),
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+        );
+
+        let formatted = format_mcp_ec2_diagnostic_output(&raw, 4096);
+
+        assert!(!formatted.truncated);
+        assert_eq!(formatted.dropped_bytes, 0);
+        assert!(formatted
+            .output_text
+            .starts_with(MCP_EC2_UNTRUSTED_OUTPUT_BEGIN));
+        assert!(formatted
+            .output_text
+            .ends_with(MCP_EC2_UNTRUSTED_OUTPUT_END));
+        assert!(formatted.output_text.contains("| ERROR"));
+        assert!(formatted.output_text.contains("| [REDACTED]"));
+        assert!(formatted.output_text.contains("| [REDACTED PRIVATE KEY]"));
+        assert!(!formatted.output_text.contains('\x1b'));
+        assert!(!formatted.output_text.contains("super-secret"));
+        assert!(!formatted.output_text.contains("eyJhbGci"));
+        assert!(!formatted.output_text.contains("AKIA"));
+        assert!(!formatted.output_text.contains("PRIVATE KEY-----\n| body"));
+
+        for line in formatted.output_text.lines().skip(1) {
+            if line == MCP_EC2_UNTRUSTED_OUTPUT_END {
+                break;
+            }
+            assert!(
+                line.starts_with("| "),
+                "remote output line must be visibly marked untrusted: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn formatter_truncates_without_splitting_utf8() {
+        let raw = "ok αβγ\n".repeat(64);
+        let budget = MCP_EC2_UNTRUSTED_OUTPUT_BEGIN.len() + MCP_EC2_UNTRUSTED_OUTPUT_END.len() + 32;
+
+        let formatted = format_mcp_ec2_diagnostic_output(&raw, budget);
+
+        assert!(formatted.truncated);
+        assert!(formatted.dropped_bytes > 0);
+        assert!(formatted
+            .output_text
+            .is_char_boundary(formatted.output_text.len()));
+        assert!(formatted
+            .output_text
+            .starts_with(MCP_EC2_UNTRUSTED_OUTPUT_BEGIN));
+        assert!(formatted
+            .output_text
+            .ends_with(MCP_EC2_UNTRUSTED_OUTPUT_END));
     }
 
     #[tokio::test]
