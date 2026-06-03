@@ -133,6 +133,8 @@ pub const MCP_EC2_COMMAND_SPEC_HELPER_VERSION: &str = "2026-06-04.1";
 pub const MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME: &str = "Canopy-Ec2Diagnostics";
 pub const MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS: i64 = 900;
 pub const MCP_EC2_DIAGNOSTIC_SSM_TIMEOUT_SECONDS: i32 = 120;
+pub const MCP_EC2_DIAGNOSTIC_SSM_MAX_CONCURRENCY: &str = "1";
+pub const MCP_EC2_DIAGNOSTIC_SSM_MAX_ERRORS: &str = "0";
 const MCP_EC2_COMMAND_SPEC_REF_NONCE_LEN: usize = 16;
 const MCP_EC2_COMMAND_SPEC_REF_CIPHERTEXT_MAX_LEN: usize = 4000;
 const MCP_EC2_COMMAND_SPEC_REF_MAX_CLOCK_SKEW_SECONDS: i64 = 60;
@@ -556,7 +558,11 @@ impl McpEc2DiagnosticSsmDispatchRequest {
         self.timeout_seconds
     }
 
-    pub fn parameters(&self) -> &BTreeMap<String, Vec<String>> {
+    pub fn parameter_keys(&self) -> Vec<&str> {
+        self.parameters.keys().map(String::as_str).collect()
+    }
+
+    fn parameters(&self) -> &BTreeMap<String, Vec<String>> {
         &self.parameters
     }
 
@@ -575,7 +581,7 @@ impl McpEc2DiagnosticSsmDispatchRequest {
             .map(String::as_str)
     }
 
-    pub fn command_spec_ref(&self) -> Option<&str> {
+    fn command_spec_ref(&self) -> Option<&str> {
         self.parameters
             .get("commandSpecRef")
             .and_then(|values| values.first())
@@ -671,6 +677,189 @@ pub fn build_mcp_ec2_diagnostic_ssm_dispatch_request(
         cloudwatch_output_enabled: false,
         s3_output_enabled: false,
     })
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct McpEc2DiagnosticSsmSendCommandInput {
+    document_name: String,
+    document_version: String,
+    instance_ids: Vec<String>,
+    timeout_seconds: i32,
+    parameters: BTreeMap<String, Vec<String>>,
+    max_concurrency: String,
+    max_errors: String,
+    cloudwatch_output_enabled: bool,
+    s3_output_enabled: bool,
+}
+
+impl std::fmt::Debug for McpEc2DiagnosticSsmSendCommandInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpEc2DiagnosticSsmSendCommandInput")
+            .field("document_name", &self.document_name)
+            .field("document_version", &self.document_version)
+            .field("instance_ids", &self.instance_ids)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field(
+                "parameter_keys",
+                &self.parameters.keys().collect::<Vec<_>>(),
+            )
+            .field("max_concurrency", &self.max_concurrency)
+            .field("max_errors", &self.max_errors)
+            .field("cloudwatch_output_enabled", &self.cloudwatch_output_enabled)
+            .field("s3_output_enabled", &self.s3_output_enabled)
+            .finish()
+    }
+}
+
+impl McpEc2DiagnosticSsmSendCommandInput {
+    pub fn document_name(&self) -> &str {
+        &self.document_name
+    }
+
+    pub fn document_version(&self) -> &str {
+        &self.document_version
+    }
+
+    pub fn instance_ids(&self) -> &[String] {
+        &self.instance_ids
+    }
+
+    pub fn timeout_seconds(&self) -> i32 {
+        self.timeout_seconds
+    }
+
+    pub fn parameter_keys(&self) -> Vec<&str> {
+        self.parameters.keys().map(String::as_str).collect()
+    }
+
+    pub fn max_concurrency(&self) -> &str {
+        &self.max_concurrency
+    }
+
+    pub fn max_errors(&self) -> &str {
+        &self.max_errors
+    }
+
+    pub fn cloudwatch_output_enabled(&self) -> bool {
+        self.cloudwatch_output_enabled
+    }
+
+    pub fn s3_output_enabled(&self) -> bool {
+        self.s3_output_enabled
+    }
+
+    fn parameters_for_aws(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.parameters
+    }
+}
+
+pub fn build_mcp_ec2_diagnostic_ssm_send_command_input(
+    request: &McpEc2DiagnosticSsmDispatchRequest,
+) -> Result<McpEc2DiagnosticSsmSendCommandInput, McpEc2DiagnosticDispatchError> {
+    if request.cloudwatch_output_enabled() {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput(
+            "cloudwatch_output",
+        ));
+    }
+    if request.s3_output_enabled() {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("s3_output"));
+    }
+    let expected_parameter_keys = ["commandSpecRef", "helperVersion", "mcpEc2CommandId"];
+    if request
+        .parameters()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        != expected_parameter_keys
+    {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("parameters"));
+    }
+    for values in request.parameters().values() {
+        if values.len() != 1 || values[0].trim().is_empty() {
+            return Err(McpEc2DiagnosticDispatchError::InvalidInput("parameters"));
+        }
+    }
+
+    Ok(McpEc2DiagnosticSsmSendCommandInput {
+        document_name: request.document_name().to_string(),
+        document_version: request.document_version().to_string(),
+        instance_ids: vec![request.instance_id().to_string()],
+        timeout_seconds: request.timeout_seconds(),
+        parameters: request.parameters().clone(),
+        max_concurrency: MCP_EC2_DIAGNOSTIC_SSM_MAX_CONCURRENCY.into(),
+        max_errors: MCP_EC2_DIAGNOSTIC_SSM_MAX_ERRORS.into(),
+        cloudwatch_output_enabled: false,
+        s3_output_enabled: false,
+    })
+}
+
+fn build_mcp_ec2_diagnostic_aws_send_command(
+    client: &aws_sdk_ssm::Client,
+    input: &McpEc2DiagnosticSsmSendCommandInput,
+) -> aws_sdk_ssm::operation::send_command::builders::SendCommandFluentBuilder {
+    let mut builder = client
+        .send_command()
+        .document_name(input.document_name())
+        .document_version(input.document_version())
+        .timeout_seconds(input.timeout_seconds())
+        .max_concurrency(input.max_concurrency())
+        .max_errors(input.max_errors())
+        .cloud_watch_output_config(
+            aws_sdk_ssm::types::CloudWatchOutputConfig::builder()
+                .cloud_watch_output_enabled(input.cloudwatch_output_enabled())
+                .build(),
+        );
+    for instance_id in input.instance_ids() {
+        builder = builder.instance_ids(instance_id.clone());
+    }
+    for (key, values) in input.parameters_for_aws() {
+        builder = builder.parameters(key.clone(), values.clone());
+    }
+    builder
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum McpEc2DiagnosticSsmDispatcherError {
+    #[error("MCP EC2 diagnostics SSM dispatch backend error")]
+    Backend,
+    #[error("MCP EC2 diagnostics SSM dispatch returned no command id")]
+    MissingCommandId,
+}
+
+#[async_trait]
+pub trait McpEc2DiagnosticSsmDispatcher: Send + Sync {
+    async fn dispatch(
+        &self,
+        input: &McpEc2DiagnosticSsmSendCommandInput,
+    ) -> Result<String, McpEc2DiagnosticSsmDispatcherError>;
+}
+
+pub struct AwsMcpEc2DiagnosticSsmDispatcher {
+    client: aws_sdk_ssm::Client,
+}
+
+impl AwsMcpEc2DiagnosticSsmDispatcher {
+    pub fn new(client: aws_sdk_ssm::Client) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl McpEc2DiagnosticSsmDispatcher for AwsMcpEc2DiagnosticSsmDispatcher {
+    async fn dispatch(
+        &self,
+        input: &McpEc2DiagnosticSsmSendCommandInput,
+    ) -> Result<String, McpEc2DiagnosticSsmDispatcherError> {
+        let response = build_mcp_ec2_diagnostic_aws_send_command(&self.client, input)
+            .send()
+            .await
+            .map_err(|_| McpEc2DiagnosticSsmDispatcherError::Backend)?;
+        response
+            .command()
+            .and_then(|command| command.command_id())
+            .map(str::to_string)
+            .ok_or(McpEc2DiagnosticSsmDispatcherError::MissingCommandId)
+    }
 }
 
 fn mcp_ec2_dispatch_document_version_is_pinned(version: &str) -> bool {
@@ -2243,6 +2432,103 @@ mod tests {
             .unwrap_err(),
             McpEc2DiagnosticDispatchError::InvalidInput("instance_id")
         );
+    }
+
+    #[test]
+    fn ssm_send_command_input_maps_to_single_target_pinned_document_and_disabled_sinks() {
+        let now = Utc::now();
+        let payload = spec_ref_payload(now);
+        let claim = spec_ref_claim(now);
+        let command_spec_ref =
+            seal_mcp_ec2_diagnostic_command_spec_ref("spec-ref-key", &payload, now).unwrap();
+        let verified_command_spec_ref = verify_mcp_ec2_diagnostic_command_spec_ref(
+            "spec-ref-key",
+            &command_spec_ref,
+            &spec_ref_binding(now, &claim),
+        )
+        .unwrap();
+        let dispatch_request = build_mcp_ec2_diagnostic_ssm_dispatch_request(
+            &ssm_dispatch_config(),
+            "mcp-ec2-cmd-1",
+            "i-0123456789abcdef0",
+            &verified_command_spec_ref,
+        )
+        .unwrap();
+        let input = build_mcp_ec2_diagnostic_ssm_send_command_input(&dispatch_request).unwrap();
+
+        assert_eq!(input.document_name(), "Canopy-Ec2Diagnostics");
+        assert_eq!(input.document_version(), "7");
+        assert_eq!(input.instance_ids(), &["i-0123456789abcdef0".to_string()]);
+        assert_eq!(
+            input.timeout_seconds(),
+            MCP_EC2_DIAGNOSTIC_SSM_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            input.parameter_keys(),
+            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
+        );
+        assert_eq!(
+            input.max_concurrency(),
+            MCP_EC2_DIAGNOSTIC_SSM_MAX_CONCURRENCY
+        );
+        assert_eq!(input.max_errors(), MCP_EC2_DIAGNOSTIC_SSM_MAX_ERRORS);
+        assert!(!input.cloudwatch_output_enabled());
+        assert!(!input.s3_output_enabled());
+
+        let input_debug = format!("{input:?}");
+        assert!(!input_debug.contains(&command_spec_ref));
+        assert!(!input_debug.contains("/tmp/canopy-safe/app.log"));
+        assert!(!input_debug.contains("request-id"));
+        assert!(!input_debug.contains("grep_log"));
+
+        let sdk_config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("ap-northeast-1"))
+            .build();
+        let client = aws_sdk_ssm::Client::new(&sdk_config);
+        let builder = build_mcp_ec2_diagnostic_aws_send_command(&client, &input);
+        let aws_input = builder.as_input();
+
+        assert_eq!(
+            aws_input.get_document_name().as_deref(),
+            Some("Canopy-Ec2Diagnostics")
+        );
+        assert_eq!(aws_input.get_document_version().as_deref(), Some("7"));
+        assert_eq!(
+            aws_input.get_instance_ids().as_ref().unwrap(),
+            &vec!["i-0123456789abcdef0".to_string()]
+        );
+        assert!(aws_input.get_targets().is_none());
+        assert_eq!(
+            aws_input.get_timeout_seconds(),
+            &Some(MCP_EC2_DIAGNOSTIC_SSM_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            aws_input.get_max_concurrency().as_deref(),
+            Some(MCP_EC2_DIAGNOSTIC_SSM_MAX_CONCURRENCY)
+        );
+        assert_eq!(
+            aws_input.get_max_errors().as_deref(),
+            Some(MCP_EC2_DIAGNOSTIC_SSM_MAX_ERRORS)
+        );
+        assert!(aws_input.get_output_s3_region().is_none());
+        assert!(aws_input.get_output_s3_bucket_name().is_none());
+        assert!(aws_input.get_output_s3_key_prefix().is_none());
+        let cloudwatch_config = aws_input.get_cloud_watch_output_config().as_ref().unwrap();
+        assert!(!cloudwatch_config.cloud_watch_output_enabled());
+        assert!(cloudwatch_config.cloud_watch_log_group_name().is_none());
+
+        let parameters = aws_input.get_parameters().as_ref().unwrap();
+        let mut keys = parameters.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
+        );
+        let parameters_debug = format!("{parameters:?}");
+        assert!(!parameters_debug.contains("/tmp/canopy-safe/app.log"));
+        assert!(!parameters_debug.contains("request-id"));
+        assert!(!parameters_debug.contains("grep_log"));
     }
 
     #[test]
