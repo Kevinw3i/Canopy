@@ -457,12 +457,12 @@ mod tests {
             description = "Business scopes for MCP CloudWatch"
 
             [[scopes]]
-            platform = "WS168"
+            platform = "PLATFORM_A"
             environment = "production"
             aliases = ["正式環境", "prod", "PRO"]
 
             [[scopes]]
-            platform = "WS168"
+            platform = "PLATFORM_A"
             environment = "demo"
         "#;
         let metadata: RuleMetadata = toml::from_str(toml).unwrap();
@@ -471,7 +471,7 @@ mod tests {
             Some("Business scopes for MCP CloudWatch")
         );
         assert_eq!(metadata.scopes.len(), 2);
-        assert_eq!(metadata.scopes[0].platform, "WS168");
+        assert_eq!(metadata.scopes[0].platform, "PLATFORM_A");
         assert_eq!(metadata.scopes[0].environment, "production");
         assert_eq!(metadata.scopes[0].aliases, vec!["正式環境", "prod", "PRO"]);
         assert!(metadata.scopes[1].aliases.is_empty());
@@ -574,7 +574,7 @@ mod tests {
                 allow_views: false,
             }],
             business_scopes: vec![McpBusinessScope {
-                platform: "WS168".into(),
+                platform: "PLATFORM_A".into(),
                 environment: "production".into(),
                 aliases: vec!["prod".into()],
                 account_id: "111".into(),
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(back.max_session_seconds, Some(3600));
         assert_eq!(back.database_scopes.len(), 1);
         assert_eq!(back.business_scopes.len(), 1);
-        assert_eq!(back.business_scopes[0].platform, "WS168");
+        assert_eq!(back.business_scopes[0].platform, "PLATFORM_A");
     }
 
     #[test]

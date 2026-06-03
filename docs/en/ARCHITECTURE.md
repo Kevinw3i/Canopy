@@ -316,7 +316,7 @@ the only connect path that does not need AWS-scoped credentials.
 ```
 
 `rules.metadata.scopes` is a discovery hint for MCP clients. It lets
-`canopy_describe_capabilities` expose business labels such as `WS168 production`
+`canopy_describe_capabilities` expose business labels such as `PLATFORM_A production`
 with the same rule's account, region list, and log group ARN patterns. It is not
 an authorization source: metadata cannot add accounts, regions, log groups, or
 roles, and MCP CloudWatch routes still authorize every request through the

@@ -1811,7 +1811,7 @@ mod tests {
                 mcp_cloudwatch_business_rule(
                     "metadata-without-logs",
                     "rd",
-                    business_scope_metadata("WS168", "production"),
+                    business_scope_metadata("PLATFORM_A", "production"),
                     "111111111111",
                     vec![],
                 ),
@@ -1821,7 +1821,7 @@ mod tests {
                         "rd",
                         RuleMetadata::default(),
                         "111111111111",
-                        vec!["arn:aws:logs:*:111111111111:log-group:/ws168/*".into()],
+                        vec!["arn:aws:logs:*:111111111111:log-group:/platform-a/*".into()],
                     );
                     rule.metadata = RuleMetadata::default();
                     rule
@@ -1830,9 +1830,9 @@ mod tests {
                     let mut rule = mcp_cloudwatch_business_rule(
                         "metadata-without-mcp-master",
                         "rd",
-                        business_scope_metadata("DS88", "production"),
+                        business_scope_metadata("PLATFORM_B", "production"),
                         "222222222222",
-                        vec!["arn:aws:logs:*:222222222222:log-group:/ds88/*".into()],
+                        vec!["arn:aws:logs:*:222222222222:log-group:/platform-b/*".into()],
                     );
                     rule.features.can_use_mcp = false;
                     rule
@@ -1841,9 +1841,9 @@ mod tests {
                     let mut rule = mcp_cloudwatch_business_rule(
                         "metadata-without-mcp-cloudwatch",
                         "rd",
-                        business_scope_metadata("DS88", "demo"),
+                        business_scope_metadata("PLATFORM_B", "demo"),
                         "333333333333",
-                        vec!["arn:aws:logs:*:333333333333:log-group:/ds88-demo/*".into()],
+                        vec!["arn:aws:logs:*:333333333333:log-group:/platform-b-demo/*".into()],
                     );
                     rule.features.can_use_mcp_cloudwatch = false;
                     rule
@@ -1852,9 +1852,9 @@ mod tests {
                     let mut rule = mcp_cloudwatch_business_rule(
                         "metadata-without-account",
                         "rd",
-                        business_scope_metadata("WS168", "demo"),
+                        business_scope_metadata("PLATFORM_A", "demo"),
                         "444444444444",
-                        vec!["arn:aws:logs:*:444444444444:log-group:/ws168-demo/*".into()],
+                        vec!["arn:aws:logs:*:444444444444:log-group:/platform-a-demo/*".into()],
                     );
                     rule.allowed_accounts.clear();
                     rule
@@ -1863,9 +1863,9 @@ mod tests {
                     let mut rule = mcp_cloudwatch_business_rule(
                         "metadata-without-region",
                         "rd",
-                        business_scope_metadata("WS168", "qa"),
+                        business_scope_metadata("PLATFORM_A", "qa"),
                         "555555555555",
-                        vec!["arn:aws:logs:*:555555555555:log-group:/ws168-qa/*".into()],
+                        vec!["arn:aws:logs:*:555555555555:log-group:/platform-a-qa/*".into()],
                     );
                     rule.allowed_regions.clear();
                     rule
@@ -1891,43 +1891,44 @@ mod tests {
             rules: vec![
                 {
                     let mut rule = mcp_cloudwatch_business_rule(
-                        "ws168-prod",
+                        "platform-a-prod",
                         "rd",
                         RuleMetadata {
                             description: None,
                             scopes: vec![BusinessScopeMetadata {
-                                platform: "WS168".into(),
+                                platform: "PLATFORM_A".into(),
                                 environment: "production".into(),
                                 aliases: vec!["正式環境".into(), "prod".into(), "prod".into()],
                             }],
                         },
                         "111111111111",
                         vec![
-                            "arn:aws:logs:*:111111111111:log-group:/ws168/prod/*".into(),
-                            "arn:aws:logs:*:111111111112:log-group:/ws168/prod-secondary/*".into(),
+                            "arn:aws:logs:*:111111111111:log-group:/platform-a/prod/*".into(),
+                            "arn:aws:logs:*:111111111112:log-group:/platform-a/prod-secondary/*"
+                                .into(),
                         ],
                     );
                     rule.allowed_accounts.push(AllowedAccount {
                         account_id: "111111111112".into(),
-                        account_name: "ws168-prod-secondary".into(),
+                        account_name: "platform-a-prod-secondary".into(),
                         role_arn: "arn:aws:iam::111111111112:role/CanopyReadOnly".into(),
                     });
                     rule.allowed_regions.push("us-west-2".into());
                     rule
                 },
                 mcp_cloudwatch_business_rule(
-                    "ds88-demo",
+                    "platform-b-demo",
                     "rd",
-                    business_scope_metadata("DS88", "demo"),
+                    business_scope_metadata("PLATFORM_B", "demo"),
                     "222222222222",
-                    vec!["arn:aws:logs:*:222222222222:log-group:/ds88/demo/*".into()],
+                    vec!["arn:aws:logs:*:222222222222:log-group:/platform-b/demo/*".into()],
                 ),
                 mcp_cloudwatch_business_rule(
-                    "ws168-prod-dr",
+                    "platform-a-prod-dr",
                     "rd",
-                    business_scope_metadata("WS168", "production"),
+                    business_scope_metadata("PLATFORM_A", "production"),
                     "333333333333",
-                    vec!["arn:aws:logs:*:333333333333:log-group:/ws168/prod-dr/*".into()],
+                    vec!["arn:aws:logs:*:333333333333:log-group:/platform-a/prod-dr/*".into()],
                 ),
             ],
             memberships: vec![GroupMembership {
@@ -1939,51 +1940,51 @@ mod tests {
         let ent = store.evaluate("alice", "alice@example.com", "Alice", true);
         assert_eq!(ent.business_scopes.len(), 4);
 
-        let ws168 = ent
+        let platform_a = ent
             .business_scopes
             .iter()
-            .find(|scope| scope.platform == "WS168" && scope.account_id == "111111111111")
-            .expect("WS168 scope should be present");
-        assert_eq!(ws168.environment, "production");
-        assert_eq!(ws168.account_id, "111111111111");
-        assert_eq!(ws168.regions, vec!["ap-northeast-1", "us-west-2"]);
+            .find(|scope| scope.platform == "PLATFORM_A" && scope.account_id == "111111111111")
+            .expect("PLATFORM_A scope should be present");
+        assert_eq!(platform_a.environment, "production");
+        assert_eq!(platform_a.account_id, "111111111111");
+        assert_eq!(platform_a.regions, vec!["ap-northeast-1", "us-west-2"]);
         assert_eq!(
-            ws168.log_group_arn_patterns,
-            vec!["arn:aws:logs:*:111111111111:log-group:/ws168/prod/*"]
+            platform_a.log_group_arn_patterns,
+            vec!["arn:aws:logs:*:111111111111:log-group:/platform-a/prod/*"]
         );
-        assert_eq!(ws168.aliases, vec!["正式環境", "prod"]);
+        assert_eq!(platform_a.aliases, vec!["正式環境", "prod"]);
         assert!(
             ent.business_scopes
                 .iter()
-                .any(|scope| scope.platform == "WS168"
+                .any(|scope| scope.platform == "PLATFORM_A"
                     && scope.environment == "production"
                     && scope.account_id == "111111111112"
                     && scope.regions.as_slice() == ["ap-northeast-1", "us-west-2"]
                     && scope.log_group_arn_patterns.as_slice()
-                        == ["arn:aws:logs:*:111111111112:log-group:/ws168/prod-secondary/*"]),
+                        == ["arn:aws:logs:*:111111111112:log-group:/platform-a/prod-secondary/*"]),
             "same rule should emit account-local log group patterns per allowed account"
         );
         assert!(
             ent.business_scopes
                 .iter()
-                .any(|scope| scope.platform == "WS168"
+                .any(|scope| scope.platform == "PLATFORM_A"
                     && scope.environment == "production"
                     && scope.account_id == "333333333333"
                     && scope.log_group_arn_patterns.as_slice()
-                        == ["arn:aws:logs:*:333333333333:log-group:/ws168/prod-dr/*"]),
+                        == ["arn:aws:logs:*:333333333333:log-group:/platform-a/prod-dr/*"]),
             "same business label in another rule must remain a separate rule-local candidate"
         );
 
-        let ds88 = ent
+        let platform_b = ent
             .business_scopes
             .iter()
-            .find(|scope| scope.platform == "DS88")
-            .expect("DS88 scope should be present");
-        assert_eq!(ds88.environment, "demo");
-        assert_eq!(ds88.account_id, "222222222222");
+            .find(|scope| scope.platform == "PLATFORM_B")
+            .expect("PLATFORM_B scope should be present");
+        assert_eq!(platform_b.environment, "demo");
+        assert_eq!(platform_b.account_id, "222222222222");
         assert_eq!(
-            ds88.log_group_arn_patterns,
-            vec!["arn:aws:logs:*:222222222222:log-group:/ds88/demo/*"]
+            platform_b.log_group_arn_patterns,
+            vec!["arn:aws:logs:*:222222222222:log-group:/platform-b/demo/*"]
         );
     }
 
@@ -1992,18 +1993,18 @@ mod tests {
         let store = EntitlementStore {
             rules: vec![
                 mcp_cloudwatch_business_rule(
-                    "rd-ws168",
+                    "rd-platform-a",
                     "rd",
-                    business_scope_metadata("WS168", "production"),
+                    business_scope_metadata("PLATFORM_A", "production"),
                     "111111111111",
-                    vec!["arn:aws:logs:*:111111111111:log-group:/ws168/*".into()],
+                    vec!["arn:aws:logs:*:111111111111:log-group:/platform-a/*".into()],
                 ),
                 mcp_cloudwatch_business_rule(
-                    "ops-ds88",
+                    "ops-platform-b",
                     "ops",
-                    business_scope_metadata("DS88", "production"),
+                    business_scope_metadata("PLATFORM_B", "production"),
                     "222222222222",
-                    vec!["arn:aws:logs:*:222222222222:log-group:/ds88/*".into()],
+                    vec!["arn:aws:logs:*:222222222222:log-group:/platform-b/*".into()],
                 ),
             ],
             memberships: vec![
@@ -2020,7 +2021,7 @@ mod tests {
 
         let alice = store.evaluate("alice", "alice@example.com", "Alice", true);
         assert_eq!(alice.business_scopes.len(), 1);
-        assert_eq!(alice.business_scopes[0].platform, "WS168");
+        assert_eq!(alice.business_scopes[0].platform, "PLATFORM_A");
 
         let unverified_bob = store.evaluate("bob-sub", "bob@example.com", "Bob", false);
         assert!(
@@ -2030,7 +2031,7 @@ mod tests {
 
         let verified_bob = store.evaluate("bob-sub", "bob@example.com", "Bob", true);
         assert_eq!(verified_bob.business_scopes.len(), 1);
-        assert_eq!(verified_bob.business_scopes[0].platform, "DS88");
+        assert_eq!(verified_bob.business_scopes[0].platform, "PLATFORM_B");
     }
 
     #[test]
@@ -2074,7 +2075,7 @@ can_use_mcp = true
 can_use_mcp_cloudwatch = true
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["prod", " "]
 
@@ -2103,7 +2104,7 @@ can_use_mcp_cloudwatch = true
 token = "do-not-allow"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 
 [[memberships]]

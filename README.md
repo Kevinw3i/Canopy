@@ -242,12 +242,12 @@ can_use_mcp_database = true       # Can use MCP Database tools when scoped below
 description = "MCP CloudWatch business scopes"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["正式環境", "prod", "PRO"]
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "demo"
 aliases = ["Demo", "測試環境"]
 
@@ -458,7 +458,7 @@ MCP permissions are intentionally separate from the normal TUI permissions:
 
 - `can_use_mcp` is the master switch for the local MCP server.
 - `can_use_mcp_cloudwatch` does **not** follow `can_use_cloudwatch_search`; it is a separate MCP feature gate.
-- `rules.metadata.scopes` can describe business names such as `WS168 production` or aliases such as `正式環境`, but it is only a discovery hint. It never authorizes AWS resources, never contains regions, and is returned only from matching rules that also grant MCP CloudWatch access, allowed accounts, allowed regions, and log group ARN patterns.
+- `rules.metadata.scopes` can describe business names such as `PLATFORM_A production` or aliases such as `正式環境`, but it is only a discovery hint. It never authorizes AWS resources, never contains regions, and is returned only from matching rules that also grant MCP CloudWatch access, allowed accounts, allowed regions, and log group ARN patterns.
 - The AI workflow is: call `canopy_describe_capabilities`, choose a returned `business_scopes` entry, then call `canopy_list_allowed_log_groups` with that entry's `account_id` and one of its `regions`. The server still performs the normal entitlement check for `account_id + region + log group`.
 - MCP CloudWatch raw filter/query audit values are encrypted by default; set `can_view_mcp_raw_audit_plaintext = true` only on the same rule that authorizes the exact account/region/log-group scope.
 - `can_use_mcp_database` enables MCP database tools only when a matching `[[rules.database_scopes]]` grants a specific connection/schema/table scope.

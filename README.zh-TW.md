@@ -240,12 +240,12 @@ can_use_mcp_database = true       # 搭配下方 scope 使用 MCP Database tools
 description = "MCP CloudWatch business scopes"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["正式環境", "prod", "PRO"]
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "demo"
 aliases = ["Demo", "測試環境"]
 
@@ -454,7 +454,7 @@ MCP 權限刻意和一般 TUI 權限分開：
 
 - `can_use_mcp` 是本機 MCP server 的總開關。
 - `can_use_mcp_cloudwatch` 不會跟隨 `can_use_cloudwatch_search`；這是獨立的 MCP feature gate。
-- `rules.metadata.scopes` 可以描述 `WS168 production`、`正式環境` 這類業務語意，但它只是一個 discovery hint。metadata 不授權 AWS 資源、不放 region，且只有同一條 matching rule 同時具備 MCP CloudWatch 權限、allowed accounts、allowed regions、log group ARN patterns 時才會回傳。
+- `rules.metadata.scopes` 可以描述 `PLATFORM_A production`、`正式環境` 這類業務語意，但它只是一個 discovery hint。metadata 不授權 AWS 資源、不放 region，且只有同一條 matching rule 同時具備 MCP CloudWatch 權限、allowed accounts、allowed regions、log group ARN patterns 時才會回傳。
 - AI 使用流程是：先呼叫 `canopy_describe_capabilities` 取得 `business_scopes`，選出對應的 `account_id` 與其中一個 `regions`，再呼叫 `canopy_list_allowed_log_groups`。server 仍會對 `account_id + region + log group` 做原本的 entitlement 檢查。
 - MCP CloudWatch raw filter/query audit 預設加密保存；只有同一條 rule 同時授權該 account / region / log group scope 時，才應設定 `can_view_mcp_raw_audit_plaintext = true`。
 - `can_use_mcp_database` 只是在 MCP 開 DB tools；真正能查哪些 DB / schema / table，要看同一條 matching rule 裡的 `[[rules.database_scopes]]`。

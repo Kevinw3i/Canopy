@@ -93,12 +93,12 @@ can_use_mcp_database = false
 description = "MCP CloudWatch business scopes"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["正式環境", "prod", "PRO"]
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "demo"
 aliases = ["Demo", "測試環境"]
 

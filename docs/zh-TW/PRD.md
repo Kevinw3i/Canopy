@@ -536,7 +536,7 @@ can_use_mcp_cloudwatch = true
 description = "MCP CloudWatch business scopes"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["正式環境", "prod", "PRO"]
 

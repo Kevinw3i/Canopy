@@ -346,7 +346,7 @@ cat > "$TMP_DIR/metadata-scopes-entitlements.toml" <<EOF
 [[rules]]
 id = "metadata-scopes"
 allowed_regions = ["ap-northeast-1"]
-allowed_log_group_arns = ["arn:aws:logs:*:123456789012:log-group:/ws168/*"]
+allowed_log_group_arns = ["arn:aws:logs:*:123456789012:log-group:/platform-a/*"]
 
 [rules.features]
 can_use_mcp = true
@@ -356,12 +356,12 @@ can_use_mcp_cloudwatch = true
 description = "MCP CloudWatch business scopes"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["正式環境", "prod", "PRO"]
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "demo"
 aliases = ["Demo", "測試環境"]
 

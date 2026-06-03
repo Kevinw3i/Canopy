@@ -1354,23 +1354,23 @@ mod tests {
     fn describe_capabilities_discloses_business_scopes_only_with_cloudwatch_mcp() {
         let mut entitlements = minimal_entitlements();
         entitlements.business_scopes.push(McpBusinessScope {
-            platform: "WS168".into(),
+            platform: "PLATFORM_A".into(),
             environment: "production".into(),
             aliases: vec!["正式環境".into(), "prod".into()],
             account_id: "111111111111".into(),
-            account_name: "ws168-prod".into(),
+            account_name: "platform-a-prod".into(),
             regions: vec!["ap-northeast-1".into()],
             log_group_arn_patterns: vec![
-                "arn:aws:logs:*:111111111111:log-group:/ws168/prod/*".into()
+                "arn:aws:logs:*:111111111111:log-group:/platform-a/prod/*".into(),
             ],
         });
 
         let hidden = describe_capabilities(&entitlements);
         assert!(hidden.business_scopes.is_empty());
         let hidden_json = serde_json::to_string(&hidden).unwrap();
-        assert!(!hidden_json.contains("WS168"));
+        assert!(!hidden_json.contains("PLATFORM_A"));
         assert!(!hidden_json.contains("111111111111"));
-        assert!(!hidden_json.contains("/ws168/prod"));
+        assert!(!hidden_json.contains("/platform-a/prod"));
 
         entitlements.features.can_use_mcp = false;
         entitlements.features.can_use_mcp_cloudwatch = true;
@@ -1381,10 +1381,10 @@ mod tests {
         entitlements.features.can_use_mcp_cloudwatch = true;
         let visible = describe_capabilities(&entitlements);
         assert_eq!(visible.business_scopes.len(), 1);
-        assert_eq!(visible.business_scopes[0].platform, "WS168");
+        assert_eq!(visible.business_scopes[0].platform, "PLATFORM_A");
 
         let json = serde_json::to_string(&visible.business_scopes).unwrap();
-        assert!(json.contains("WS168"));
+        assert!(json.contains("PLATFORM_A"));
         assert!(!json.contains("role_arn"));
         assert!(!json.contains("external_id"));
         assert!(!json.contains("jwt"));

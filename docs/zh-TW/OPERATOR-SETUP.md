@@ -174,7 +174,7 @@ Guidance 只負責提供查詢規則、工作流程、表格語意與安全提�
 table scope、`LIMIT`、SQL validation、`EXPLAIN` 與 preflight token 仍必須由
 control-plane server-side enforcement 強制執行。
 
-若要讓 AI 能把「WS168 正式環境」這類描述解析成可授權查詢的
+若要讓 AI 能把「PLATFORM_A 正式環境」這類描述解析成可授權查詢的
 `account_id + region`，可在同一條 MCP CloudWatch rule 加
 Business Scopes：
 
@@ -187,12 +187,12 @@ can_use_mcp_cloudwatch = true
 description = "MCP CloudWatch business scopes"
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "production"
 aliases = ["正式環境", "prod", "PRO"]
 
 [[rules.metadata.scopes]]
-platform = "WS168"
+platform = "PLATFORM_A"
 environment = "demo"
 aliases = ["Demo", "測試環境"]
 ```
