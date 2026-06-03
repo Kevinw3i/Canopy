@@ -13,6 +13,7 @@
 | IAM Roles | Task Execution（拉 image、讀 secret）+ Task（呼叫 AWS API） |
 | Secrets Manager | JWT signing secret |
 | DynamoDB Table | MCP session 跨 task 共享狀態（`mcp_session_store = dynamodb` 時建立；TTL 欄位 `expires_at_epoch` 自動清理過期 session） |
+| SSM Documents | MCP EC2 Diagnostics v1 的 managed document artifact（見 `ssm-documents/`；發布時需 pin document version） |
 | CloudWatch Log Group | 容器日誌 |
 | Route 53 Record | DNS 指向 ALB（可選） |
 

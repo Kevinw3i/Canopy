@@ -1,0 +1,42 @@
+schemaVersion: '2.2'
+description: Canopy EC2 diagnostics command document. Runs only the installed Canopy diagnostics helper with opaque command metadata.
+parameters:
+  mcpEc2CommandId:
+    type: String
+    description: Opaque Canopy MCP EC2 command identifier.
+    allowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
+    interpolationType: ENV_VAR
+  commandSpecRef:
+    type: String
+    description: Opaque encrypted or short-lived command-spec reference. Must not contain raw paths, patterns, URLs, hosts, ports, or journal units.
+    allowedPattern: '^canopy-ec2-spec:[A-Za-z0-9_.:/+=-]{1,256}$'
+    interpolationType: ENV_VAR
+  helperVersion:
+    type: String
+    description: Required Canopy diagnostics helper contract version.
+    allowedPattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}([.][0-9]+)?$'
+    interpolationType: ENV_VAR
+mainSteps:
+  - action: aws:runShellScript
+    name: runCanopyEc2Diagnostics
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: '120'
+      runCommand:
+        - |
+          set -eu
+          umask 077
+
+          helper=/usr/local/bin/canopy-ec2-diagnostics
+          if [ ! -x "$helper" ]; then
+            printf '%s\n' 'canopy diagnostics helper missing or not executable' >&2
+            exit 127
+          fi
+
+          exec "$helper" \
+            --mcp-ec2-command-id "${SSM_mcpEc2CommandId:?}" \
+            --command-spec-ref "${SSM_commandSpecRef:?}" \
+            --helper-version "${SSM_helperVersion:?}"
