@@ -1572,6 +1572,9 @@ mod tests {
             ),
             database_executor: Arc::new(crate::services::database::MySqlDatabaseExecutor::new()),
             mcp_sessions: Arc::new(crate::services::MemoryMcpSessionStore::new()),
+            mcp_ec2_diagnostic_commands: Arc::new(
+                crate::services::MemoryMcpEc2DiagnosticCommandStore::new(),
+            ),
             ready: std::sync::atomic::AtomicBool::new(true),
             db_connection_ready: dashmap::DashMap::new(),
             db_connection_next_probe: dashmap::DashMap::new(),

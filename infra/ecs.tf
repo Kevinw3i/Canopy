@@ -51,10 +51,13 @@ resource "aws_ecs_task_definition" "control_plane" {
     precondition {
       condition = (
         var.desired_count <= 1 ||
-        var.mcp_session_store == "dynamodb" ||
+        (
+          var.mcp_session_store == "dynamodb" &&
+          var.mcp_ec2_diagnostic_command_store == "dynamodb"
+        ) ||
         var.allow_multi_task_memory_mcp_session_store
       )
-      error_message = "desired_count > 1 requires mcp_session_store = \"dynamodb\" unless allow_multi_task_memory_mcp_session_store = true."
+      error_message = "desired_count > 1 requires mcp_session_store and mcp_ec2_diagnostic_command_store to be \"dynamodb\" unless allow_multi_task_memory_mcp_session_store = true."
     }
   }
   requires_compatibilities = ["FARGATE"]
@@ -98,6 +101,8 @@ resource "aws_ecs_task_definition" "control_plane" {
       { name = "AUDIT_EXPORT_QUEUE_SIZE", value = tostring(var.audit_export_queue_size) },
       { name = "MCP_SESSION_STORE", value = var.mcp_session_store },
       { name = "MCP_SESSION_TABLE_NAME", value = var.mcp_session_store == "dynamodb" ? local.mcp_session_table_name : "" },
+      { name = "MCP_EC2_DIAGNOSTIC_COMMAND_STORE", value = var.mcp_ec2_diagnostic_command_store },
+      { name = "MCP_EC2_DIAGNOSTIC_COMMAND_TABLE_NAME", value = var.mcp_ec2_diagnostic_command_store == "dynamodb" ? local.mcp_ec2_diagnostic_command_table_name : "" },
     ]
 
     # Inject secrets via ECS-native secrets injection (uses execution role).

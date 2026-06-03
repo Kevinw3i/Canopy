@@ -40,7 +40,9 @@ use control_plane::services::database::{
     DatabaseExecutor, DatabaseSecret, DatabaseSecretProvider, MySqlDatabaseExecutor,
 };
 use control_plane::services::oidc::OidcClient;
-use control_plane::services::{AppState, MemoryMcpSessionStore};
+use control_plane::services::{
+    AppState, MemoryMcpEc2DiagnosticCommandStore, MemoryMcpSessionStore,
+};
 use http_body_util::BodyExt;
 use mysql_async::prelude::Queryable;
 use serde_json::{json, Value};
@@ -333,6 +335,7 @@ fn build_state(
         }),
         database_executor: executor,
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
+        mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),

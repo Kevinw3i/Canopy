@@ -46,7 +46,9 @@ use control_plane::services::database::{
     DatabaseSecretProvider, QueryRows, TableType, TableTypeQuery, ViewCheckedQueryOutcome,
 };
 use control_plane::services::oidc::{OidcClient, OidcEndpoints};
-use control_plane::services::{AppState, McpSessionStore, MemoryMcpSessionStore};
+use control_plane::services::{
+    AppState, McpSessionStore, MemoryMcpEc2DiagnosticCommandStore, MemoryMcpSessionStore,
+};
 use shared::dto::database::{ExplainSummary, ExplainTableSummary};
 
 const TEST_MFA_SECRET_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -146,6 +148,7 @@ fn build_state_with_audit_service_and_mcp_store(
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),
         mcp_sessions,
+        mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -211,6 +214,7 @@ fn build_state_with_database_and_allow_views(
         database_secret_provider: secret_provider,
         database_executor: executor,
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
+        mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
         ready: std::sync::atomic::AtomicBool::new(true),
         db_connection_ready,
         db_connection_next_probe: dashmap::DashMap::new(),
@@ -6339,6 +6343,7 @@ async fn live_tail_ws_rejects_log_group_from_non_tail_rule() {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -8372,6 +8377,7 @@ fn build_state_not_ready(config: AppConfig) -> Arc<AppState> {
         database_secret_provider: Arc::new(StaticSecretProvider),
         database_executor: Arc::new(NullDatabaseExecutor),
         mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
+        mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
         ready: std::sync::atomic::AtomicBool::new(false),
         // Global readiness gate fails-closed here; db_connection_ready
         // is irrelevant in this scenario (the global gate fires first).

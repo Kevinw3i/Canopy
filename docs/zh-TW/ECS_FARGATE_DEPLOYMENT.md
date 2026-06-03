@@ -41,7 +41,7 @@ Internet
 
 - AWS CLI v2 已設定
 - Docker 已安裝
-- 一個 AWS 帳號，有 ECR、ECS、ALB、Secrets Manager、DynamoDB 權限（DynamoDB 供 MCP session store；`mcp_session_store = dynamodb` 時 Terraform 會建立 session table）
+- 一個 AWS 帳號，有 ECR、ECS、ALB、Secrets Manager、DynamoDB 權限（DynamoDB 供 MCP session store 與 EC2 diagnostics command record store；Terraform 預設建立兩張 table）
 - 一個已註冊的域名（用於 ALB + ACM 憑證）
 
 以下範例使用：

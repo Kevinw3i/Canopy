@@ -206,6 +206,35 @@ variable "mcp_session_table_name" {
   }
 }
 
+variable "mcp_ec2_diagnostic_command_store" {
+  description = "MCP EC2 diagnostic command record backend. Use dynamodb for production so command ownership and completion state survive task restarts."
+  type        = string
+  default     = "dynamodb"
+
+  validation {
+    condition     = contains(["memory", "dynamodb"], var.mcp_ec2_diagnostic_command_store)
+    error_message = "mcp_ec2_diagnostic_command_store must be either memory or dynamodb."
+  }
+}
+
+variable "mcp_ec2_diagnostic_command_table_name" {
+  description = "Optional DynamoDB table name for MCP EC2 diagnostic command records. Defaults to <project>-mcp-ec2-diagnostic-commands when mcp_ec2_diagnostic_command_store = dynamodb."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.mcp_ec2_diagnostic_command_table_name == "" ||
+      (
+        length(var.mcp_ec2_diagnostic_command_table_name) >= 3 &&
+        length(var.mcp_ec2_diagnostic_command_table_name) <= 255 &&
+        can(regex("^[A-Za-z0-9_.-]+$", var.mcp_ec2_diagnostic_command_table_name))
+      )
+    )
+    error_message = "mcp_ec2_diagnostic_command_table_name must be empty or a valid DynamoDB table name."
+  }
+}
+
 variable "allow_multi_task_memory_mcp_session_store" {
   description = "Explicit unsafe override for desired_count > 1 with memory MCP sessions. Intended only for emergency debugging; production should keep this false."
   type        = bool

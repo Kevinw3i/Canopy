@@ -52,3 +52,8 @@ output "mcp_session_table_name" {
   description = "DynamoDB table used for MCP session state when enabled"
   value       = var.mcp_session_store == "dynamodb" ? aws_dynamodb_table.mcp_sessions[0].name : ""
 }
+
+output "mcp_ec2_diagnostic_command_table_name" {
+  description = "DynamoDB table used for MCP EC2 diagnostic command records when enabled"
+  value       = var.mcp_ec2_diagnostic_command_store == "dynamodb" ? aws_dynamodb_table.mcp_ec2_diagnostic_commands[0].name : ""
+}

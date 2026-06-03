@@ -436,6 +436,8 @@ No shared state -- survives restarts and multi-replica routing.
 | `audit_export.s3.*` | disabled | Optional direct audit export to S3 |
 | `mcp.session_store` | `memory` | MCP session store backend: `memory` (process-local; dev/single-task) or `dynamodb` (durable; shared across multi-task ECS) |
 | `mcp.session_table_name` | -- | DynamoDB table name; required when `mcp.session_store = dynamodb` |
+| `mcp.ec2_diagnostic_command_store` | `memory` | MCP EC2 diagnostics command metadata backend: `memory` for dev/testing or `dynamodb` for production ownership/status records |
+| `mcp.ec2_diagnostic_command_table_name` | -- | DynamoDB table name; required when `mcp.ec2_diagnostic_command_store = dynamodb` |
 | `control_plane_url` | -- | (TUI) Control plane URL |
 | `pkce_callback_port` | `9876` | (TUI) PKCE callback port |
 | `enable_live_tail` | `false` | (TUI) Live tail beta |

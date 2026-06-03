@@ -510,6 +510,7 @@ mod tests {
                     allowed_os_users: vec!["ec2-user".into()],
                     max_session_seconds: None,
                     database_scopes: vec![],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-ops".into(),
@@ -542,6 +543,7 @@ mod tests {
                     allowed_os_users: vec!["ubuntu".into()],
                     max_session_seconds: Some(1800),
                     database_scopes: vec![],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
             ],
             group_mappings: vec![],
@@ -721,6 +723,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.rules.push(EntitlementRule {
             id: "rule-eng-power-staging".into(),
@@ -749,6 +752,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
 
         let svc = EntitlementService::new(Arc::new(RwLock::new(store)));
@@ -821,6 +825,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
 
         let svc = EntitlementService::new(Arc::new(RwLock::new(store)));

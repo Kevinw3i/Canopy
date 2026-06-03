@@ -106,6 +106,8 @@ assert data["aws"]["session_duration_seconds"] == 1800
 assert data["aws"]["sts_external_id"] == 'canopy"external'
 assert data["mcp"]["session_store"] == "memory"
 assert data["mcp"]["session_table_name"] == ""
+assert data["mcp"]["ec2_diagnostic_command_store"] == "memory"
+assert data["mcp"]["ec2_diagnostic_command_table_name"] == ""
 assert data["cors_allowed_origins"] == [
     "https://one.example",
     'https://two.example/path?x="y"',
@@ -121,6 +123,8 @@ env \
   OIDC_CLIENT_ID='client-id' \
   MCP_SESSION_STORE='dynamodb' \
   MCP_SESSION_TABLE_NAME='canopy-mcp-sessions' \
+  MCP_EC2_DIAGNOSTIC_COMMAND_STORE='dynamodb' \
+  MCP_EC2_DIAGNOSTIC_COMMAND_TABLE_NAME='canopy-mcp-ec2-diagnostic-commands' \
   sh "$ENTRYPOINT" > "$MCP_CONFIG_OUT"
 
 python3 - <<'PY' "$MCP_CONFIG_OUT"
@@ -132,6 +136,8 @@ with open(sys.argv[1], "rb") as f:
 
 assert data["mcp"]["session_store"] == "dynamodb"
 assert data["mcp"]["session_table_name"] == "canopy-mcp-sessions"
+assert data["mcp"]["ec2_diagnostic_command_store"] == "dynamodb"
+assert data["mcp"]["ec2_diagnostic_command_table_name"] == "canopy-mcp-ec2-diagnostic-commands"
 PY
 
 DB_CONFIG_OUT="$TMP_DIR/generated-db.toml"

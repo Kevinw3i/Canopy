@@ -181,6 +181,10 @@ pub struct McpConfig {
     pub session_store: McpSessionStoreKind,
     #[serde(default)]
     pub session_table_name: Option<String>,
+    #[serde(default)]
+    pub ec2_diagnostic_command_store: McpEc2DiagnosticCommandStoreKind,
+    #[serde(default)]
+    pub ec2_diagnostic_command_table_name: Option<String>,
 }
 
 impl McpConfig {
@@ -197,6 +201,19 @@ impl McpConfig {
                 "mcp.session_table_name is required when mcp.session_store = \"dynamodb\""
             );
         }
+        if self.ec2_diagnostic_command_store == McpEc2DiagnosticCommandStoreKind::Dynamodb
+            && self
+                .ec2_diagnostic_command_table_name
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            anyhow::bail!(
+                "mcp.ec2_diagnostic_command_table_name is required when \
+                 mcp.ec2_diagnostic_command_store = \"dynamodb\""
+            );
+        }
         Ok(())
     }
 }
@@ -204,6 +221,14 @@ impl McpConfig {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum McpSessionStoreKind {
+    #[default]
+    Memory,
+    Dynamodb,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum McpEc2DiagnosticCommandStoreKind {
     #[default]
     Memory,
     Dynamodb,
@@ -556,6 +581,8 @@ mod tests {
             [mcp]
             session_store = "dynamodb"
             session_table_name = "canopy-mcp-sessions"
+            ec2_diagnostic_command_store = "dynamodb"
+            ec2_diagnostic_command_table_name = "canopy-mcp-ec2-diagnostic-commands"
 
             [database_connections.orders_prod]
             engine = "mysql"
@@ -609,6 +636,14 @@ mod tests {
         assert_eq!(
             config.mcp.session_table_name.as_deref(),
             Some("canopy-mcp-sessions")
+        );
+        assert_eq!(
+            config.mcp.ec2_diagnostic_command_store,
+            McpEc2DiagnosticCommandStoreKind::Dynamodb
+        );
+        assert_eq!(
+            config.mcp.ec2_diagnostic_command_table_name.as_deref(),
+            Some("canopy-mcp-ec2-diagnostic-commands")
         );
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:3000"]);
         let db = config.database_connections.get("orders_prod").unwrap();
@@ -698,6 +733,26 @@ mod tests {
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("mcp.session_table_name"));
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_dynamodb_store_requires_table_name() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [oidc]
+            issuer_url = "x"
+            client_id = "x"
+            [jwt]
+            secret = "x"
+            [aws]
+            [mcp]
+            ec2_diagnostic_command_store = "dynamodb"
+        "#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.ec2_diagnostic_command_table_name"));
     }
 
     #[test]

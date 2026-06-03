@@ -169,6 +169,20 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = aws_dynamodb_table.mcp_sessions[0].arn
       }] : [],
 
+      var.mcp_ec2_diagnostic_command_store == "dynamodb" ? [{
+        Sid    = "McpEc2DiagnosticCommandDynamoDb"
+        Effect = "Allow"
+        # No DeleteItem: expired command records are reaped by DynamoDB TTL.
+        # The control-plane still checks expires_at on every read/update, so
+        # TTL lag cannot extend command-result access.
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = aws_dynamodb_table.mcp_ec2_diagnostic_commands[0].arn
+      }] : [],
+
       # STS GetCallerIdentity is always needed for preflight health check
       [{
         Sid      = "StsIdentity"

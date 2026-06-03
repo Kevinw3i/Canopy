@@ -5,11 +5,12 @@ pub mod database;
 pub mod ec2;
 pub mod ecs;
 pub mod entitlements;
+pub mod mcp_ec2_diagnostics;
 pub mod mcp_sessions;
 pub mod oidc;
 pub mod step_up;
 
-use crate::config::{AppConfig, McpSessionStoreKind};
+use crate::config::{AppConfig, McpEc2DiagnosticCommandStoreKind, McpSessionStoreKind};
 use crate::models::entitlements::EntitlementStore;
 use crate::models::mfa::MfaStore;
 use aws_config::SdkConfig;
@@ -23,6 +24,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+pub use mcp_ec2_diagnostics::{
+    DynamoMcpEc2DiagnosticCommandStore, McpEc2DiagnosticCommandCompletion,
+    McpEc2DiagnosticCommandRecord, McpEc2DiagnosticCommandStore,
+    MemoryMcpEc2DiagnosticCommandStore,
+};
 pub use mcp_sessions::{DynamoMcpSessionStore, McpSessionStore, MemoryMcpSessionStore};
 
 /// Tracks who started a Logs Insights query and which log groups were approved.
@@ -126,6 +132,7 @@ pub struct AppState {
     pub database_secret_provider: Arc<dyn DatabaseSecretProvider>,
     pub database_executor: Arc<dyn DatabaseExecutor>,
     pub mcp_sessions: Arc<dyn McpSessionStore>,
+    pub mcp_ec2_diagnostic_commands: Arc<dyn McpEc2DiagnosticCommandStore>,
     /// Set to true after startup preflight checks (OIDC discovery + STS identity) succeed.
     /// This is the **global** readiness signal (drives `/health`); a failed database
     /// connection does NOT clear it (Codex round 30 HIGH — one bad DB scope should not
@@ -192,6 +199,7 @@ impl AppState {
             .load()
             .await;
         let secrets_client = aws_sdk_secretsmanager::Client::new(&base_aws_config);
+        let dynamodb_client = aws_sdk_dynamodb::Client::new(&base_aws_config);
         let mcp_sessions: Arc<dyn McpSessionStore> = match config.mcp.session_store {
             McpSessionStoreKind::Memory => {
                 // The in-memory store is process-local: sessions registered on
@@ -218,7 +226,34 @@ impl AppState {
                         "session_table_name is validated by AppConfig::validate for dynamodb",
                     );
                 Arc::new(DynamoMcpSessionStore::new(
-                    aws_sdk_dynamodb::Client::new(&base_aws_config),
+                    dynamodb_client.clone(),
+                    table_name,
+                ))
+            }
+        };
+        let mcp_ec2_diagnostic_commands: Arc<dyn McpEc2DiagnosticCommandStore> = match config
+            .mcp
+            .ec2_diagnostic_command_store
+        {
+            McpEc2DiagnosticCommandStoreKind::Memory => {
+                tracing::warn!(
+                    "MCP EC2 diagnostic command store is in-memory: command ownership and \
+                         completion state are NOT shared across tasks and will be lost on restart. \
+                         Safe only for local/dev; production deployments must set \
+                         mcp.ec2_diagnostic_command_store = \"dynamodb\"."
+                );
+                Arc::new(MemoryMcpEc2DiagnosticCommandStore::new())
+            }
+            McpEc2DiagnosticCommandStoreKind::Dynamodb => {
+                let table_name = config
+                        .mcp
+                        .ec2_diagnostic_command_table_name
+                        .clone()
+                        .expect(
+                            "ec2_diagnostic_command_table_name is validated by AppConfig::validate for dynamodb",
+                        );
+                Arc::new(DynamoMcpEc2DiagnosticCommandStore::new(
+                    dynamodb_client,
                     table_name,
                 ))
             }
@@ -263,6 +298,7 @@ impl AppState {
             )),
             database_executor: Arc::new(MySqlDatabaseExecutor::new()),
             mcp_sessions,
+            mcp_ec2_diagnostic_commands,
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
             db_connection_next_probe: DashMap::new(),
@@ -836,6 +872,7 @@ mod tests {
             database_secret_provider: provider,
             database_executor: Arc::new(UnreachableExecutor),
             mcp_sessions: Arc::new(MemoryMcpSessionStore::new()),
+            mcp_ec2_diagnostic_commands: Arc::new(MemoryMcpEc2DiagnosticCommandStore::new()),
             ready: std::sync::atomic::AtomicBool::new(false),
             db_connection_ready: DashMap::new(),
             db_connection_next_probe: DashMap::new(),

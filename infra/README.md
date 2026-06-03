@@ -13,6 +13,7 @@
 | IAM Roles | Task Execution（拉 image、讀 secret）+ Task（呼叫 AWS API） |
 | Secrets Manager | JWT signing secret |
 | DynamoDB Table | MCP session 跨 task 共享狀態（`mcp_session_store = dynamodb` 時建立；TTL 欄位 `expires_at_epoch` 自動清理過期 session） |
+| DynamoDB Table | MCP EC2 diagnostics command ownership/status metadata（`mcp_ec2_diagnostic_command_store = dynamodb` 時建立；TTL 欄位 `expires_at_epoch` 自動清理過期 records；不存 raw command/output） |
 | SSM Documents | MCP EC2 Diagnostics v1 的 managed document artifact（見 `ssm-documents/`；發布時需 pin document version） |
 | CloudWatch Log Group | 容器日誌 |
 | Route 53 Record | DNS 指向 ALB（可選） |
@@ -287,7 +288,9 @@ encrypt        = true
 | `desired_count` | No | 預設 2（跨 AZ）；必須是非負整數 |
 | `mcp_session_store` | No | 預設 `dynamodb`；`desired_count > 1` 時必須使用 durable store，避免 MCP guidance/session 跨 task 遺失 |
 | `mcp_session_table_name` | No | 預設 `<project>-mcp-sessions`；DynamoDB on-demand table，TTL 欄位為 `expires_at_epoch` |
-| `allow_multi_task_memory_mcp_session_store` | No | 預設 `false`；緊急除錯用的不安全 override，允許 `desired_count > 1` 搭配 memory store。正式環境必須保持 `false`，否則 MCP guidance/session 會在 task 間遺失 |
+| `mcp_ec2_diagnostic_command_store` | No | 預設 `dynamodb`；MCP EC2 diagnostics command ownership/status metadata 的 durable store。正式環境不要使用 memory，否則 task restart 會遺失 command ownership |
+| `mcp_ec2_diagnostic_command_table_name` | No | 預設 `<project>-mcp-ec2-diagnostic-commands`；DynamoDB on-demand table，TTL 欄位為 `expires_at_epoch` |
+| `allow_multi_task_memory_mcp_session_store` | No | 預設 `false`；緊急除錯用的不安全 override，允許 `desired_count > 1` 搭配 memory MCP state。正式環境必須保持 `false`，否則 MCP guidance/session 或 EC2 diagnostics command ownership 會在 task 間遺失 |
 | `alb_internal` | No | 預設 `true`（內部 ALB） |
 | `allow_public_alb_world_cidr` | No | 預設 `false`；只有 public ALB 必須允許全網段時才設為 `true` |
 | `sts_external_id` | No | 預設 `canopy`，跨帳號 AssumeRole 的 ExternalId；必須符合 STS ExternalId 格式限制 |
