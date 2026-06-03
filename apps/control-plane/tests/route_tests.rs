@@ -22,7 +22,10 @@ use shared::dto::entitlements::{
     AllowedAccount, EntitlementRule, FeatureFlags, GroupMembership, McpEc2DiagnosticScope,
     McpEc2LogPathScope, RuleMetadata,
 };
-use shared::dto::mcp::{lookup_mcp_guidance_by_id, MCP_GUIDANCE_CATALOG};
+use shared::dto::mcp::{
+    lookup_mcp_guidance_by_id, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
+    MCP_GUIDANCE_CATALOG,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -48,7 +51,8 @@ use control_plane::services::database::{
 };
 use control_plane::services::oidc::{OidcClient, OidcEndpoints};
 use control_plane::services::{
-    AppState, McpSessionStore, MemoryMcpEc2DiagnosticCommandStore, MemoryMcpSessionStore,
+    AppState, McpEc2DiagnosticCommandRecord, McpSessionStore, MemoryMcpEc2DiagnosticCommandStore,
+    MemoryMcpSessionStore,
 };
 use shared::dto::database::{ExplainSummary, ExplainTableSummary};
 
@@ -1101,6 +1105,39 @@ fn mcp_ec2_run_body(
     body
 }
 
+fn mcp_ec2_command_record(
+    actor: &str,
+    session_id: &str,
+    local_secret_generation: &str,
+) -> McpEc2DiagnosticCommandRecord {
+    let now = chrono::Utc::now();
+    McpEc2DiagnosticCommandRecord {
+        actor: actor.into(),
+        actor_email: format!("{actor}@example.test"),
+        mcp_session_id: session_id.into(),
+        local_secret_generation: local_secret_generation.into(),
+        instance_id: "i-0123456789abcdef0".into(),
+        account_id: "111111111111".into(),
+        region: "us-east-1".into(),
+        command_type: McpEc2DiagnosticCommandType::TailLog,
+        allowlist_rule_id: "allow-nginx-error-v1".into(),
+        command_scope_id: "nginx-error-tail".into(),
+        status: McpEc2DiagnosticCommandStatus::Running,
+        aws_ssm_command_id: Some("ssm-command-owned-by-other".into()),
+        submitted_at: now,
+        completed_at: None,
+        output_byte_count: 0,
+        dropped_byte_count: 0,
+        output_sequence_start: 0,
+        output_sequence_end: 0,
+        exit_status: None,
+        truncated: false,
+        expires_at: now + chrono::Duration::minutes(10),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 async fn post_mcp_ec2_run(app: &Router, token: &str, body: Value) -> axum::response::Response {
     app.clone()
         .oneshot(
@@ -1296,6 +1333,121 @@ async fn mcp_ec2_diagnostics_result_unknown_command_is_not_found_and_audited() {
         "command_not_found_or_not_owned"
     );
     assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+}
+
+#[tokio::test]
+async fn mcp_ec2_diagnostics_result_rejects_command_owned_by_other_actor() {
+    let audit = AuditFile::new("mcp-ec2-result-other-owner");
+    let config = dev_config();
+    let token = issue_test_token(&config);
+    let state = build_state_with_audit_file(config, &audit.path);
+    let app = build_app(state.clone());
+    let (session_id, local_secret_generation) =
+        register_ec2_diagnostics_guidance(&app, &token).await;
+
+    state
+        .mcp_ec2_diagnostic_commands
+        .create_command(
+            "cmd_owned_by_other".into(),
+            mcp_ec2_command_record("other-mcp-user", "mcp_other", "lsg_other"),
+        )
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/mcp/ec2/diagnostics/cmd_owned_by_other?canopy_mcp_session_id={session_id}&local_secret_generation={local_secret_generation}&max_bytes=1024"
+            ))
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let events = read_audit_events(&audit.path);
+    let event = events
+        .iter()
+        .rfind(|event| event["metadata"]["mcp_event_kind"] == "ec2_diagnostic_result")
+        .unwrap();
+    assert_eq!(event["outcome"], "denied");
+    assert_eq!(
+        event["metadata"]["mcp_outcome_kind"],
+        "command_not_found_or_not_owned"
+    );
+    assert_eq!(event["metadata"]["aws_execution_attempted"], false);
+    assert_eq!(
+        event["metadata"]["mcp_ec2_command_id"],
+        "cmd_owned_by_other"
+    );
+}
+
+#[test]
+fn mcp_ec2_diagnostics_ssm_document_uses_only_opaque_env_parameters() {
+    let document = include_str!("../../../infra/ssm-documents/canopy-ec2-diagnostics.yaml");
+
+    assert!(document.contains("schemaVersion: '2.2'"));
+    assert!(document.contains("action: aws:runShellScript"));
+    assert_eq!(
+        document.matches("interpolationType: ENV_VAR").count(),
+        3,
+        "all SSM document parameters must use ENV_VAR interpolation"
+    );
+    for parameter in ["mcpEc2CommandId", "commandSpecRef", "helperVersion"] {
+        assert!(
+            document.contains(parameter),
+            "{parameter} parameter missing"
+        );
+    }
+
+    assert!(
+        !document.contains("{{") && !document.contains("}}"),
+        "SSM document must not interpolate parameters into shell text"
+    );
+    assert!(document.contains("helper=/usr/local/bin/canopy-ec2-diagnostics"));
+    assert!(document.contains("exec \"$helper\" \\"));
+    for env_ref in [
+        "${SSM_mcpEc2CommandId:?}",
+        "${SSM_commandSpecRef:?}",
+        "${SSM_helperVersion:?}",
+    ] {
+        assert!(
+            document.contains(env_ref),
+            "helper invocation must use opaque ENV_VAR reference {env_ref}"
+        );
+    }
+
+    for forbidden in [
+        concat!("raw_", "command"),
+        concat!("raw_", "output"),
+        concat!("send", "_input"),
+        concat!("Connect", "Response"),
+        concat!("Pty", "SpawnSpec"),
+        "SSM_logPath",
+        "SSM_literalPattern",
+        "SSM_url",
+        "SSM_host",
+        "SSM_port",
+        "SSM_journalUnit",
+        "--log-path",
+        "--literal-pattern",
+        "--url",
+        "--host",
+        "--port",
+        "--unit",
+        "bash -c",
+        "sh -c",
+        "$(",
+        "`",
+    ] {
+        assert!(
+            !document.contains(forbidden),
+            "SSM document must not contain forbidden raw execution marker {forbidden:?}"
+        );
+    }
 }
 
 #[tokio::test]
