@@ -8,8 +8,8 @@ use entitlements::{
 };
 use serde::{Deserialize, Serialize};
 use shared::dto::entitlements::{
-    AllowedAccount, DatabaseScope, EntitlementRule, FeatureFlags, GroupMembership, RuleMetadata,
-    TagSelector, UserEntitlements,
+    AllowedAccount, DatabaseScope, EntitlementRule, FeatureFlags, GroupMembership,
+    McpEc2DiagnosticScope, RuleMetadata, TagSelector, UserEntitlements,
 };
 
 const CATALOG_FEATURE_FIELDS: &[(&str, &str)] = &[
@@ -39,6 +39,7 @@ const HIGH_RISK_FEATURES: &[&str] = &[
     "ec2:stop",
     "ec2:reboot",
     "mcp:raw-audit-plaintext",
+    "mcp:ec2",
     "mcp:database",
     "ecs:exec",
 ];
@@ -105,6 +106,8 @@ pub struct CatalogScope {
     pub os_users: Vec<String>,
     #[serde(default)]
     pub database_scopes: Vec<DatabaseScope>,
+    #[serde(default)]
+    pub mcp_ec2_diagnostic_scopes: Vec<McpEc2DiagnosticScope>,
     #[serde(default)]
     pub metadata: RuleMetadata,
 }
@@ -229,6 +232,7 @@ impl Catalog {
                 allowed_os_users: scope.os_users.clone(),
                 max_session_seconds: package.max_session_seconds,
                 database_scopes: scope.database_scopes.clone(),
+                mcp_ec2_diagnostic_scopes: scope.mcp_ec2_diagnostic_scopes.clone(),
             });
         }
 
@@ -308,6 +312,11 @@ impl Catalog {
                     .database_scopes
                     .iter()
                     .map(|scope| scope.name.clone())
+                    .collect(),
+                mcp_ec2_diagnostic_scopes: scope
+                    .mcp_ec2_diagnostic_scopes
+                    .iter()
+                    .map(|scope| scope.id.clone())
                     .collect(),
                 max_session_seconds: package.max_session_seconds,
             });
@@ -439,6 +448,14 @@ impl Catalog {
                     &package.id,
                     "database_scope",
                     &database_scope.name,
+                ));
+            }
+            for ec2_scope in &scope.mcp_ec2_diagnostic_scopes {
+                grants.insert(SemanticGrant::new(
+                    &binding.group,
+                    &package.id,
+                    "mcp_ec2_diagnostic_scope",
+                    &ec2_scope.id,
                 ));
             }
             if let Some(max_session_seconds) = package.max_session_seconds {
@@ -768,6 +785,7 @@ pub struct PackagePreview {
     pub excluded_container_names: Vec<String>,
     pub os_users: Vec<String>,
     pub database_scopes: Vec<String>,
+    pub mcp_ec2_diagnostic_scopes: Vec<String>,
     pub max_session_seconds: Option<u64>,
 }
 
@@ -1351,6 +1369,99 @@ mod tests {
         );
         assert_eq!(generated.runtime.group_mappings.len(), 1);
         assert_eq!(generated.runtime.memberships.len(), 1);
+    }
+
+    #[test]
+    fn catalog_generates_mcp_ec2_diagnostic_scopes_on_same_rule() {
+        let catalog = Catalog::from_str(
+            r#"
+            [[accounts]]
+            id = "prod"
+            account_id = "123456789012"
+            name = "production"
+
+            [[roles]]
+            id = "canopy"
+            role_arn = "arn:aws:iam::{account_id}:role/CanopyRole"
+
+            [[scopes]]
+            id = "prod-ec2-diagnostics"
+            accounts = ["prod"]
+            regions = ["ap-northeast-1"]
+
+            [[scopes.mcp_ec2_diagnostic_scopes]]
+            id = "rails-nginx-health"
+            max_lines = 100
+            max_since_seconds = 1800
+            max_timeout_seconds = 30
+            max_matches = 50
+            connectivity_probe_budget_per_window = 20
+            budget_window_seconds = 600
+            denylist_version = "2026-06-04"
+            allowlist_rule_id = "rails-nginx-health-v1"
+            private_target_refs = ["service:orders-api"]
+
+            [[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+            path_pattern = "/var/log/nginx/error.log"
+            canonical_safe_prefix = "/var/log/nginx/"
+            safe_for_mcp_output = true
+
+            [[scopes.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+            normalized_url = "https://orders.internal/health"
+            query_policy = "no_query"
+            safe_for_mcp_output = true
+            private_target_ref = "service:orders-api"
+
+            [[scopes.mcp_ec2_diagnostic_scopes.allowed_dns_targets]]
+            host = "orders.internal"
+            record_types = ["A", "AAAA", "CNAME"]
+            safe_for_mcp_output = true
+            private_target_ref = "service:orders-api"
+
+            [[packages]]
+            id = "mcp-ec2-diagnostics"
+            features = ["mcp:use", "mcp:ec2"]
+            scope = "prod-ec2-diagnostics"
+            role = "canopy"
+
+            [[bindings]]
+            group = "platform-engineering"
+            package = "mcp-ec2-diagnostics"
+
+            [[memberships]]
+            user_id = "platform@example.com"
+            group = "platform-engineering"
+            "#,
+        )
+        .unwrap();
+
+        let generated = catalog.generate_runtime().unwrap();
+        let rule = &generated.runtime.rules[0];
+        assert!(rule.features.can_use_mcp);
+        assert!(rule.features.can_use_mcp_ec2);
+        assert_eq!(rule.mcp_ec2_diagnostic_scopes.len(), 1);
+        assert_eq!(rule.mcp_ec2_diagnostic_scopes[0].id, "rails-nginx-health");
+
+        let store: EntitlementStore = toml::from_str(&generated.toml).unwrap();
+        assert_eq!(store.rules[0].mcp_ec2_diagnostic_scopes.len(), 1);
+
+        let preview = catalog.preview_group("platform-engineering").unwrap();
+        assert_eq!(
+            preview.packages[0].high_risk_features,
+            vec!["mcp:ec2".to_string()]
+        );
+        assert_eq!(
+            preview.packages[0].mcp_ec2_diagnostic_scopes,
+            vec!["rails-nginx-health".to_string()]
+        );
+
+        let grants = catalog.semantic_grants().unwrap();
+        assert!(grants.contains(&SemanticGrant::new(
+            "platform-engineering",
+            "mcp-ec2-diagnostics",
+            "mcp_ec2_diagnostic_scope",
+            "rails-nginx-health"
+        )));
     }
 
     #[test]

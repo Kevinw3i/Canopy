@@ -206,6 +206,8 @@ pub struct EntitlementRule {
     pub max_session_seconds: Option<u64>,
     #[serde(default)]
     pub database_scopes: Vec<DatabaseScope>,
+    #[serde(default)]
+    pub mcp_ec2_diagnostic_scopes: Vec<McpEc2DiagnosticScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +238,91 @@ pub struct DatabaseScope {
     /// reviewers can spot scopes that took this opt-in.
     #[serde(default)]
     pub allow_views: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2DiagnosticScope {
+    pub id: String,
+    #[serde(default)]
+    pub allowed_log_paths: Vec<McpEc2LogPathScope>,
+    #[serde(default)]
+    pub allowed_journal_units: Vec<McpEc2JournalUnitScope>,
+    #[serde(default)]
+    pub allowed_http_urls: Vec<McpEc2HttpUrlScope>,
+    #[serde(default)]
+    pub allowed_tcp_targets: Vec<McpEc2TcpTargetScope>,
+    #[serde(default)]
+    pub allowed_dns_targets: Vec<McpEc2DnsTargetScope>,
+    #[serde(default)]
+    pub private_target_refs: Vec<String>,
+    pub max_lines: u16,
+    pub max_since_seconds: u64,
+    pub max_timeout_seconds: u8,
+    pub max_matches: u16,
+    pub connectivity_probe_budget_per_window: u32,
+    pub budget_window_seconds: u64,
+    pub denylist_version: String,
+    pub allowlist_rule_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2LogPathScope {
+    pub path_pattern: String,
+    pub canonical_safe_prefix: String,
+    pub safe_for_mcp_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2JournalUnitScope {
+    pub unit: String,
+    pub safe_for_mcp_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2HttpUrlScope {
+    pub normalized_url: String,
+    pub query_policy: McpEc2HttpQueryPolicy,
+    pub safe_for_mcp_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEc2HttpQueryPolicy {
+    NoQuery,
+    ExactOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2TcpTargetScope {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2DnsTargetScope {
+    pub host: String,
+    pub record_types: Vec<McpEc2DnsRecordType>,
+    pub safe_for_mcp_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum McpEc2DnsRecordType {
+    A,
+    Aaaa,
+    Cname,
 }
 
 fn default_true() -> bool {
@@ -447,6 +534,7 @@ mod tests {
         assert!(rule.allowed_os_users.is_empty());
         assert!(rule.max_session_seconds.is_none());
         assert!(rule.database_scopes.is_empty());
+        assert!(rule.mcp_ec2_diagnostic_scopes.is_empty());
         // features should default to all-false
         assert!(!rule.features.can_view_ec2);
     }
@@ -621,6 +709,93 @@ mod tests {
         assert_eq!(scope.connection, "orders_prod");
         assert!(scope.require_explain);
         assert!(!scope.allow_full_table_scan);
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_scope_roundtrip() {
+        let toml = r#"
+            id = "rails-nginx-health"
+            max_lines = 100
+            max_since_seconds = 1800
+            max_timeout_seconds = 30
+            max_matches = 50
+            connectivity_probe_budget_per_window = 20
+            budget_window_seconds = 600
+            denylist_version = "2026-06-04"
+            allowlist_rule_id = "rails-nginx-health-v1"
+            private_target_refs = ["service:orders-api"]
+
+            [[allowed_log_paths]]
+            path_pattern = "/var/log/nginx/error.log"
+            canonical_safe_prefix = "/var/log/nginx/"
+            safe_for_mcp_output = true
+
+            [[allowed_journal_units]]
+            unit = "nginx.service"
+            safe_for_mcp_output = true
+
+            [[allowed_http_urls]]
+            normalized_url = "https://orders.internal/health"
+            query_policy = "no_query"
+            safe_for_mcp_output = true
+            private_target_ref = "service:orders-api"
+
+            [[allowed_tcp_targets]]
+            host = "orders.internal"
+            port = 443
+            private_target_ref = "service:orders-api"
+
+            [[allowed_dns_targets]]
+            host = "orders.internal"
+            record_types = ["A", "AAAA", "CNAME"]
+            safe_for_mcp_output = true
+            private_target_ref = "service:orders-api"
+        "#;
+
+        let scope: McpEc2DiagnosticScope = toml::from_str(toml).unwrap();
+        assert_eq!(scope.id, "rails-nginx-health");
+        assert_eq!(
+            scope.allowed_log_paths[0].canonical_safe_prefix,
+            "/var/log/nginx/"
+        );
+        assert_eq!(
+            scope.allowed_http_urls[0].query_policy,
+            McpEc2HttpQueryPolicy::NoQuery
+        );
+        assert_eq!(
+            scope.allowed_dns_targets[0].record_types,
+            vec![
+                McpEc2DnsRecordType::A,
+                McpEc2DnsRecordType::Aaaa,
+                McpEc2DnsRecordType::Cname
+            ]
+        );
+
+        let encoded = toml::to_string(&scope).unwrap();
+        let back: McpEc2DiagnosticScope = toml::from_str(&encoded).unwrap();
+        assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_scope_rejects_txt_dns_record_type() {
+        let toml = r#"
+            id = "dns"
+            max_lines = 100
+            max_since_seconds = 1800
+            max_timeout_seconds = 30
+            max_matches = 50
+            connectivity_probe_budget_per_window = 20
+            budget_window_seconds = 600
+            denylist_version = "2026-06-04"
+            allowlist_rule_id = "dns-v1"
+
+            [[allowed_dns_targets]]
+            host = "orders.internal"
+            record_types = ["TXT"]
+            safe_for_mcp_output = true
+        "#;
+
+        assert!(toml::from_str::<McpEc2DiagnosticScope>(toml).is_err());
     }
 
     #[test]

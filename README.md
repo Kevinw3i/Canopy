@@ -233,8 +233,33 @@ can_use_ec2_instance_connect = true  # Can connect via EC2 Instance Connect
 can_use_mcp = true                # Can start the local MCP / AI Tools server
 can_use_mcp_cloudwatch = false    # Reserved for MCP CloudWatch data tools
 can_view_mcp_raw_audit_plaintext = false  # Default: encrypt raw MCP CloudWatch filters/queries in audit
-can_use_mcp_ec2 = false           # Reserved for future MCP EC2 tools
+can_use_mcp_ec2 = false           # Enables only scoped MCP EC2 diagnostics when mcp_ec2_diagnostic_scopes are present
 can_use_mcp_database = true       # Can use MCP Database tools when scoped below
+
+# Optional MCP EC2 diagnostics scopes. These are rule-local command scopes;
+# they are not merged across rules. Keep can_use_mcp_ec2=false unless the same
+# rule also provides concrete safe-for-MCP log/connectivity scopes.
+#
+# [[rules.mcp_ec2_diagnostic_scopes]]
+# id = "rails-nginx-health"
+# max_lines = 100
+# max_since_seconds = 1800
+# max_timeout_seconds = 30
+# max_matches = 50
+# connectivity_probe_budget_per_window = 20
+# budget_window_seconds = 600
+# denylist_version = "2026-06-04"
+# allowlist_rule_id = "rails-nginx-health-v1"
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+# path_pattern = "/var/log/nginx/error.log"
+# canonical_safe_prefix = "/var/log/nginx/"
+# safe_for_mcp_output = true
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+# normalized_url = "https://orders.internal/health"
+# query_policy = "no_query"
+# safe_for_mcp_output = true
 
 # Optional MCP Business Scopes. These are AI/MCP discovery hints only;
 # authorization still comes from this same rule's accounts, regions, and

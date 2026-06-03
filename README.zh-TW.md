@@ -232,8 +232,33 @@ can_use_ec2_instance_connect = true  # 可以透過 EC2 Instance Connect 連線
 can_use_mcp = true                # 可以啟動本機 MCP / AI Tools server
 can_use_mcp_cloudwatch = false    # 預留給 MCP CloudWatch data tools
 can_view_mcp_raw_audit_plaintext = false  # 預設：MCP CloudWatch raw filter/query audit 加密保存
-can_use_mcp_ec2 = false           # 預留給未來 MCP EC2 tools
+can_use_mcp_ec2 = false           # 僅在同 rule 有 mcp_ec2_diagnostic_scopes 時啟用 scoped MCP EC2 diagnostics
 can_use_mcp_database = true       # 搭配下方 scope 使用 MCP Database tools
+
+# 可選：MCP EC2 diagnostics scopes。這些是 rule-local command scopes；
+# 不會跨 rule merge。除非同一條 rule 也提供具體 safe-for-MCP
+# log/connectivity scopes，否則保持 can_use_mcp_ec2=false。
+#
+# [[rules.mcp_ec2_diagnostic_scopes]]
+# id = "rails-nginx-health"
+# max_lines = 100
+# max_since_seconds = 1800
+# max_timeout_seconds = 30
+# max_matches = 50
+# connectivity_probe_budget_per_window = 20
+# budget_window_seconds = 600
+# denylist_version = "2026-06-04"
+# allowlist_rule_id = "rails-nginx-health-v1"
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+# path_pattern = "/var/log/nginx/error.log"
+# canonical_safe_prefix = "/var/log/nginx/"
+# safe_for_mcp_output = true
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+# normalized_url = "https://orders.internal/health"
+# query_policy = "no_query"
+# safe_for_mcp_output = true
 
 # 可選：MCP Business Scopes。這只提供 AI/MCP discovery 提示；
 # 真正授權仍看同一條 rule 的 accounts、regions、log group ARN patterns。
