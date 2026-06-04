@@ -4,13 +4,17 @@
 //! the real `reqwest`-based ApiClient, covering the full HTTP round-trip.
 
 use axum::{
-    extract::{Json, State},
+    extract::{Json, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
+use shared::dto::mcp::{
+    McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
+    McpGetEc2DiagnosticResultRequest, McpRunEc2DiagnosticCommandRequest,
+};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -146,6 +150,66 @@ async fn list_ec2_handler(headers: HeaderMap, Json(_body): Json<Value>) -> impl 
         ],
         "next_token": null,
         "total_count": 1
+    }))
+    .into_response()
+}
+
+async fn mcp_ec2_run_handler(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+
+    assert_eq!(body["canopy_mcp_session_id"], "mcp_test");
+    assert_eq!(body["local_secret_generation"], "lsg_test");
+    assert_eq!(body["instance_id"], "i-0123456789abcdef0");
+    assert_eq!(body["command"]["type"], "tail_log");
+    assert_eq!(body["command"]["path"], "/var/log/nginx/error.log");
+
+    Json(json!({
+        "mcp_ec2_command_id": "mcp-ec2-cmd-1",
+        "status": "queued",
+        "instance_id": "i-0123456789abcdef0",
+        "account_id": "111111111111",
+        "region": "us-east-1",
+        "command_type": "tail_log",
+        "submitted_at": "2026-06-04T00:00:00Z",
+        "expires_at": "2026-06-04T00:10:00Z"
+    }))
+    .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct McpEc2ResultQuery {
+    canopy_mcp_session_id: String,
+    local_secret_generation: String,
+    max_bytes: u64,
+}
+
+async fn mcp_ec2_result_handler(
+    headers: HeaderMap,
+    Path(command_id): Path<String>,
+    Query(query): Query<McpEc2ResultQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_bearer(&headers) {
+        return e.into_response();
+    }
+
+    assert_eq!(command_id, "cmd/with space");
+    assert_eq!(query.canopy_mcp_session_id, "mcp_test");
+    assert_eq!(query.local_secret_generation, "lsg_test");
+    assert_eq!(query.max_bytes, 4096);
+
+    Json(json!({
+        "mcp_ec2_command_id": command_id,
+        "status": "succeeded",
+        "sequence_start": 0,
+        "sequence_end": 1,
+        "output_text": "-----BEGIN CANOPY UNTRUSTED REMOTE OUTPUT-----\n| ok\n-----END CANOPY UNTRUSTED REMOTE OUTPUT-----",
+        "untrusted_remote_output": true,
+        "output_bytes": 2,
+        "dropped_bytes": 0,
+        "exit_code": 0,
+        "error": null
     }))
     .into_response()
 }
@@ -819,9 +883,55 @@ fn mock_app_ec2_forbidden() -> Router {
     Router::new().route("/api/ec2/list", post(list_ec2_forbidden))
 }
 
+fn mock_app_mcp_ec2_diagnostics() -> Router {
+    Router::new()
+        .route("/api/mcp/ec2/diagnostics/run", post(mcp_ec2_run_handler))
+        .route(
+            "/api/mcp/ec2/diagnostics/:command_id",
+            get(mcp_ec2_result_handler),
+        )
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn mcp_ec2_diagnostic_methods_forward_session_and_auth() {
+    let base_url = start_mock(mock_app_mcp_ec2_diagnostics()).await;
+    let client = ApiClient::new(&base_url).unwrap();
+    client.set_token("jwt".into());
+
+    let run = client
+        .run_mcp_ec2_diagnostic_command(&McpRunEc2DiagnosticCommandRequest {
+            canopy_mcp_session_id: Some("mcp_test".into()),
+            local_secret_generation: Some("lsg_test".into()),
+            instance_id: "i-0123456789abcdef0".into(),
+            account_id: "111111111111".into(),
+            region: "us-east-1".into(),
+            command: McpEc2DiagnosticCommand::TailLog {
+                path: "/var/log/nginx/error.log".into(),
+                lines: 100,
+            },
+        })
+        .await
+        .expect("EC2 diagnostic run response");
+    assert_eq!(run.status, McpEc2DiagnosticCommandStatus::Queued);
+    assert_eq!(run.command_type, McpEc2DiagnosticCommandType::TailLog);
+
+    let result = client
+        .get_mcp_ec2_diagnostic_result(&McpGetEc2DiagnosticResultRequest {
+            canopy_mcp_session_id: Some("mcp_test".into()),
+            local_secret_generation: Some("lsg_test".into()),
+            mcp_ec2_command_id: "cmd/with space".into(),
+            max_bytes: 4096,
+        })
+        .await
+        .expect("EC2 diagnostic result response");
+    assert_eq!(result.mcp_ec2_command_id, "cmd/with space");
+    assert_eq!(result.status, McpEc2DiagnosticCommandStatus::Succeeded);
+    assert!(result.untrusted_remote_output);
+}
 
 #[tokio::test]
 async fn dev_login_returns_token() {

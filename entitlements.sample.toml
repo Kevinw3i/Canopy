@@ -50,8 +50,9 @@ can_use_ec2_instance_connect = true
 # 並可在 can_use_mcp_database=true 且 database_scopes 授權時
 # 啟用 MCP Database v1。
 #
-# EC2 MCP data tools 是後續 phase；不要因為使用者
-# 有 TUI CloudWatch 權限就自動開 MCP CloudWatch。
+# MCP EC2 diagnostics 需要 can_use_mcp_ec2=true 且同一條 rule 提供
+# [[rules.mcp_ec2_diagnostic_scopes]]；不要因為使用者有 TUI EC2/SSM
+# 權限就自動開 MCP EC2 diagnostics。
 can_use_mcp = true
 can_use_mcp_cloudwatch = false
 # Raw MCP CloudWatch filter/query audit values are encrypted by default.
@@ -59,6 +60,37 @@ can_use_mcp_cloudwatch = false
 # allowed_log_group_arns also authorize the exact same CloudWatch scope.
 can_view_mcp_raw_audit_plaintext = false
 can_use_mcp_ec2 = false
+# Example only; keep commented unless this same rule is intended to grant
+# scoped MCP EC2 diagnostics.
+#
+# [[rules.mcp_ec2_diagnostic_scopes]]
+# id = "rails-nginx-health"
+# max_lines = 100
+# max_since_seconds = 1800
+# max_timeout_seconds = 30
+# max_matches = 50
+# connectivity_probe_budget_per_window = 20
+# budget_window_seconds = 600
+# denylist_version = "2026-06-04"
+# allowlist_rule_id = "rails-nginx-health-v1"
+# private_target_refs = ["service:orders-api"]
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+# path_pattern = "/var/log/nginx/error.log"
+# canonical_safe_prefix = "/var/log/nginx/"
+# safe_for_mcp_output = true
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+# normalized_url = "https://orders.internal/health"
+# query_policy = "no_query"
+# safe_for_mcp_output = true
+# private_target_ref = "service:orders-api"
+#
+# [[rules.mcp_ec2_diagnostic_scopes.allowed_dns_targets]]
+# host = "orders.internal"
+# record_types = ["A", "AAAA", "CNAME"]
+# safe_for_mcp_output = true
+# private_target_ref = "service:orders-api"
 # MCP Database v1 是獨立權限。開啟後仍需要下方
 # [[rules.database_scopes]] 授權具體 connection / schema / table。
 can_use_mcp_database = false

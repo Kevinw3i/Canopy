@@ -34,6 +34,7 @@ resource "aws_iam_role_policy" "task_execution_secrets" {
         Resource = compact([
           data.aws_secretsmanager_secret.jwt_secret.arn,
           var.oidc_client_secret_arn != "" ? var.oidc_client_secret_arn : "",
+          var.mcp_ec2_diagnostic_command_spec_key_secret_id != "" ? var.mcp_ec2_diagnostic_command_spec_key_secret_id : "",
         ])
       }],
       length(var.secrets_kms_key_arns) > 0 ? [{
@@ -128,6 +129,23 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = "*"
       }] : [],
 
+      var.enable_direct_access && var.mcp_ec2_diagnostic_ssm_document_name != "" ? [{
+        Sid    = "DirectMcpEc2DiagnosticSendCommand"
+        Effect = "Allow"
+        Action = ["ssm:SendCommand"]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:document/Canopy-Ec2Diagnostics",
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
+        ]
+      }] : [],
+
+      var.enable_direct_access && var.mcp_ec2_diagnostic_ssm_document_name != "" ? [{
+        Sid      = "DirectMcpEc2DiagnosticGetCommandInvocation"
+        Effect   = "Allow"
+        Action   = ["ssm:GetCommandInvocation"]
+        Resource = "*"
+      }] : [],
+
       # Optional direct audit event export to CloudWatch Logs.
       var.audit_export_cloudwatch_log_group_name != "" ? [{
         Sid    = "AuditCloudWatchLogsExport"
@@ -167,6 +185,20 @@ resource "aws_iam_role_policy" "task_permissions" {
           "dynamodb:UpdateItem",
         ]
         Resource = aws_dynamodb_table.mcp_sessions[0].arn
+      }] : [],
+
+      var.mcp_ec2_diagnostic_command_store == "dynamodb" ? [{
+        Sid    = "McpEc2DiagnosticCommandDynamoDb"
+        Effect = "Allow"
+        # No DeleteItem: expired command records are reaped by DynamoDB TTL.
+        # The control-plane still checks expires_at on every read/update, so
+        # TTL lag cannot extend command-result access.
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+        ]
+        Resource = aws_dynamodb_table.mcp_ec2_diagnostic_commands[0].arn
       }] : [],
 
       # STS GetCallerIdentity is always needed for preflight health check

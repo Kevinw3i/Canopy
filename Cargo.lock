@@ -1386,6 +1386,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.9.0",
  "jsonwebtoken",
+ "libc",
  "mysql_async",
  "passkey-auth",
  "rand 0.8.6",

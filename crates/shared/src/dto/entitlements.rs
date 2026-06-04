@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+pub const MCP_EC2_DIAGNOSTIC_BUILTIN_DENYLIST_VERSION: &str = "builtin-2026-06-04.2";
 
 /// Full entitlements for a user, returned after authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +83,7 @@ pub struct FeatureFlags {
     /// values encrypted-only in durable audit metadata.
     #[serde(default)]
     pub can_view_mcp_raw_audit_plaintext: bool,
-    /// Reserved for future MCP EC2 tools. Product Phase 3 does not expose EC2 MCP tools.
+    /// Allows scoped MCP EC2 diagnostics when combined with `can_use_mcp`.
     #[serde(default)]
     pub can_use_mcp_ec2: bool,
     /// Allows MCP database tools. The control-plane still enforces
@@ -206,6 +209,8 @@ pub struct EntitlementRule {
     pub max_session_seconds: Option<u64>,
     #[serde(default)]
     pub database_scopes: Vec<DatabaseScope>,
+    #[serde(default)]
+    pub mcp_ec2_diagnostic_scopes: Vec<McpEc2DiagnosticScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +241,296 @@ pub struct DatabaseScope {
     /// reviewers can spot scopes that took this opt-in.
     #[serde(default)]
     pub allow_views: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2DiagnosticScope {
+    pub id: String,
+    #[serde(default)]
+    pub allowed_log_paths: Vec<McpEc2LogPathScope>,
+    #[serde(default)]
+    pub allowed_journal_units: Vec<McpEc2JournalUnitScope>,
+    #[serde(default)]
+    pub allowed_http_urls: Vec<McpEc2HttpUrlScope>,
+    #[serde(default)]
+    pub allowed_tcp_targets: Vec<McpEc2TcpTargetScope>,
+    #[serde(default)]
+    pub allowed_dns_targets: Vec<McpEc2DnsTargetScope>,
+    #[serde(default)]
+    pub private_target_refs: Vec<String>,
+    pub max_lines: u16,
+    pub max_since_seconds: u64,
+    pub max_timeout_seconds: u8,
+    pub max_matches: u16,
+    pub connectivity_probe_budget_per_window: u32,
+    pub budget_window_seconds: u64,
+    pub denylist_version: String,
+    pub allowlist_rule_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2LogPathScope {
+    pub path_pattern: String,
+    pub canonical_safe_prefix: String,
+    pub safe_for_mcp_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2JournalUnitScope {
+    pub unit: String,
+    pub safe_for_mcp_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2HttpUrlScope {
+    pub normalized_url: String,
+    pub query_policy: McpEc2HttpQueryPolicy,
+    pub safe_for_mcp_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpEc2HttpQueryPolicy {
+    NoQuery,
+    ExactOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2TcpTargetScope {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEc2DnsTargetScope {
+    pub host: String,
+    pub record_types: Vec<McpEc2DnsRecordType>,
+    pub safe_for_mcp_output: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+}
+
+pub fn mcp_ec2_log_path_builtin_deny_reason(path: &str) -> Option<&'static str> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('/') || trimmed.contains('\0') {
+        return Some("invalid_log_path");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("/home/") || lower == "/home" || lower.starts_with("/root/") {
+        return Some("home_directory_log_path");
+    }
+    for raw_segment in lower.split('/').filter(|segment| !segment.is_empty()) {
+        let segment = raw_segment.trim_matches('*');
+        if segment.starts_with('.') {
+            return Some("hidden_log_path_segment");
+        }
+        if segment == "auth.log"
+            || segment == "secure"
+            || segment == "sudo.log"
+            || segment == "audit.log"
+            || segment == "auditd"
+            || segment == "security"
+            || segment == "shadow"
+            || segment == "passwd"
+            || segment.starts_with("cloud-init")
+        {
+            return Some("sensitive_log_path");
+        }
+        if segment.contains("credential")
+            || segment.contains("secret")
+            || segment.contains("password")
+            || segment.contains("token")
+            || segment == "key"
+            || segment == "keys"
+            || segment == "id_rsa"
+            || segment == "id_ed25519"
+            || segment == ".env"
+            || segment.ends_with(".pem")
+            || segment.ends_with(".key")
+            || segment.ends_with(".p12")
+            || segment.ends_with(".pfx")
+        {
+            return Some("credential_like_log_path");
+        }
+    }
+    None
+}
+
+pub fn mcp_ec2_journal_unit_builtin_deny_reason(unit: &str) -> Option<&'static str> {
+    let lower = unit.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.contains('\0') {
+        return Some("invalid_journal_unit");
+    }
+    let service = lower.strip_suffix(".service").unwrap_or(&lower);
+    if matches!(
+        service,
+        "ssh" | "sshd" | "sudo" | "auditd" | "systemd-journald" | "cloud-init"
+    ) || service.contains("auth")
+        || service.contains("security")
+        || service.contains("credential")
+        || service.contains("secret")
+    {
+        return Some("sensitive_journal_unit");
+    }
+    None
+}
+
+pub fn mcp_ec2_http_url_builtin_deny_reason(
+    normalized_url: &str,
+    private_target_ref: Option<&str>,
+) -> Option<&'static str> {
+    let lower = normalized_url.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') {
+        return Some("http_url_embedded_credentials");
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed
+            .split_once(']')
+            .map(|(host, _)| host)
+            .unwrap_or("")
+    } else {
+        authority
+            .split_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(authority)
+    };
+    if let Some(reason) = mcp_ec2_network_host_builtin_deny_reason(host, private_target_ref) {
+        return Some(reason);
+    }
+    let path_and_query = &rest[authority_end..];
+    if path_and_query.contains("password=")
+        || path_and_query.contains("passwd=")
+        || path_and_query.contains("secret=")
+        || path_and_query.contains("client_secret=")
+        || path_and_query.contains("token=")
+        || path_and_query.contains("api_key=")
+        || path_and_query.contains("apikey=")
+        || path_and_query.contains("access_key=")
+    {
+        return Some("http_url_credential_query");
+    }
+    None
+}
+
+pub fn mcp_ec2_network_host_builtin_deny_reason(
+    host: &str,
+    private_target_ref: Option<&str>,
+) -> Option<&'static str> {
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if host.is_empty() || host.contains('\0') || host.contains('@') || host.contains('/') {
+        return Some("invalid_network_host");
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Some("loopback_network_host");
+    }
+    if host == "169.254.169.254" || host == "metadata.google.internal" {
+        return Some("metadata_network_host");
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return mcp_ec2_ip_builtin_deny_reason(ip, private_target_ref);
+    }
+    let has_private_ref = private_target_ref
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if host.ends_with(".internal")
+        || host.ends_with(".local")
+        || host.ends_with(".lan")
+        || host.ends_with(".home")
+    {
+        return Some("private_dns_network_host_unsupported");
+    }
+    if has_private_ref {
+        return Some("private_target_ref_requires_private_literal_ip");
+    }
+    None
+}
+
+fn mcp_ec2_ip_builtin_deny_reason(
+    ip: IpAddr,
+    private_target_ref: Option<&str>,
+) -> Option<&'static str> {
+    let has_private_ref = private_target_ref
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    match ip {
+        IpAddr::V4(addr) => {
+            if addr.is_loopback() {
+                return Some("loopback_network_host");
+            }
+            if addr == Ipv4Addr::new(169, 254, 169, 254) {
+                return Some("metadata_network_host");
+            }
+            if addr.is_link_local() {
+                return Some("link_local_network_host");
+            }
+            if addr.is_unspecified() || addr.is_broadcast() || addr.is_multicast() {
+                return Some("non_unicast_network_host");
+            }
+            let private = ipv4_is_private(addr);
+            if private && !has_private_ref {
+                return Some("private_network_host_requires_ref");
+            }
+            if !private && has_private_ref {
+                return Some("private_target_ref_requires_private_literal_ip");
+            }
+        }
+        IpAddr::V6(addr) => {
+            if let Some(mapped) = addr.to_ipv4_mapped() {
+                return mcp_ec2_ip_builtin_deny_reason(IpAddr::V4(mapped), private_target_ref);
+            }
+            if addr.is_loopback() {
+                return Some("loopback_network_host");
+            }
+            if addr.is_unspecified() || addr.is_multicast() || ipv6_is_link_local(addr) {
+                return Some("non_unicast_network_host");
+            }
+            let private = ipv6_is_unique_local(addr);
+            if private && !has_private_ref {
+                return Some("private_network_host_requires_ref");
+            }
+            if !private && has_private_ref {
+                return Some("private_target_ref_requires_private_literal_ip");
+            }
+        }
+    }
+    None
+}
+
+fn ipv4_is_private(addr: Ipv4Addr) -> bool {
+    let [a, b, _, _] = addr.octets();
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
+fn ipv6_is_link_local(addr: Ipv6Addr) -> bool {
+    let first = addr.segments()[0];
+    (first & 0xffc0) == 0xfe80
+}
+
+fn ipv6_is_unique_local(addr: Ipv6Addr) -> bool {
+    (addr.segments()[0] & 0xfe00) == 0xfc00
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum McpEc2DnsRecordType {
+    A,
+    Aaaa,
+    Cname,
 }
 
 fn default_true() -> bool {
@@ -303,6 +598,101 @@ mod tests {
         };
         let tags = HashMap::from([("anything".into(), "value".into())]);
         assert!(selector.matches(&tags));
+    }
+
+    #[test]
+    fn mcp_ec2_builtin_denylist_blocks_sensitive_log_paths() {
+        assert_eq!(
+            mcp_ec2_log_path_builtin_deny_reason("/var/log/auth.log"),
+            Some("sensitive_log_path")
+        );
+        assert_eq!(
+            mcp_ec2_log_path_builtin_deny_reason("/var/log/cloud-init-output.log"),
+            Some("sensitive_log_path")
+        );
+        assert_eq!(
+            mcp_ec2_log_path_builtin_deny_reason("/var/log/app/access-token.log"),
+            Some("credential_like_log_path")
+        );
+        assert_eq!(
+            mcp_ec2_log_path_builtin_deny_reason("/home/app/app.log"),
+            Some("home_directory_log_path")
+        );
+        assert_eq!(
+            mcp_ec2_log_path_builtin_deny_reason("/var/log/nginx/app.log"),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_ec2_builtin_denylist_blocks_sensitive_network_targets() {
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("169.254.169.254", None),
+            Some("metadata_network_host")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("localhost", None),
+            Some("loopback_network_host")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("10.0.1.15", None),
+            Some("private_network_host_requires_ref")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("10.0.1.15", Some("inventory-api")),
+            None
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("orders.example.com", Some("orders-api")),
+            Some("private_target_ref_requires_private_literal_ip")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("203.0.113.10", Some("inventory-api")),
+            Some("private_target_ref_requires_private_literal_ip")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("orders.internal", Some("orders-api")),
+            Some("private_dns_network_host_unsupported")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("::ffff:169.254.169.254", None),
+            Some("metadata_network_host")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("::ffff:127.0.0.1", None),
+            Some("loopback_network_host")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("::ffff:169.254.1.2", None),
+            Some("link_local_network_host")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("::ffff:10.0.1.15", None),
+            Some("private_network_host_requires_ref")
+        );
+        assert_eq!(
+            mcp_ec2_network_host_builtin_deny_reason("::ffff:10.0.1.15", Some("inventory-api")),
+            None
+        );
+        assert_eq!(
+            mcp_ec2_http_url_builtin_deny_reason("https://user:pass@example.com/health", None),
+            Some("http_url_embedded_credentials")
+        );
+        assert_eq!(
+            mcp_ec2_http_url_builtin_deny_reason("https://example.com/health?token=abc", None),
+            Some("http_url_credential_query")
+        );
+        assert_eq!(
+            mcp_ec2_http_url_builtin_deny_reason("https://example.com/health", None),
+            None
+        );
+        assert_eq!(
+            mcp_ec2_http_url_builtin_deny_reason(
+                "https://orders.example.com/health",
+                Some("orders-api")
+            ),
+            Some("private_target_ref_requires_private_literal_ip")
+        );
     }
 
     #[test]
@@ -447,6 +837,7 @@ mod tests {
         assert!(rule.allowed_os_users.is_empty());
         assert!(rule.max_session_seconds.is_none());
         assert!(rule.database_scopes.is_empty());
+        assert!(rule.mcp_ec2_diagnostic_scopes.is_empty());
         // features should default to all-false
         assert!(!rule.features.can_view_ec2);
     }
@@ -621,6 +1012,88 @@ mod tests {
         assert_eq!(scope.connection, "orders_prod");
         assert!(scope.require_explain);
         assert!(!scope.allow_full_table_scan);
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_scope_roundtrip() {
+        let toml = r#"
+            id = "rails-nginx-health"
+            max_lines = 100
+            max_since_seconds = 1800
+            max_timeout_seconds = 30
+            max_matches = 50
+            connectivity_probe_budget_per_window = 20
+            budget_window_seconds = 600
+            denylist_version = "2026-06-04"
+            allowlist_rule_id = "rails-nginx-health-v1"
+            private_target_refs = ["service:orders-api"]
+
+            [[allowed_log_paths]]
+            path_pattern = "/var/log/nginx/error.log"
+            canonical_safe_prefix = "/var/log/nginx/"
+            safe_for_mcp_output = true
+
+            [[allowed_journal_units]]
+            unit = "nginx.service"
+            safe_for_mcp_output = true
+
+            [[allowed_http_urls]]
+            normalized_url = "https://10.0.1.20/health"
+            query_policy = "no_query"
+            safe_for_mcp_output = true
+            private_target_ref = "service:orders-api"
+
+            [[allowed_tcp_targets]]
+            host = "10.0.1.20"
+            port = 443
+            private_target_ref = "service:orders-api"
+
+            [[allowed_dns_targets]]
+            host = "orders.example.com"
+            record_types = ["A", "AAAA"]
+            safe_for_mcp_output = true
+        "#;
+
+        let scope: McpEc2DiagnosticScope = toml::from_str(toml).unwrap();
+        assert_eq!(scope.id, "rails-nginx-health");
+        assert_eq!(
+            scope.allowed_log_paths[0].canonical_safe_prefix,
+            "/var/log/nginx/"
+        );
+        assert_eq!(
+            scope.allowed_http_urls[0].query_policy,
+            McpEc2HttpQueryPolicy::NoQuery
+        );
+        assert_eq!(
+            scope.allowed_dns_targets[0].record_types,
+            vec![McpEc2DnsRecordType::A, McpEc2DnsRecordType::Aaaa]
+        );
+
+        let encoded = toml::to_string(&scope).unwrap();
+        let back: McpEc2DiagnosticScope = toml::from_str(&encoded).unwrap();
+        assert_eq!(back, scope);
+    }
+
+    #[test]
+    fn mcp_ec2_diagnostic_scope_rejects_txt_dns_record_type() {
+        let toml = r#"
+            id = "dns"
+            max_lines = 100
+            max_since_seconds = 1800
+            max_timeout_seconds = 30
+            max_matches = 50
+            connectivity_probe_budget_per_window = 20
+            budget_window_seconds = 600
+            denylist_version = "2026-06-04"
+            allowlist_rule_id = "dns-v1"
+
+            [[allowed_dns_targets]]
+            host = "orders.example.com"
+            record_types = ["TXT"]
+            safe_for_mcp_output = true
+        "#;
+
+        assert!(toml::from_str::<McpEc2DiagnosticScope>(toml).is_err());
     }
 
     #[test]

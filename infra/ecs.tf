@@ -45,16 +45,42 @@ resource "aws_ecs_task_definition" "control_plane" {
       error_message = "oidc_client_secret_arn is required when oidc_client_secret_version_id is set."
     }
     precondition {
+      condition     = var.mcp_ec2_diagnostic_command_spec_key_secret_id == "" || var.mcp_ec2_diagnostic_command_spec_key_secret_version_id != ""
+      error_message = "mcp_ec2_diagnostic_command_spec_key_secret_version_id is required when mcp_ec2_diagnostic_command_spec_key_secret_id is set."
+    }
+    precondition {
+      condition     = var.mcp_ec2_diagnostic_command_spec_key_secret_id != "" || var.mcp_ec2_diagnostic_command_spec_key_secret_version_id == ""
+      error_message = "mcp_ec2_diagnostic_command_spec_key_secret_id is required when mcp_ec2_diagnostic_command_spec_key_secret_version_id is set."
+    }
+    precondition {
+      condition = (
+        (
+          var.mcp_ec2_diagnostic_ssm_document_name == "" &&
+          var.mcp_ec2_diagnostic_ssm_document_version == "" &&
+          var.mcp_ec2_diagnostic_command_spec_key_secret_id == ""
+        ) ||
+        (
+          var.mcp_ec2_diagnostic_ssm_document_name != "" &&
+          var.mcp_ec2_diagnostic_ssm_document_version != "" &&
+          var.mcp_ec2_diagnostic_command_spec_key_secret_id != ""
+        )
+      )
+      error_message = "MCP EC2 diagnostics SSM dispatch requires document name, pinned document version, and command spec key secret ARN to be configured together."
+    }
+    precondition {
       condition     = contains(local.fargate_cpu_memory_pairs, "${var.cpu}:${var.memory}")
       error_message = "cpu and memory must be a valid AWS Fargate Linux task size combination."
     }
     precondition {
       condition = (
         var.desired_count <= 1 ||
-        var.mcp_session_store == "dynamodb" ||
+        (
+          var.mcp_session_store == "dynamodb" &&
+          var.mcp_ec2_diagnostic_command_store == "dynamodb"
+        ) ||
         var.allow_multi_task_memory_mcp_session_store
       )
-      error_message = "desired_count > 1 requires mcp_session_store = \"dynamodb\" unless allow_multi_task_memory_mcp_session_store = true."
+      error_message = "desired_count > 1 requires mcp_session_store and mcp_ec2_diagnostic_command_store to be \"dynamodb\" unless allow_multi_task_memory_mcp_session_store = true."
     }
   }
   requires_compatibilities = ["FARGATE"]
@@ -98,6 +124,11 @@ resource "aws_ecs_task_definition" "control_plane" {
       { name = "AUDIT_EXPORT_QUEUE_SIZE", value = tostring(var.audit_export_queue_size) },
       { name = "MCP_SESSION_STORE", value = var.mcp_session_store },
       { name = "MCP_SESSION_TABLE_NAME", value = var.mcp_session_store == "dynamodb" ? local.mcp_session_table_name : "" },
+      { name = "MCP_EC2_DIAGNOSTIC_COMMAND_STORE", value = var.mcp_ec2_diagnostic_command_store },
+      { name = "MCP_EC2_DIAGNOSTIC_COMMAND_TABLE_NAME", value = var.mcp_ec2_diagnostic_command_store == "dynamodb" ? local.mcp_ec2_diagnostic_command_table_name : "" },
+      { name = "MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_NAME", value = var.mcp_ec2_diagnostic_ssm_document_name },
+      { name = "MCP_EC2_DIAGNOSTIC_SSM_DOCUMENT_VERSION", value = var.mcp_ec2_diagnostic_ssm_document_version },
+      { name = "MCP_EC2_DIAGNOSTIC_HELPER_VERSION", value = var.mcp_ec2_diagnostic_helper_version },
     ]
 
     # Inject secrets via ECS-native secrets injection (uses execution role).
@@ -105,6 +136,9 @@ resource "aws_ecs_task_definition" "control_plane" {
       [{ name = "JWT_SECRET", valueFrom = var.jwt_secret_version_id != "" ? "${data.aws_secretsmanager_secret.jwt_secret.arn}:::${var.jwt_secret_version_id}" : data.aws_secretsmanager_secret.jwt_secret.arn }],
       var.oidc_client_secret_arn != "" ? [
         { name = "OIDC_CLIENT_SECRET", valueFrom = var.oidc_client_secret_version_id != "" ? "${var.oidc_client_secret_arn}:::${var.oidc_client_secret_version_id}" : var.oidc_client_secret_arn }
+      ] : [],
+      var.mcp_ec2_diagnostic_command_spec_key_secret_id != "" ? [
+        { name = "MCP_EC2_DIAGNOSTIC_COMMAND_SPEC_KEY", valueFrom = var.mcp_ec2_diagnostic_command_spec_key_secret_version_id != "" ? "${var.mcp_ec2_diagnostic_command_spec_key_secret_id}:::${var.mcp_ec2_diagnostic_command_spec_key_secret_version_id}" : var.mcp_ec2_diagnostic_command_spec_key_secret_id }
       ] : []
     )
 

@@ -845,6 +845,27 @@ impl EntitlementStore {
             for scope in &rule.database_scopes {
                 validate_database_scope_identifiers(&rule.id, scope)?;
             }
+            if rule.features.can_use_mcp_ec2 {
+                if !rule.features.can_use_mcp {
+                    anyhow::bail!(
+                        "Rule '{}' (group '{}') has can_use_mcp_ec2=true but can_use_mcp=false. \
+                         MCP EC2 diagnostics must be enabled by the same rule that enables MCP.",
+                        rule.id,
+                        rule.group
+                    );
+                }
+                if rule.mcp_ec2_diagnostic_scopes.is_empty() {
+                    anyhow::bail!(
+                        "Rule '{}' (group '{}') has can_use_mcp_ec2=true but no \
+                         mcp_ec2_diagnostic_scopes.",
+                        rule.id,
+                        rule.group
+                    );
+                }
+            }
+            for scope in &rule.mcp_ec2_diagnostic_scopes {
+                validate_mcp_ec2_diagnostic_scope(&rule.id, scope)?;
+            }
             for scope in &rule.metadata.scopes {
                 validate_business_scope_metadata(&rule.id, scope)?;
             }
@@ -1068,6 +1089,7 @@ impl EntitlementStore {
                 )?,
                 max_session_seconds,
                 database_scopes: vec![],
+                mcp_ec2_diagnostic_scopes: vec![],
             });
         }
 
@@ -1169,6 +1191,7 @@ impl EntitlementStore {
                         allow_full_table_scan: false,
                         allow_views: false,
                     }],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-platform-eng-power".into(),
@@ -1213,6 +1236,7 @@ impl EntitlementStore {
                     allowed_os_users: vec![],
                     max_session_seconds: None,
                     database_scopes: vec![],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-readonly".into(),
@@ -1256,6 +1280,7 @@ impl EntitlementStore {
                     allowed_os_users: vec![],
                     max_session_seconds: Some(3600), // 60 min for readonly
                     database_scopes: vec![],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
             ],
             group_mappings: vec![],
@@ -1296,6 +1321,287 @@ fn validate_database_scope_identifiers(rule_id: &str, scope: &DatabaseScope) -> 
     }
     for table in &scope.allowed_tables {
         check("allowed_table", rule_id, scope, table)?;
+    }
+    Ok(())
+}
+
+fn validate_mcp_ec2_diagnostic_scope(
+    rule_id: &str,
+    scope: &McpEc2DiagnosticScope,
+) -> anyhow::Result<()> {
+    if scope.id.trim().is_empty() {
+        anyhow::bail!(
+            "Rule '{}' has an MCP EC2 diagnostic scope with empty id",
+            rule_id
+        );
+    }
+    if scope.allowlist_rule_id.trim().is_empty() {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' has empty allowlist_rule_id",
+            rule_id,
+            scope.id
+        );
+    }
+    if scope.denylist_version.trim().is_empty() {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' has empty denylist_version",
+            rule_id,
+            scope.id
+        );
+    }
+    if scope.max_lines == 0 || scope.max_lines > 500 {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' max_lines must be 1..500",
+            rule_id,
+            scope.id
+        );
+    }
+    if scope.max_matches == 0 || scope.max_matches > 500 {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' max_matches must be 1..500",
+            rule_id,
+            scope.id
+        );
+    }
+    if scope.max_since_seconds == 0 || scope.max_since_seconds > 30 * 60 {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' max_since_seconds must be 1..1800",
+            rule_id,
+            scope.id
+        );
+    }
+    if scope.max_timeout_seconds == 0 || scope.max_timeout_seconds > 120 {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' max_timeout_seconds must be 1..120",
+            rule_id,
+            scope.id
+        );
+    }
+    if scope.connectivity_probe_budget_per_window == 0 || scope.budget_window_seconds == 0 {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' must set positive connectivity budgets",
+            rule_id,
+            scope.id
+        );
+    }
+
+    let command_scope_count = scope.allowed_log_paths.len()
+        + scope.allowed_journal_units.len()
+        + scope.allowed_http_urls.len()
+        + scope.allowed_tcp_targets.len()
+        + scope.allowed_dns_targets.len();
+    if command_scope_count == 0 {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' has no command scopes",
+            rule_id,
+            scope.id
+        );
+    }
+
+    let mut private_target_refs = HashSet::new();
+    for private_target_ref in &scope.private_target_refs {
+        let trimmed = private_target_ref.trim();
+        if trimmed.is_empty() || trimmed.len() > 128 {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' has invalid private_target_ref",
+                rule_id,
+                scope.id
+            );
+        }
+        if !private_target_refs.insert(trimmed.to_string()) {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' has duplicate private_target_ref '{}'",
+                rule_id,
+                scope.id,
+                trimmed
+            );
+        }
+    }
+
+    for log in &scope.allowed_log_paths {
+        validate_mcp_ec2_safe_output_flag(rule_id, &scope.id, log.safe_for_mcp_output, "log")?;
+        validate_absolute_scope_path(rule_id, &scope.id, "path_pattern", &log.path_pattern)?;
+        validate_absolute_scope_path(
+            rule_id,
+            &scope.id,
+            "canonical_safe_prefix",
+            &log.canonical_safe_prefix,
+        )?;
+        if let Some(reason) = mcp_ec2_log_path_builtin_deny_reason(&log.path_pattern)
+            .or_else(|| mcp_ec2_log_path_builtin_deny_reason(&log.canonical_safe_prefix))
+        {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' log path is blocked by built-in denylist: {}",
+                rule_id,
+                scope.id,
+                reason
+            );
+        }
+        if log.path_pattern == "/var/log/**" {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' cannot allow blanket /var/log/**",
+                rule_id,
+                scope.id
+            );
+        }
+    }
+    for unit in &scope.allowed_journal_units {
+        validate_mcp_ec2_safe_output_flag(rule_id, &scope.id, unit.safe_for_mcp_output, "journal")?;
+        if unit.unit.trim().is_empty() {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' has empty journal unit",
+                rule_id,
+                scope.id
+            );
+        }
+        if let Some(reason) = mcp_ec2_journal_unit_builtin_deny_reason(&unit.unit) {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' journal unit is blocked by built-in denylist: {}",
+                rule_id,
+                scope.id,
+                reason
+            );
+        }
+    }
+    for url in &scope.allowed_http_urls {
+        validate_mcp_ec2_safe_output_flag(rule_id, &scope.id, url.safe_for_mcp_output, "http")?;
+        if !(url.normalized_url.starts_with("https://")
+            || url.normalized_url.starts_with("http://"))
+        {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' HTTP URL must be http or https",
+                rule_id,
+                scope.id
+            );
+        }
+        if let Some(reason) = mcp_ec2_http_url_builtin_deny_reason(
+            &url.normalized_url,
+            url.private_target_ref.as_deref(),
+        ) {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' HTTP URL is blocked by built-in denylist: {}",
+                rule_id,
+                scope.id,
+                reason
+            );
+        }
+        validate_mcp_ec2_private_target_ref_member(
+            rule_id,
+            &scope.id,
+            &private_target_refs,
+            url.private_target_ref.as_deref(),
+        )?;
+    }
+    for target in &scope.allowed_tcp_targets {
+        if target.host.trim().is_empty() || target.port == 0 {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' TCP target must set host and port",
+                rule_id,
+                scope.id
+            );
+        }
+        if let Some(reason) = mcp_ec2_network_host_builtin_deny_reason(
+            &target.host,
+            target.private_target_ref.as_deref(),
+        ) {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' TCP target is blocked by built-in denylist: {}",
+                rule_id,
+                scope.id,
+                reason
+            );
+        }
+        validate_mcp_ec2_private_target_ref_member(
+            rule_id,
+            &scope.id,
+            &private_target_refs,
+            target.private_target_ref.as_deref(),
+        )?;
+    }
+    for target in &scope.allowed_dns_targets {
+        validate_mcp_ec2_safe_output_flag(rule_id, &scope.id, target.safe_for_mcp_output, "dns")?;
+        if target.host.trim().is_empty() || target.record_types.is_empty() {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' DNS target must set host and record_types",
+                rule_id,
+                scope.id
+            );
+        }
+        if let Some(reason) = mcp_ec2_network_host_builtin_deny_reason(
+            &target.host,
+            target.private_target_ref.as_deref(),
+        ) {
+            anyhow::bail!(
+                "Rule '{}' MCP EC2 diagnostic scope '{}' DNS target is blocked by built-in denylist: {}",
+                rule_id,
+                scope.id,
+                reason
+            );
+        }
+        validate_mcp_ec2_private_target_ref_member(
+            rule_id,
+            &scope.id,
+            &private_target_refs,
+            target.private_target_ref.as_deref(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_mcp_ec2_private_target_ref_member(
+    rule_id: &str,
+    scope_id: &str,
+    private_target_refs: &HashSet<String>,
+    private_target_ref: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(private_target_ref) = private_target_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if !private_target_refs.contains(private_target_ref) {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' references undefined private_target_ref '{}'",
+            rule_id,
+            scope_id,
+            private_target_ref
+        );
+    }
+    Ok(())
+}
+
+fn validate_mcp_ec2_safe_output_flag(
+    rule_id: &str,
+    scope_id: &str,
+    safe_for_mcp_output: bool,
+    kind: &str,
+) -> anyhow::Result<()> {
+    if !safe_for_mcp_output {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' has {} output not marked safe for MCP",
+            rule_id,
+            scope_id,
+            kind
+        );
+    }
+    Ok(())
+}
+
+fn validate_absolute_scope_path(
+    rule_id: &str,
+    scope_id: &str,
+    field: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    if !value.starts_with('/') || value.contains("..") {
+        anyhow::bail!(
+            "Rule '{}' MCP EC2 diagnostic scope '{}' {} must be absolute and must not contain '..'",
+            rule_id,
+            scope_id,
+            field
+        );
     }
     Ok(())
 }
@@ -1851,6 +2157,45 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
+        }
+    }
+
+    fn valid_mcp_ec2_diagnostic_scope() -> McpEc2DiagnosticScope {
+        McpEc2DiagnosticScope {
+            id: "rails-nginx-health".into(),
+            allowed_log_paths: vec![McpEc2LogPathScope {
+                path_pattern: "/var/log/nginx/error.log".into(),
+                canonical_safe_prefix: "/var/log/nginx/".into(),
+                safe_for_mcp_output: true,
+            }],
+            allowed_journal_units: vec![],
+            allowed_http_urls: vec![McpEc2HttpUrlScope {
+                normalized_url: "https://10.0.1.20/health".into(),
+                query_policy: McpEc2HttpQueryPolicy::NoQuery,
+                safe_for_mcp_output: true,
+                private_target_ref: Some("service:orders-api".into()),
+            }],
+            allowed_tcp_targets: vec![McpEc2TcpTargetScope {
+                host: "10.0.1.20".into(),
+                port: 443,
+                private_target_ref: Some("service:orders-api".into()),
+            }],
+            allowed_dns_targets: vec![McpEc2DnsTargetScope {
+                host: "orders.example.com".into(),
+                record_types: vec![McpEc2DnsRecordType::A, McpEc2DnsRecordType::Aaaa],
+                safe_for_mcp_output: true,
+                private_target_ref: None,
+            }],
+            private_target_refs: vec!["service:orders-api".into()],
+            max_lines: 100,
+            max_since_seconds: 1800,
+            max_timeout_seconds: 30,
+            max_matches: 50,
+            connectivity_probe_budget_per_window: 20,
+            budget_window_seconds: 600,
+            denylist_version: "2026-06-04".into(),
+            allowlist_rule_id: "rails-nginx-health-v1".into(),
         }
     }
 
@@ -1990,6 +2335,130 @@ mod tests {
     }
 
     #[test]
+    fn validate_mcp_ec2_requires_same_rule_mcp_and_command_scopes() {
+        let mut rule = minimal_rule_with_accounts(vec![AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "production".into(),
+            role_arn: "arn:aws:iam::111111111111:role/CanopyRole".into(),
+        }]);
+        rule.features.can_use_mcp_ec2 = true;
+        rule.mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+
+        let mut store = EntitlementStore {
+            rules: vec![rule],
+            group_mappings: vec![],
+            memberships: vec![GroupMembership {
+                user_id: "ops@example.com".into(),
+                group: "ops".into(),
+            }],
+        };
+
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("can_use_mcp=false"));
+
+        store.rules[0].features.can_use_mcp = true;
+        store.rules[0].mcp_ec2_diagnostic_scopes.clear();
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("no mcp_ec2_diagnostic_scopes"));
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_mcp_ec2_scope_rejects_unsafe_or_blanket_log_scope() {
+        let mut rule = minimal_rule_with_accounts(vec![AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "production".into(),
+            role_arn: "arn:aws:iam::111111111111:role/CanopyRole".into(),
+        }]);
+        rule.features.can_use_mcp = true;
+        rule.features.can_use_mcp_ec2 = true;
+        rule.mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+
+        let mut store = EntitlementStore {
+            rules: vec![rule],
+            group_mappings: vec![],
+            memberships: vec![GroupMembership {
+                user_id: "ops@example.com".into(),
+                group: "ops".into(),
+            }],
+        };
+
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_log_paths[0].safe_for_mcp_output =
+            false;
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("not marked safe for MCP"));
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_log_paths[0].path_pattern =
+            "/var/log/**".into();
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("blanket /var/log/**"));
+    }
+
+    #[test]
+    fn validate_mcp_ec2_scope_rejects_builtin_denied_targets() {
+        let mut rule = minimal_rule_with_accounts(vec![AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "production".into(),
+            role_arn: "arn:aws:iam::111111111111:role/CanopyRole".into(),
+        }]);
+        rule.features.can_use_mcp = true;
+        rule.features.can_use_mcp_ec2 = true;
+        rule.mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+
+        let mut store = EntitlementStore {
+            rules: vec![rule],
+            group_mappings: vec![],
+            memberships: vec![GroupMembership {
+                user_id: "ops@example.com".into(),
+                group: "ops".into(),
+            }],
+        };
+
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_log_paths[0].path_pattern =
+            "/var/log/auth.log".into();
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("built-in denylist"));
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_http_urls[0].normalized_url =
+            "http://169.254.169.254/latest/meta-data/".into();
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("metadata_network_host"));
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_tcp_targets[0].host =
+            "10.0.1.15".into();
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_tcp_targets[0].private_target_ref =
+            None;
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("private_network_host_requires_ref"));
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_tcp_targets[0].host =
+            "10.0.1.15".into();
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_tcp_targets[0].private_target_ref =
+            Some("service:orders-api".into());
+        store.validate().unwrap();
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_http_urls[0].normalized_url =
+            "https://orders.example.com/health".into();
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_http_urls[0].private_target_ref =
+            Some("service:orders-api".into());
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("private_target_ref_requires_private_literal_ip"));
+
+        store.rules[0].mcp_ec2_diagnostic_scopes = vec![valid_mcp_ec2_diagnostic_scope()];
+        store.rules[0].mcp_ec2_diagnostic_scopes[0].allowed_tcp_targets[0].private_target_ref =
+            Some("undefined-service".into());
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("undefined private_target_ref"));
+    }
+
+    #[test]
     fn evaluate_for_groups_uses_resolved_groups_not_memberships() {
         let store = test_store();
 
@@ -2056,6 +2525,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         }
     }
 
@@ -2175,6 +2645,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -2615,6 +3086,7 @@ group = "ops"
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -2658,6 +3130,7 @@ group = "ops"
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![scope.clone()],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -2709,6 +3182,7 @@ group = "ops"
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![conflicting_scope],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -2824,6 +3298,7 @@ group = "ops"
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![leaked_scope],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -2970,6 +3445,7 @@ group = "ops"
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.memberships.push(GroupMembership {
             user_id: "dev-admin".into(),
@@ -3035,6 +3511,7 @@ group = "ops"
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
 
         let ent = store.evaluate("dev-admin", "admin@example.com", "Admin", true);

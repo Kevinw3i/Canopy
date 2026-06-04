@@ -1,5 +1,7 @@
 use shared::dto::ec2::Ec2Instance;
-use shared::dto::entitlements::{AllowedAccount, FeatureFlags, UserEntitlements};
+use shared::dto::entitlements::{
+    AllowedAccount, FeatureFlags, McpEc2DiagnosticScope, TagSelector, UserEntitlements,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -10,6 +12,16 @@ pub use entitlements::arn_matches_pattern;
 
 pub struct EntitlementService {
     store: Arc<RwLock<EntitlementStore>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpEc2DiagnosticScopeGrant {
+    pub entitlement_rule_id: String,
+    pub account: AllowedAccount,
+    pub scope: McpEc2DiagnosticScope,
+    pub instance_tag_selectors: Vec<TagSelector>,
+    pub excluded_tag_selectors: Vec<TagSelector>,
+    pub requires_instance_metadata: bool,
 }
 
 impl EntitlementService {
@@ -267,6 +279,114 @@ impl EntitlementService {
         result
     }
 
+    /// Return rule-local MCP EC2 diagnostic scopes for a target account/region.
+    /// Rules with tag selectors are surfaced as requiring instance metadata so
+    /// callers can fail closed until they have server-resolved EC2 tags.
+    pub async fn mcp_ec2_diagnostic_scope_grants_for_target(
+        &self,
+        claims: &Claims,
+        account_id: &str,
+        region: &str,
+    ) -> Vec<McpEc2DiagnosticScopeGrant> {
+        let store = self.store.read().await;
+        let user_groups = &claims.groups;
+
+        let mut result = Vec::new();
+        for rule in &store.rules {
+            if !user_groups.contains(&rule.group)
+                || !rule.features.can_use_mcp
+                || !rule.features.can_use_mcp_ec2
+            {
+                continue;
+            }
+            let matching_accounts = rule
+                .allowed_accounts
+                .iter()
+                .filter(|account| account.account_id == account_id)
+                .collect::<Vec<_>>();
+            let [account] = matching_accounts.as_slice() else {
+                continue;
+            };
+            if !rule.allowed_regions.is_empty()
+                && !rule.allowed_regions.contains(&region.to_string())
+            {
+                continue;
+            }
+
+            let requires_instance_metadata =
+                !rule.instance_tag_selectors.is_empty() || !rule.excluded_tag_selectors.is_empty();
+            for scope in &rule.mcp_ec2_diagnostic_scopes {
+                result.push(McpEc2DiagnosticScopeGrant {
+                    entitlement_rule_id: rule.id.clone(),
+                    account: (*account).clone(),
+                    scope: scope.clone(),
+                    instance_tag_selectors: rule.instance_tag_selectors.clone(),
+                    excluded_tag_selectors: rule.excluded_tag_selectors.clone(),
+                    requires_instance_metadata,
+                });
+            }
+        }
+        result
+    }
+
+    pub async fn mcp_ec2_diagnostic_scope_grants_for_instance(
+        &self,
+        claims: &Claims,
+        instance: &Ec2Instance,
+    ) -> Vec<McpEc2DiagnosticScopeGrant> {
+        let store = self.store.read().await;
+        let user_groups = &claims.groups;
+
+        let mut result = Vec::new();
+        for rule in &store.rules {
+            if !user_groups.contains(&rule.group)
+                || !rule.features.can_use_mcp
+                || !rule.features.can_use_mcp_ec2
+            {
+                continue;
+            }
+            let matching_accounts = rule
+                .allowed_accounts
+                .iter()
+                .filter(|account| account.account_id == instance.account_id)
+                .collect::<Vec<_>>();
+            let [account] = matching_accounts.as_slice() else {
+                continue;
+            };
+            if !rule.allowed_regions.is_empty() && !rule.allowed_regions.contains(&instance.region)
+            {
+                continue;
+            }
+            if !rule.instance_tag_selectors.is_empty()
+                && !rule
+                    .instance_tag_selectors
+                    .iter()
+                    .any(|selector| selector.matches(&instance.tags))
+            {
+                continue;
+            }
+            if rule
+                .excluded_tag_selectors
+                .iter()
+                .any(|selector| selector.matches(&instance.tags))
+            {
+                continue;
+            }
+
+            for scope in &rule.mcp_ec2_diagnostic_scopes {
+                result.push(McpEc2DiagnosticScopeGrant {
+                    entitlement_rule_id: rule.id.clone(),
+                    account: (*account).clone(),
+                    scope: scope.clone(),
+                    instance_tag_selectors: rule.instance_tag_selectors.clone(),
+                    excluded_tag_selectors: rule.excluded_tag_selectors.clone(),
+                    requires_instance_metadata: false,
+                });
+            }
+        }
+        result
+    }
+
     pub async fn ecs_rule_scopes_for_feature(
         &self,
         claims: &Claims,
@@ -510,6 +630,7 @@ mod tests {
                     allowed_os_users: vec!["ec2-user".into()],
                     max_session_seconds: None,
                     database_scopes: vec![],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
                 EntitlementRule {
                     id: "rule-ops".into(),
@@ -542,6 +663,7 @@ mod tests {
                     allowed_os_users: vec!["ubuntu".into()],
                     max_session_seconds: Some(1800),
                     database_scopes: vec![],
+                    mcp_ec2_diagnostic_scopes: vec![],
                 },
             ],
             group_mappings: vec![],
@@ -568,6 +690,81 @@ mod tests {
 
     fn make_service() -> EntitlementService {
         EntitlementService::new(Arc::new(RwLock::new(test_store())))
+    }
+
+    fn mcp_ec2_test_scope() -> McpEc2DiagnosticScope {
+        McpEc2DiagnosticScope {
+            id: "nginx-error-tail".into(),
+            allowed_log_paths: vec![McpEc2LogPathScope {
+                path_pattern: "/var/log/nginx/error.log".into(),
+                canonical_safe_prefix: "/var/log/nginx/".into(),
+                safe_for_mcp_output: true,
+            }],
+            allowed_journal_units: vec![],
+            allowed_http_urls: vec![],
+            allowed_tcp_targets: vec![],
+            allowed_dns_targets: vec![],
+            private_target_refs: vec![],
+            max_lines: 100,
+            max_since_seconds: 1800,
+            max_timeout_seconds: 30,
+            max_matches: 25,
+            connectivity_probe_budget_per_window: 10,
+            budget_window_seconds: 600,
+            denylist_version: "2026-06-04".into(),
+            allowlist_rule_id: "allow-nginx-error-v1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_ec2_diagnostic_grants_fail_closed_for_duplicate_target_accounts() {
+        let mut store = test_store();
+        store.rules.push(EntitlementRule {
+            id: "rule-ambiguous-mcp-ec2".into(),
+            group: "eng".into(),
+            metadata: RuleMetadata::default(),
+            features: FeatureFlags {
+                can_use_mcp: true,
+                can_use_mcp_ec2: true,
+                ..Default::default()
+            },
+            allowed_accounts: vec![
+                AllowedAccount {
+                    account_id: "111".into(),
+                    account_name: "prod-direct".into(),
+                    role_arn: "direct".into(),
+                },
+                AllowedAccount {
+                    account_id: "111".into(),
+                    account_name: "prod-profile".into(),
+                    role_arn: "profile:ops".into(),
+                },
+            ],
+            allowed_regions: vec!["us-east-1".into()],
+            allowed_log_group_arns: vec![],
+            instance_tag_selectors: vec![],
+            excluded_tag_selectors: vec![],
+            allowed_clusters: vec![],
+            task_tag_selectors: vec![],
+            excluded_task_tag_selectors: vec![],
+            excluded_container_names: vec![],
+            allow_broad_cluster_discovery: false,
+            allowed_os_users: vec![],
+            max_session_seconds: None,
+            database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![mcp_ec2_test_scope()],
+        });
+        let svc = EntitlementService::new(Arc::new(RwLock::new(store)));
+        let claims = test_claims("alice", "alice@example.com");
+
+        let grants = svc
+            .mcp_ec2_diagnostic_scope_grants_for_target(&claims, "111", "us-east-1")
+            .await;
+
+        assert!(
+            grants.is_empty(),
+            "duplicate target account entries must not silently select a credential mode"
+        );
     }
 
     #[tokio::test]
@@ -721,6 +918,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
         store.rules.push(EntitlementRule {
             id: "rule-eng-power-staging".into(),
@@ -749,6 +947,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
 
         let svc = EntitlementService::new(Arc::new(RwLock::new(store)));
@@ -821,6 +1020,7 @@ mod tests {
             allowed_os_users: vec![],
             max_session_seconds: None,
             database_scopes: vec![],
+            mcp_ec2_diagnostic_scopes: vec![],
         });
 
         let svc = EntitlementService::new(Arc::new(RwLock::new(store)));

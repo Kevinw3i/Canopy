@@ -82,6 +82,13 @@ oidc_client_id  = "your-client-id"
 # MCP session state. Keep dynamodb when desired_count > 1.
 # mcp_session_store             = "dynamodb"
 # mcp_session_table_name        = "canopy-mcp-sessions"
+# MCP EC2 diagnostics dispatch. Leave empty/commented until the SSM document,
+# helper, command store, and command-spec key secret are deployed together.
+# mcp_ec2_diagnostic_ssm_document_name = "Canopy-Ec2Diagnostics"
+# mcp_ec2_diagnostic_ssm_document_version = "7"
+# mcp_ec2_diagnostic_helper_version = "2026-06-04.1"
+# mcp_ec2_diagnostic_command_spec_key_secret_id = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/mcp-ec2-command-spec-key-XXXXXX"
+# mcp_ec2_diagnostic_command_spec_key_secret_version_id = "00000000-0000-0000-0000-000000000000"
 
 # STS ExternalId for cross-account AssumeRole (must match target trust policy)
 # sts_external_id = "my-custom-external-id"

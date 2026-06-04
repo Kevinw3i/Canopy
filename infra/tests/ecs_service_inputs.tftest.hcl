@@ -31,11 +31,11 @@ run "rejects_multi_task_memory_mcp_session_store" {
   command = plan
 
   variables {
-    create_service         = true
-    image_tag              = "cp-v0.1.0"
-    jwt_secret_version_id  = "00000000-0000-0000-0000-000000000000"
-    desired_count          = 2
-    mcp_session_store      = "memory"
+    create_service        = true
+    image_tag             = "cp-v0.1.0"
+    jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
+    desired_count         = 2
+    mcp_session_store     = "memory"
   }
 
   expect_failures = [
@@ -47,11 +47,11 @@ run "accepts_single_task_memory_mcp_session_store" {
   command = plan
 
   variables {
-    create_service         = true
-    image_tag              = "cp-v0.1.0"
-    jwt_secret_version_id  = "00000000-0000-0000-0000-000000000000"
-    desired_count          = 1
-    mcp_session_store      = "memory"
+    create_service        = true
+    image_tag             = "cp-v0.1.0"
+    jwt_secret_version_id = "00000000-0000-0000-0000-000000000000"
+    desired_count         = 1
+    mcp_session_store     = "memory"
   }
 }
 
@@ -383,6 +383,30 @@ run "rejects_invalid_oidc_client_secret_version_id" {
   ]
 }
 
+run "rejects_invalid_mcp_ec2_command_spec_key_secret_arn" {
+  command = plan
+
+  variables {
+    mcp_ec2_diagnostic_command_spec_key_secret_id = "arn:aws:ssm:ap-northeast-1:123456789012:parameter/canopy/mcp-ec2-command-spec-key"
+  }
+
+  expect_failures = [
+    var.mcp_ec2_diagnostic_command_spec_key_secret_id,
+  ]
+}
+
+run "rejects_invalid_mcp_ec2_command_spec_key_secret_version_id" {
+  command = plan
+
+  variables {
+    mcp_ec2_diagnostic_command_spec_key_secret_version_id = "short"
+  }
+
+  expect_failures = [
+    var.mcp_ec2_diagnostic_command_spec_key_secret_version_id,
+  ]
+}
+
 run "rejects_service_without_jwt_secret_version_id" {
   command = plan
 
@@ -395,6 +419,54 @@ run "rejects_service_without_jwt_secret_version_id" {
   expect_failures = [
     aws_ecs_task_definition.control_plane,
   ]
+}
+
+run "rejects_mcp_ec2_dispatch_without_command_spec_key_secret_version_id" {
+  command = plan
+
+  variables {
+    create_service                                = true
+    image_tag                                     = "cp-v0.1.0"
+    jwt_secret_version_id                         = "00000000-0000-0000-0000-000000000000"
+    mcp_ec2_diagnostic_ssm_document_name          = "Canopy-Ec2Diagnostics"
+    mcp_ec2_diagnostic_ssm_document_version       = "7"
+    mcp_ec2_diagnostic_command_spec_key_secret_id = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/mcp-ec2-command-spec-key-XXXXXX"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
+run "rejects_mcp_ec2_dispatch_without_document_config" {
+  command = plan
+
+  variables {
+    create_service                                        = true
+    image_tag                                             = "cp-v0.1.0"
+    jwt_secret_version_id                                 = "00000000-0000-0000-0000-000000000000"
+    mcp_ec2_diagnostic_command_spec_key_secret_id         = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/mcp-ec2-command-spec-key-XXXXXX"
+    mcp_ec2_diagnostic_command_spec_key_secret_version_id = "00000000-0000-0000-0000-000000000000"
+  }
+
+  expect_failures = [
+    aws_ecs_task_definition.control_plane,
+  ]
+}
+
+run "accepts_mcp_ec2_dispatch_config" {
+  command = plan
+
+  variables {
+    create_service                                        = true
+    image_tag                                             = "cp-v0.1.0"
+    jwt_secret_version_id                                 = "00000000-0000-0000-0000-000000000000"
+    mcp_ec2_diagnostic_ssm_document_name                  = "Canopy-Ec2Diagnostics"
+    mcp_ec2_diagnostic_ssm_document_version               = "7"
+    mcp_ec2_diagnostic_helper_version                     = "2026-06-04.1"
+    mcp_ec2_diagnostic_command_spec_key_secret_id         = "arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:canopy/mcp-ec2-command-spec-key-XXXXXX"
+    mcp_ec2_diagnostic_command_spec_key_secret_version_id = "00000000-0000-0000-0000-000000000000"
+  }
 }
 
 run "rejects_oidc_secret_without_version_id" {

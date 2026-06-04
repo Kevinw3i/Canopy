@@ -3,13 +3,13 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::dto::audit::{AuditAction, AuditOutcome};
@@ -18,20 +18,34 @@ use shared::dto::database::{
     ListDatabaseScopesRequest, ListDatabaseScopesResponse, QueryDatabaseRequest,
     QueryDatabaseResponse,
 };
+use shared::dto::ec2::Ec2Instance;
+use shared::dto::entitlements::{
+    mcp_ec2_http_url_builtin_deny_reason, mcp_ec2_journal_unit_builtin_deny_reason,
+    mcp_ec2_log_path_builtin_deny_reason, mcp_ec2_network_host_builtin_deny_reason, AllowedAccount,
+    McpEc2DiagnosticScope, McpEc2DnsRecordType as EntitlementDnsRecordType, McpEc2HttpQueryPolicy,
+    McpEc2LogPathScope,
+};
 use shared::dto::mcp::{
     lookup_mcp_guidance, McpCloudwatchPreflightRequest, McpCloudwatchPreflightResponse,
+    McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
+    McpEc2DnsRecordType as McpCommandDnsRecordType, McpGetEc2DiagnosticResultResponse,
     McpGuardrails, McpGuidanceSyncRequest, McpGuidanceSyncResponse, McpListAllowedLogGroupsRequest,
     McpListAllowedLogGroupsResponse, McpRegisterSessionRequest, McpRegisterSessionResponse,
+    McpRunEc2DiagnosticCommandRequest, McpRunEc2DiagnosticCommandResponse,
     McpRunInsightsQueryRequest, McpRunInsightsQueryResponse, McpSearchLogsRequest,
     McpSearchLogsResponse, MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
     MCP_CLOUDWATCH_SEARCH_GUIDANCE_KEY, MCP_DATABASE_GUIDANCE_KEY,
-    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PROTOCOL_VERSION, MCP_SECURITY_BOUNDARIES_KEY,
+    MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY, MCP_PRIVACY_AND_AUDIT_NOTICE_KEY, MCP_PROTOCOL_VERSION,
+    MCP_SECURITY_BOUNDARIES_KEY,
 };
 use shared::errors::ApiError;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::aws::clients::AwsClients;
+use crate::aws::credentials::SessionContext;
+use crate::aws::ec2_convert::convert_sdk_instance;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::services::audit::AuditRequestContext;
 use crate::services::auth::Claims;
@@ -41,8 +55,20 @@ use crate::services::database::{
     ConnectionQueueFull, DatabaseConnectionUnavailable, DatabaseError, TableType, TableTypeQuery,
     ViewCheckedQueryOutcome,
 };
-use crate::services::entitlements::EntitlementService;
-use crate::services::{AppState, McpSessionRecord};
+use crate::services::entitlements::{
+    arn_matches_pattern, EntitlementService, McpEc2DiagnosticScopeGrant,
+};
+use crate::services::mcp_ec2_diagnostics::{
+    build_mcp_ec2_diagnostic_ssm_dispatch_request, build_mcp_ec2_diagnostic_ssm_send_command_input,
+    format_mcp_ec2_diagnostic_output, prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch,
+    McpEc2DiagnosticCommandSpecRefPayload, MCP_EC2_COMMAND_SPEC_HELPER_VERSION,
+    MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS,
+};
+use crate::services::{
+    AppState, McpEc2DiagnosticCommandCompletion, McpEc2DiagnosticCommandRecord,
+    McpEc2DiagnosticQuotaReservation, McpEc2DiagnosticSsmInvocation,
+    McpEc2DiagnosticSsmInvocationStatus, McpEc2DiagnosticSsmTargetConfig, McpSessionRecord,
+};
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
@@ -69,10 +95,29 @@ const CLOUDWATCH_INSIGHTS_REQUIRED_GUIDANCE: &[&str] = &[
     MCP_CLOUDWATCH_INSIGHTS_GUIDANCE_KEY,
     MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
 ];
+const EC2_DIAGNOSTICS_REQUIRED_GUIDANCE: &[&str] = &[
+    MCP_SECURITY_BOUNDARIES_KEY,
+    MCP_EC2_DIAGNOSTICS_GUIDANCE_KEY,
+    MCP_PRIVACY_AND_AUDIT_NOTICE_KEY,
+];
 const CLOUDWATCH_PREFLIGHT_TOKEN_AAD: &[u8] = b"canopy:mcp:cloudwatch:preflight:v1";
 const CLOUDWATCH_SEARCH_CURSOR_AAD: &[u8] = b"canopy:mcp:cloudwatch:search-cursor:v1";
 const CLOUDWATCH_INSIGHTS_QUERY_TOKEN_AAD: &[u8] = b"canopy:mcp:cloudwatch:insights-query-token:v1";
 const CLOUDWATCH_RAW_AUDIT_AAD: &[u8] = b"canopy:mcp:cloudwatch:raw-audit:v1";
+const MCP_EC2_DIAGNOSTIC_RESULT_MAX_BYTES: u64 = 64 * 1024;
+const MCP_EC2_INFLIGHT_PER_SESSION_LIMIT: u64 = 1;
+const MCP_EC2_INFLIGHT_PER_ACTOR_LIMIT: u64 = 2;
+const MCP_EC2_INFLIGHT_PER_ACTOR_TARGET_LIMIT: u64 = 1;
+const MCP_EC2_INFLIGHT_PER_RULE_LIMIT: u64 = 5;
+const MCP_EC2_INFLIGHT_GLOBAL_LIMIT: u64 = 100;
+const MCP_EC2_COMMAND_WINDOW_SECONDS: i64 = 60;
+const MCP_EC2_COMMANDS_PER_ACTOR_WINDOW_LIMIT: u64 = 20;
+const MCP_EC2_COMMANDS_PER_ACTOR_TARGET_WINDOW_LIMIT: u64 = 10;
+const MCP_EC2_COMMANDS_PER_RULE_WINDOW_LIMIT: u64 = 100;
+const MCP_EC2_RETURNED_BYTES_WINDOW_SECONDS: i64 = 60;
+const MCP_EC2_RETURNED_BYTES_PER_ACTOR_WINDOW_LIMIT: u64 = 1024 * 1024;
+const MCP_EC2_RETURNED_BYTES_PER_ACTOR_TARGET_WINDOW_LIMIT: u64 = 512 * 1024;
+const MCP_EC2_RETURNED_BYTES_PER_RULE_WINDOW_LIMIT: u64 = 5 * 1024 * 1024;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -90,6 +135,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/mcp/cloudwatch/insights", post(run_insights_query))
         .route("/api/mcp/database/scopes", post(list_database_scopes))
         .route("/api/mcp/database/query", post(query_database))
+        .route(
+            "/api/mcp/ec2/diagnostics/run",
+            post(run_ec2_diagnostic_command),
+        )
+        .route(
+            "/api/mcp/ec2/diagnostics/:command_id",
+            get(get_ec2_diagnostic_result),
+        )
 }
 
 async fn register_session(
@@ -1356,6 +1409,1452 @@ async fn run_insights_query(
             ))
         }
     }
+}
+
+async fn run_ec2_diagnostic_command(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Json(req): Json<McpRunEc2DiagnosticCommandRequest>,
+) -> ApiResult<McpRunEc2DiagnosticCommandResponse> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Audit logging unavailable")),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let entitlements = ent_service.evaluate(&claims).await;
+
+    if !entitlements.features.can_use_mcp_ec2 {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Run {
+                req: &req,
+                command_type: Some(mcp_ec2_command_type(&req.command)),
+                command_id: None,
+            },
+            AuditOutcome::Denied,
+            "entitlement_disabled",
+            None,
+            false,
+        )?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden(
+                "MCP EC2 diagnostics is not enabled for this user",
+            )),
+        ));
+    }
+
+    if let Err(denial) = require_mcp_guidance(
+        &state,
+        &claims,
+        req.canopy_mcp_session_id.as_deref(),
+        req.local_secret_generation.as_deref(),
+        EC2_DIAGNOSTICS_REQUIRED_GUIDANCE,
+    )
+    .await
+    {
+        if !denial.is_store_unavailable() {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(mcp_ec2_command_type(&req.command)),
+                    command_id: None,
+                },
+                AuditOutcome::Denied,
+                denial.audit_outcome_kind(),
+                None,
+                false,
+            )?;
+        }
+        return Err(
+            denial.http_response("Required MCP EC2 diagnostics guidance has not been delivered")
+        );
+    }
+
+    let mut authorization =
+        match authorize_mcp_ec2_diagnostic_command(&ent_service, &claims, &req).await {
+            Ok(authorization) => authorization,
+            Err(reason) => {
+                audit_mcp_ec2_diagnostics(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    McpEc2DiagnosticAudit::Run {
+                        req: &req,
+                        command_type: Some(mcp_ec2_command_type(&req.command)),
+                        command_id: None,
+                    },
+                    AuditOutcome::Denied,
+                    reason,
+                    None,
+                    false,
+                )?;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden(
+                        "EC2 diagnostic command is outside the authorized MCP scope",
+                    )),
+                ));
+            }
+        };
+
+    if !state
+        .mcp_ec2_diagnostic_ssm_dispatchers
+        .uses_live_aws_backend()
+    {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Run {
+                req: &req,
+                command_type: Some(authorization.command_type.clone()),
+                command_id: None,
+            },
+            AuditOutcome::Failure,
+            "dispatch_backend_unavailable",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics dispatch backend is not available yet",
+            )),
+        ));
+    }
+
+    let Some(mut account) = authorization.account.clone() else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Run {
+                req: &req,
+                command_type: Some(authorization.command_type.clone()),
+                command_id: None,
+            },
+            AuditOutcome::Failure,
+            "authorized_account_missing",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics target account is unavailable",
+            )),
+        ));
+    };
+
+    if authorization.requires_instance_metadata {
+        let target_instance = match resolve_mcp_ec2_target_instance(
+            &state,
+            &claims,
+            &account,
+            &req.account_id,
+            &req.region,
+            &req.instance_id,
+        )
+        .await
+        {
+            Ok(instance) => instance,
+            Err(reason) => {
+                audit_mcp_ec2_diagnostics(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    McpEc2DiagnosticAudit::Run {
+                        req: &req,
+                        command_type: Some(authorization.command_type.clone()),
+                        command_id: None,
+                    },
+                    AuditOutcome::Failure,
+                    reason,
+                    Some(&authorization),
+                    true,
+                )?;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden(
+                        "EC2 diagnostic command is outside the authorized MCP scope",
+                    )),
+                ));
+            }
+        };
+        let grants = ent_service
+            .mcp_ec2_diagnostic_scope_grants_for_instance(&claims, &target_instance)
+            .await;
+        match authorize_mcp_ec2_diagnostic_command_from_grants(grants, &req.command) {
+            Ok(resolved_authorization) => {
+                authorization = resolved_authorization;
+                if let Some(resolved_account) = authorization.account.clone() {
+                    account = resolved_account;
+                }
+            }
+            Err(reason) => {
+                audit_mcp_ec2_diagnostics(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    McpEc2DiagnosticAudit::Run {
+                        req: &req,
+                        command_type: Some(authorization.command_type.clone()),
+                        command_id: None,
+                    },
+                    AuditOutcome::Denied,
+                    reason,
+                    Some(&authorization),
+                    false,
+                )?;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden(
+                        "EC2 diagnostic command is outside the authorized MCP scope",
+                    )),
+                ));
+            }
+        }
+    }
+
+    let Some(session_id) = req.canopy_mcp_session_id.as_deref() else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Run {
+                req: &req,
+                command_type: Some(authorization.command_type.clone()),
+                command_id: None,
+            },
+            AuditOutcome::Failure,
+            "mcp_session_required",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics session is unavailable",
+            )),
+        ));
+    };
+    let Some(local_secret_generation) = req.local_secret_generation.as_deref() else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Run {
+                req: &req,
+                command_type: Some(authorization.command_type.clone()),
+                command_id: None,
+            },
+            AuditOutcome::Failure,
+            "local_secret_generation_required",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics session generation is unavailable",
+            )),
+        ));
+    };
+
+    let Some(command_spec_key) = state
+        .config
+        .mcp
+        .ec2_diagnostic_command_spec_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Run {
+                req: &req,
+                command_type: Some(authorization.command_type.clone()),
+                command_id: None,
+            },
+            AuditOutcome::Failure,
+            "dispatch_config_unavailable",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics dispatch configuration is unavailable",
+            )),
+        ));
+    };
+
+    let now = Utc::now();
+    let command_id = format!("mcp-ec2-{}", Uuid::new_v4());
+    let submitted_at = now;
+    let expires_at = now + Duration::minutes(10);
+    let quota_reservations =
+        mcp_ec2_run_quota_reservations(&authorization, &claims, session_id, &req, now, expires_at);
+    let quota_release_keys = quota_reservations
+        .iter()
+        .filter_map(McpEc2DiagnosticQuotaReservation::release_key)
+        .collect::<Vec<_>>();
+    let spec_ref_ttl_seconds = MCP_EC2_COMMAND_SPEC_REF_MAX_TTL_SECONDS.min(300);
+    let helper_version = state
+        .config
+        .mcp
+        .ec2_diagnostic_helper_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(MCP_EC2_COMMAND_SPEC_HELPER_VERSION)
+        .to_string();
+    let command_type = authorization.command_type.clone();
+    let command_spec_payload = McpEc2DiagnosticCommandSpecRefPayload {
+        version: 1,
+        helper_version,
+        mcp_ec2_command_id: command_id.clone(),
+        actor: claims.sub.clone(),
+        mcp_session_id: session_id.to_string(),
+        local_secret_generation: local_secret_generation.to_string(),
+        instance_id: req.instance_id.clone(),
+        account_id: req.account_id.clone(),
+        region: req.region.clone(),
+        command_type: command_type.clone(),
+        command: authorization.command.clone(),
+        private_target_ref: authorization.private_target_ref.clone(),
+        log_safe_prefix: authorization.log_safe_prefix.clone(),
+        one_time_command_store_claim_required: true,
+        allowlist_rule_id: authorization.allowlist_rule_id.clone(),
+        command_scope_id: authorization.command_scope_id.clone(),
+        issued_at: now,
+        expires_at: now + Duration::seconds(spec_ref_ttl_seconds),
+    };
+    let prepared_ref = match prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch(
+        command_spec_key,
+        &command_spec_payload,
+        now,
+    ) {
+        Ok(prepared_ref) => prepared_ref,
+        Err(_) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: None,
+                },
+                AuditOutcome::Failure,
+                "command_spec_ref_failed",
+                Some(&authorization),
+                false,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics command spec reference could not be prepared",
+                )),
+            ));
+        }
+    };
+    let dispatch_request = match build_mcp_ec2_diagnostic_ssm_dispatch_request(
+        &state.config.mcp,
+        &command_id,
+        &req.instance_id,
+        &prepared_ref,
+    ) {
+        Ok(request) => request,
+        Err(_) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "dispatch_config_unavailable",
+                Some(&authorization),
+                false,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics dispatch configuration is unavailable",
+                )),
+            ));
+        }
+    };
+    let ssm_command_input = match build_mcp_ec2_diagnostic_ssm_send_command_input(&dispatch_request)
+    {
+        Ok(input) => input,
+        Err(_) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "dispatch_request_invalid",
+                Some(&authorization),
+                false,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics dispatch request is invalid",
+                )),
+            ));
+        }
+    };
+
+    audit_mcp_ec2_diagnostics(
+        &state,
+        &claims.sub,
+        &audit_ctx,
+        McpEc2DiagnosticAudit::Run {
+            req: &req,
+            command_type: Some(command_type.clone()),
+            command_id: Some(&command_id),
+        },
+        AuditOutcome::Success,
+        "attempt",
+        Some(&authorization),
+        false,
+    )?;
+
+    let command_record = McpEc2DiagnosticCommandRecord {
+        actor: claims.sub.clone(),
+        actor_email: claims.email.clone(),
+        mcp_session_id: session_id.to_string(),
+        local_secret_generation: local_secret_generation.to_string(),
+        instance_id: req.instance_id.clone(),
+        account_id: req.account_id.clone(),
+        region: req.region.clone(),
+        command_type: command_type.clone(),
+        allowlist_rule_id: authorization.allowlist_rule_id.clone(),
+        command_scope_id: authorization.command_scope_id.clone(),
+        authorization_fingerprint: Some(authorization.authorization_fingerprint.clone()),
+        quota_release_keys: quota_release_keys.clone(),
+        status: McpEc2DiagnosticCommandStatus::Queued,
+        aws_ssm_command_id: None,
+        submitted_at,
+        completed_at: None,
+        output_byte_count: 0,
+        dropped_byte_count: 0,
+        output_sequence_start: 0,
+        output_sequence_end: 0,
+        exit_status: None,
+        truncated: false,
+        expires_at,
+        created_at: now,
+        updated_at: now,
+    };
+    match state
+        .mcp_ec2_diagnostic_commands
+        .create_command_with_quota(command_id.clone(), command_record, &quota_reservations)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "quota_exhausted",
+                Some(&authorization),
+                false,
+            )?;
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiError::new(
+                    "quota_exceeded",
+                    "MCP EC2 diagnostics quota exhausted",
+                )),
+            ));
+        }
+        Err(_) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "command_store_unavailable",
+                Some(&authorization),
+                false,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics command store is unavailable",
+                )),
+            ));
+        }
+    }
+
+    let session_context = SessionContext {
+        user_id: claims.sub.clone(),
+        team: claims
+            .groups
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string()),
+        environment: if state.config.dev_mode {
+            "dev".to_string()
+        } else {
+            "production".to_string()
+        },
+        session_duration_seconds: state.config.aws.session_duration_seconds,
+        sts_external_id: state.config.aws.sts_external_id.clone(),
+    };
+    let resolved_aws_config = match state
+        .mcp_ec2_diagnostic_aws_config_resolver
+        .resolve_config(
+            &state.base_aws_config,
+            &account,
+            &req.region,
+            &session_context,
+        )
+        .await
+    {
+        Ok(config) => config,
+        Err(_) => {
+            release_mcp_ec2_run_quota_reservations(&state, &quota_release_keys).await;
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "dispatch_credentials_unavailable",
+                Some(&authorization),
+                true,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics AWS credentials are unavailable",
+                )),
+            ));
+        }
+    };
+    let target_config = match McpEc2DiagnosticSsmTargetConfig::new(
+        &req.account_id,
+        &req.region,
+        resolved_aws_config.resolved_account_id(),
+        resolved_aws_config.resolved_region(),
+        resolved_aws_config.aws_config(),
+    ) {
+        Ok(target_config) => target_config,
+        Err(_) => {
+            release_mcp_ec2_run_quota_reservations(&state, &quota_release_keys).await;
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "dispatch_target_config_invalid",
+                Some(&authorization),
+                true,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics target configuration is invalid",
+                )),
+            ));
+        }
+    };
+    let dispatcher = state
+        .mcp_ec2_diagnostic_ssm_dispatchers
+        .dispatcher_for_target_config(&target_config);
+    let aws_ssm_command_id = match dispatcher.dispatch(&ssm_command_input).await {
+        Ok(command_id) => command_id,
+        Err(_) => {
+            release_mcp_ec2_run_quota_reservations(&state, &quota_release_keys).await;
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "dispatch_backend_unavailable",
+                Some(&authorization),
+                true,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics dispatch backend is unavailable",
+                )),
+            ));
+        }
+    };
+    let claim = state
+        .mcp_ec2_diagnostic_commands
+        .mark_dispatched(
+            &command_id,
+            &claims.sub,
+            session_id,
+            local_secret_generation,
+            &aws_ssm_command_id,
+            Utc::now(),
+        )
+        .await;
+    match claim {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let cancel_succeeded = dispatcher.cancel(&aws_ssm_command_id).await.is_ok();
+            release_mcp_ec2_run_quota_reservations(&state, &quota_release_keys).await;
+            audit_mcp_ec2_diagnostics_with_details(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Run {
+                    req: &req,
+                    command_type: Some(command_type.clone()),
+                    command_id: Some(&command_id),
+                },
+                AuditOutcome::Failure,
+                "command_store_claim_failed",
+                Some(&authorization),
+                true,
+                McpEc2DiagnosticAuditDetails {
+                    aws_ssm_command_id: Some(&aws_ssm_command_id),
+                    aws_cancel_attempted: Some(true),
+                    aws_cancel_succeeded: Some(cancel_succeeded),
+                    ..McpEc2DiagnosticAuditDetails::default()
+                },
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics command store claim failed",
+                )),
+            ));
+        }
+    }
+
+    audit_mcp_ec2_diagnostics(
+        &state,
+        &claims.sub,
+        &audit_ctx,
+        McpEc2DiagnosticAudit::Run {
+            req: &req,
+            command_type: Some(command_type.clone()),
+            command_id: Some(&command_id),
+        },
+        AuditOutcome::Success,
+        "dispatch_submitted",
+        Some(&authorization),
+        true,
+    )?;
+
+    Ok(Json(McpRunEc2DiagnosticCommandResponse {
+        mcp_ec2_command_id: command_id,
+        status: McpEc2DiagnosticCommandStatus::Running,
+        instance_id: req.instance_id,
+        account_id: req.account_id,
+        region: req.region,
+        command_type,
+        submitted_at,
+        expires_at,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct McpGetEc2DiagnosticResultQuery {
+    canopy_mcp_session_id: Option<String>,
+    local_secret_generation: Option<String>,
+    max_bytes: u64,
+}
+
+async fn get_ec2_diagnostic_result(
+    State(state): State<Arc<AppState>>,
+    AuthenticatedUser(claims): AuthenticatedUser,
+    headers: HeaderMap,
+    Path(command_id): Path<String>,
+    Query(query): Query<McpGetEc2DiagnosticResultQuery>,
+) -> ApiResult<McpGetEc2DiagnosticResultResponse> {
+    if !state.audit_service.is_healthy() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::internal("Audit logging unavailable")),
+        ));
+    }
+
+    let audit_ctx = AuditRequestContext::from_headers_and_claims(&headers, &claims);
+    if let Err(denial) = require_mcp_guidance(
+        &state,
+        &claims,
+        query.canopy_mcp_session_id.as_deref(),
+        query.local_secret_generation.as_deref(),
+        EC2_DIAGNOSTICS_REQUIRED_GUIDANCE,
+    )
+    .await
+    {
+        if !denial.is_store_unavailable() {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: query.canopy_mcp_session_id.as_deref(),
+                    local_secret_generation: query.local_secret_generation.as_deref(),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Denied,
+                denial.audit_outcome_kind(),
+                None,
+                false,
+            )?;
+        }
+        return Err(
+            denial.http_response("Required MCP EC2 diagnostics guidance has not been delivered")
+        );
+    }
+
+    let Some(session_id) = query.canopy_mcp_session_id.as_deref() else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden("MCP session is required")),
+        ));
+    };
+    let Some(local_secret_generation) = query.local_secret_generation.as_deref() else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::forbidden("MCP session is required")),
+        ));
+    };
+    let result_byte_budget = match mcp_ec2_result_byte_budget(query.max_bytes) {
+        Some(budget) => budget,
+        None => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "invalid_max_bytes",
+                None,
+                false,
+            )?;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::bad_request("max_bytes must be greater than zero")),
+            ));
+        }
+    };
+
+    let record = state
+        .mcp_ec2_diagnostic_commands
+        .get_owned_command(
+            &command_id,
+            &claims.sub,
+            session_id,
+            local_secret_generation,
+            Utc::now(),
+        )
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostic command store unavailable",
+                )),
+            )
+        })?;
+
+    let Some(record) = record else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Denied,
+            "command_not_found_or_not_owned",
+            None,
+            false,
+        )?;
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::not_found("EC2 diagnostic command not found")),
+        ));
+    };
+
+    let authorization = AuthorizedMcpEc2DiagnosticCommand {
+        entitlement_rule_id: String::new(),
+        account: None,
+        allowlist_rule_id: record.allowlist_rule_id.clone(),
+        command_scope_id: record.command_scope_id.clone(),
+        authorization_fingerprint: String::new(),
+        command_type: record.command_type.clone(),
+        command: mcp_ec2_placeholder_command_for_type(&record.command_type),
+        private_target_ref: None,
+        log_safe_prefix: None,
+        connectivity_probe_budget_per_window: 1,
+        budget_window_seconds: 60,
+        requires_instance_metadata: false,
+    };
+    if !state
+        .mcp_ec2_diagnostic_ssm_dispatchers
+        .uses_live_aws_backend()
+    {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Failure,
+            "result_backend_unavailable",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics result backend is not available yet",
+            )),
+        ));
+    }
+
+    if record.status == McpEc2DiagnosticCommandStatus::Queued {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Success,
+            "result_poll_queued",
+            Some(&authorization),
+            false,
+        )?;
+        return Ok(Json(McpGetEc2DiagnosticResultResponse {
+            mcp_ec2_command_id: command_id,
+            status: McpEc2DiagnosticCommandStatus::Queued,
+            sequence_start: record.output_sequence_start,
+            sequence_end: record.output_sequence_end,
+            output_text: None,
+            untrusted_remote_output: false,
+            output_bytes: 0,
+            dropped_bytes: 0,
+            exit_code: None,
+            error: None,
+        }));
+    }
+
+    let Some(aws_ssm_command_id) = record.aws_ssm_command_id.as_deref() else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Failure,
+            "result_command_record_invalid",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostic command record is invalid",
+            )),
+        ));
+    };
+
+    let ent_service = EntitlementService::new(state.entitlement_store.clone());
+    let mut authorization =
+        match authorize_mcp_ec2_diagnostic_result_record(&ent_service, &claims, &record).await {
+            Ok(authorization) => authorization,
+            Err(reason) => {
+                audit_mcp_ec2_diagnostics(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    McpEc2DiagnosticAudit::Result {
+                        command_id: &command_id,
+                        session_id: Some(session_id),
+                        local_secret_generation: Some(local_secret_generation),
+                        max_bytes: query.max_bytes,
+                    },
+                    AuditOutcome::Denied,
+                    reason,
+                    Some(&authorization),
+                    false,
+                )?;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden(
+                        "MCP EC2 diagnostic command is not authorized",
+                    )),
+                ));
+            }
+        };
+    let Some(mut account) = authorization.account.clone() else {
+        audit_mcp_ec2_diagnostics(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Failure,
+            "authorized_account_missing",
+            Some(&authorization),
+            false,
+        )?;
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::service_unavailable(
+                "MCP EC2 diagnostics target account is unavailable",
+            )),
+        ));
+    };
+    if authorization.requires_instance_metadata {
+        let target_instance = match resolve_mcp_ec2_target_instance(
+            &state,
+            &claims,
+            &account,
+            &record.account_id,
+            &record.region,
+            &record.instance_id,
+        )
+        .await
+        {
+            Ok(instance) => instance,
+            Err(reason) => {
+                audit_mcp_ec2_diagnostics(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    McpEc2DiagnosticAudit::Result {
+                        command_id: &command_id,
+                        session_id: Some(session_id),
+                        local_secret_generation: Some(local_secret_generation),
+                        max_bytes: query.max_bytes,
+                    },
+                    AuditOutcome::Failure,
+                    reason,
+                    Some(&authorization),
+                    true,
+                )?;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden(
+                        "MCP EC2 diagnostic command is not authorized",
+                    )),
+                ));
+            }
+        };
+        let matching_grants = ent_service
+            .mcp_ec2_diagnostic_scope_grants_for_instance(&claims, &target_instance)
+            .await
+            .into_iter()
+            .filter(|grant| {
+                grant.scope.id == record.command_scope_id
+                    && grant.scope.allowlist_rule_id == record.allowlist_rule_id
+            })
+            .collect::<Vec<_>>();
+        match authorize_mcp_ec2_diagnostic_result_record_from_grants(matching_grants, &record) {
+            Ok(resolved_authorization) => {
+                authorization = resolved_authorization;
+                if let Some(resolved_account) = authorization.account.clone() {
+                    account = resolved_account;
+                }
+            }
+            Err(reason) => {
+                audit_mcp_ec2_diagnostics(
+                    &state,
+                    &claims.sub,
+                    &audit_ctx,
+                    McpEc2DiagnosticAudit::Result {
+                        command_id: &command_id,
+                        session_id: Some(session_id),
+                        local_secret_generation: Some(local_secret_generation),
+                        max_bytes: query.max_bytes,
+                    },
+                    AuditOutcome::Denied,
+                    reason,
+                    Some(&authorization),
+                    false,
+                )?;
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(ApiError::forbidden(
+                        "MCP EC2 diagnostic command is not authorized",
+                    )),
+                ));
+            }
+        }
+    }
+
+    let session_context = mcp_ec2_session_context(&state, &claims);
+    let resolved_aws_config = match state
+        .mcp_ec2_diagnostic_aws_config_resolver
+        .resolve_config(
+            &state.base_aws_config,
+            &account,
+            &record.region,
+            &session_context,
+        )
+        .await
+    {
+        Ok(config) => config,
+        Err(_) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "result_credentials_unavailable",
+                Some(&authorization),
+                true,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics AWS credentials are unavailable",
+                )),
+            ));
+        }
+    };
+    let target_config = match McpEc2DiagnosticSsmTargetConfig::new(
+        &record.account_id,
+        &record.region,
+        resolved_aws_config.resolved_account_id(),
+        resolved_aws_config.resolved_region(),
+        resolved_aws_config.aws_config(),
+    ) {
+        Ok(target_config) => target_config,
+        Err(_) => {
+            audit_mcp_ec2_diagnostics(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "result_target_config_invalid",
+                Some(&authorization),
+                true,
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics target configuration is invalid",
+                )),
+            ));
+        }
+    };
+    let dispatcher = state
+        .mcp_ec2_diagnostic_ssm_dispatchers
+        .dispatcher_for_target_config(&target_config);
+    let invocation = match dispatcher
+        .get_invocation(aws_ssm_command_id, &record.instance_id)
+        .await
+    {
+        Ok(invocation) => invocation,
+        Err(_) => {
+            audit_mcp_ec2_diagnostics_with_details(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "result_backend_unavailable",
+                Some(&authorization),
+                true,
+                McpEc2DiagnosticAuditDetails {
+                    aws_ssm_command_id: Some(aws_ssm_command_id),
+                    ssm_invocation_status: None,
+                    ..McpEc2DiagnosticAuditDetails::default()
+                },
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics result backend is unavailable",
+                )),
+            ));
+        }
+    };
+
+    if !invocation.status().is_terminal() {
+        if record.status != McpEc2DiagnosticCommandStatus::Running {
+            audit_mcp_ec2_diagnostics_with_details(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "result_command_record_invalid",
+                Some(&authorization),
+                true,
+                McpEc2DiagnosticAuditDetails {
+                    aws_ssm_command_id: Some(aws_ssm_command_id),
+                    ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(
+                        invocation.status(),
+                    )),
+                    ..McpEc2DiagnosticAuditDetails::default()
+                },
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostic command record is invalid",
+                )),
+            ));
+        }
+
+        audit_mcp_ec2_diagnostics_with_details(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Success,
+            "result_poll_running",
+            Some(&authorization),
+            true,
+            McpEc2DiagnosticAuditDetails {
+                aws_ssm_command_id: Some(aws_ssm_command_id),
+                ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(invocation.status())),
+                ..McpEc2DiagnosticAuditDetails::default()
+            },
+        )?;
+        return Ok(Json(McpGetEc2DiagnosticResultResponse {
+            mcp_ec2_command_id: command_id,
+            status: McpEc2DiagnosticCommandStatus::Running,
+            sequence_start: record.output_sequence_start,
+            sequence_end: record.output_sequence_end,
+            output_text: None,
+            untrusted_remote_output: false,
+            output_bytes: 0,
+            dropped_bytes: 0,
+            exit_code: None,
+            error: None,
+        }));
+    }
+
+    let completed_status = mcp_ec2_terminal_status_for_invocation(&invocation);
+    let response_status = if record.status == McpEc2DiagnosticCommandStatus::Running {
+        completed_status.clone()
+    } else {
+        record.status.clone()
+    };
+    let formatted_output = format_mcp_ec2_diagnostic_output(
+        &mcp_ec2_invocation_output_text(&invocation),
+        result_byte_budget,
+    );
+    let output_sequence_start = 0;
+    let output_sequence_end = formatted_output.output_bytes;
+    let completion = McpEc2DiagnosticCommandCompletion {
+        status: completed_status.clone(),
+        completed_at: Utc::now(),
+        output_byte_count: formatted_output.output_bytes,
+        dropped_byte_count: formatted_output.dropped_bytes,
+        output_sequence_start,
+        output_sequence_end,
+        exit_status: invocation.response_code(),
+        truncated: formatted_output.truncated,
+    };
+    if record.status == McpEc2DiagnosticCommandStatus::Running {
+        audit_mcp_ec2_diagnostics_with_details(
+            &state,
+            &claims.sub,
+            &audit_ctx,
+            McpEc2DiagnosticAudit::Result {
+                command_id: &command_id,
+                session_id: Some(session_id),
+                local_secret_generation: Some(local_secret_generation),
+                max_bytes: query.max_bytes,
+            },
+            AuditOutcome::Success,
+            "result_completion_observed",
+            Some(&authorization),
+            true,
+            McpEc2DiagnosticAuditDetails {
+                aws_ssm_command_id: Some(aws_ssm_command_id),
+                output_byte_count: Some(formatted_output.output_bytes),
+                dropped_byte_count: Some(formatted_output.dropped_bytes),
+                output_sequence_start: Some(output_sequence_start),
+                output_sequence_end: Some(output_sequence_end),
+                exit_status: invocation.response_code(),
+                truncated: Some(formatted_output.truncated),
+                ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(invocation.status())),
+                ..McpEc2DiagnosticAuditDetails::default()
+            },
+        )?;
+        if !state
+            .mcp_ec2_diagnostic_commands
+            .mark_terminal(
+                &command_id,
+                &claims.sub,
+                session_id,
+                local_secret_generation,
+                completion,
+                Utc::now(),
+            )
+            .await
+            .unwrap_or(false)
+        {
+            audit_mcp_ec2_diagnostics_with_details(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "command_store_completion_failed",
+                Some(&authorization),
+                true,
+                McpEc2DiagnosticAuditDetails {
+                    aws_ssm_command_id: Some(aws_ssm_command_id),
+                    output_byte_count: Some(formatted_output.output_bytes),
+                    dropped_byte_count: Some(formatted_output.dropped_bytes),
+                    output_sequence_start: Some(output_sequence_start),
+                    output_sequence_end: Some(output_sequence_end),
+                    exit_status: invocation.response_code(),
+                    truncated: Some(formatted_output.truncated),
+                    ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(
+                        invocation.status(),
+                    )),
+                    ..McpEc2DiagnosticAuditDetails::default()
+                },
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostic command completion could not be recorded",
+                )),
+            ));
+        }
+    }
+
+    let byte_quota_reservations =
+        mcp_ec2_result_byte_quota_reservations(&record, formatted_output.output_bytes, Utc::now());
+    match state
+        .mcp_ec2_diagnostic_commands
+        .record_quota_usage(&byte_quota_reservations, Utc::now())
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            audit_mcp_ec2_diagnostics_with_details(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "returned_byte_quota_exhausted",
+                Some(&authorization),
+                true,
+                McpEc2DiagnosticAuditDetails {
+                    aws_ssm_command_id: Some(aws_ssm_command_id),
+                    output_byte_count: Some(formatted_output.output_bytes),
+                    dropped_byte_count: Some(formatted_output.dropped_bytes),
+                    output_sequence_start: Some(output_sequence_start),
+                    output_sequence_end: Some(output_sequence_end),
+                    exit_status: invocation.response_code(),
+                    truncated: Some(formatted_output.truncated),
+                    ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(
+                        invocation.status(),
+                    )),
+                    ..McpEc2DiagnosticAuditDetails::default()
+                },
+            )?;
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiError::new(
+                    "quota_exceeded",
+                    "MCP EC2 diagnostics returned-byte quota exhausted",
+                )),
+            ));
+        }
+        Err(_) => {
+            audit_mcp_ec2_diagnostics_with_details(
+                &state,
+                &claims.sub,
+                &audit_ctx,
+                McpEc2DiagnosticAudit::Result {
+                    command_id: &command_id,
+                    session_id: Some(session_id),
+                    local_secret_generation: Some(local_secret_generation),
+                    max_bytes: query.max_bytes,
+                },
+                AuditOutcome::Failure,
+                "returned_byte_quota_store_unavailable",
+                Some(&authorization),
+                true,
+                McpEc2DiagnosticAuditDetails {
+                    aws_ssm_command_id: Some(aws_ssm_command_id),
+                    output_byte_count: Some(formatted_output.output_bytes),
+                    dropped_byte_count: Some(formatted_output.dropped_bytes),
+                    output_sequence_start: Some(output_sequence_start),
+                    output_sequence_end: Some(output_sequence_end),
+                    exit_status: invocation.response_code(),
+                    truncated: Some(formatted_output.truncated),
+                    ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(
+                        invocation.status(),
+                    )),
+                    ..McpEc2DiagnosticAuditDetails::default()
+                },
+            )?;
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::service_unavailable(
+                    "MCP EC2 diagnostics quota store is unavailable",
+                )),
+            ));
+        }
+    }
+
+    audit_mcp_ec2_diagnostics_with_details(
+        &state,
+        &claims.sub,
+        &audit_ctx,
+        McpEc2DiagnosticAudit::Result {
+            command_id: &command_id,
+            session_id: Some(session_id),
+            local_secret_generation: Some(local_secret_generation),
+            max_bytes: query.max_bytes,
+        },
+        AuditOutcome::Success,
+        "result_completed",
+        Some(&authorization),
+        true,
+        McpEc2DiagnosticAuditDetails {
+            aws_ssm_command_id: Some(aws_ssm_command_id),
+            output_byte_count: Some(formatted_output.output_bytes),
+            dropped_byte_count: Some(formatted_output.dropped_bytes),
+            output_sequence_start: Some(output_sequence_start),
+            output_sequence_end: Some(output_sequence_end),
+            exit_status: invocation.response_code(),
+            truncated: Some(formatted_output.truncated),
+            ssm_invocation_status: Some(mcp_ec2_invocation_status_wire(invocation.status())),
+            ..McpEc2DiagnosticAuditDetails::default()
+        },
+    )?;
+
+    Ok(Json(McpGetEc2DiagnosticResultResponse {
+        mcp_ec2_command_id: command_id,
+        status: response_status.clone(),
+        sequence_start: output_sequence_start,
+        sequence_end: output_sequence_end,
+        output_text: Some(formatted_output.output_text),
+        untrusted_remote_output: true,
+        output_bytes: formatted_output.output_bytes,
+        dropped_bytes: formatted_output.dropped_bytes,
+        exit_code: invocation.response_code(),
+        error: mcp_ec2_terminal_error(&response_status),
+    }))
 }
 
 async fn list_database_scopes(
@@ -4480,6 +5979,1075 @@ async fn require_mcp_guidance(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AuthorizedMcpEc2DiagnosticCommand {
+    entitlement_rule_id: String,
+    account: Option<AllowedAccount>,
+    allowlist_rule_id: String,
+    command_scope_id: String,
+    authorization_fingerprint: String,
+    command_type: McpEc2DiagnosticCommandType,
+    command: McpEc2DiagnosticCommand,
+    private_target_ref: Option<String>,
+    log_safe_prefix: Option<String>,
+    connectivity_probe_budget_per_window: u32,
+    budget_window_seconds: u64,
+    requires_instance_metadata: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AuthorizedMcpEc2ScopeCommand {
+    command: McpEc2DiagnosticCommand,
+    private_target_ref: Option<String>,
+    log_safe_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthorizedMcpEc2LogTarget {
+    path: String,
+    safe_prefix: String,
+}
+
+fn mcp_ec2_command_type(command: &McpEc2DiagnosticCommand) -> McpEc2DiagnosticCommandType {
+    match command {
+        McpEc2DiagnosticCommand::TailLog { .. } => McpEc2DiagnosticCommandType::TailLog,
+        McpEc2DiagnosticCommand::GrepLog { .. } => McpEc2DiagnosticCommandType::GrepLog,
+        McpEc2DiagnosticCommand::JournalctlUnit { .. } => {
+            McpEc2DiagnosticCommandType::JournalctlUnit
+        }
+        McpEc2DiagnosticCommand::HttpHead { .. } => McpEc2DiagnosticCommandType::HttpHead,
+        McpEc2DiagnosticCommand::TcpProbe { .. } => McpEc2DiagnosticCommandType::TcpProbe,
+        McpEc2DiagnosticCommand::DnsLookup { .. } => McpEc2DiagnosticCommandType::DnsLookup,
+    }
+}
+
+fn mcp_ec2_command_type_wire(command_type: &McpEc2DiagnosticCommandType) -> &'static str {
+    match command_type {
+        McpEc2DiagnosticCommandType::TailLog => "tail_log",
+        McpEc2DiagnosticCommandType::GrepLog => "grep_log",
+        McpEc2DiagnosticCommandType::JournalctlUnit => "journalctl_unit",
+        McpEc2DiagnosticCommandType::HttpHead => "http_head",
+        McpEc2DiagnosticCommandType::TcpProbe => "tcp_probe",
+        McpEc2DiagnosticCommandType::DnsLookup => "dns_lookup",
+    }
+}
+
+fn mcp_ec2_placeholder_command_for_type(
+    command_type: &McpEc2DiagnosticCommandType,
+) -> McpEc2DiagnosticCommand {
+    match command_type {
+        McpEc2DiagnosticCommandType::TailLog => McpEc2DiagnosticCommand::TailLog {
+            path: String::new(),
+            lines: 1,
+        },
+        McpEc2DiagnosticCommandType::GrepLog => McpEc2DiagnosticCommand::GrepLog {
+            path: String::new(),
+            literal_pattern: String::new(),
+            case_insensitive: false,
+            max_matches: 1,
+        },
+        McpEc2DiagnosticCommandType::JournalctlUnit => McpEc2DiagnosticCommand::JournalctlUnit {
+            unit: String::new(),
+            since: String::new(),
+            lines: 1,
+        },
+        McpEc2DiagnosticCommandType::HttpHead => McpEc2DiagnosticCommand::HttpHead {
+            url: String::new(),
+            max_time_seconds: 1,
+        },
+        McpEc2DiagnosticCommandType::TcpProbe => McpEc2DiagnosticCommand::TcpProbe {
+            host: String::new(),
+            port: 1,
+            timeout_seconds: 1,
+        },
+        McpEc2DiagnosticCommandType::DnsLookup => McpEc2DiagnosticCommand::DnsLookup {
+            host: String::new(),
+            record_type: McpCommandDnsRecordType::A,
+        },
+    }
+}
+
+fn mcp_ec2_result_byte_budget(max_bytes: u64) -> Option<usize> {
+    if max_bytes == 0 {
+        return None;
+    }
+    MCP_EC2_DIAGNOSTIC_RESULT_MAX_BYTES
+        .min(max_bytes)
+        .try_into()
+        .ok()
+}
+
+fn mcp_ec2_run_quota_reservations(
+    authorization: &AuthorizedMcpEc2DiagnosticCommand,
+    claims: &Claims,
+    session_id: &str,
+    req: &McpRunEc2DiagnosticCommandRequest,
+    now: DateTime<Utc>,
+    command_expires_at: DateTime<Utc>,
+) -> Vec<McpEc2DiagnosticQuotaReservation> {
+    let actor = mcp_ec2_quota_component(&claims.sub);
+    let session = mcp_ec2_quota_component(session_id);
+    let target = mcp_ec2_quota_component(&format!(
+        "{}:{}:{}",
+        req.account_id, req.region, req.instance_id
+    ));
+    let rule = mcp_ec2_quota_component(&authorization.entitlement_rule_id);
+    let scope = mcp_ec2_quota_component(&authorization.command_scope_id);
+    let command_target =
+        mcp_ec2_quota_component(&mcp_ec2_command_target_fingerprint(&authorization.command));
+    let window_expires_at = now + Duration::seconds(MCP_EC2_COMMAND_WINDOW_SECONDS);
+    let mut reservations = vec![
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:inflight:session:{actor}:{session}"),
+            MCP_EC2_INFLIGHT_PER_SESSION_LIMIT,
+            1,
+            command_expires_at,
+            true,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:inflight:actor:{actor}"),
+            MCP_EC2_INFLIGHT_PER_ACTOR_LIMIT,
+            1,
+            command_expires_at,
+            true,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:inflight:actor-target:{actor}:{target}"),
+            MCP_EC2_INFLIGHT_PER_ACTOR_TARGET_LIMIT,
+            1,
+            command_expires_at,
+            true,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:inflight:rule:{rule}:{scope}"),
+            MCP_EC2_INFLIGHT_PER_RULE_LIMIT,
+            1,
+            command_expires_at,
+            true,
+        ),
+        mcp_ec2_quota_reservation(
+            "quota:v1:inflight:global".to_string(),
+            MCP_EC2_INFLIGHT_GLOBAL_LIMIT,
+            1,
+            command_expires_at,
+            true,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:commands:actor:{actor}"),
+            MCP_EC2_COMMANDS_PER_ACTOR_WINDOW_LIMIT,
+            1,
+            window_expires_at,
+            false,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:commands:actor-target:{actor}:{target}"),
+            MCP_EC2_COMMANDS_PER_ACTOR_TARGET_WINDOW_LIMIT,
+            1,
+            window_expires_at,
+            false,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:commands:rule:{rule}:{scope}"),
+            MCP_EC2_COMMANDS_PER_RULE_WINDOW_LIMIT,
+            1,
+            window_expires_at,
+            false,
+        ),
+    ];
+    if mcp_ec2_command_is_connectivity_probe(&authorization.command) {
+        let window = authorization.budget_window_seconds.clamp(1, 3600);
+        let limit = authorization.connectivity_probe_budget_per_window.max(1) as u64;
+        reservations.push(mcp_ec2_quota_reservation(
+            format!("quota:v1:connectivity:{actor}:{target}:{rule}:{scope}:{command_target}"),
+            limit,
+            1,
+            now + Duration::seconds(window as i64),
+            false,
+        ));
+    }
+    reservations
+}
+
+fn mcp_ec2_result_byte_quota_reservations(
+    record: &McpEc2DiagnosticCommandRecord,
+    output_bytes: u64,
+    now: DateTime<Utc>,
+) -> Vec<McpEc2DiagnosticQuotaReservation> {
+    let actor = mcp_ec2_quota_component(&record.actor);
+    let target = mcp_ec2_quota_component(&format!(
+        "{}:{}:{}",
+        record.account_id, record.region, record.instance_id
+    ));
+    let rule = mcp_ec2_quota_component(&record.allowlist_rule_id);
+    let scope = mcp_ec2_quota_component(&record.command_scope_id);
+    let expires_at = now + Duration::seconds(MCP_EC2_RETURNED_BYTES_WINDOW_SECONDS);
+    vec![
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:bytes:actor:{actor}"),
+            MCP_EC2_RETURNED_BYTES_PER_ACTOR_WINDOW_LIMIT,
+            output_bytes.max(1),
+            expires_at,
+            false,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:bytes:actor-target:{actor}:{target}"),
+            MCP_EC2_RETURNED_BYTES_PER_ACTOR_TARGET_WINDOW_LIMIT,
+            output_bytes.max(1),
+            expires_at,
+            false,
+        ),
+        mcp_ec2_quota_reservation(
+            format!("quota:v1:bytes:rule:{rule}:{scope}"),
+            MCP_EC2_RETURNED_BYTES_PER_RULE_WINDOW_LIMIT,
+            output_bytes.max(1),
+            expires_at,
+            false,
+        ),
+    ]
+}
+
+async fn release_mcp_ec2_run_quota_reservations(state: &AppState, quota_release_keys: &[String]) {
+    if quota_release_keys.is_empty() {
+        return;
+    }
+    if let Err(err) = state
+        .mcp_ec2_diagnostic_commands
+        .release_quota_reservations(quota_release_keys, Utc::now())
+        .await
+    {
+        tracing::warn!(
+            error = ?err,
+            "failed to release MCP EC2 diagnostic in-flight quota after failed dispatch path"
+        );
+    }
+}
+
+fn mcp_ec2_quota_reservation(
+    key: String,
+    limit: u64,
+    amount: u64,
+    expires_at: DateTime<Utc>,
+    release_on_terminal: bool,
+) -> McpEc2DiagnosticQuotaReservation {
+    McpEc2DiagnosticQuotaReservation {
+        key,
+        limit,
+        amount,
+        expires_at,
+        release_on_terminal,
+    }
+}
+
+fn mcp_ec2_quota_component(value: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
+}
+
+fn mcp_ec2_command_target_fingerprint(command: &McpEc2DiagnosticCommand) -> String {
+    match command {
+        McpEc2DiagnosticCommand::TailLog { path, .. }
+        | McpEc2DiagnosticCommand::GrepLog { path, .. } => {
+            format!("log:{path}")
+        }
+        McpEc2DiagnosticCommand::JournalctlUnit { unit, .. } => format!("journal:{unit}"),
+        McpEc2DiagnosticCommand::HttpHead { url, .. } => format!("http:{url}"),
+        McpEc2DiagnosticCommand::TcpProbe { host, port, .. } => format!("tcp:{host}:{port}"),
+        McpEc2DiagnosticCommand::DnsLookup { host, record_type } => {
+            format!("dns:{host}:{record_type:?}")
+        }
+    }
+}
+
+fn mcp_ec2_command_is_connectivity_probe(command: &McpEc2DiagnosticCommand) -> bool {
+    matches!(
+        command,
+        McpEc2DiagnosticCommand::HttpHead { .. }
+            | McpEc2DiagnosticCommand::TcpProbe { .. }
+            | McpEc2DiagnosticCommand::DnsLookup { .. }
+    )
+}
+
+fn mcp_ec2_session_context(state: &AppState, claims: &Claims) -> SessionContext {
+    SessionContext {
+        user_id: claims.sub.clone(),
+        team: claims
+            .groups
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string()),
+        environment: if state.config.dev_mode {
+            "dev".to_string()
+        } else {
+            "production".to_string()
+        },
+        session_duration_seconds: state.config.aws.session_duration_seconds,
+        sts_external_id: state.config.aws.sts_external_id.clone(),
+    }
+}
+
+async fn resolve_mcp_ec2_target_instance(
+    state: &AppState,
+    claims: &Claims,
+    account: &AllowedAccount,
+    account_id: &str,
+    region: &str,
+    instance_id: &str,
+) -> Result<Ec2Instance, &'static str> {
+    let session_context = mcp_ec2_session_context(state, claims);
+    let resolved_aws_config = state
+        .mcp_ec2_diagnostic_aws_config_resolver
+        .resolve_config(&state.base_aws_config, account, region, &session_context)
+        .await
+        .map_err(|_| "target_metadata_credentials_unavailable")?;
+    let target_config = McpEc2DiagnosticSsmTargetConfig::new(
+        account_id,
+        region,
+        resolved_aws_config.resolved_account_id(),
+        resolved_aws_config.resolved_region(),
+        resolved_aws_config.aws_config(),
+    )
+    .map_err(|_| "target_metadata_config_invalid")?;
+    let ec2_client = AwsClients::ec2(target_config.aws_config());
+    let describe_resp = ec2_client
+        .describe_instances()
+        .instance_ids(instance_id)
+        .send()
+        .await
+        .map_err(|_| "target_metadata_describe_failed")?;
+    let sdk_instance = describe_resp
+        .reservations()
+        .first()
+        .and_then(|reservation| reservation.instances().first())
+        .ok_or("target_metadata_not_found")?;
+    Ok(convert_sdk_instance(sdk_instance, account_id, region))
+}
+
+fn mcp_ec2_invocation_output_text(invocation: &McpEc2DiagnosticSsmInvocation) -> String {
+    match (
+        invocation.stdout().is_empty(),
+        invocation.stderr().is_empty(),
+    ) {
+        (true, true) => String::new(),
+        (false, true) => invocation.stdout().to_string(),
+        (true, false) => format!("[stderr]\n{}", invocation.stderr()),
+        (false, false) => format!("{}\n[stderr]\n{}", invocation.stdout(), invocation.stderr()),
+    }
+}
+
+fn mcp_ec2_terminal_status_for_invocation(
+    invocation: &McpEc2DiagnosticSsmInvocation,
+) -> McpEc2DiagnosticCommandStatus {
+    match invocation.status() {
+        McpEc2DiagnosticSsmInvocationStatus::Succeeded => McpEc2DiagnosticCommandStatus::Succeeded,
+        McpEc2DiagnosticSsmInvocationStatus::Failed => McpEc2DiagnosticCommandStatus::Failed,
+        McpEc2DiagnosticSsmInvocationStatus::Running => McpEc2DiagnosticCommandStatus::Running,
+    }
+}
+
+fn mcp_ec2_terminal_error(status: &McpEc2DiagnosticCommandStatus) -> Option<String> {
+    match status {
+        McpEc2DiagnosticCommandStatus::Failed => {
+            Some("MCP EC2 diagnostic command failed".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn mcp_ec2_invocation_status_wire(status: &McpEc2DiagnosticSsmInvocationStatus) -> &'static str {
+    match status {
+        McpEc2DiagnosticSsmInvocationStatus::Running => "running",
+        McpEc2DiagnosticSsmInvocationStatus::Succeeded => "succeeded",
+        McpEc2DiagnosticSsmInvocationStatus::Failed => "failed",
+    }
+}
+
+fn mcp_ec2_authorization_fingerprint(grant: &McpEc2DiagnosticScopeGrant) -> String {
+    let payload = serde_json::json!({
+        "version": 1,
+        "entitlement_rule_id": grant.entitlement_rule_id.as_str(),
+        "account": &grant.account,
+        "scope": &grant.scope,
+        "instance_tag_selectors": &grant.instance_tag_selectors,
+        "excluded_tag_selectors": &grant.excluded_tag_selectors,
+        "requires_instance_metadata": grant.requires_instance_metadata,
+    });
+    let encoded = serde_json::to_vec(&payload).unwrap_or_default();
+    URL_SAFE_NO_PAD.encode(Sha256::digest(encoded))
+}
+
+async fn authorize_mcp_ec2_diagnostic_command(
+    ent_service: &EntitlementService,
+    claims: &Claims,
+    req: &McpRunEc2DiagnosticCommandRequest,
+) -> Result<AuthorizedMcpEc2DiagnosticCommand, &'static str> {
+    if req.instance_id.trim().is_empty()
+        || req.account_id.trim().is_empty()
+        || req.region.trim().is_empty()
+    {
+        return Err("invalid_target");
+    }
+
+    let grants = ent_service
+        .mcp_ec2_diagnostic_scope_grants_for_target(&claims, &req.account_id, &req.region)
+        .await;
+    if grants.is_empty() {
+        return Err("no_matching_rule_scope");
+    }
+    if mcp_ec2_grants_have_ambiguous_account_identity(&grants) {
+        return Err("ambiguous_target_account");
+    }
+
+    authorize_mcp_ec2_diagnostic_command_from_grants(grants, &req.command)
+}
+
+fn authorize_mcp_ec2_diagnostic_command_from_grants(
+    grants: Vec<McpEc2DiagnosticScopeGrant>,
+    command: &McpEc2DiagnosticCommand,
+) -> Result<AuthorizedMcpEc2DiagnosticCommand, &'static str> {
+    let mut metadata_required_candidate = None;
+    for grant in grants {
+        if let Some(authorization) = authorize_mcp_ec2_command_for_grant(&grant, command) {
+            if authorization.requires_instance_metadata {
+                metadata_required_candidate = Some(authorization);
+                continue;
+            }
+            return Ok(authorization);
+        }
+    }
+
+    metadata_required_candidate.ok_or("command_scope_denied")
+}
+
+async fn authorize_mcp_ec2_diagnostic_result_record(
+    ent_service: &EntitlementService,
+    claims: &Claims,
+    record: &McpEc2DiagnosticCommandRecord,
+) -> Result<AuthorizedMcpEc2DiagnosticCommand, &'static str> {
+    let matching_grants = ent_service
+        .mcp_ec2_diagnostic_scope_grants_for_target(&claims, &record.account_id, &record.region)
+        .await
+        .into_iter()
+        .filter(|grant| {
+            grant.scope.id == record.command_scope_id
+                && grant.scope.allowlist_rule_id == record.allowlist_rule_id
+        })
+        .collect::<Vec<_>>();
+    if matching_grants.is_empty() {
+        return Err("result_scope_not_authorized");
+    }
+    if mcp_ec2_grants_have_ambiguous_account_identity(&matching_grants) {
+        return Err("ambiguous_target_account");
+    }
+    if let Some(grant) = matching_grants
+        .iter()
+        .find(|grant| grant.requires_instance_metadata)
+        .cloned()
+    {
+        let authorization_fingerprint = mcp_ec2_authorization_fingerprint(&grant);
+        return Ok(AuthorizedMcpEc2DiagnosticCommand {
+            entitlement_rule_id: grant.entitlement_rule_id,
+            account: Some(grant.account),
+            allowlist_rule_id: record.allowlist_rule_id.clone(),
+            command_scope_id: record.command_scope_id.clone(),
+            authorization_fingerprint,
+            command_type: record.command_type.clone(),
+            command: mcp_ec2_placeholder_command_for_type(&record.command_type),
+            private_target_ref: None,
+            log_safe_prefix: None,
+            connectivity_probe_budget_per_window: grant.scope.connectivity_probe_budget_per_window,
+            budget_window_seconds: grant.scope.budget_window_seconds,
+            requires_instance_metadata: grant.requires_instance_metadata,
+        });
+    }
+    authorize_mcp_ec2_diagnostic_result_record_from_grants(matching_grants, record)
+}
+
+fn authorize_mcp_ec2_diagnostic_result_record_from_grants(
+    matching_grants: Vec<McpEc2DiagnosticScopeGrant>,
+    record: &McpEc2DiagnosticCommandRecord,
+) -> Result<AuthorizedMcpEc2DiagnosticCommand, &'static str> {
+    if matching_grants.is_empty() {
+        return Err("result_scope_not_authorized");
+    }
+    if mcp_ec2_grants_have_ambiguous_account_identity(&matching_grants) {
+        return Err("ambiguous_target_account");
+    }
+    let Some(expected_fingerprint) = record.authorization_fingerprint.as_deref() else {
+        return Err("result_scope_fingerprint_missing");
+    };
+    let grant = matching_grants
+        .into_iter()
+        .find(|grant| mcp_ec2_authorization_fingerprint(grant) == expected_fingerprint)
+        .ok_or("result_scope_changed")?;
+    let authorization_fingerprint = mcp_ec2_authorization_fingerprint(&grant);
+    Ok(AuthorizedMcpEc2DiagnosticCommand {
+        entitlement_rule_id: grant.entitlement_rule_id,
+        account: Some(grant.account),
+        allowlist_rule_id: record.allowlist_rule_id.clone(),
+        command_scope_id: record.command_scope_id.clone(),
+        authorization_fingerprint,
+        command_type: record.command_type.clone(),
+        command: mcp_ec2_placeholder_command_for_type(&record.command_type),
+        private_target_ref: None,
+        log_safe_prefix: None,
+        connectivity_probe_budget_per_window: grant.scope.connectivity_probe_budget_per_window,
+        budget_window_seconds: grant.scope.budget_window_seconds,
+        requires_instance_metadata: grant.requires_instance_metadata,
+    })
+}
+
+fn mcp_ec2_grants_have_ambiguous_account_identity(grants: &[McpEc2DiagnosticScopeGrant]) -> bool {
+    let Some(first) = grants.first() else {
+        return false;
+    };
+    grants.iter().any(|grant| {
+        grant.account.account_id != first.account.account_id
+            || grant.account.account_name != first.account.account_name
+            || grant.account.role_arn != first.account.role_arn
+    })
+}
+
+fn authorize_mcp_ec2_command_for_grant(
+    grant: &McpEc2DiagnosticScopeGrant,
+    command: &McpEc2DiagnosticCommand,
+) -> Option<AuthorizedMcpEc2DiagnosticCommand> {
+    let authorized_scope_command = mcp_ec2_authorized_command_for_scope(&grant.scope, command)?;
+    Some(AuthorizedMcpEc2DiagnosticCommand {
+        entitlement_rule_id: grant.entitlement_rule_id.clone(),
+        account: Some(grant.account.clone()),
+        allowlist_rule_id: grant.scope.allowlist_rule_id.clone(),
+        command_scope_id: grant.scope.id.clone(),
+        authorization_fingerprint: mcp_ec2_authorization_fingerprint(grant),
+        command_type: mcp_ec2_command_type(&authorized_scope_command.command),
+        command: authorized_scope_command.command,
+        private_target_ref: authorized_scope_command.private_target_ref,
+        log_safe_prefix: authorized_scope_command.log_safe_prefix,
+        connectivity_probe_budget_per_window: grant.scope.connectivity_probe_budget_per_window,
+        budget_window_seconds: grant.scope.budget_window_seconds,
+        requires_instance_metadata: grant.requires_instance_metadata,
+    })
+}
+
+fn mcp_ec2_authorized_command_for_scope(
+    scope: &McpEc2DiagnosticScope,
+    command: &McpEc2DiagnosticCommand,
+) -> Option<AuthorizedMcpEc2ScopeCommand> {
+    match command {
+        McpEc2DiagnosticCommand::TailLog { path, lines } => {
+            if *lines == 0 || *lines > scope.max_lines {
+                return None;
+            }
+            let log_target = mcp_ec2_authorized_log_path(scope, path)?;
+            Some(AuthorizedMcpEc2ScopeCommand {
+                command: McpEc2DiagnosticCommand::TailLog {
+                    path: log_target.path,
+                    lines: *lines,
+                },
+                private_target_ref: None,
+                log_safe_prefix: Some(log_target.safe_prefix),
+            })
+        }
+        McpEc2DiagnosticCommand::GrepLog {
+            path,
+            literal_pattern,
+            case_insensitive,
+            max_matches,
+        } => {
+            let pattern = literal_pattern.trim();
+            if *max_matches == 0
+                || *max_matches > scope.max_matches
+                || pattern.len() < 3
+                || pattern == "."
+            {
+                return None;
+            }
+            let log_target = mcp_ec2_authorized_log_path(scope, path)?;
+            Some(AuthorizedMcpEc2ScopeCommand {
+                command: McpEc2DiagnosticCommand::GrepLog {
+                    path: log_target.path,
+                    literal_pattern: literal_pattern.clone(),
+                    case_insensitive: *case_insensitive,
+                    max_matches: *max_matches,
+                },
+                private_target_ref: None,
+                log_safe_prefix: Some(log_target.safe_prefix),
+            })
+        }
+        McpEc2DiagnosticCommand::JournalctlUnit { unit, since, lines } => {
+            if mcp_ec2_journal_unit_builtin_deny_reason(unit).is_some() {
+                return None;
+            }
+            if *lines > 0
+                && *lines <= scope.max_lines
+                && scope
+                    .allowed_journal_units
+                    .iter()
+                    .any(|allowed| allowed.safe_for_mcp_output && allowed.unit == *unit)
+            {
+                let since =
+                    normalize_mcp_ec2_journal_since(since, scope.max_since_seconds, Utc::now())?;
+                Some(AuthorizedMcpEc2ScopeCommand {
+                    command: McpEc2DiagnosticCommand::JournalctlUnit {
+                        unit: unit.clone(),
+                        since,
+                        lines: *lines,
+                    },
+                    private_target_ref: None,
+                    log_safe_prefix: None,
+                })
+            } else {
+                None
+            }
+        }
+        McpEc2DiagnosticCommand::HttpHead {
+            url,
+            max_time_seconds,
+        } => {
+            if *max_time_seconds == 0 || *max_time_seconds > scope.max_timeout_seconds {
+                return None;
+            }
+            scope.allowed_http_urls.iter().find_map(|allowed| {
+                let authorized = allowed.safe_for_mcp_output
+                    && allowed.normalized_url == *url
+                    && mcp_ec2_http_url_builtin_deny_reason(
+                        &allowed.normalized_url,
+                        allowed.private_target_ref.as_deref(),
+                    )
+                    .is_none()
+                    && match allowed.query_policy {
+                        McpEc2HttpQueryPolicy::NoQuery => !url.contains('?'),
+                        McpEc2HttpQueryPolicy::ExactOnly => true,
+                    };
+                authorized.then(|| AuthorizedMcpEc2ScopeCommand {
+                    command: command.clone(),
+                    private_target_ref: allowed.private_target_ref.clone(),
+                    log_safe_prefix: None,
+                })
+            })
+        }
+        McpEc2DiagnosticCommand::TcpProbe {
+            host,
+            port,
+            timeout_seconds,
+        } => {
+            if *timeout_seconds == 0 || *timeout_seconds > scope.max_timeout_seconds {
+                return None;
+            }
+            scope.allowed_tcp_targets.iter().find_map(|allowed| {
+                let authorized = allowed.host == *host
+                    && allowed.port == *port
+                    && mcp_ec2_network_host_builtin_deny_reason(
+                        &allowed.host,
+                        allowed.private_target_ref.as_deref(),
+                    )
+                    .is_none();
+                authorized.then(|| AuthorizedMcpEc2ScopeCommand {
+                    command: command.clone(),
+                    private_target_ref: allowed.private_target_ref.clone(),
+                    log_safe_prefix: None,
+                })
+            })
+        }
+        McpEc2DiagnosticCommand::DnsLookup { host, record_type } => {
+            scope.allowed_dns_targets.iter().find_map(|allowed| {
+                let authorized = allowed.safe_for_mcp_output
+                    && allowed.host == *host
+                    && mcp_ec2_network_host_builtin_deny_reason(
+                        &allowed.host,
+                        allowed.private_target_ref.as_deref(),
+                    )
+                    .is_none()
+                    && allowed.record_types.iter().any(|allowed_type| {
+                        mcp_ec2_dns_record_type_matches(allowed_type, record_type)
+                    });
+                authorized.then(|| AuthorizedMcpEc2ScopeCommand {
+                    command: command.clone(),
+                    private_target_ref: allowed.private_target_ref.clone(),
+                    log_safe_prefix: None,
+                })
+            })
+        }
+    }
+}
+
+fn mcp_ec2_authorized_log_path(
+    scope: &McpEc2DiagnosticScope,
+    path: &str,
+) -> Option<AuthorizedMcpEc2LogTarget> {
+    let normalized_path = normalize_mcp_ec2_absolute_log_path(path)?;
+    if mcp_ec2_log_path_builtin_deny_reason(&normalized_path).is_some() {
+        return None;
+    }
+    scope
+        .allowed_log_paths
+        .iter()
+        .find_map(|allowed| mcp_ec2_log_path_matches_allowed(allowed, &normalized_path))
+}
+
+fn mcp_ec2_log_path_matches_allowed(
+    allowed: &McpEc2LogPathScope,
+    normalized_path: &str,
+) -> Option<AuthorizedMcpEc2LogTarget> {
+    if !allowed.safe_for_mcp_output || !arn_matches_pattern(&allowed.path_pattern, normalized_path)
+    {
+        return None;
+    }
+    let normalized_prefix = normalize_mcp_ec2_absolute_log_path(&allowed.canonical_safe_prefix)?;
+    if mcp_ec2_log_path_builtin_deny_reason(&allowed.path_pattern)
+        .or_else(|| mcp_ec2_log_path_builtin_deny_reason(&normalized_prefix))
+        .is_some()
+    {
+        return None;
+    }
+    let under_prefix = if normalized_prefix == "/" {
+        normalized_path.starts_with('/')
+    } else {
+        normalized_path == normalized_prefix
+            || normalized_path
+                .strip_prefix(&normalized_prefix)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    };
+    under_prefix.then(|| AuthorizedMcpEc2LogTarget {
+        path: normalized_path.to_string(),
+        safe_prefix: normalized_prefix,
+    })
+}
+
+fn normalize_mcp_ec2_absolute_log_path(path: &str) -> Option<String> {
+    if path.is_empty() || !path.starts_with('/') || path.contains('\0') {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for segment in path.split('/').skip(1) {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            value => segments.push(value),
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(format!("/{}", segments.join("/")))
+}
+
+fn normalize_mcp_ec2_journal_since(
+    since: &str,
+    max_since_seconds: u64,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let trimmed = since.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.len() > 64 {
+        return None;
+    }
+    let seconds = parse_mcp_ec2_journal_since_duration_seconds(trimmed)
+        .or_else(|| parse_mcp_ec2_journal_since_rfc3339_seconds(trimmed, now))?;
+    if seconds == 0 || seconds > max_since_seconds {
+        return None;
+    }
+    Some(format!("{seconds}s"))
+}
+
+fn parse_mcp_ec2_journal_since_rfc3339_seconds(since: &str, now: DateTime<Utc>) -> Option<u64> {
+    let requested = DateTime::parse_from_rfc3339(since)
+        .ok()?
+        .with_timezone(&Utc);
+    if requested > now {
+        return None;
+    }
+    now.signed_duration_since(requested)
+        .num_seconds()
+        .try_into()
+        .ok()
+}
+
+fn parse_mcp_ec2_journal_since_duration_seconds(since: &str) -> Option<u64> {
+    let compact = since
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if compact.is_empty() {
+        return None;
+    }
+    let digit_count = compact
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count == 0 {
+        return None;
+    }
+    let value = compact[..digit_count].parse::<u64>().ok()?;
+    let unit = &compact[digit_count..];
+    let multiplier = match unit {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
+        _ => return None,
+    };
+    value.checked_mul(multiplier)
+}
+
+fn mcp_ec2_dns_record_type_matches(
+    allowed: &EntitlementDnsRecordType,
+    requested: &McpCommandDnsRecordType,
+) -> bool {
+    matches!(
+        (allowed, requested),
+        (EntitlementDnsRecordType::A, McpCommandDnsRecordType::A)
+            | (
+                EntitlementDnsRecordType::Aaaa,
+                McpCommandDnsRecordType::Aaaa
+            )
+            | (
+                EntitlementDnsRecordType::Cname,
+                McpCommandDnsRecordType::Cname
+            )
+    )
+}
+
+enum McpEc2DiagnosticAudit<'a> {
+    Run {
+        req: &'a McpRunEc2DiagnosticCommandRequest,
+        command_type: Option<McpEc2DiagnosticCommandType>,
+        command_id: Option<&'a str>,
+    },
+    Result {
+        command_id: &'a str,
+        session_id: Option<&'a str>,
+        local_secret_generation: Option<&'a str>,
+        max_bytes: u64,
+    },
+}
+
+#[derive(Default)]
+struct McpEc2DiagnosticAuditDetails<'a> {
+    aws_ssm_command_id: Option<&'a str>,
+    aws_cancel_attempted: Option<bool>,
+    aws_cancel_succeeded: Option<bool>,
+    output_byte_count: Option<u64>,
+    dropped_byte_count: Option<u64>,
+    output_sequence_start: Option<u64>,
+    output_sequence_end: Option<u64>,
+    exit_status: Option<i32>,
+    truncated: Option<bool>,
+    ssm_invocation_status: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_mcp_ec2_diagnostics(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    event: McpEc2DiagnosticAudit<'_>,
+    outcome: AuditOutcome,
+    outcome_kind: &str,
+    authorization: Option<&AuthorizedMcpEc2DiagnosticCommand>,
+    aws_execution_attempted: bool,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    audit_mcp_ec2_diagnostics_with_details(
+        state,
+        actor,
+        audit_ctx,
+        event,
+        outcome,
+        outcome_kind,
+        authorization,
+        aws_execution_attempted,
+        McpEc2DiagnosticAuditDetails::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_mcp_ec2_diagnostics_with_details(
+    state: &AppState,
+    actor: &str,
+    audit_ctx: &AuditRequestContext,
+    event: McpEc2DiagnosticAudit<'_>,
+    outcome: AuditOutcome,
+    outcome_kind: &str,
+    authorization: Option<&AuthorizedMcpEc2DiagnosticCommand>,
+    aws_execution_attempted: bool,
+    details: McpEc2DiagnosticAuditDetails<'_>,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let mut metadata = serde_json::json!({
+        "client_type": "mcp",
+        "surface": "mcp",
+        "mcp_outcome_kind": outcome_kind,
+        "aws_execution_attempted": aws_execution_attempted,
+        "raw_command_recorded": false,
+        "remote_output_recorded": false,
+    });
+    match event {
+        McpEc2DiagnosticAudit::Run {
+            req,
+            command_type,
+            command_id,
+        } => {
+            metadata["mcp_event_kind"] = serde_json::json!("ec2_diagnostic_run");
+            metadata["tool_name"] = serde_json::json!("canopy_run_ec2_diagnostic_command");
+            metadata["canopy_mcp_session_id"] =
+                serde_json::json!(req.canopy_mcp_session_id.as_deref());
+            metadata["local_secret_generation"] =
+                serde_json::json!(req.local_secret_generation.as_deref());
+            metadata["account_id"] = serde_json::json!(req.account_id.as_str());
+            metadata["region"] = serde_json::json!(req.region.as_str());
+            metadata["instance_id"] = serde_json::json!(req.instance_id.as_str());
+            metadata["command_type"] =
+                serde_json::json!(command_type.as_ref().map(mcp_ec2_command_type_wire));
+            metadata["mcp_ec2_command_id"] = serde_json::json!(command_id);
+        }
+        McpEc2DiagnosticAudit::Result {
+            command_id,
+            session_id,
+            local_secret_generation,
+            max_bytes,
+        } => {
+            metadata["mcp_event_kind"] = serde_json::json!("ec2_diagnostic_result");
+            metadata["tool_name"] = serde_json::json!("canopy_get_ec2_diagnostic_result");
+            metadata["canopy_mcp_session_id"] = serde_json::json!(session_id);
+            metadata["local_secret_generation"] = serde_json::json!(local_secret_generation);
+            metadata["mcp_ec2_command_id"] = serde_json::json!(command_id);
+            metadata["max_bytes"] = serde_json::json!(max_bytes);
+        }
+    }
+    if let Some(authorization) = authorization {
+        metadata["entitlement_rule_id"] =
+            serde_json::json!(authorization.entitlement_rule_id.as_str());
+        if let Some(account) = authorization.account.as_ref() {
+            metadata["authorized_account_id"] = serde_json::json!(account.account_id.as_str());
+            metadata["authorized_account_name"] = serde_json::json!(account.account_name.as_str());
+            metadata["authorized_credential_mode"] =
+                serde_json::json!(mcp_ec2_credential_mode(account));
+        }
+        metadata["allowlist_rule_id"] = serde_json::json!(authorization.allowlist_rule_id.as_str());
+        metadata["command_scope_id"] = serde_json::json!(authorization.command_scope_id.as_str());
+        metadata["authorized_command_type"] =
+            serde_json::json!(mcp_ec2_command_type_wire(&authorization.command_type));
+        metadata["requires_instance_metadata"] =
+            serde_json::json!(authorization.requires_instance_metadata);
+    }
+    if let Some(aws_ssm_command_id) = details.aws_ssm_command_id {
+        metadata["aws_ssm_command_id"] = serde_json::json!(aws_ssm_command_id);
+    }
+    if let Some(aws_cancel_attempted) = details.aws_cancel_attempted {
+        metadata["aws_cancel_attempted"] = serde_json::json!(aws_cancel_attempted);
+    }
+    if let Some(aws_cancel_succeeded) = details.aws_cancel_succeeded {
+        metadata["aws_cancel_succeeded"] = serde_json::json!(aws_cancel_succeeded);
+    }
+    if let Some(output_byte_count) = details.output_byte_count {
+        metadata["output_byte_count"] = serde_json::json!(output_byte_count);
+    }
+    if let Some(dropped_byte_count) = details.dropped_byte_count {
+        metadata["dropped_byte_count"] = serde_json::json!(dropped_byte_count);
+    }
+    if let Some(output_sequence_start) = details.output_sequence_start {
+        metadata["output_sequence_start"] = serde_json::json!(output_sequence_start);
+    }
+    if let Some(output_sequence_end) = details.output_sequence_end {
+        metadata["output_sequence_end"] = serde_json::json!(output_sequence_end);
+    }
+    if let Some(exit_status) = details.exit_status {
+        metadata["exit_status"] = serde_json::json!(exit_status);
+    }
+    if let Some(truncated) = details.truncated {
+        metadata["truncated"] = serde_json::json!(truncated);
+    }
+    if let Some(ssm_invocation_status) = details.ssm_invocation_status {
+        metadata["ssm_invocation_status"] = serde_json::json!(ssm_invocation_status);
+    }
+
+    state
+        .audit_service
+        .event(actor, AuditAction::McpEc2Diagnostics, outcome)
+        .metadata(audit_ctx.metadata(metadata))
+        .commit_or_fail()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiError::internal(
+                    "Audit logging failed — refusing MCP EC2 diagnostics request",
+                )),
+            )
+        })
+}
+
+fn mcp_ec2_credential_mode(account: &AllowedAccount) -> &'static str {
+    if account.role_arn == "direct" {
+        "direct"
+    } else if account.role_arn.starts_with("profile:") {
+        "profile"
+    } else {
+        "assume_role"
+    }
+}
+
+#[cfg(test)]
+mod mcp_ec2_diagnostic_tests {
+    use super::*;
+
+    fn account_with_role(role_arn: &str) -> AllowedAccount {
+        AllowedAccount {
+            account_id: "111111111111".into(),
+            account_name: "test".into(),
+            role_arn: role_arn.into(),
+        }
+    }
+
+    #[test]
+    fn mcp_ec2_credential_mode_classifies_without_exposing_role_arn() {
+        assert_eq!(
+            mcp_ec2_credential_mode(&account_with_role("direct")),
+            "direct"
+        );
+        assert_eq!(
+            mcp_ec2_credential_mode(&account_with_role("profile:ops")),
+            "profile"
+        );
+        assert_eq!(
+            mcp_ec2_credential_mode(&account_with_role(concat!(
+                "arn:aws:iam::111111111111",
+                ":role/CanopyMcpEc2Diagnostics"
+            ),)),
+            "assume_role"
+        );
+    }
+
+    #[test]
+    fn mcp_ec2_log_path_normalization_rejects_traversal() {
+        assert_eq!(
+            normalize_mcp_ec2_absolute_log_path("/var/log/nginx/./error.log").as_deref(),
+            Some("/var/log/nginx/error.log")
+        );
+        assert!(normalize_mcp_ec2_absolute_log_path("/var/log/nginx/../../etc/shadow").is_none());
+        assert!(normalize_mcp_ec2_absolute_log_path("var/log/nginx/error.log").is_none());
+    }
+
+    #[test]
+    fn mcp_ec2_journal_since_normalizes_and_enforces_scope_window() {
+        let now = DateTime::parse_from_rfc3339("2026-06-04T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            normalize_mcp_ec2_journal_since("10m", 1800, now).as_deref(),
+            Some("600s")
+        );
+        assert_eq!(
+            normalize_mcp_ec2_journal_since("600 seconds", 1800, now).as_deref(),
+            Some("600s")
+        );
+        assert_eq!(
+            normalize_mcp_ec2_journal_since("2026-06-04T11:50:00Z", 1800, now).as_deref(),
+            Some("600s")
+        );
+        assert!(normalize_mcp_ec2_journal_since("3600s", 1800, now).is_none());
+        assert!(normalize_mcp_ec2_journal_since("2026-06-04T12:01:00Z", 1800, now).is_none());
+        assert!(normalize_mcp_ec2_journal_since("yesterday", 1800, now).is_none());
+    }
 }
 
 fn audit_database_scope_list_denied(
