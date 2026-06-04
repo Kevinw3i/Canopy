@@ -6,6 +6,21 @@ parameters:
     description: Opaque Canopy MCP EC2 command identifier.
     allowedPattern: '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
     interpolationType: ENV_VAR
+  instanceId:
+    type: String
+    description: Target EC2 instance id used for helper-side binding validation.
+    allowedPattern: '^i-[0-9a-fA-F]{8}([0-9a-fA-F]{9})?$'
+    interpolationType: ENV_VAR
+  accountId:
+    type: String
+    description: Target AWS account id used for helper-side binding validation.
+    allowedPattern: '^[0-9]{12}$'
+    interpolationType: ENV_VAR
+  region:
+    type: String
+    description: Target AWS region used for helper-side binding validation.
+    allowedPattern: '^[a-z0-9-]{3,32}$'
+    interpolationType: ENV_VAR
   commandSpecRef:
     type: String
     description: Opaque encrypted or short-lived command-spec reference. Must not contain raw paths, patterns, URLs, hosts, ports, or journal units.
@@ -38,5 +53,8 @@ mainSteps:
 
           exec "$helper" \
             --mcp-ec2-command-id "${SSM_mcpEc2CommandId:?}" \
+            --instance-id "${SSM_instanceId:?}" \
+            --account-id "${SSM_accountId:?}" \
+            --region "${SSM_region:?}" \
             --command-spec-ref "${SSM_commandSpecRef:?}" \
             --helper-version "${SSM_helperVersion:?}"

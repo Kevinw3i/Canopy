@@ -16,7 +16,7 @@ use shared::dto::mcp::{
     McpEc2DiagnosticCommand, McpEc2DiagnosticCommandStatus, McpEc2DiagnosticCommandType,
 };
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::aws::credentials::SessionContext;
 use crate::config::McpConfig;
@@ -27,6 +27,21 @@ pub enum McpEc2DiagnosticCommandStoreError {
     Backend(String),
     #[error("MCP EC2 diagnostic command store record is invalid: {0}")]
     InvalidRecord(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpEc2DiagnosticQuotaReservation {
+    pub key: String,
+    pub limit: u64,
+    pub amount: u64,
+    pub expires_at: DateTime<Utc>,
+    pub release_on_terminal: bool,
+}
+
+impl McpEc2DiagnosticQuotaReservation {
+    pub fn release_key(&self) -> Option<String> {
+        (self.release_on_terminal && self.amount > 0).then(|| self.key.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +57,7 @@ pub struct McpEc2DiagnosticCommandRecord {
     pub allowlist_rule_id: String,
     pub command_scope_id: String,
     pub authorization_fingerprint: Option<String>,
+    pub quota_release_keys: Vec<String>,
     pub status: McpEc2DiagnosticCommandStatus,
     pub aws_ssm_command_id: Option<String>,
     pub submitted_at: DateTime<Utc>,
@@ -187,6 +203,10 @@ pub struct McpEc2DiagnosticCommandSpecRefPayload {
     pub region: String,
     pub command_type: McpEc2DiagnosticCommandType,
     pub command: McpEc2DiagnosticCommand,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_target_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_safe_prefix: Option<String>,
     pub one_time_command_store_claim_required: bool,
     pub allowlist_rule_id: String,
     pub command_scope_id: String,
@@ -223,6 +243,8 @@ impl std::fmt::Debug for McpEc2DiagnosticCommandSpecRefPayload {
             .field("region", &self.region)
             .field("command_type", &self.command_type)
             .field("command", &"[redacted]")
+            .field("private_target_ref", &self.private_target_ref)
+            .field("log_safe_prefix", &self.log_safe_prefix)
             .field(
                 "one_time_command_store_claim_required",
                 &self.one_time_command_store_claim_required,
@@ -321,6 +343,45 @@ impl McpEc2DiagnosticCommandSpecRefPayload {
                 "command_type",
             ));
         }
+        if self
+            .private_target_ref
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+        {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "private_target_ref",
+            ));
+        }
+        if self.log_safe_prefix.as_ref().is_some_and(|value| {
+            let trimmed = value.trim();
+            trimmed.is_empty()
+                || trimmed.len() > 512
+                || !trimmed.starts_with('/')
+                || trimmed.contains('\0')
+        }) {
+            return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                "log_safe_prefix",
+            ));
+        }
+        match &self.command {
+            McpEc2DiagnosticCommand::TailLog { .. } | McpEc2DiagnosticCommand::GrepLog { .. } => {
+                if self.log_safe_prefix.is_none() {
+                    return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                        "log_safe_prefix",
+                    ));
+                }
+            }
+            McpEc2DiagnosticCommand::JournalctlUnit { .. }
+            | McpEc2DiagnosticCommand::HttpHead { .. }
+            | McpEc2DiagnosticCommand::TcpProbe { .. }
+            | McpEc2DiagnosticCommand::DnsLookup { .. } => {
+                if self.log_safe_prefix.is_some() {
+                    return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+                        "log_safe_prefix",
+                    ));
+                }
+            }
+        }
         if !self.one_time_command_store_claim_required {
             return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
                 "one_time_command_store_claim",
@@ -392,6 +453,8 @@ pub trait McpEc2DiagnosticDispatchCommandSpecRef: dispatch_command_spec_ref::Sea
     fn helper_version(&self) -> &str;
     fn mcp_ec2_command_id(&self) -> &str;
     fn instance_id(&self) -> &str;
+    fn account_id(&self) -> &str;
+    fn region(&self) -> &str;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -400,6 +463,8 @@ pub struct PreparedMcpEc2DiagnosticCommandSpecRef {
     helper_version: String,
     mcp_ec2_command_id: String,
     instance_id: String,
+    account_id: String,
+    region: String,
 }
 
 impl PreparedMcpEc2DiagnosticCommandSpecRef {
@@ -417,6 +482,14 @@ impl PreparedMcpEc2DiagnosticCommandSpecRef {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
     }
 }
 
@@ -446,6 +519,14 @@ impl McpEc2DiagnosticDispatchCommandSpecRef for PreparedMcpEc2DiagnosticCommandS
     fn instance_id(&self) -> &str {
         &self.instance_id
     }
+
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    fn region(&self) -> &str {
+        &self.region
+    }
 }
 
 pub fn prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch(
@@ -459,6 +540,8 @@ pub fn prepare_mcp_ec2_diagnostic_command_spec_ref_for_dispatch(
         helper_version: payload.helper_version.clone(),
         mcp_ec2_command_id: payload.mcp_ec2_command_id.clone(),
         instance_id: payload.instance_id.clone(),
+        account_id: payload.account_id.clone(),
+        region: payload.region.clone(),
     })
 }
 
@@ -473,12 +556,55 @@ pub fn open_mcp_ec2_diagnostic_command_spec_ref(
     Ok(payload)
 }
 
+pub fn open_mcp_ec2_diagnostic_command_spec_ref_for_helper(
+    key_material: &str,
+    command_spec_ref: &str,
+    helper_version: &str,
+    mcp_ec2_command_id: &str,
+    instance_id: &str,
+    account_id: &str,
+    region: &str,
+    now: DateTime<Utc>,
+) -> Result<McpEc2DiagnosticCommandSpecRefPayload, McpEc2DiagnosticCommandSpecRefError> {
+    let payload =
+        open_mcp_ec2_diagnostic_command_spec_ref_unchecked(key_material, command_spec_ref)?;
+    payload.validate_common(now)?;
+    if payload.helper_version != helper_version {
+        return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+            "helper_version",
+        ));
+    }
+    if payload.mcp_ec2_command_id != mcp_ec2_command_id {
+        return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+            "mcp_ec2_command_id",
+        ));
+    }
+    if payload.instance_id != instance_id {
+        return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+            "instance_id",
+        ));
+    }
+    if payload.account_id != account_id {
+        return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+            "account_id",
+        ));
+    }
+    if payload.region != region {
+        return Err(McpEc2DiagnosticCommandSpecRefError::BindingMismatch(
+            "region",
+        ));
+    }
+    Ok(payload)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedMcpEc2DiagnosticCommandSpecRef {
     command_spec_ref: String,
     helper_version: String,
     mcp_ec2_command_id: String,
     instance_id: String,
+    account_id: String,
+    region: String,
 }
 
 impl VerifiedMcpEc2DiagnosticCommandSpecRef {
@@ -496,6 +622,14 @@ impl VerifiedMcpEc2DiagnosticCommandSpecRef {
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn region(&self) -> &str {
+        &self.region
     }
 }
 
@@ -525,6 +659,14 @@ impl McpEc2DiagnosticDispatchCommandSpecRef for VerifiedMcpEc2DiagnosticCommandS
     fn instance_id(&self) -> &str {
         &self.instance_id
     }
+
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    fn region(&self) -> &str {
+        &self.region
+    }
 }
 
 pub fn verify_mcp_ec2_diagnostic_command_spec_ref(
@@ -539,6 +681,8 @@ pub fn verify_mcp_ec2_diagnostic_command_spec_ref(
         helper_version: payload.helper_version,
         mcp_ec2_command_id: payload.mcp_ec2_command_id,
         instance_id: payload.instance_id,
+        account_id: payload.account_id,
+        region: payload.region,
     })
 }
 
@@ -733,6 +877,12 @@ pub fn build_mcp_ec2_diagnostic_ssm_dispatch_request(
     if instance_id != command_spec_ref.instance_id() {
         return Err(McpEc2DiagnosticDispatchError::InvalidInput("instance_id"));
     }
+    if !mcp_ec2_account_id_shape_is_allowed(command_spec_ref.account_id()) {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("account_id"));
+    }
+    if !mcp_ec2_region_shape_is_allowed(command_spec_ref.region()) {
+        return Err(McpEc2DiagnosticDispatchError::InvalidInput("region"));
+    }
     if !mcp_ec2_command_spec_ref_shape_is_allowed(command_spec_ref.as_str()) {
         return Err(McpEc2DiagnosticDispatchError::InvalidInput(
             "command_spec_ref",
@@ -766,6 +916,12 @@ pub fn build_mcp_ec2_diagnostic_ssm_dispatch_request(
         "mcpEc2CommandId".into(),
         vec![mcp_ec2_command_id.to_string()],
     );
+    parameters.insert("instanceId".into(), vec![instance_id.to_string()]);
+    parameters.insert(
+        "accountId".into(),
+        vec![command_spec_ref.account_id().to_string()],
+    );
+    parameters.insert("region".into(), vec![command_spec_ref.region().to_string()]);
     parameters.insert(
         "commandSpecRef".into(),
         vec![command_spec_ref.as_str().to_string()],
@@ -868,7 +1024,14 @@ pub fn build_mcp_ec2_diagnostic_ssm_send_command_input(
     if request.s3_output_enabled() {
         return Err(McpEc2DiagnosticDispatchError::InvalidInput("s3_output"));
     }
-    let expected_parameter_keys = ["commandSpecRef", "helperVersion", "mcpEc2CommandId"];
+    let expected_parameter_keys = [
+        "accountId",
+        "commandSpecRef",
+        "helperVersion",
+        "instanceId",
+        "mcpEc2CommandId",
+        "region",
+    ];
     if request
         .parameters()
         .keys()
@@ -1715,6 +1878,32 @@ pub trait McpEc2DiagnosticCommandStore: Send + Sync {
         record: McpEc2DiagnosticCommandRecord,
     ) -> Result<(), McpEc2DiagnosticCommandStoreError>;
 
+    async fn create_command_with_quota(
+        &self,
+        command_id: String,
+        record: McpEc2DiagnosticCommandRecord,
+        _reservations: &[McpEc2DiagnosticQuotaReservation],
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        self.create_command(command_id, record).await?;
+        Ok(true)
+    }
+
+    async fn record_quota_usage(
+        &self,
+        _reservations: &[McpEc2DiagnosticQuotaReservation],
+        _now: DateTime<Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        Ok(true)
+    }
+
+    async fn release_quota_reservations(
+        &self,
+        _keys: &[String],
+        _now: DateTime<Utc>,
+    ) -> Result<(), McpEc2DiagnosticCommandStoreError> {
+        Ok(())
+    }
+
     async fn get_command(
         &self,
         command_id: &str,
@@ -1753,12 +1942,96 @@ pub trait McpEc2DiagnosticCommandStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct MemoryMcpEc2DiagnosticCommandStore {
     commands: DashMap<String, McpEc2DiagnosticCommandRecord>,
+    quotas: Mutex<HashMap<String, MemoryMcpEc2QuotaCounter>>,
 }
 
 impl MemoryMcpEc2DiagnosticCommandStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn reserve_quotas(
+        &self,
+        reservations: &[McpEc2DiagnosticQuotaReservation],
+        now: DateTime<Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        let mut quotas = self.quotas.lock().map_err(|_| {
+            McpEc2DiagnosticCommandStoreError::Backend("quota mutex poisoned".into())
+        })?;
+        quotas.retain(|_, counter| counter.expires_at >= now);
+        for reservation in reservations {
+            validate_quota_reservation(reservation)?;
+            let current = quotas
+                .get(&reservation.key)
+                .filter(|counter| counter.expires_at >= now)
+                .map(|counter| counter.count)
+                .unwrap_or(0);
+            if current.saturating_add(reservation.amount) > reservation.limit {
+                return Ok(false);
+            }
+        }
+        for reservation in reservations {
+            let counter =
+                quotas
+                    .entry(reservation.key.clone())
+                    .or_insert(MemoryMcpEc2QuotaCounter {
+                        count: 0,
+                        expires_at: reservation.expires_at,
+                    });
+            if counter.expires_at < now {
+                counter.count = 0;
+                counter.expires_at = reservation.expires_at;
+            } else if reservation.expires_at > counter.expires_at {
+                counter.expires_at = reservation.expires_at;
+            }
+            counter.count = counter.count.saturating_add(reservation.amount);
+        }
+        Ok(true)
+    }
+
+    fn release_quota_amounts(&self, releases: &[(String, u64)], now: DateTime<Utc>) {
+        let Ok(mut quotas) = self.quotas.lock() else {
+            return;
+        };
+        for (key, amount) in releases {
+            if let Some(counter) = quotas.get_mut(key) {
+                if counter.expires_at < now || counter.count <= *amount {
+                    quotas.remove(key);
+                } else {
+                    counter.count -= *amount;
+                }
+            }
+        }
+    }
+
+    fn release_quotas(&self, keys: &[String], now: DateTime<Utc>) {
+        let releases = keys
+            .iter()
+            .map(|key| (key.clone(), 1_u64))
+            .collect::<Vec<_>>();
+        self.release_quota_amounts(&releases, now);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemoryMcpEc2QuotaCounter {
+    count: u64,
+    expires_at: DateTime<Utc>,
+}
+
+fn validate_quota_reservation(
+    reservation: &McpEc2DiagnosticQuotaReservation,
+) -> Result<(), McpEc2DiagnosticCommandStoreError> {
+    if reservation.key.trim().is_empty()
+        || reservation.amount == 0
+        || reservation.limit == 0
+        || reservation.amount > reservation.limit
+    {
+        return Err(McpEc2DiagnosticCommandStoreError::InvalidRecord(
+            "quota reservation must have non-empty key and bounded positive amount".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1787,6 +2060,57 @@ impl McpEc2DiagnosticCommandStore for MemoryMcpEc2DiagnosticCommandStore {
                 Ok(())
             }
         }
+    }
+
+    async fn create_command_with_quota(
+        &self,
+        command_id: String,
+        record: McpEc2DiagnosticCommandRecord,
+        reservations: &[McpEc2DiagnosticQuotaReservation],
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        use dashmap::mapref::entry::Entry;
+        if self.commands.contains_key(&command_id) {
+            return Err(McpEc2DiagnosticCommandStoreError::Backend(format!(
+                "mcp_ec2_command_id already exists: {command_id}"
+            )));
+        }
+        if !self.reserve_quotas(reservations, record.created_at)? {
+            return Ok(false);
+        }
+        match self.commands.entry(command_id) {
+            Entry::Occupied(existing) => {
+                let releases = reservations
+                    .iter()
+                    .map(|reservation| (reservation.key.clone(), reservation.amount))
+                    .collect::<Vec<_>>();
+                self.release_quota_amounts(&releases, record.created_at);
+                Err(McpEc2DiagnosticCommandStoreError::Backend(format!(
+                    "mcp_ec2_command_id already exists: {}",
+                    existing.key()
+                )))
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(record);
+                Ok(true)
+            }
+        }
+    }
+
+    async fn record_quota_usage(
+        &self,
+        reservations: &[McpEc2DiagnosticQuotaReservation],
+        now: DateTime<Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        self.reserve_quotas(reservations, now)
+    }
+
+    async fn release_quota_reservations(
+        &self,
+        keys: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), McpEc2DiagnosticCommandStoreError> {
+        self.release_quotas(keys, now);
+        Ok(())
     }
 
     async fn get_command(
@@ -1883,6 +2207,9 @@ impl McpEc2DiagnosticCommandStore for MemoryMcpEc2DiagnosticCommandStore {
         record.exit_status = completion.exit_status;
         record.truncated = completion.truncated;
         record.updated_at = now;
+        let quota_release_keys = record.quota_release_keys.clone();
+        drop(record);
+        self.release_quotas(&quota_release_keys, now);
         Ok(true)
     }
 }
@@ -1904,6 +2231,158 @@ impl DynamoMcpEc2DiagnosticCommandStore {
             client,
             table_name: table_name.into(),
         }
+    }
+
+    async fn reserve_quotas(
+        &self,
+        reservations: &[McpEc2DiagnosticQuotaReservation],
+        now: DateTime<Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        let mut reserved = Vec::new();
+        for reservation in reservations {
+            validate_quota_reservation(reservation)?;
+            match self.reserve_quota(reservation, now).await {
+                Ok(true) => reserved.push((reservation.key.clone(), reservation.amount)),
+                Ok(false) => {
+                    self.release_quota_amounts(&reserved, now).await;
+                    return Ok(false);
+                }
+                Err(err) => {
+                    self.release_quota_amounts(&reserved, now).await;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    async fn reserve_quota(
+        &self,
+        reservation: &McpEc2DiagnosticQuotaReservation,
+        now: DateTime<Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        let now_epoch = now.timestamp();
+        let existing = self
+            .client
+            .get_item()
+            .table_name(&self.table_name)
+            .key(
+                "mcp_ec2_command_id",
+                AttributeValue::S(reservation.key.clone()),
+            )
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|err| dynamo_backend_error("get_ec2_diagnostic_quota", err))?;
+        let expired = existing
+            .item()
+            .and_then(|item| item.get(TTL_ATTRIBUTE))
+            .and_then(|value| match value {
+                AttributeValue::N(value) => value.parse::<i64>().ok(),
+                _ => None,
+            })
+            .is_none_or(|expires_at| expires_at < now_epoch);
+        if expired {
+            let put = self
+                .client
+                .put_item()
+                .table_name(&self.table_name)
+                .item(
+                    "mcp_ec2_command_id",
+                    AttributeValue::S(reservation.key.clone()),
+                )
+                .item("record_kind", AttributeValue::S("quota".into()))
+                .item(
+                    "quota_count",
+                    AttributeValue::N(reservation.amount.to_string()),
+                )
+                .item(
+                    TTL_ATTRIBUTE,
+                    AttributeValue::N(reservation.expires_at.timestamp().to_string()),
+                )
+                .condition_expression(format!(
+                    "attribute_not_exists(mcp_ec2_command_id) OR {TTL_ATTRIBUTE} < :now_epoch"
+                ))
+                .expression_attribute_values(":now_epoch", AttributeValue::N(now_epoch.to_string()))
+                .send()
+                .await;
+            match put {
+                Ok(_) => return Ok(true),
+                Err(err)
+                    if err.as_service_error().is_some_and(|service_err| {
+                        service_err.is_conditional_check_failed_exception()
+                    }) => {}
+                Err(err) => return Err(dynamo_backend_error("put_ec2_diagnostic_quota", err)),
+            }
+        }
+
+        let available = reservation.limit.saturating_sub(reservation.amount);
+        let result = self
+            .client
+            .update_item()
+            .table_name(&self.table_name)
+            .key(
+                "mcp_ec2_command_id",
+                AttributeValue::S(reservation.key.clone()),
+            )
+            .update_expression(
+                "SET quota_count = quota_count + :amount, expires_at_epoch = :expires_at_epoch",
+            )
+            .condition_expression(format!(
+                "{TTL_ATTRIBUTE} >= :now_epoch AND quota_count <= :available"
+            ))
+            .expression_attribute_values(
+                ":amount",
+                AttributeValue::N(reservation.amount.to_string()),
+            )
+            .expression_attribute_values(
+                ":expires_at_epoch",
+                AttributeValue::N(reservation.expires_at.timestamp().to_string()),
+            )
+            .expression_attribute_values(":now_epoch", AttributeValue::N(now_epoch.to_string()))
+            .expression_attribute_values(":available", AttributeValue::N(available.to_string()))
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(true),
+            Err(err)
+                if err
+                    .as_service_error()
+                    .is_some_and(UpdateItemError::is_conditional_check_failed_exception) =>
+            {
+                Ok(false)
+            }
+            Err(err) => Err(dynamo_backend_error("update_ec2_diagnostic_quota", err)),
+        }
+    }
+
+    async fn release_quota_amounts(&self, releases: &[(String, u64)], now: DateTime<Utc>) {
+        for (key, amount) in releases {
+            let _ = self
+                .client
+                .update_item()
+                .table_name(&self.table_name)
+                .key("mcp_ec2_command_id", AttributeValue::S(key.clone()))
+                .update_expression("SET quota_count = quota_count - :amount")
+                .condition_expression(format!(
+                    "{TTL_ATTRIBUTE} >= :now_epoch AND quota_count >= :amount"
+                ))
+                .expression_attribute_values(":amount", AttributeValue::N(amount.to_string()))
+                .expression_attribute_values(
+                    ":now_epoch",
+                    AttributeValue::N(now.timestamp().to_string()),
+                )
+                .send()
+                .await;
+        }
+    }
+
+    async fn release_quotas(&self, keys: &[String], now: DateTime<Utc>) {
+        let releases = keys
+            .iter()
+            .map(|key| (key.clone(), 1_u64))
+            .collect::<Vec<_>>();
+        self.release_quota_amounts(&releases, now).await;
     }
 
     fn record_to_item(
@@ -1940,6 +2419,16 @@ impl DynamoMcpEc2DiagnosticCommandStore {
         if let Some(value) = record.authorization_fingerprint {
             item.insert("authorization_fingerprint".into(), AttributeValue::S(value));
         }
+        item.insert(
+            "quota_release_keys".into(),
+            AttributeValue::L(
+                record
+                    .quota_release_keys
+                    .into_iter()
+                    .map(AttributeValue::S)
+                    .collect(),
+            ),
+        );
         item.insert(
             "status".into(),
             AttributeValue::S(status_to_s(&record.status).into()),
@@ -2008,6 +2497,7 @@ impl DynamoMcpEc2DiagnosticCommandStore {
             allowlist_rule_id: required_s(item, "allowlist_rule_id")?,
             command_scope_id: required_s(item, "command_scope_id")?,
             authorization_fingerprint: optional_s(item, "authorization_fingerprint")?,
+            quota_release_keys: optional_string_list(item, "quota_release_keys")?,
             status: status_from_s(&required_s(item, "status")?)?,
             aws_ssm_command_id: optional_s(item, "aws_ssm_command_id")?,
             submitted_at: required_time(item, "submitted_at")?,
@@ -2058,6 +2548,27 @@ fn optional_s(
         None => Ok(None),
         _ => Err(McpEc2DiagnosticCommandStoreError::InvalidRecord(format!(
             "{key} must be a non-empty string when present"
+        ))),
+    }
+}
+
+fn optional_string_list(
+    item: &HashMap<String, AttributeValue>,
+    key: &str,
+) -> Result<Vec<String>, McpEc2DiagnosticCommandStoreError> {
+    match item.get(key) {
+        Some(AttributeValue::L(values)) => values
+            .iter()
+            .map(|value| match value {
+                AttributeValue::S(text) if !text.is_empty() => Ok(text.clone()),
+                _ => Err(McpEc2DiagnosticCommandStoreError::InvalidRecord(format!(
+                    "{key} must contain only non-empty strings"
+                ))),
+            })
+            .collect(),
+        None => Ok(Vec::new()),
+        _ => Err(McpEc2DiagnosticCommandStoreError::InvalidRecord(format!(
+            "{key} must be a string list when present"
         ))),
     }
 }
@@ -2203,6 +2714,45 @@ impl McpEc2DiagnosticCommandStore for DynamoMcpEc2DiagnosticCommandStore {
         Ok(())
     }
 
+    async fn create_command_with_quota(
+        &self,
+        command_id: String,
+        record: McpEc2DiagnosticCommandRecord,
+        reservations: &[McpEc2DiagnosticQuotaReservation],
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        if !self.reserve_quotas(reservations, record.created_at).await? {
+            return Ok(false);
+        }
+        let releases = reservations
+            .iter()
+            .map(|reservation| (reservation.key.clone(), reservation.amount))
+            .collect::<Vec<_>>();
+        match self.create_command(command_id, record).await {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                self.release_quota_amounts(&releases, Utc::now()).await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn record_quota_usage(
+        &self,
+        reservations: &[McpEc2DiagnosticQuotaReservation],
+        now: DateTime<Utc>,
+    ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
+        self.reserve_quotas(reservations, now).await
+    }
+
+    async fn release_quota_reservations(
+        &self,
+        keys: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), McpEc2DiagnosticCommandStoreError> {
+        self.release_quotas(keys, now).await;
+        Ok(())
+    }
+
     async fn create_command(
         &self,
         command_id: String,
@@ -2334,6 +2884,11 @@ impl McpEc2DiagnosticCommandStore for DynamoMcpEc2DiagnosticCommandStore {
         now: DateTime<Utc>,
     ) -> Result<bool, McpEc2DiagnosticCommandStoreError> {
         completion.validate()?;
+        let release_keys = self
+            .get_command(command_id)
+            .await?
+            .map(|record| record.quota_release_keys)
+            .unwrap_or_default();
         let update_expression = if completion.exit_status.is_some() {
             "SET #status = :status, completed_at = :completed_at, \
              output_byte_count = :output_byte_count, dropped_byte_count = :dropped_byte_count, \
@@ -2412,7 +2967,10 @@ impl McpEc2DiagnosticCommandStore for DynamoMcpEc2DiagnosticCommandStore {
         let result = request.send().await;
 
         match result {
-            Ok(_) => Ok(true),
+            Ok(_) => {
+                self.release_quotas(&release_keys, now).await;
+                Ok(true)
+            }
             Err(err)
                 if err
                     .as_service_error()
@@ -2443,6 +3001,7 @@ mod tests {
             allowlist_rule_id: "rule-1".into(),
             command_scope_id: "scope-1".into(),
             authorization_fingerprint: Some("test-authorization-fingerprint".into()),
+            quota_release_keys: Vec::new(),
             status: McpEc2DiagnosticCommandStatus::Queued,
             aws_ssm_command_id: None,
             submitted_at: now,
@@ -2490,6 +3049,8 @@ mod tests {
                 case_insensitive: true,
                 max_matches: 10,
             },
+            private_target_ref: None,
+            log_safe_prefix: Some("/tmp/canopy-safe".into()),
             one_time_command_store_claim_required: true,
             allowlist_rule_id: "allow-app-log-v1".into(),
             command_scope_id: "app-log-grep".into(),
@@ -2800,7 +3361,14 @@ mod tests {
         );
         assert_eq!(
             request.parameters().keys().cloned().collect::<Vec<_>>(),
-            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
+            vec![
+                "accountId",
+                "commandSpecRef",
+                "helperVersion",
+                "instanceId",
+                "mcpEc2CommandId",
+                "region"
+            ]
         );
         assert_eq!(
             request.command_spec_ref(),
@@ -3000,7 +3568,14 @@ mod tests {
         );
         assert_eq!(
             input.parameter_keys(),
-            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
+            vec![
+                "accountId",
+                "commandSpecRef",
+                "helperVersion",
+                "instanceId",
+                "mcpEc2CommandId",
+                "region"
+            ]
         );
         assert_eq!(
             input.max_concurrency(),
@@ -3058,7 +3633,14 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["commandSpecRef", "helperVersion", "mcpEc2CommandId"]
+            vec![
+                "accountId",
+                "commandSpecRef",
+                "helperVersion",
+                "instanceId",
+                "mcpEc2CommandId",
+                "region"
+            ]
         );
         let parameters_debug = format!("{parameters:?}");
         assert!(!parameters_debug.contains("/tmp/canopy-safe/app.log"));

@@ -1407,16 +1407,15 @@ mod tests {
             safe_for_mcp_output = true
 
             [[scopes.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
-            normalized_url = "https://orders.internal/health"
+            normalized_url = "https://10.0.1.20/health"
             query_policy = "no_query"
             safe_for_mcp_output = true
             private_target_ref = "service:orders-api"
 
             [[scopes.mcp_ec2_diagnostic_scopes.allowed_dns_targets]]
-            host = "orders.internal"
-            record_types = ["A", "AAAA", "CNAME"]
+            host = "orders.example.com"
+            record_types = ["A", "AAAA"]
             safe_for_mcp_output = true
-            private_target_ref = "service:orders-api"
 
             [[packages]]
             id = "mcp-ec2-diagnostics"

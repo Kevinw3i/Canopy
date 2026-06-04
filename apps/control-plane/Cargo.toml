@@ -53,6 +53,7 @@ passkey-auth.workspace = true
 toml = "0.8"
 dashmap = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

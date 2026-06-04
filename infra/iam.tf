@@ -129,6 +129,23 @@ resource "aws_iam_role_policy" "task_permissions" {
         Resource = "*"
       }] : [],
 
+      var.enable_direct_access && var.mcp_ec2_diagnostic_ssm_document_name != "" ? [{
+        Sid    = "DirectMcpEc2DiagnosticSendCommand"
+        Effect = "Allow"
+        Action = ["ssm:SendCommand"]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:document/Canopy-Ec2Diagnostics",
+          "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
+        ]
+      }] : [],
+
+      var.enable_direct_access && var.mcp_ec2_diagnostic_ssm_document_name != "" ? [{
+        Sid      = "DirectMcpEc2DiagnosticGetCommandInvocation"
+        Effect   = "Allow"
+        Action   = ["ssm:GetCommandInvocation"]
+        Resource = "*"
+      }] : [],
+
       # Optional direct audit event export to CloudWatch Logs.
       var.audit_export_cloudwatch_log_group_name != "" ? [{
         Sid    = "AuditCloudWatchLogsExport"

@@ -308,6 +308,38 @@ encrypt        = true
 | `enable_direct_access` | No | 預設 `false`；設為 `true` 時允許 `role_arn = "direct"` 查看部署帳號的 EC2、SSM managed-instance inventory、ECS task inventory、CloudWatch Logs |
 | `audit_export_cloudwatch_log_group_name` | No | 遠端稽核事件直接匯出到 CloudWatch Logs 的 log group；空值停用 |
 | `audit_export_cloudwatch_log_stream_name` | No | CloudWatch audit export log stream，預設 `canopy-audit` |
+
+### MCP EC2 Diagnostics IAM
+
+When `enable_direct_access = true` and `mcp_ec2_diagnostic_ssm_document_name` is set, this Terraform module grants the ECS task role:
+
+- `ssm:SendCommand` scoped to the deployment account's `Canopy-Ec2Diagnostics` document and EC2 instances in `aws_region`.
+- `ssm:GetCommandInvocation` with `Resource = "*"`. AWS Systems Manager does not expose a document-name condition key for this polling action, so Canopy relies on command ownership/status checks in the command store before polling.
+
+For cross-account `assumable_role_arns` / `assumable_role_arn_patterns`, the target role policy must include equivalent permissions in the target account. At minimum:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CanopyMcpEc2DiagnosticsSendCommand",
+      "Effect": "Allow",
+      "Action": "ssm:SendCommand",
+      "Resource": [
+        "arn:aws:ssm:REGION:ACCOUNT_ID:document/Canopy-Ec2Diagnostics",
+        "arn:aws:ec2:REGION:ACCOUNT_ID:instance/*"
+      ]
+    },
+    {
+      "Sid": "CanopyMcpEc2DiagnosticsGetCommandInvocation",
+      "Effect": "Allow",
+      "Action": "ssm:GetCommandInvocation",
+      "Resource": "*"
+    }
+  ]
+}
+```
 | `audit_export_s3_bucket` | No | 遠端稽核事件直接匯出到 S3 的 bucket；空值停用 |
 | `audit_export_s3_prefix` | No | S3 audit export key prefix，預設 `canopy/audit/` |
 | `audit_export_queue_size` | No | 遠端 audit export 的記憶體 queue 大小，預設 1024 |

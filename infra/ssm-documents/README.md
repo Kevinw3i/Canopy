@@ -18,6 +18,9 @@ with `$LATEST`.
 The document accepts only opaque command metadata:
 
 - `mcpEc2CommandId`
+- `instanceId`
+- `accountId`
+- `region`
 - `commandSpecRef`
 - `helperVersion`
 
@@ -26,6 +29,30 @@ hosts, ports, journal units, raw shell text, credentials, or document secrets.
 The helper must retrieve or decrypt the already validated command spec using
 the opaque reference, then verify command id, instance, account, region, expiry,
 and helper version binding before executing anything.
+
+## Helper Packaging And Installation
+
+Build the helper package from a Linux builder, or pass an installed Linux Rust
+target explicitly:
+
+```sh
+scripts/package-canopy-ec2-diagnostics-helper.sh --target x86_64-unknown-linux-gnu
+```
+
+The package contains the `canopy-ec2-diagnostics` binary and an `INSTALL.md`
+with the target-instance install command. Every EC2 instance targeted by the
+document must have the helper installed at:
+
+```text
+/usr/local/bin/canopy-ec2-diagnostics
+```
+
+The instance must also have command spec key material at
+`/etc/canopy/mcp-ec2-command-spec-key`, or set
+`CANOPY_MCP_EC2_COMMAND_SPEC_KEY_FILE` to an equivalent root-owned `0600` file.
+The key content must match the control-plane
+`mcp.ec2_diagnostic_command_spec_key` config. Never commit the key or bake it
+into public images.
 
 The document uses SSM `interpolationType: ENV_VAR` for all string parameters and
 the shell step reads only the generated `SSM_...` environment variables. The

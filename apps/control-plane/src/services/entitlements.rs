@@ -1,6 +1,6 @@
 use shared::dto::ec2::Ec2Instance;
 use shared::dto::entitlements::{
-    AllowedAccount, FeatureFlags, McpEc2DiagnosticScope, UserEntitlements,
+    AllowedAccount, FeatureFlags, McpEc2DiagnosticScope, TagSelector, UserEntitlements,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,6 +19,8 @@ pub struct McpEc2DiagnosticScopeGrant {
     pub entitlement_rule_id: String,
     pub account: AllowedAccount,
     pub scope: McpEc2DiagnosticScope,
+    pub instance_tag_selectors: Vec<TagSelector>,
+    pub excluded_tag_selectors: Vec<TagSelector>,
     pub requires_instance_metadata: bool,
 }
 
@@ -318,7 +320,67 @@ impl EntitlementService {
                     entitlement_rule_id: rule.id.clone(),
                     account: (*account).clone(),
                     scope: scope.clone(),
+                    instance_tag_selectors: rule.instance_tag_selectors.clone(),
+                    excluded_tag_selectors: rule.excluded_tag_selectors.clone(),
                     requires_instance_metadata,
+                });
+            }
+        }
+        result
+    }
+
+    pub async fn mcp_ec2_diagnostic_scope_grants_for_instance(
+        &self,
+        claims: &Claims,
+        instance: &Ec2Instance,
+    ) -> Vec<McpEc2DiagnosticScopeGrant> {
+        let store = self.store.read().await;
+        let user_groups = &claims.groups;
+
+        let mut result = Vec::new();
+        for rule in &store.rules {
+            if !user_groups.contains(&rule.group)
+                || !rule.features.can_use_mcp
+                || !rule.features.can_use_mcp_ec2
+            {
+                continue;
+            }
+            let matching_accounts = rule
+                .allowed_accounts
+                .iter()
+                .filter(|account| account.account_id == instance.account_id)
+                .collect::<Vec<_>>();
+            let [account] = matching_accounts.as_slice() else {
+                continue;
+            };
+            if !rule.allowed_regions.is_empty() && !rule.allowed_regions.contains(&instance.region)
+            {
+                continue;
+            }
+            if !rule.instance_tag_selectors.is_empty()
+                && !rule
+                    .instance_tag_selectors
+                    .iter()
+                    .any(|selector| selector.matches(&instance.tags))
+            {
+                continue;
+            }
+            if rule
+                .excluded_tag_selectors
+                .iter()
+                .any(|selector| selector.matches(&instance.tags))
+            {
+                continue;
+            }
+
+            for scope in &rule.mcp_ec2_diagnostic_scopes {
+                result.push(McpEc2DiagnosticScopeGrant {
+                    entitlement_rule_id: rule.id.clone(),
+                    account: (*account).clone(),
+                    scope: scope.clone(),
+                    instance_tag_selectors: rule.instance_tag_selectors.clone(),
+                    excluded_tag_selectors: rule.excluded_tag_selectors.clone(),
+                    requires_instance_metadata: false,
                 });
             }
         }

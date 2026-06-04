@@ -256,7 +256,7 @@ can_use_mcp_database = true       # 搭配下方 scope 使用 MCP Database tools
 # safe_for_mcp_output = true
 #
 # [[rules.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
-# normalized_url = "https://orders.internal/health"
+# normalized_url = "https://orders.example.com/health"
 # query_policy = "no_query"
 # safe_for_mcp_output = true
 
