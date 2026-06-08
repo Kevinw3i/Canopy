@@ -270,10 +270,20 @@
               <strong>Preview not refreshed</strong>
               <small>Select a group and run Preview</small>
             </div>
+            <div class="preview-result" id="explain-result" aria-live="polite">
+              <strong>Explain not run</strong>
+              <small>Uses the current operator identity</small>
+            </div>
+            <div class="preview-result" id="dry-run-result" aria-live="polite">
+              <strong>Dry Run not run</strong>
+              <small>Select a database package first</small>
+            </div>
           </section>
           <section class="review-actions">
             <button type="button" id="validate-button">✓ Validate</button>
             <button type="button" id="preview-button">◉ Preview</button>
+            <button type="button" id="explain-button">◎ Explain</button>
+            <button type="button" id="dry-run-button">▶ Dry Run</button>
             <button type="button" class="disabled" disabled>▢ Apply (0)</button>
           </section>
         </footer>

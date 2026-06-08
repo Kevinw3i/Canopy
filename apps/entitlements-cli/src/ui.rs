@@ -110,6 +110,8 @@ fn router(state: UiAppState) -> Router {
         .route("/api/session/exchange", post(exchange_session))
         .route("/api/state", get(api_state))
         .route("/api/preview", post(post_preview))
+        .route("/api/explain", post(post_explain))
+        .route("/api/dry-run", post(post_dry_run))
         .route("/api/draft/bindings", put(put_draft_binding))
         .fallback(not_found)
         .with_state(state)
@@ -182,6 +184,41 @@ struct PreviewRequest {
     group: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExplainRequestBody {
+    sub: Option<String>,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    external_groups: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DryRunRequestBody {
+    operation: String,
+    sub: Option<String>,
+    email: Option<String>,
+    email_verified: Option<bool>,
+    external_groups: Option<Vec<String>>,
+    account: Option<String>,
+    region: Option<String>,
+    cluster: Option<String>,
+    log_group_arn: Option<String>,
+    os_user: Option<String>,
+    #[serde(default)]
+    instance_tags: Vec<String>,
+    #[serde(default)]
+    task_tags: Vec<String>,
+    container: Option<String>,
+    scope: Option<String>,
+    connection: Option<String>,
+    environment: Option<String>,
+    schema: Option<String>,
+    table: Option<String>,
+    action: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ExchangeResponse {
     status: &'static str,
@@ -233,6 +270,8 @@ struct UiIdentityState {
 struct UiCapabilities {
     state: bool,
     preview: bool,
+    explain: bool,
+    dry_run: bool,
     draft_write: bool,
     validate: bool,
     apply: bool,
@@ -268,8 +307,19 @@ struct UiPackageSummary {
     scope: String,
     role: String,
     database_scope_count: usize,
+    database_scopes: Vec<UiDatabaseScopeSummary>,
     mcp_ec2_diagnostic_scope_count: usize,
     max_session_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiDatabaseScopeSummary {
+    name: String,
+    connection: String,
+    environment: String,
+    allowed_schemas: Vec<String>,
+    allowed_tables: Vec<String>,
+    allowed_actions: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -498,6 +548,70 @@ async fn post_preview(
     }
 }
 
+async fn post_explain(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<ExplainRequestBody>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_explain_request",
+                "explain request must be valid JSON",
+            );
+        }
+    };
+
+    match state.explain(request) {
+        Ok(explain) => json_response(StatusCode::OK, &explain),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn post_dry_run(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DryRunRequestBody>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_dry_run_request",
+                "dry-run request must be valid JSON",
+            );
+        }
+    };
+
+    match state.dry_run(request) {
+        Ok(output) => json_response(StatusCode::OK, &output),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn not_found() -> impl IntoResponse {
     let mut response = static_response("text/plain; charset=utf-8", "not found\n");
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -615,6 +729,30 @@ impl UiAppState {
         draft.preview_group(request)
     }
 
+    fn explain(
+        &self,
+        request: ExplainRequestBody,
+    ) -> Result<catalog::ExplainOutput, UiMutationError> {
+        let catalog_request = explain_request_from_body(self.args.as_ref(), request)?;
+        let draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.explain(catalog_request)
+    }
+
+    fn dry_run(
+        &self,
+        request: DryRunRequestBody,
+    ) -> Result<catalog::DryRunOutput, UiMutationError> {
+        let catalog_request = dry_run_request_from_body(self.args.as_ref(), request)?;
+        let draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.dry_run(catalog_request)
+    }
+
     fn sanitized_state(&self) -> UiStateResponse {
         let args = self.args.as_ref();
         let (draft, changes) = self
@@ -647,6 +785,8 @@ impl UiAppState {
             capabilities: UiCapabilities {
                 state: true,
                 preview: draft_write,
+                explain: draft_write,
+                dry_run: draft_write,
                 draft_write,
                 validate: false,
                 apply: false,
@@ -781,6 +921,46 @@ impl DraftState {
         })
     }
 
+    fn explain(
+        &self,
+        request: catalog::ExplainRequest,
+    ) -> Result<catalog::ExplainOutput, UiMutationError> {
+        let Some(draft) = self.draft.as_ref() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+        draft.explain(request).map_err(|err| {
+            UiMutationError::conflict(
+                "draft_explain_failed",
+                format!("draft explain failed: {err}"),
+            )
+        })
+    }
+
+    fn dry_run(
+        &self,
+        request: catalog::DryRunRequest,
+    ) -> Result<catalog::DryRunOutput, UiMutationError> {
+        let Some(draft) = self.draft.as_ref() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+        draft.dry_run(request).map_err(|err| {
+            UiMutationError::bad_request(
+                "draft_dry_run_failed",
+                format!("draft dry-run failed: {err}"),
+            )
+        })
+    }
+
     fn summarize(&self) -> (UiDraftResponse, UiPendingChanges) {
         let Some(draft) = self.draft.as_ref() else {
             return (
@@ -849,6 +1029,100 @@ fn file_status(path: &Path) -> UiFileStatus {
     }
 }
 
+fn explain_request_from_body(
+    args: &UiArgs,
+    request: ExplainRequestBody,
+) -> Result<catalog::ExplainRequest, UiMutationError> {
+    Ok(catalog::ExplainRequest {
+        sub: required_identity_sub(request.sub, args)?,
+        email: trimmed_optional(request.email)
+            .or_else(|| trimmed_optional(args.dev_operator_email.clone())),
+        email_verified: request
+            .email_verified
+            .unwrap_or(args.dev_operator_email_verified),
+        external_groups: request
+            .external_groups
+            .unwrap_or_else(|| args.dev_operator_external_groups.clone())
+            .into_iter()
+            .filter_map(trimmed_string)
+            .collect(),
+    })
+}
+
+fn dry_run_request_from_body(
+    args: &UiArgs,
+    request: DryRunRequestBody,
+) -> Result<catalog::DryRunRequest, UiMutationError> {
+    let operation = trimmed_string(request.operation).ok_or_else(|| {
+        UiMutationError::bad_request("empty_dry_run_operation", "operation is required")
+    })?;
+    Ok(catalog::DryRunRequest {
+        operation,
+        sub: required_identity_sub(request.sub, args)?,
+        email: trimmed_optional(request.email)
+            .or_else(|| trimmed_optional(args.dev_operator_email.clone())),
+        email_verified: request
+            .email_verified
+            .unwrap_or(args.dev_operator_email_verified),
+        external_groups: request
+            .external_groups
+            .unwrap_or_else(|| args.dev_operator_external_groups.clone())
+            .into_iter()
+            .filter_map(trimmed_string)
+            .collect(),
+        account: trimmed_optional(request.account),
+        region: trimmed_optional(request.region),
+        cluster: trimmed_optional(request.cluster),
+        log_group_arn: trimmed_optional(request.log_group_arn),
+        os_user: trimmed_optional(request.os_user),
+        instance_tags: request
+            .instance_tags
+            .into_iter()
+            .filter_map(trimmed_string)
+            .collect(),
+        task_tags: request
+            .task_tags
+            .into_iter()
+            .filter_map(trimmed_string)
+            .collect(),
+        container: trimmed_optional(request.container),
+        scope: trimmed_optional(request.scope),
+        connection: trimmed_optional(request.connection),
+        environment: trimmed_optional(request.environment),
+        schema: trimmed_optional(request.schema),
+        table: trimmed_optional(request.table),
+        action: trimmed_optional(request.action),
+    })
+}
+
+fn required_identity_sub(
+    request_sub: Option<String>,
+    args: &UiArgs,
+) -> Result<String, UiMutationError> {
+    trimmed_optional(request_sub)
+        .or_else(|| args.dev_operator_sub.clone())
+        .and_then(trimmed_string)
+        .ok_or_else(|| {
+            UiMutationError::bad_request(
+                "missing_operator_subject",
+                "operator subject is required for explain and dry-run",
+            )
+        })
+}
+
+fn trimmed_optional(value: Option<String>) -> Option<String> {
+    value.and_then(trimmed_string)
+}
+
+fn trimmed_string(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
 impl UiPendingChanges {
     fn empty() -> Self {
         Self {
@@ -898,6 +1172,22 @@ fn package_summaries(catalog: &Catalog) -> Vec<UiPackageSummary> {
                 scope: package.scope.clone(),
                 role: package.role.clone(),
                 database_scope_count: scope.map_or(0, |scope| scope.database_scopes.len()),
+                database_scopes: scope
+                    .map(|scope| {
+                        scope
+                            .database_scopes
+                            .iter()
+                            .map(|database_scope| UiDatabaseScopeSummary {
+                                name: database_scope.name.clone(),
+                                connection: database_scope.connection.clone(),
+                                environment: database_scope.environment.clone(),
+                                allowed_schemas: database_scope.allowed_schemas.clone(),
+                                allowed_tables: database_scope.allowed_tables.clone(),
+                                allowed_actions: database_scope.allowed_actions.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 mcp_ec2_diagnostic_scope_count: scope
                     .map_or(0, |scope| scope.mcp_ec2_diagnostic_scopes.len()),
                 max_session_seconds: package.max_session_seconds,
@@ -1197,6 +1487,11 @@ mod tests {
         UiAppState::for_test(args, "draft-code", Instant::now() + BOOTSTRAP_CODE_TTL)
     }
 
+    fn test_state_with_catalog_and_args(catalog: PathBuf, mut args: UiArgs) -> UiAppState {
+        args.catalog = catalog;
+        UiAppState::for_test(args, "draft-code", Instant::now() + BOOTSTRAP_CODE_TTL)
+    }
+
     fn catalog_fixture_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("canopy-ui-{name}-{}.toml", random_url_token()))
     }
@@ -1427,10 +1722,23 @@ group = "RD"
             .unwrap()
             .iter()
             .any(|package| package["id"] == "mcp-database"
+                && package["database_scopes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|scope| scope["name"] == "orders_read"
+                        && scope["connection"] == "orders"
+                        && scope["allowed_tables"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&serde_json::Value::String("orders".to_owned())))
                 && package["high_risk_features"]
                     .as_array()
                     .unwrap()
                     .contains(&serde_json::Value::String("mcp:database".to_owned()))));
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("secret-value"));
         assert_eq!(
             state["changes"]["added_bindings"].as_array().unwrap().len(),
             0
@@ -1566,6 +1874,84 @@ group = "RD"
     }
 
     #[tokio::test]
+    async fn draft_explain_resolves_external_group_against_memory_draft() {
+        let (catalog_path, _content) = write_catalog_fixture("explain-external-group");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/explain")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"sub":"operator","email":"operator@example.com","email_verified":true,"external_groups":["canopy-rd"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let explain: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(explain["command"], "explain");
+        assert!(explain["resolved_groups"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("RD".to_owned())));
+        assert!(explain["matched_packages"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("analytics".to_owned())));
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_explain_defaults_to_startup_operator_identity() {
+        let (catalog_path, _content) = write_catalog_fixture("explain-default-identity");
+        let mut args = test_args();
+        args.dev_operator_sub = Some("operator".to_owned());
+        args.dev_operator_email = Some("operator@example.com".to_owned());
+        args.dev_operator_email_verified = true;
+        args.dev_operator_external_groups = vec!["canopy-rd".to_owned()];
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/explain")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let explain: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(explain["sub"], "operator");
+        assert_eq!(explain["email"], "operator@example.com");
+        assert!(explain["external_groups"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("canopy-rd".to_owned())));
+        assert!(explain["resolved_groups"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("RD".to_owned())));
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
     async fn draft_binding_update_adds_pending_high_risk_without_writing_catalog() {
         let (catalog_path, original_content) = write_catalog_fixture("binding-update");
         let state = test_state_with_catalog(catalog_path.clone());
@@ -1602,6 +1988,159 @@ group = "RD"
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_content
         );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_dry_run_mcp_database_uses_updated_memory_draft_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("dry-run-memory-draft");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"mcp-database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dry-run")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"operation":"mcp-database","sub":"operator","external_groups":["canopy-rd"],"scope":"orders_read","connection":"orders","environment":"production","schema":"mart","table":"orders","action":"select"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let dry_run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(dry_run["command"], "dry-run");
+        assert_eq!(dry_run["operation"], "mcp-database");
+        assert_eq!(dry_run["allow"], true);
+        assert_eq!(dry_run["matched_rule"], "catalog-rd-mcp-database");
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_dry_run_defaults_to_startup_operator_identity() {
+        let (catalog_path, original_content) = write_catalog_fixture("dry-run-default-identity");
+        let mut args = test_args();
+        args.dev_operator_sub = Some("operator".to_owned());
+        args.dev_operator_email = Some("operator@example.com".to_owned());
+        args.dev_operator_email_verified = true;
+        args.dev_operator_external_groups = vec!["canopy-rd".to_owned()];
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"mcp-database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dry-run")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"operation":"mcp-database","scope":"orders_read","connection":"orders","environment":"production","schema":"mart","table":"orders","action":"select"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let dry_run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(dry_run["allow"], true);
+        assert!(dry_run["resolved_groups"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("RD".to_owned())));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_dry_run_mcp_database_rejects_noncanonical_schema_before_db_execution() {
+        let (catalog_path, _content) = write_catalog_fixture("dry-run-uppercase-schema");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dry-run")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"operation":"mcp-database","sub":"operator","external_groups":["canopy-rd"],"scope":"orders_read","connection":"orders","environment":"production","schema":"Mart","table":"orders","action":"select"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "draft_dry_run_failed");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--schema must be a lowercase ASCII SQL identifier"));
         let _ = std::fs::remove_file(catalog_path);
     }
 

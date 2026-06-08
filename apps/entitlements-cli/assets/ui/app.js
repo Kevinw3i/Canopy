@@ -9,6 +9,8 @@ const state = {
   draft: null,
   changes: null,
   preview: null,
+  explain: null,
+  dryRun: null,
 };
 
 function setSessionStatus(status, detail) {
@@ -23,7 +25,7 @@ function setSessionStatus(status, detail) {
 }
 
 function setValidationStatus(summary, detail, valid = true) {
-  const line = document.querySelector(".validation-block strong");
+  const line = document.querySelector(".validation-block > strong");
   const summaryNode = document.getElementById("validation-summary");
   const detailNode = document.getElementById("validation-detail");
   if (line) {
@@ -99,6 +101,34 @@ async function loadDraftPreview(group) {
   return response.json();
 }
 
+async function loadDraftExplain() {
+  const response = await fetch("/api/explain", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft explain failed");
+  }
+  return response.json();
+}
+
+async function runDraftDryRun(request) {
+  const response = await fetch("/api/dry-run", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft dry-run failed");
+  }
+  return response.json();
+}
+
 function applyServerState(payload) {
   state.server = payload;
   state.draft = payload.draft || null;
@@ -112,6 +142,8 @@ function applyServerState(payload) {
   const environment = document.querySelector(".env-picker select");
   const applyButton = document.querySelector(".review-actions button[disabled]");
   const previewButton = document.getElementById("preview-button");
+  const explainButton = document.getElementById("explain-button");
+  const dryRunButton = document.getElementById("dry-run-button");
 
   setSessionStatus("Session active", mode);
   if (environment && payload.deployment?.mode) {
@@ -124,7 +156,20 @@ function applyServerState(payload) {
   ) {
     state.preview = null;
   }
+  if (state.explain && state.explain.revision !== draft.revision) {
+    state.explain = null;
+  }
+  if (
+    state.dryRun &&
+    (state.dryRun.revision !== draft.revision ||
+      state.dryRun.group !== state.selectedGroup ||
+      state.dryRun.package !== state.selectedPackage)
+  ) {
+    state.dryRun = null;
+  }
   renderPreviewSummary(state.preview);
+  renderExplainSummary(state.explain);
+  renderDryRunSummary(state.dryRun);
   if (!draft.loaded) {
     setValidationStatus(
       "Draft unavailable",
@@ -159,6 +204,12 @@ function applyServerState(payload) {
   }
   if (previewButton) {
     previewButton.disabled = !payload.capabilities?.preview;
+  }
+  if (explainButton) {
+    explainButton.disabled = !payload.capabilities?.explain;
+  }
+  if (dryRunButton) {
+    dryRunButton.disabled = !payload.capabilities?.dry_run;
   }
 }
 
@@ -305,6 +356,8 @@ function renderInspector(groups, packages, bindings, changes) {
     );
     packageSelect.onchange = (event) => {
       state.selectedPackage = event.target.value;
+      state.dryRun = null;
+      renderDryRunSummary(null);
       renderInspector(groups, packages, bindings, changes);
     };
   }
@@ -412,6 +465,77 @@ function renderPreviewSummary(preview) {
   );
 }
 
+function renderExplainSummary(explain) {
+  const result = document.getElementById("explain-result");
+  if (!result) {
+    return;
+  }
+  if (!explain) {
+    result.replaceChildren(
+      el("strong", "", "Explain not run"),
+      el("small", "", "Uses the current operator identity"),
+    );
+    return;
+  }
+  const groups = explain.resolved_groups || [];
+  const packages = explain.matched_packages || [];
+  result.replaceChildren(
+    el("strong", "", `${groups.length} resolved group(s)`),
+    el("small", "", groups.length ? groups.join(", ") : "No matching group"),
+    el("small", "", `${packages.length} matched package(s)`),
+  );
+}
+
+function renderDryRunSummary(dryRun) {
+  const result = document.getElementById("dry-run-result");
+  if (!result) {
+    return;
+  }
+  if (!dryRun) {
+    result.replaceChildren(
+      el("strong", "", "Dry Run not run"),
+      el("small", "", "Select a database package first"),
+    );
+    return;
+  }
+  result.replaceChildren(
+    el("strong", "", `${dryRun.allow ? "Allow" : "Deny"} ${dryRun.operation}`),
+    el("small", "", dryRun.reason || "No reason returned"),
+    el("small", "", dryRun.matched_rule ? `Rule: ${dryRun.matched_rule}` : "No matched rule"),
+  );
+}
+
+function selectedPackageData() {
+  return (state.draft?.packages || []).find((pkg) => pkg.id === state.selectedPackage) || null;
+}
+
+function mcpDatabaseDryRunRequestForPackage(pkg) {
+  if (!pkg?.features?.includes("mcp:database")) {
+    throw new Error("selected package does not include mcp:database");
+  }
+  const scope = pkg?.database_scopes?.[0];
+  if (!scope) {
+    throw new Error("selected package has no database scope");
+  }
+  const schema = scope.allowed_schemas?.[0];
+  const table = scope.allowed_tables?.[0];
+  const action =
+    scope.allowed_actions?.find((item) => item.toLowerCase() === "select") ||
+    scope.allowed_actions?.[0];
+  if (!schema || !table || !action) {
+    throw new Error("database scope needs schema, table, and action");
+  }
+  return {
+    operation: "mcp-database",
+    scope: scope.name,
+    connection: scope.connection,
+    environment: scope.environment,
+    schema,
+    table,
+    action,
+  };
+}
+
 function changeRow(type, change) {
   const row = document.createElement("tr");
   [type, change.group, change.package, type === "Add" ? "New binding" : "Removed binding", change.features.join(", ") || "package binding"].forEach((value, index) => {
@@ -462,6 +586,8 @@ function selectGroup(row) {
     state.preview = null;
     renderPreviewSummary(null);
   }
+  state.dryRun = null;
+  renderDryRunSummary(null);
   if (state.draft?.loaded) {
     renderInspector(
       state.draft.groups || [],
@@ -508,6 +634,8 @@ async function toggleBinding(button, row) {
     const payload = await updateDraftBinding(group, packageId, enabled);
     state.selectedGroup = group;
     state.selectedPackage = packageId;
+    state.explain = null;
+    state.dryRun = null;
     applyServerState(payload);
   } catch (error) {
     setValidationStatus("Draft update failed", error.message, false);
@@ -538,7 +666,11 @@ document.querySelector(".switch")?.addEventListener("click", (event) => {
   const enabled = !button.classList.contains("on");
   if (state.selectedGroup && state.selectedPackage && state.server?.capabilities?.draft_write) {
     updateDraftBinding(state.selectedGroup, state.selectedPackage, enabled)
-      .then(applyServerState)
+      .then((payload) => {
+        state.explain = null;
+        state.dryRun = null;
+        applyServerState(payload);
+      })
       .catch((error) => setValidationStatus("Draft update failed", error.message, false));
   } else {
     button.classList.toggle("on", enabled);
@@ -581,6 +713,63 @@ document.getElementById("preview-button")?.addEventListener("click", async (even
     setValidationStatus("Preview failed", error.message, false);
   } finally {
     button.disabled = !state.server?.capabilities?.preview;
+    button.textContent = originalLabel;
+  }
+});
+
+document.getElementById("explain-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (!state.server?.capabilities?.explain) {
+    setValidationStatus("Explain unavailable", "catalog draft is not loaded", false);
+    return;
+  }
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = "◎ Explaining";
+  try {
+    const explain = await loadDraftExplain();
+    explain.revision = state.draft?.revision ?? 0;
+    state.explain = explain;
+    renderExplainSummary(explain);
+    setValidationStatus(
+      "Explain refreshed",
+      `${explain.resolved_groups?.length || 0} group(s), ${explain.matched_packages?.length || 0} package(s)`,
+      true,
+    );
+  } catch (error) {
+    setValidationStatus("Explain failed", error.message, false);
+  } finally {
+    button.disabled = !state.server?.capabilities?.explain;
+    button.textContent = originalLabel;
+  }
+});
+
+document.getElementById("dry-run-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (!state.server?.capabilities?.dry_run) {
+    setValidationStatus("Dry Run unavailable", "catalog draft is not loaded", false);
+    return;
+  }
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = "▶ Running";
+  try {
+    const request = mcpDatabaseDryRunRequestForPackage(selectedPackageData());
+    const dryRun = await runDraftDryRun(request);
+    dryRun.revision = state.draft?.revision ?? 0;
+    dryRun.group = state.selectedGroup;
+    dryRun.package = state.selectedPackage;
+    state.dryRun = dryRun;
+    renderDryRunSummary(dryRun);
+    setValidationStatus(
+      dryRun.allow ? "Dry Run allowed" : "Dry Run denied",
+      dryRun.reason || "No reason returned",
+      dryRun.allow,
+    );
+  } catch (error) {
+    setValidationStatus("Dry Run failed", error.message, false);
+  } finally {
+    button.disabled = !state.server?.capabilities?.dry_run;
     button.textContent = originalLabel;
   }
 });
