@@ -2,11 +2,14 @@ const state = {
   selectedGroup: null,
   selectedPackage: null,
   selectedMembers: "0",
+  selectedDbConnection: null,
+  currentView: "groups",
   filter: "all",
   search: "",
   server: null,
   draft: null,
   changes: null,
+  databaseConnections: null,
   validation: null,
   preview: null,
   explain: null,
@@ -147,6 +150,7 @@ function applyServerState(payload) {
   state.server = payload;
   state.draft = payload.draft || null;
   state.changes = payload.changes || null;
+  state.databaseConnections = payload.database_connections || null;
   const mode = payload.mode || "local-auth-shell";
   const catalog = payload.catalog || {};
   const runtime = payload.runtime || {};
@@ -189,6 +193,7 @@ function applyServerState(payload) {
   renderPreviewSummary(state.preview);
   renderExplainSummary(state.explain);
   renderDryRunSummary(state.dryRun);
+  renderDatabaseConnections(state.databaseConnections);
   if (!draft.loaded) {
     setValidationStatus(
       "Draft unavailable",
@@ -245,6 +250,36 @@ function applyServerState(payload) {
   }
 }
 
+function setActiveView(view) {
+  state.currentView = view;
+  const workspace = document.querySelector(".workspace");
+  const groupGrid = document.querySelector(".content-grid");
+  const dbView = document.querySelector(".db-connections-view");
+  const toolbar = document.querySelector(".toolbar");
+  const title = document.querySelector(".title-row h1");
+  const subtitle = document.querySelector(".title-row span");
+  workspace?.classList.toggle("db-mode", view === "db-connections");
+  if (groupGrid) {
+    groupGrid.hidden = view !== "groups";
+  }
+  if (dbView) {
+    dbView.hidden = view !== "db-connections";
+  }
+  if (toolbar) {
+    toolbar.hidden = view !== "groups";
+  }
+  if (title) {
+    title.textContent = view === "db-connections" ? "DB Connections" : "Groups";
+  }
+  if (subtitle) {
+    subtitle.textContent =
+      view === "db-connections" ? "Connection Safety" : "Entitlement Catalog";
+  }
+  document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
+    item.classList.toggle("active", item.dataset.view === view);
+  });
+}
+
 function renderDraft(draft, changes) {
   if (!draft.loaded) {
     renderChanges(changes || {});
@@ -263,6 +298,177 @@ function renderDraft(draft, changes) {
   renderInspector(groups, packages, draft.bindings || [], changes || {});
   renderChanges(changes || {});
   applyFilters();
+}
+
+function renderDatabaseConnections(connections) {
+  const rowsNode = document.getElementById("db-connection-rows");
+  if (!rowsNode) {
+    return;
+  }
+  const local = connections?.local || [];
+  const required = connections?.required || [];
+  const missing = connections?.missing_required || [];
+  const issues = connections?.issues || [];
+  const summary = document.getElementById("db-connection-summary");
+  const requiredCount = document.getElementById("db-required-count");
+  const issueCount = document.getElementById("db-issue-count");
+
+  if (summary) {
+    summary.textContent = connections?.configured
+      ? `${local.length} local connection(s), ${missing.length} missing required`
+      : "No --db-config configured for this UI session";
+  }
+  if (requiredCount) {
+    requiredCount.textContent = `${required.length} required`;
+  }
+  if (issueCount) {
+    issueCount.textContent = `${issues.length} issue${issues.length === 1 ? "" : "s"}`;
+  }
+
+  const hasSelected =
+    local.some((connection) => connection.name === state.selectedDbConnection) ||
+    missing.includes(state.selectedDbConnection);
+  if (!state.selectedDbConnection || !hasSelected) {
+    state.selectedDbConnection = local[0]?.name || missing[0] || null;
+  }
+
+  const rows = [
+    ...local.map((connection) => dbConnectionRow(connection, required.includes(connection.name))),
+    ...missing.map((connection) => missingDbConnectionRow(connection)),
+  ];
+  rowsNode.replaceChildren(...(rows.length ? rows : [emptyDbConnectionRow()]));
+  renderDbConnectionInspector(connections);
+}
+
+function dbConnectionRow(connection, required) {
+  const row = document.createElement("tr");
+  row.dataset.connection = connection.name;
+  row.classList.toggle("selected", state.selectedDbConnection === connection.name);
+  row.classList.toggle(
+    "db-blocking-row",
+    connection.safety === "blocking" || connection.safety === "attention",
+  );
+  row.addEventListener("click", () => {
+    state.selectedDbConnection = connection.name;
+    renderDatabaseConnections(state.databaseConnections);
+  });
+  [
+    connection.name,
+    `${connection.host}:${connection.port}`,
+    connection.database,
+    dbSafetyLabel(connection),
+    required ? "required" : "unused",
+  ].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 3) {
+      cell.className =
+        connection.safety === "blocking" || connection.safety === "attention" ? "risk" : "ok";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function missingDbConnectionRow(connection) {
+  const row = document.createElement("tr");
+  row.dataset.connection = connection;
+  row.classList.add("db-blocking-row");
+  row.classList.toggle("selected", state.selectedDbConnection === connection);
+  row.addEventListener("click", () => {
+    state.selectedDbConnection = connection;
+    renderDatabaseConnections(state.databaseConnections);
+  });
+  ["Missing", "not configured", connection, "blocking", "required"].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 3) {
+      cell.className = "risk";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function emptyDbConnectionRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.textContent = "No database connections to display";
+  row.append(cell);
+  return row;
+}
+
+function dbSafetyLabel(connection) {
+  if (connection.safety === "blocking") {
+    return "blocking";
+  }
+  if (connection.safety === "attention") {
+    return "attention";
+  }
+  if (connection.required_by_scope_count > 0) {
+    return "ready";
+  }
+  return "unused";
+}
+
+function renderDbConnectionInspector(connections) {
+  const local = connections?.local || [];
+  const selected = local.find((connection) => connection.name === state.selectedDbConnection);
+  const missing = (connections?.missing_required || []).find(
+    (connection) => connection === state.selectedDbConnection,
+  );
+  const issues = connections?.issues || [];
+  setInputValue("db-engine", selected?.engine || "");
+  setInputValue("db-host", selected?.host || "");
+  setInputValue("db-port", selected ? String(selected.port) : "");
+  setInputValue("db-name", selected?.database || missing || "");
+  setInputValue("db-secret-ref", selected ? (selected.secret_ref_configured ? "configured" : "missing") : "");
+  setInputValue(
+    "db-limits",
+    selected
+      ? `${selected.max_connections}c; stmt ${selected.statement_timeout_ms}; ex ${selected.explain_timeout_ms}`
+      : "",
+  );
+  const name = document.getElementById("db-selected-name");
+  const badge = document.getElementById("db-selected-safety");
+  if (name) {
+    name.textContent = selected?.name || missing || "Connection";
+  }
+  if (badge) {
+    const safety = selected ? dbSafetyLabel(selected) : missing ? "blocking" : "Unknown";
+    badge.textContent = safety;
+    badge.classList.toggle("badge-risk", safety === "blocking" || safety === "attention");
+  }
+  renderDbSafetyList(selected, missing, issues);
+}
+
+function setInputValue(id, value) {
+  const input = document.getElementById(id);
+  if (input) {
+    input.value = value;
+  }
+}
+
+function renderDbSafetyList(connection, missing, issues) {
+  const list = document.getElementById("db-safety-list");
+  if (!list) {
+    return;
+  }
+  const relevantIssues = issues.filter((issue) => {
+    const message = issue.message || "";
+    return (
+      (connection && message.includes(`'${connection.name}'`)) ||
+      (missing && message.includes(`'${missing}'`))
+    );
+  });
+  const title = document.createElement("h3");
+  title.append("Safety Checks ");
+  title.append(el("span", "", String(relevantIssues.length)));
+  const items = relevantIssues.length
+    ? relevantIssues.map((issue) => el("p", "", `△ ${issue.code}: ${issue.message}`))
+    : [el("p", "", connection ? "Readonly TLS connection metadata is clean" : "No connection selected")];
+  list.replaceChildren(title, ...items);
 }
 
 function firstBoundPackage(groupId, bindings) {
@@ -858,6 +1064,13 @@ document.querySelector(".switch")?.addEventListener("click", (event) => {
 document.querySelector(".search input")?.addEventListener("input", (event) => {
   state.search = event.target.value.trim().toLowerCase();
   applyFilters();
+});
+
+document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
+  item.addEventListener("click", (event) => {
+    event.preventDefault();
+    setActiveView(item.dataset.view || "groups");
+  });
 });
 
 document.getElementById("validate-button")?.addEventListener("click", async (event) => {

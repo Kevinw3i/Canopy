@@ -236,6 +236,7 @@ struct UiStateResponse {
     import_runtime: Option<UiFileStatus>,
     deployment: UiDeploymentState,
     database_config: Option<UiFileStatus>,
+    database_connections: UiDatabaseConnectionsState,
     identity: UiIdentityState,
     capabilities: UiCapabilities,
     draft: UiDraftResponse,
@@ -320,6 +321,35 @@ struct UiValidateDatabaseConnections {
     required: Vec<String>,
     local_config: Vec<String>,
     deployment_source: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiDatabaseConnectionsState {
+    configured: bool,
+    required: Vec<String>,
+    missing_required: Vec<String>,
+    local: Vec<UiDatabaseConnectionSummary>,
+    issues: Vec<UiValidationIssue>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiDatabaseConnectionSummary {
+    name: String,
+    engine: String,
+    host: String,
+    port: i64,
+    database: String,
+    readonly: bool,
+    require_tls: bool,
+    accept_invalid_tls_certs: bool,
+    skip_tls_hostname_verification: bool,
+    connect_timeout_ms: i64,
+    statement_timeout_ms: i64,
+    explain_timeout_ms: i64,
+    max_connections: i64,
+    secret_ref_configured: bool,
+    required_by_scope_count: usize,
+    safety: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -907,11 +937,15 @@ impl UiAppState {
 
     fn sanitized_state(&self) -> UiStateResponse {
         let args = self.args.as_ref();
-        let (draft, changes) = self
-            .draft
-            .lock()
-            .expect("draft mutex should not be poisoned")
-            .summarize();
+        let (draft, changes, draft_catalog) = {
+            let draft = self
+                .draft
+                .lock()
+                .expect("draft mutex should not be poisoned");
+            let draft_catalog = draft.draft.clone();
+            let (draft, changes) = draft.summarize();
+            (draft, changes, draft_catalog)
+        };
         let draft_write = draft.loaded;
         UiStateResponse {
             status: "ok",
@@ -925,6 +959,7 @@ impl UiAppState {
                 deployment_config: args.deployment_config.as_deref().map(file_status),
             },
             database_config: args.db_config.as_deref().map(file_status),
+            database_connections: database_connections_state(args, draft_catalog.as_ref()),
             identity: UiIdentityState {
                 source: args.identity_source.clone(),
                 dev_identity_allowed: args.allow_dev_identity,
@@ -1202,6 +1237,174 @@ fn file_status(path: &Path) -> UiFileStatus {
             error: Some(err.kind().to_string()),
         },
     }
+}
+
+fn database_connections_state(
+    args: &UiArgs,
+    draft: Option<&Catalog>,
+) -> UiDatabaseConnectionsState {
+    let required_counts = required_database_connection_counts(draft);
+    let required = required_counts.keys().cloned().collect::<Vec<_>>();
+    let Some(path) = args.db_config.as_deref() else {
+        let issues = if required.is_empty() {
+            Vec::new()
+        } else {
+            vec![validation_issue(
+                "missing_db_config",
+                "draft uses database scopes, but --db-config was not provided",
+                None,
+            )]
+        };
+        return UiDatabaseConnectionsState {
+            configured: false,
+            missing_required: required.clone(),
+            required,
+            local: Vec::new(),
+            issues,
+        };
+    };
+
+    match load_connection_registry_from_file(path) {
+        Ok(registry) => database_connections_state_from_registry(path, &required_counts, &registry),
+        Err(issue) => UiDatabaseConnectionsState {
+            configured: true,
+            missing_required: required.clone(),
+            required,
+            local: Vec::new(),
+            issues: vec![issue],
+        },
+    }
+}
+
+fn required_database_connection_counts(draft: Option<&Catalog>) -> BTreeMap<String, usize> {
+    let Some(draft) = draft else {
+        return BTreeMap::new();
+    };
+    let mut required = BTreeMap::new();
+    for scope in &draft.scopes {
+        for database_scope in &scope.database_scopes {
+            *required
+                .entry(database_scope.connection.clone())
+                .or_insert(0) += 1;
+        }
+    }
+    required
+}
+
+fn database_connections_state_from_registry(
+    path: &Path,
+    required_counts: &BTreeMap<String, usize>,
+    registry: &BTreeMap<String, DbConnectionMetadata>,
+) -> UiDatabaseConnectionsState {
+    let required = required_counts.keys().cloned().collect::<Vec<_>>();
+    let missing_required = required
+        .iter()
+        .filter(|connection| !registry.contains_key(*connection))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut issues = Vec::new();
+    for connection in &missing_required {
+        issues.push(validation_issue(
+            "missing_database_connection",
+            format!("db_config is missing required database connection '{connection}'"),
+            Some(path.display().to_string()),
+        ));
+    }
+    let local = registry
+        .iter()
+        .map(|(name, metadata)| {
+            collect_database_connection_safety_issues(
+                "db_config",
+                path,
+                name,
+                metadata,
+                &mut issues,
+            );
+            UiDatabaseConnectionSummary {
+                name: name.clone(),
+                engine: metadata.engine.clone(),
+                host: metadata.host.clone(),
+                port: metadata.port,
+                database: metadata.database.clone(),
+                readonly: metadata.readonly,
+                require_tls: metadata.require_tls,
+                accept_invalid_tls_certs: metadata.accept_invalid_tls_certs,
+                skip_tls_hostname_verification: metadata.skip_tls_hostname_verification,
+                connect_timeout_ms: metadata.connect_timeout_ms,
+                statement_timeout_ms: metadata.statement_timeout_ms,
+                explain_timeout_ms: metadata.explain_timeout_ms,
+                max_connections: metadata.max_connections,
+                secret_ref_configured: !metadata.secret_arn.trim().is_empty(),
+                required_by_scope_count: *required_counts.get(name).unwrap_or(&0),
+                safety: if required_counts.contains_key(name)
+                    && connection_has_blocking_safety_issue(metadata)
+                {
+                    "blocking"
+                } else if connection_has_blocking_safety_issue(metadata) {
+                    "attention"
+                } else if required_counts.contains_key(name) {
+                    "required"
+                } else {
+                    "unused"
+                },
+            }
+        })
+        .collect();
+    UiDatabaseConnectionsState {
+        configured: true,
+        required,
+        missing_required,
+        local,
+        issues,
+    }
+}
+
+fn collect_database_connection_safety_issues(
+    source: &str,
+    path: &Path,
+    name: &str,
+    metadata: &DbConnectionMetadata,
+    issues: &mut Vec<UiValidationIssue>,
+) {
+    if !metadata.readonly {
+        issues.push(validation_issue(
+            "database_connection_not_readonly",
+            format!("{source} database connection '{name}' must set readonly=true"),
+            Some(path.display().to_string()),
+        ));
+    }
+    if !metadata.require_tls {
+        issues.push(validation_issue(
+            "database_connection_tls_disabled",
+            format!("{source} database connection '{name}' must keep require_tls=true"),
+            Some(path.display().to_string()),
+        ));
+    }
+    if metadata.accept_invalid_tls_certs {
+        issues.push(validation_issue(
+            "database_connection_accepts_invalid_tls",
+            format!(
+                "{source} database connection '{name}' must keep accept_invalid_tls_certs=false"
+            ),
+            Some(path.display().to_string()),
+        ));
+    }
+    if metadata.skip_tls_hostname_verification {
+        issues.push(validation_issue(
+            "database_connection_skips_tls_hostname",
+            format!(
+                "{source} database connection '{name}' must keep skip_tls_hostname_verification=false"
+            ),
+            Some(path.display().to_string()),
+        ));
+    }
+}
+
+fn connection_has_blocking_safety_issue(metadata: &DbConnectionMetadata) -> bool {
+    !metadata.readonly
+        || !metadata.require_tls
+        || metadata.accept_invalid_tls_certs
+        || metadata.skip_tls_hostname_verification
 }
 
 fn validate_draft_catalog(args: &UiArgs, draft: &Catalog, revision: u64) -> UiValidateOutput {
@@ -2476,6 +2679,29 @@ require_tls = true
         path
     }
 
+    fn write_unsafe_database_config_fixture(name: &str) -> PathBuf {
+        let secret_ref = ["db", "-ref"].concat();
+        let content = format!(
+            r#"
+[database_connections.orders]
+engine = "mysql"
+host = "orders.example.internal"
+port = 3306
+database = "orders"
+secret_arn = "{secret_ref}"
+readonly = false
+require_tls = false
+accept_invalid_tls_certs = true
+skip_tls_hostname_verification = true
+"#
+        )
+        .trim_start()
+        .to_owned();
+        let path = catalog_fixture_path(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
     fn write_runtime_from_catalog_fixture(name: &str, catalog_content: &str) -> PathBuf {
         let runtime_path = catalog_fixture_path(name);
         let generated = Catalog::from_toml_str(catalog_content)
@@ -2687,6 +2913,59 @@ require_tls = true
             0
         );
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn state_includes_sanitized_database_connection_metadata() {
+        let (catalog_path, _content) = write_catalog_fixture("state-db-connections");
+        let db_config_path = write_unsafe_database_config_fixture("state-db-connections-config");
+        let mut args = test_args();
+        args.db_config = Some(db_config_path.clone());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let connections = &state["database_connections"];
+        assert_eq!(connections["configured"], true);
+        assert!(connections["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("orders".to_owned())));
+        assert_eq!(connections["local"][0]["name"], "orders");
+        assert_eq!(connections["local"][0]["engine"], "mysql");
+        assert_eq!(connections["local"][0]["readonly"], false);
+        assert_eq!(connections["local"][0]["require_tls"], false);
+        assert_eq!(connections["local"][0]["secret_ref_configured"], true);
+        assert_eq!(connections["local"][0]["safety"], "blocking");
+        let issue_codes = connections["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|issue| issue["code"].as_str())
+            .collect::<Vec<_>>();
+        assert!(issue_codes.contains(&"database_connection_not_readonly"));
+        assert!(issue_codes.contains(&"database_connection_tls_disabled"));
+        assert!(issue_codes.contains(&"database_connection_accepts_invalid_tls"));
+        assert!(issue_codes.contains(&"database_connection_skips_tls_hostname"));
+        let secret_ref = ["db", "-ref"].concat();
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&secret_ref));
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(db_config_path);
     }
 
     #[tokio::test]

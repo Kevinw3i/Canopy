@@ -22,11 +22,11 @@
 
         <nav class="nav-list">
           <a href="#" class="nav-item"><span class="ico">⚡</span>Overview</a>
-          <a href="#" class="nav-item active"><span class="ico">◎</span>Groups</a>
+          <a href="#" class="nav-item active" data-view="groups"><span class="ico">◎</span>Groups</a>
           <a href="#" class="nav-item"><span class="ico">□</span>Packages</a>
           <a href="#" class="nav-item"><span class="ico">⌖</span>Scopes</a>
           <a href="#" class="nav-item"><span class="ico">♙</span>Accounts/Roles</a>
-          <a href="#" class="nav-item"><span class="ico">▤</span>DB Connections</a>
+          <a href="#" class="nav-item" data-view="db-connections"><span class="ico">▤</span>DB Connections</a>
           <a href="#" class="nav-item"><span class="ico">✓</span>Review &amp; Apply</a>
         </nav>
 
@@ -241,6 +241,58 @@
                 <p>△ Direct table access to mart.orders</p>
               </div>
             </form>
+          </aside>
+        </section>
+
+        <section class="db-connections-view" aria-label="Database connections" hidden>
+          <section class="db-connections-panel">
+            <div class="db-panel-head">
+              <div>
+                <h2>DB Connections</h2>
+                <small id="db-connection-summary">No database connection metadata loaded</small>
+              </div>
+              <div class="db-status-stack">
+                <strong id="db-required-count">0 required</strong>
+                <small id="db-issue-count">0 issues</small>
+              </div>
+            </div>
+            <table class="db-table">
+              <thead>
+                <tr>
+                  <th>Connection</th>
+                  <th>Endpoint</th>
+                  <th>Database</th>
+                  <th>Safety</th>
+                  <th>Use</th>
+                </tr>
+              </thead>
+              <tbody id="db-connection-rows">
+                <tr><td colspan="5">Loading database connections</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <aside class="db-inspector" aria-label="Database connection inspector">
+            <div class="inspector-title">
+              <div>
+                <h2 id="db-selected-name">Connection</h2>
+                <span class="badge-ok" id="db-selected-safety">Unknown</span>
+              </div>
+            </div>
+
+            <div class="db-detail-grid">
+              <label><span>Engine</span><input id="db-engine" readonly /></label>
+              <label><span>Host</span><input id="db-host" readonly /></label>
+              <label><span>Port</span><input id="db-port" readonly /></label>
+              <label><span>Database</span><input id="db-name" readonly /></label>
+              <label><span>Secret Ref</span><input id="db-secret-ref" readonly /></label>
+              <label><span>Limits</span><input id="db-limits" readonly /></label>
+            </div>
+
+            <div class="db-safety-list" id="db-safety-list">
+              <h3>Safety Checks <span>0</span></h3>
+              <p>No connection selected</p>
+            </div>
           </aside>
         </section>
 
