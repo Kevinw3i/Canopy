@@ -451,12 +451,12 @@ impl Catalog {
                 );
             }
             for ec2_scope in &scope.mcp_ec2_diagnostic_scopes {
-                grants.insert(SemanticGrant::new(
+                insert_mcp_ec2_diagnostic_scope_semantic_grants(
+                    &mut grants,
                     &binding.group,
                     &package.id,
-                    "mcp_ec2_diagnostic_scope",
-                    &ec2_scope.id,
-                ));
+                    ec2_scope,
+                );
             }
             if let Some(max_session_seconds) = package.max_session_seconds {
                 grants.insert(SemanticGrant::new(
@@ -1012,20 +1012,20 @@ fn insert_database_scope_semantic_grants(
         group,
         package,
         "database_scope_connection",
-        database_scope_grant_value(&database_scope.name, &database_scope.connection),
+        scope_grant_value(&database_scope.name, &database_scope.connection),
     ));
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_environment",
-        database_scope_grant_value(&database_scope.name, &database_scope.environment),
+        scope_grant_value(&database_scope.name, &database_scope.environment),
     ));
     for schema in &database_scope.allowed_schemas {
         grants.insert(SemanticGrant::new(
             group,
             package,
             "database_scope_allowed_schema",
-            database_scope_grant_value(&database_scope.name, schema),
+            scope_grant_value(&database_scope.name, schema),
         ));
     }
     for table in &database_scope.allowed_tables {
@@ -1033,7 +1033,7 @@ fn insert_database_scope_semantic_grants(
             group,
             package,
             "database_scope_allowed_table",
-            database_scope_grant_value(&database_scope.name, table),
+            scope_grant_value(&database_scope.name, table),
         ));
     }
     for action in &database_scope.allowed_actions {
@@ -1041,48 +1041,48 @@ fn insert_database_scope_semantic_grants(
             group,
             package,
             "database_scope_allowed_action",
-            database_scope_grant_value(&database_scope.name, action),
+            scope_grant_value(&database_scope.name, action),
         ));
     }
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_max_rows",
-        database_scope_grant_value(&database_scope.name, database_scope.max_rows),
+        scope_grant_value(&database_scope.name, database_scope.max_rows),
     ));
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_statement_timeout_ms",
-        database_scope_grant_value(&database_scope.name, database_scope.statement_timeout_ms),
+        scope_grant_value(&database_scope.name, database_scope.statement_timeout_ms),
     ));
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_require_explain",
-        database_scope_grant_value(&database_scope.name, database_scope.require_explain),
+        scope_grant_value(&database_scope.name, database_scope.require_explain),
     ));
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_max_examined_rows",
-        database_scope_grant_value(&database_scope.name, database_scope.max_examined_rows),
+        scope_grant_value(&database_scope.name, database_scope.max_examined_rows),
     ));
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_allow_full_table_scan",
-        database_scope_grant_value(&database_scope.name, database_scope.allow_full_table_scan),
+        scope_grant_value(&database_scope.name, database_scope.allow_full_table_scan),
     ));
     grants.insert(SemanticGrant::new(
         group,
         package,
         "database_scope_allow_views",
-        database_scope_grant_value(&database_scope.name, database_scope.allow_views),
+        scope_grant_value(&database_scope.name, database_scope.allow_views),
     ));
 }
 
-fn database_scope_grant_value(scope_name: &str, value: impl std::fmt::Display) -> String {
+fn scope_grant_value(scope_name: &str, value: impl std::fmt::Display) -> String {
     format!("{scope_name}|{value}")
 }
 
@@ -1097,28 +1097,245 @@ fn is_high_risk_added_grant(grant: &SemanticGrant, old_grants: &BTreeSet<Semanti
         | "database_scope_allowed_action" => true,
         "database_scope_max_rows"
         | "database_scope_statement_timeout_ms"
-        | "database_scope_max_examined_rows" => {
-            database_scope_numeric_field_increased(grant, old_grants)
-        }
-        "database_scope_require_explain" => database_scope_bool_field_equals(grant, false),
+        | "database_scope_max_examined_rows" => numeric_scope_field_increased(grant, old_grants),
+        "database_scope_require_explain" => scope_bool_field_equals(grant, false),
         "database_scope_allow_full_table_scan" | "database_scope_allow_views" => {
-            database_scope_bool_field_equals(grant, true)
+            scope_bool_field_equals(grant, true)
         }
+        "mcp_ec2_diagnostic_scope"
+        | "mcp_ec2_log_path"
+        | "mcp_ec2_journal_unit"
+        | "mcp_ec2_http_url"
+        | "mcp_ec2_tcp_target"
+        | "mcp_ec2_dns_target"
+        | "mcp_ec2_private_target_ref"
+        | "mcp_ec2_denylist_version"
+        | "mcp_ec2_allowlist_rule_id" => true,
+        "mcp_ec2_max_lines"
+        | "mcp_ec2_max_since_seconds"
+        | "mcp_ec2_max_timeout_seconds"
+        | "mcp_ec2_max_matches"
+        | "mcp_ec2_probe_budget_per_window" => numeric_scope_field_increased(grant, old_grants),
+        "mcp_ec2_budget_window_seconds" => numeric_scope_field_decreased(grant, old_grants),
+        "mcp_ec2_log_path_safe_output"
+        | "mcp_ec2_journal_unit_safe_output"
+        | "mcp_ec2_http_url_safe_output"
+        | "mcp_ec2_dns_target_safe_output" => scope_trailing_bool_field_equals(grant, false),
         _ => false,
     }
 }
 
-fn database_scope_numeric_field_increased(
+fn insert_mcp_ec2_diagnostic_scope_semantic_grants(
+    grants: &mut BTreeSet<SemanticGrant>,
+    group: &str,
+    package: &str,
+    ec2_scope: &McpEc2DiagnosticScope,
+) {
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_diagnostic_scope",
+        &ec2_scope.id,
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_max_lines",
+        scope_grant_value(&ec2_scope.id, ec2_scope.max_lines),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_max_since_seconds",
+        scope_grant_value(&ec2_scope.id, ec2_scope.max_since_seconds),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_max_timeout_seconds",
+        scope_grant_value(&ec2_scope.id, ec2_scope.max_timeout_seconds),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_max_matches",
+        scope_grant_value(&ec2_scope.id, ec2_scope.max_matches),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_probe_budget_per_window",
+        scope_grant_value(
+            &ec2_scope.id,
+            ec2_scope.connectivity_probe_budget_per_window,
+        ),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_budget_window_seconds",
+        scope_grant_value(&ec2_scope.id, ec2_scope.budget_window_seconds),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_denylist_version",
+        scope_grant_value(&ec2_scope.id, &ec2_scope.denylist_version),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "mcp_ec2_allowlist_rule_id",
+        scope_grant_value(&ec2_scope.id, &ec2_scope.allowlist_rule_id),
+    ));
+
+    for private_target_ref in &ec2_scope.private_target_refs {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_private_target_ref",
+            scope_grant_value(&ec2_scope.id, private_target_ref),
+        ));
+    }
+    for log_path in &ec2_scope.allowed_log_paths {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_log_path",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!(
+                    "{}|{}",
+                    log_path.path_pattern, log_path.canonical_safe_prefix
+                ),
+            ),
+        ));
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_log_path_safe_output",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!("{}|{}", log_path.path_pattern, log_path.safe_for_mcp_output),
+            ),
+        ));
+    }
+    for journal_unit in &ec2_scope.allowed_journal_units {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_journal_unit",
+            scope_grant_value(&ec2_scope.id, &journal_unit.unit),
+        ));
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_journal_unit_safe_output",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!("{}|{}", journal_unit.unit, journal_unit.safe_for_mcp_output),
+            ),
+        ));
+    }
+    for http_url in &ec2_scope.allowed_http_urls {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_http_url",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!(
+                    "{}|{}|{}",
+                    http_url.normalized_url,
+                    serialized_key(&http_url.query_policy),
+                    option_key(http_url.private_target_ref.as_deref())
+                ),
+            ),
+        ));
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_http_url_safe_output",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!(
+                    "{}|{}",
+                    http_url.normalized_url, http_url.safe_for_mcp_output
+                ),
+            ),
+        ));
+    }
+    for tcp_target in &ec2_scope.allowed_tcp_targets {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_tcp_target",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!(
+                    "{}|{}|{}",
+                    tcp_target.host,
+                    tcp_target.port,
+                    option_key(tcp_target.private_target_ref.as_deref())
+                ),
+            ),
+        ));
+    }
+    for dns_target in &ec2_scope.allowed_dns_targets {
+        let mut record_types = dns_target
+            .record_types
+            .iter()
+            .map(serialized_key)
+            .collect::<Vec<_>>();
+        record_types.sort();
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_dns_target",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!(
+                    "{}|{}|{}",
+                    dns_target.host,
+                    record_types.join(","),
+                    option_key(dns_target.private_target_ref.as_deref())
+                ),
+            ),
+        ));
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "mcp_ec2_dns_target_safe_output",
+            scope_grant_value(
+                &ec2_scope.id,
+                format!("{}|{}", dns_target.host, dns_target.safe_for_mcp_output),
+            ),
+        ));
+    }
+}
+
+fn option_key(value: Option<&str>) -> &str {
+    value.unwrap_or("<none>")
+}
+
+fn serialized_key(value: &impl Serialize) -> String {
+    match serde_json::to_value(value).expect("semantic grant keys serialize known DTO values") {
+        serde_json::Value::String(value) => value,
+        value => value.to_string(),
+    }
+}
+
+fn numeric_scope_field_increased(
     grant: &SemanticGrant,
     old_grants: &BTreeSet<SemanticGrant>,
 ) -> bool {
-    let Some((_, new_value)) = database_scope_field_parts(&grant.value) else {
+    let Some((_, new_value)) = scope_field_parts(&grant.value) else {
         return true;
     };
     let Ok(new_value) = new_value.parse::<u64>() else {
         return true;
     };
-    let Some(old_value) = old_database_scope_field_value(grant, old_grants) else {
+    let Some(old_value) = old_scope_field_value(grant, old_grants) else {
         return true;
     };
 
@@ -1127,17 +1344,44 @@ fn database_scope_numeric_field_increased(
         .map_or(true, |old_value| new_value > old_value)
 }
 
-fn database_scope_bool_field_equals(grant: &SemanticGrant, expected: bool) -> bool {
-    database_scope_field_parts(&grant.value)
+fn numeric_scope_field_decreased(
+    grant: &SemanticGrant,
+    old_grants: &BTreeSet<SemanticGrant>,
+) -> bool {
+    let Some((_, new_value)) = scope_field_parts(&grant.value) else {
+        return true;
+    };
+    let Ok(new_value) = new_value.parse::<u64>() else {
+        return true;
+    };
+    let Some(old_value) = old_scope_field_value(grant, old_grants) else {
+        return true;
+    };
+
+    old_value
+        .parse::<u64>()
+        .map_or(true, |old_value| new_value < old_value)
+}
+
+fn scope_bool_field_equals(grant: &SemanticGrant, expected: bool) -> bool {
+    scope_field_parts(&grant.value)
         .and_then(|(_, value)| value.parse::<bool>().ok())
         .is_some_and(|value| value == expected)
 }
 
-fn old_database_scope_field_value<'a>(
+fn scope_trailing_bool_field_equals(grant: &SemanticGrant, expected: bool) -> bool {
+    grant
+        .value
+        .rsplit_once('|')
+        .and_then(|(_, value)| value.parse::<bool>().ok())
+        .is_some_and(|value| value == expected)
+}
+
+fn old_scope_field_value<'a>(
     grant: &SemanticGrant,
     old_grants: &'a BTreeSet<SemanticGrant>,
 ) -> Option<&'a str> {
-    let (scope_name, _) = database_scope_field_parts(&grant.value)?;
+    let (scope_name, _) = scope_field_parts(&grant.value)?;
     old_grants.iter().find_map(|old_grant| {
         if old_grant.group != grant.group
             || old_grant.package != grant.package
@@ -1145,12 +1389,12 @@ fn old_database_scope_field_value<'a>(
         {
             return None;
         }
-        let (old_scope_name, old_value) = database_scope_field_parts(&old_grant.value)?;
+        let (old_scope_name, old_value) = scope_field_parts(&old_grant.value)?;
         (old_scope_name == scope_name).then_some(old_value)
     })
 }
 
-fn database_scope_field_parts(value: &str) -> Option<(&str, &str)> {
+fn scope_field_parts(value: &str) -> Option<(&str, &str)> {
     value.split_once('|')
 }
 
@@ -1654,6 +1898,67 @@ mod tests {
         group = "rd"
     "#;
 
+    const MCP_EC2_CATALOG: &str = r#"
+        [[roles]]
+        id = "direct"
+        role_arn = "direct"
+
+        [[scopes]]
+        id = "mcp-ec2"
+        regions = ["ap-northeast-1"]
+
+        [[scopes.mcp_ec2_diagnostic_scopes]]
+        id = "app-diagnostics"
+        max_lines = 100
+        max_since_seconds = 900
+        max_timeout_seconds = 30
+        max_matches = 50
+        connectivity_probe_budget_per_window = 20
+        budget_window_seconds = 600
+        denylist_version = "2026-06-04"
+        allowlist_rule_id = "app-diagnostics-v1"
+        private_target_refs = ["service:app-api"]
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+        path_pattern = "/var/log/app/error.log"
+        canonical_safe_prefix = "/var/log/app/"
+        safe_for_mcp_output = true
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_journal_units]]
+        unit = "app.service"
+        safe_for_mcp_output = true
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+        normalized_url = "https://10.0.1.20/health"
+        query_policy = "no_query"
+        safe_for_mcp_output = true
+        private_target_ref = "service:app-api"
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_tcp_targets]]
+        host = "10.0.1.20"
+        port = 443
+        private_target_ref = "service:app-api"
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_dns_targets]]
+        host = "app.internal.example.com"
+        record_types = ["A", "AAAA"]
+        safe_for_mcp_output = true
+
+        [[packages]]
+        id = "mcp-ec2-diagnostics"
+        features = ["mcp:use", "mcp:ec2"]
+        scope = "mcp-ec2"
+        role = "direct"
+
+        [[bindings]]
+        group = "rd"
+        package = "mcp-ec2-diagnostics"
+
+        [[memberships]]
+        user_id = "rd@example.com"
+        group = "rd"
+    "#;
+
     #[test]
     fn generate_runtime_compiles_binding_to_one_rule() {
         let catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
@@ -1991,6 +2296,219 @@ mod tests {
             "database_scope_max_rows",
             "orders_read|50"
         ));
+
+        let _ = std::fs::remove_file(old_path);
+        let _ = std::fs::remove_file(new_path);
+    }
+
+    #[test]
+    fn semantic_grants_include_mcp_ec2_scope_fields() {
+        let catalog = Catalog::from_toml_str(MCP_EC2_CATALOG).unwrap();
+
+        let grants = catalog.semantic_grants().unwrap();
+
+        for (kind, value) in [
+            ("mcp_ec2_diagnostic_scope", "app-diagnostics"),
+            ("mcp_ec2_max_lines", "app-diagnostics|100"),
+            ("mcp_ec2_max_since_seconds", "app-diagnostics|900"),
+            ("mcp_ec2_max_timeout_seconds", "app-diagnostics|30"),
+            ("mcp_ec2_max_matches", "app-diagnostics|50"),
+            ("mcp_ec2_probe_budget_per_window", "app-diagnostics|20"),
+            ("mcp_ec2_budget_window_seconds", "app-diagnostics|600"),
+            ("mcp_ec2_denylist_version", "app-diagnostics|2026-06-04"),
+            (
+                "mcp_ec2_allowlist_rule_id",
+                "app-diagnostics|app-diagnostics-v1",
+            ),
+            (
+                "mcp_ec2_private_target_ref",
+                "app-diagnostics|service:app-api",
+            ),
+            (
+                "mcp_ec2_log_path",
+                "app-diagnostics|/var/log/app/error.log|/var/log/app/",
+            ),
+            (
+                "mcp_ec2_log_path_safe_output",
+                "app-diagnostics|/var/log/app/error.log|true",
+            ),
+            ("mcp_ec2_journal_unit", "app-diagnostics|app.service"),
+            (
+                "mcp_ec2_journal_unit_safe_output",
+                "app-diagnostics|app.service|true",
+            ),
+            (
+                "mcp_ec2_http_url",
+                "app-diagnostics|https://10.0.1.20/health|no_query|service:app-api",
+            ),
+            (
+                "mcp_ec2_http_url_safe_output",
+                "app-diagnostics|https://10.0.1.20/health|true",
+            ),
+            (
+                "mcp_ec2_tcp_target",
+                "app-diagnostics|10.0.1.20|443|service:app-api",
+            ),
+            (
+                "mcp_ec2_dns_target",
+                "app-diagnostics|app.internal.example.com|A,AAAA|<none>",
+            ),
+            (
+                "mcp_ec2_dns_target_safe_output",
+                "app-diagnostics|app.internal.example.com|true",
+            ),
+        ] {
+            assert!(
+                has_grant(grants.iter(), kind, value),
+                "missing {kind}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_catalogs_reports_mcp_ec2_expansion_as_high_risk() {
+        let old_path = write_catalog_text_fixture("diff-mcp-ec2-old", MCP_EC2_CATALOG);
+        let added_targets = r#"
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+        path_pattern = "/var/log/app/access.log"
+        canonical_safe_prefix = "/var/log/app/"
+        safe_for_mcp_output = true
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_journal_units]]
+        unit = "worker.service"
+        safe_for_mcp_output = true
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+        normalized_url = "https://10.0.1.21/ready"
+        query_policy = "no_query"
+        safe_for_mcp_output = true
+        private_target_ref = "service:worker-api"
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_tcp_targets]]
+        host = "10.0.1.21"
+        port = 443
+        private_target_ref = "service:worker-api"
+
+        [[scopes.mcp_ec2_diagnostic_scopes.allowed_dns_targets]]
+        host = "worker.internal.example.com"
+        record_types = ["A"]
+        safe_for_mcp_output = true
+        "#;
+        let new_text = MCP_EC2_CATALOG
+            .replace("max_lines = 100", "max_lines = 200")
+            .replace("max_since_seconds = 900", "max_since_seconds = 1200")
+            .replace("max_timeout_seconds = 30", "max_timeout_seconds = 60")
+            .replace("max_matches = 50", "max_matches = 80")
+            .replace(
+                "connectivity_probe_budget_per_window = 20",
+                "connectivity_probe_budget_per_window = 30",
+            )
+            .replace("budget_window_seconds = 600", "budget_window_seconds = 300")
+            .replace(
+                r#"denylist_version = "2026-06-04""#,
+                r#"denylist_version = "2026-06-05""#,
+            )
+            .replace(
+                r#"allowlist_rule_id = "app-diagnostics-v1""#,
+                r#"allowlist_rule_id = "app-diagnostics-v2""#,
+            )
+            .replace(
+                r#"private_target_refs = ["service:app-api"]"#,
+                r#"private_target_refs = ["service:app-api", "service:worker-api"]"#,
+            )
+            .replace(
+                "\n        [[packages]]",
+                &format!("\n{added_targets}\n        [[packages]]"),
+            );
+        let new_path = write_catalog_text_fixture("diff-mcp-ec2-new", &new_text);
+
+        let diff = diff_catalog_files(&old_path, &new_path).unwrap();
+
+        for (kind, value) in [
+            ("mcp_ec2_max_lines", "app-diagnostics|200"),
+            ("mcp_ec2_max_since_seconds", "app-diagnostics|1200"),
+            ("mcp_ec2_max_timeout_seconds", "app-diagnostics|60"),
+            ("mcp_ec2_max_matches", "app-diagnostics|80"),
+            ("mcp_ec2_probe_budget_per_window", "app-diagnostics|30"),
+            ("mcp_ec2_budget_window_seconds", "app-diagnostics|300"),
+            ("mcp_ec2_denylist_version", "app-diagnostics|2026-06-05"),
+            (
+                "mcp_ec2_allowlist_rule_id",
+                "app-diagnostics|app-diagnostics-v2",
+            ),
+            (
+                "mcp_ec2_private_target_ref",
+                "app-diagnostics|service:worker-api",
+            ),
+            (
+                "mcp_ec2_log_path",
+                "app-diagnostics|/var/log/app/access.log|/var/log/app/",
+            ),
+            ("mcp_ec2_journal_unit", "app-diagnostics|worker.service"),
+            (
+                "mcp_ec2_http_url",
+                "app-diagnostics|https://10.0.1.21/ready|no_query|service:worker-api",
+            ),
+            (
+                "mcp_ec2_tcp_target",
+                "app-diagnostics|10.0.1.21|443|service:worker-api",
+            ),
+            (
+                "mcp_ec2_dns_target",
+                "app-diagnostics|worker.internal.example.com|A|<none>",
+            ),
+        ] {
+            assert!(
+                has_grant(diff.added.iter(), kind, value),
+                "missing added {kind}={value}"
+            );
+            assert!(
+                has_grant(diff.high_risk_changes.iter(), kind, value),
+                "missing high-risk {kind}={value}"
+            );
+        }
+
+        let _ = std::fs::remove_file(old_path);
+        let _ = std::fs::remove_file(new_path);
+    }
+
+    #[test]
+    fn diff_catalogs_does_not_mark_tightened_mcp_ec2_limits_high_risk() {
+        let old_path = write_catalog_text_fixture("diff-mcp-ec2-tighten-old", MCP_EC2_CATALOG);
+        let new_text = MCP_EC2_CATALOG
+            .replace("max_lines = 100", "max_lines = 50")
+            .replace("max_since_seconds = 900", "max_since_seconds = 600")
+            .replace("max_timeout_seconds = 30", "max_timeout_seconds = 15")
+            .replace("max_matches = 50", "max_matches = 25")
+            .replace(
+                "connectivity_probe_budget_per_window = 20",
+                "connectivity_probe_budget_per_window = 10",
+            )
+            .replace(
+                "budget_window_seconds = 600",
+                "budget_window_seconds = 1200",
+            );
+        let new_path = write_catalog_text_fixture("diff-mcp-ec2-tighten-new", &new_text);
+
+        let diff = diff_catalog_files(&old_path, &new_path).unwrap();
+
+        for (kind, value) in [
+            ("mcp_ec2_max_lines", "app-diagnostics|50"),
+            ("mcp_ec2_max_since_seconds", "app-diagnostics|600"),
+            ("mcp_ec2_max_timeout_seconds", "app-diagnostics|15"),
+            ("mcp_ec2_max_matches", "app-diagnostics|25"),
+            ("mcp_ec2_probe_budget_per_window", "app-diagnostics|10"),
+            ("mcp_ec2_budget_window_seconds", "app-diagnostics|1200"),
+        ] {
+            assert!(
+                has_grant(diff.added.iter(), kind, value),
+                "missing added {kind}={value}"
+            );
+            assert!(
+                !has_grant(diff.high_risk_changes.iter(), kind, value),
+                "unexpected high-risk {kind}={value}"
+            );
+        }
 
         let _ = std::fs::remove_file(old_path);
         let _ = std::fs::remove_file(new_path);
