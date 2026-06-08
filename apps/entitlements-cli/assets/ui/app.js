@@ -4,10 +4,10 @@ const state = {
   selectedMembers: "0",
   filter: "all",
   search: "",
-  validatedAt: "just now",
   server: null,
   draft: null,
   changes: null,
+  validation: null,
   preview: null,
   explain: null,
   dryRun: null,
@@ -129,6 +129,20 @@ async function runDraftDryRun(request) {
   return response.json();
 }
 
+async function validateDraft() {
+  const response = await fetch("/api/validate", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft validation failed");
+  }
+  return response.json();
+}
+
 function applyServerState(payload) {
   state.server = payload;
   state.draft = payload.draft || null;
@@ -141,6 +155,7 @@ function applyServerState(payload) {
   const changes = payload.changes || {};
   const environment = document.querySelector(".env-picker select");
   const applyButton = document.querySelector(".review-actions button[disabled]");
+  const validateButton = document.getElementById("validate-button");
   const previewButton = document.getElementById("preview-button");
   const explainButton = document.getElementById("explain-button");
   const dryRunButton = document.getElementById("dry-run-button");
@@ -156,6 +171,9 @@ function applyServerState(payload) {
   ) {
     state.preview = null;
   }
+  if (state.validation && state.validation.revision !== draft.revision) {
+    state.validation = null;
+  }
   if (state.explain && state.explain.revision !== draft.revision) {
     state.explain = null;
   }
@@ -167,6 +185,7 @@ function applyServerState(payload) {
   ) {
     state.dryRun = null;
   }
+  renderValidateSummary(state.validation);
   renderPreviewSummary(state.preview);
   renderExplainSummary(state.explain);
   renderDryRunSummary(state.dryRun);
@@ -176,6 +195,16 @@ function applyServerState(payload) {
       draft.error || "catalog draft could not be loaded",
       false,
     );
+  } else if (state.validation) {
+    const blocking = state.validation.blocking_errors?.length || 0;
+    const warnings = state.validation.warnings?.length || 0;
+    setValidationStatus(
+      state.validation.valid ? "Validation clean" : "Validation blocked",
+      state.validation.valid
+        ? `${state.validation.generated?.generated_rules || 0} runtime rule(s), ${warnings} warning(s)`
+        : `${blocking} blocking issue(s), ${warnings} warning(s)`,
+      state.validation.valid,
+    );
   } else if ((changes.added_bindings?.length || 0) + (changes.removed_bindings?.length || 0) > 0) {
     setValidationStatus(
       "Draft pending review",
@@ -184,9 +213,9 @@ function applyServerState(payload) {
     );
   } else if (catalog.exists && runtime.exists) {
     setValidationStatus(
-      "Catalog and runtime detected",
+      "Validation required",
       `Identity source: ${identity.source || "unknown"}`,
-      true,
+      false,
     );
   } else {
     const missing = [
@@ -201,6 +230,9 @@ function applyServerState(payload) {
   }
   if (applyButton) {
     applyButton.textContent = payload.capabilities?.apply ? "▢ Apply" : "▢ Apply (locked)";
+  }
+  if (validateButton) {
+    validateButton.disabled = !payload.capabilities?.validate;
   }
   if (previewButton) {
     previewButton.disabled = !payload.capabilities?.preview;
@@ -465,6 +497,34 @@ function renderPreviewSummary(preview) {
   );
 }
 
+function renderValidateSummary(validation) {
+  const result = document.getElementById("validate-result");
+  if (!result) {
+    return;
+  }
+  if (!validation) {
+    result.replaceChildren(
+      el("strong", "", "Validate not run"),
+      el("small", "", "Run Validate before Apply"),
+    );
+    return;
+  }
+  const blocking = validation.blocking_errors || [];
+  const warnings = validation.warnings || [];
+  const generated = validation.generated || {};
+  const issue = blocking[0] || warnings[0] || null;
+  result.replaceChildren(
+    el("strong", "", validation.valid ? "Validate clean" : "Validate blocked"),
+    el("small", "", `${blocking.length} blocking, ${warnings.length} warning(s)`),
+    el("small", "", `Runtime: ${generated.runtime_path || "not generated"}`),
+    el(
+      "small",
+      "",
+      issue ? `${issue.code}: ${issue.message}` : "Temp runtime generated and removed",
+    ),
+  );
+}
+
 function renderExplainSummary(explain) {
   const result = document.getElementById("explain-result");
   if (!result) {
@@ -634,6 +694,7 @@ async function toggleBinding(button, row) {
     const payload = await updateDraftBinding(group, packageId, enabled);
     state.selectedGroup = group;
     state.selectedPackage = packageId;
+    state.validation = null;
     state.explain = null;
     state.dryRun = null;
     applyServerState(payload);
@@ -667,6 +728,7 @@ document.querySelector(".switch")?.addEventListener("click", (event) => {
   if (state.selectedGroup && state.selectedPackage && state.server?.capabilities?.draft_write) {
     updateDraftBinding(state.selectedGroup, state.selectedPackage, enabled)
       .then((payload) => {
+        state.validation = null;
         state.explain = null;
         state.dryRun = null;
         applyServerState(payload);
@@ -683,9 +745,35 @@ document.querySelector(".search input")?.addEventListener("input", (event) => {
   applyFilters();
 });
 
-document.getElementById("validate-button")?.addEventListener("click", () => {
-  state.validatedAt = "just now";
-  document.getElementById("validation-detail").textContent = `Last validated: ${state.validatedAt}`;
+document.getElementById("validate-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (!state.server?.capabilities?.validate) {
+    setValidationStatus("Validate unavailable", "catalog draft is not loaded", false);
+    return;
+  }
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = "✓ Validating";
+  try {
+    const validation = await validateDraft();
+    validation.revision = state.draft?.revision ?? 0;
+    state.validation = validation;
+    renderValidateSummary(validation);
+    const blocking = validation.blocking_errors?.length || 0;
+    const warnings = validation.warnings?.length || 0;
+    setValidationStatus(
+      validation.valid ? "Validation clean" : "Validation blocked",
+      validation.valid
+        ? `${validation.generated?.generated_rules || 0} runtime rule(s), ${warnings} warning(s)`
+        : `${blocking} blocking issue(s), ${warnings} warning(s)`,
+      validation.valid,
+    );
+  } catch (error) {
+    setValidationStatus("Validation failed", error.message, false);
+  } finally {
+    button.disabled = !state.server?.capabilities?.validate;
+    button.textContent = originalLabel;
+  }
 });
 
 document.getElementById("preview-button")?.addEventListener("click", async (event) => {

@@ -463,10 +463,12 @@ button:focus-visible {
 
 .check {
   position: relative;
+  box-sizing: border-box;
   display: inline-grid;
   place-items: center;
   width: 22px;
   height: 22px;
+  padding: 0;
   border: 1px solid #98a4b1;
   border-radius: 5px;
   background: #fff;
@@ -875,6 +877,7 @@ textarea {
 
 .preview-result small {
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .review-actions {

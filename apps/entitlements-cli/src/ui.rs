@@ -112,6 +112,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/preview", post(post_preview))
         .route("/api/explain", post(post_explain))
         .route("/api/dry-run", post(post_dry_run))
+        .route("/api/validate", post(post_validate))
         .route("/api/draft/bindings", put(put_draft_binding))
         .fallback(not_found)
         .with_state(state)
@@ -275,6 +276,71 @@ struct UiCapabilities {
     draft_write: bool,
     validate: bool,
     apply: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiValidateOutput {
+    status: &'static str,
+    command: &'static str,
+    valid: bool,
+    revision: u64,
+    generated: Option<UiValidateGeneratedRuntime>,
+    deployment: UiValidateDeployment,
+    database_connections: UiValidateDatabaseConnections,
+    blocking_errors: Vec<UiValidationIssue>,
+    warnings: Vec<UiValidationIssue>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiValidateGeneratedRuntime {
+    runtime_path: String,
+    temp_runtime_path: String,
+    temp_runtime_sha256: String,
+    temp_runtime_removed: bool,
+    generated_rules: usize,
+    group_mappings: usize,
+    memberships: usize,
+    runtime_exists: bool,
+    runtime_drift: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiValidateDeployment {
+    mode: Option<String>,
+    canonical_path: Option<String>,
+    canonical_sha256: Option<String>,
+    checked: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiValidateDatabaseConnections {
+    required: Vec<String>,
+    local_config: Vec<String>,
+    deployment_source: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UiValidationIssue {
+    code: String,
+    message: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbConnectionMetadata {
+    engine: String,
+    host: String,
+    port: i64,
+    database: String,
+    secret_arn: String,
+    readonly: bool,
+    connect_timeout_ms: i64,
+    statement_timeout_ms: i64,
+    explain_timeout_ms: i64,
+    max_connections: i64,
+    require_tls: bool,
+    accept_invalid_tls_certs: bool,
+    skip_tls_hostname_verification: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -612,6 +678,23 @@ async fn post_dry_run(
     }
 }
 
+async fn post_validate(State(state): State<UiAppState>, headers: HeaderMap) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    match state.validate_draft() {
+        Ok(output) => json_response(StatusCode::OK, &output),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn not_found() -> impl IntoResponse {
     let mut response = static_response("text/plain; charset=utf-8", "not found\n");
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -753,6 +836,17 @@ impl UiAppState {
         draft.dry_run(catalog_request)
     }
 
+    fn validate_draft(&self) -> Result<UiValidateOutput, UiMutationError> {
+        let (draft, revision) = {
+            let draft = self
+                .draft
+                .lock()
+                .expect("draft mutex should not be poisoned");
+            draft.clone_draft()?
+        };
+        Ok(validate_draft_catalog(self.args.as_ref(), &draft, revision))
+    }
+
     fn sanitized_state(&self) -> UiStateResponse {
         let args = self.args.as_ref();
         let (draft, changes) = self
@@ -788,7 +882,7 @@ impl UiAppState {
                 explain: draft_write,
                 dry_run: draft_write,
                 draft_write,
-                validate: false,
+                validate: draft_write,
                 apply: false,
             },
             draft,
@@ -961,6 +1055,18 @@ impl DraftState {
         })
     }
 
+    fn clone_draft(&self) -> Result<(Catalog, u64), UiMutationError> {
+        let Some(draft) = self.draft.as_ref() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+        Ok((draft.clone(), self.revision))
+    }
+
     fn summarize(&self) -> (UiDraftResponse, UiPendingChanges) {
         let Some(draft) = self.draft.as_ref() else {
             return (
@@ -1027,6 +1133,623 @@ fn file_status(path: &Path) -> UiFileStatus {
             error: Some(err.kind().to_string()),
         },
     }
+}
+
+fn validate_draft_catalog(args: &UiArgs, draft: &Catalog, revision: u64) -> UiValidateOutput {
+    let mut blocking_errors = Vec::new();
+    let mut warnings = Vec::new();
+    let mut generated_summary = None;
+    let mut required_connections = BTreeSet::new();
+
+    match draft.generate_runtime() {
+        Ok(generated) => {
+            for rule in &generated.runtime.rules {
+                for scope in &rule.database_scopes {
+                    required_connections.insert(scope.connection.clone());
+                }
+            }
+            let temp_runtime_path = std::env::temp_dir().join(format!(
+                "canopy-entitlements-ui-validate-{}.toml",
+                random_url_token()
+            ));
+            let temp_runtime_sha256 = hex::encode(Sha256::digest(generated.toml.as_bytes()));
+            let mut temp_runtime_removed = false;
+            match fs::write(&temp_runtime_path, &generated.toml) {
+                Ok(()) => match fs::remove_file(&temp_runtime_path) {
+                    Ok(()) => {
+                        temp_runtime_removed = true;
+                    }
+                    Err(err) => warnings.push(validation_issue(
+                        "temp_runtime_cleanup_failed",
+                        format!(
+                            "temporary runtime '{}' could not be removed: {}",
+                            temp_runtime_path.display(),
+                            err.kind()
+                        ),
+                        Some(temp_runtime_path.display().to_string()),
+                    )),
+                },
+                Err(err) => blocking_errors.push(validation_issue(
+                    "temp_runtime_write_failed",
+                    format!(
+                        "failed to write temporary runtime '{}': {}",
+                        temp_runtime_path.display(),
+                        err.kind()
+                    ),
+                    Some(temp_runtime_path.display().to_string()),
+                )),
+            }
+
+            let runtime_status = file_status(&args.runtime);
+            let runtime_drift = match fs::read_to_string(&args.runtime) {
+                Ok(runtime_content) => runtime_content != generated.toml,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    warnings.push(validation_issue(
+                        "runtime_missing",
+                        format!(
+                            "runtime file '{}' does not exist yet; apply would need to create it",
+                            args.runtime.display()
+                        ),
+                        Some(args.runtime.display().to_string()),
+                    ));
+                    false
+                }
+                Err(err) => {
+                    blocking_errors.push(validation_issue(
+                        "runtime_unreadable",
+                        format!(
+                            "runtime file '{}' could not be read: {}",
+                            args.runtime.display(),
+                            err.kind()
+                        ),
+                        Some(args.runtime.display().to_string()),
+                    ));
+                    false
+                }
+            };
+            if runtime_drift {
+                warnings.push(validation_issue(
+                    "runtime_drift",
+                    format!(
+                        "runtime file '{}' differs from the current draft output",
+                        args.runtime.display()
+                    ),
+                    Some(args.runtime.display().to_string()),
+                ));
+            }
+
+            generated_summary = Some(UiValidateGeneratedRuntime {
+                runtime_path: args.runtime.display().to_string(),
+                temp_runtime_path: temp_runtime_path.display().to_string(),
+                temp_runtime_sha256,
+                temp_runtime_removed,
+                generated_rules: generated.runtime.rules.len(),
+                group_mappings: generated.runtime.group_mappings.len(),
+                memberships: generated.runtime.memberships.len(),
+                runtime_exists: runtime_status.exists,
+                runtime_drift,
+            });
+        }
+        Err(err) => blocking_errors.push(validation_issue(
+            "draft_runtime_generation_failed",
+            format!("draft runtime generation failed: {err:#}"),
+            Some(args.catalog.display().to_string()),
+        )),
+    }
+
+    let required = required_connections.into_iter().collect::<Vec<_>>();
+    let mut local_config_names = Vec::new();
+    let mut local_registry = BTreeMap::new();
+    if required.is_empty() {
+        if args.db_config.is_none() {
+            warnings.push(validation_issue(
+                "db_config_not_required",
+                "draft has no database scopes; no local DB connection snippet is required",
+                None,
+            ));
+        }
+    } else if let Some(path) = args.db_config.as_deref() {
+        match load_connection_registry_from_file(path) {
+            Ok(registry) => {
+                local_config_names = registry.keys().cloned().collect();
+                validate_required_connections(
+                    "db_config",
+                    path,
+                    &required,
+                    &registry,
+                    &mut blocking_errors,
+                );
+                local_registry = registry;
+            }
+            Err(issue) => blocking_errors.push(issue),
+        }
+    } else {
+        blocking_errors.push(validation_issue(
+            "missing_db_config",
+            "draft uses database scopes, but --db-config was not provided",
+            None,
+        ));
+    }
+
+    let mut deployment = UiValidateDeployment {
+        mode: args.deployment_mode.clone(),
+        canonical_path: None,
+        canonical_sha256: None,
+        checked: false,
+    };
+    let mut deployment_names = Vec::new();
+    if required.is_empty() && args.deployment_mode.is_none() {
+        warnings.push(validation_issue(
+            "deployment_source_not_required",
+            "draft has no database scopes; deployment source cross-check was skipped",
+            None,
+        ));
+    } else {
+        validate_deployment_source(
+            args,
+            &required,
+            &local_registry,
+            &mut deployment,
+            &mut deployment_names,
+            &mut blocking_errors,
+        );
+    }
+
+    let valid = blocking_errors.is_empty();
+    UiValidateOutput {
+        status: if valid { "valid" } else { "invalid" },
+        command: "validate",
+        valid,
+        revision,
+        generated: generated_summary,
+        deployment,
+        database_connections: UiValidateDatabaseConnections {
+            required,
+            local_config: local_config_names,
+            deployment_source: deployment_names,
+        },
+        blocking_errors,
+        warnings,
+    }
+}
+
+fn validate_deployment_source(
+    args: &UiArgs,
+    required: &[String],
+    local_registry: &BTreeMap<String, DbConnectionMetadata>,
+    deployment: &mut UiValidateDeployment,
+    deployment_names: &mut Vec<String>,
+    blocking_errors: &mut Vec<UiValidationIssue>,
+) {
+    match args.deployment_mode.as_deref() {
+        Some("config") => {
+            let Some(path) = args.deployment_config.as_deref() else {
+                blocking_errors.push(validation_issue(
+                    "missing_deployment_config",
+                    "deployment-mode=config requires --deployment-config",
+                    None,
+                ));
+                return;
+            };
+            deployment.canonical_path = Some(path.display().to_string());
+            deployment.canonical_sha256 = file_sha256(path);
+            match load_connection_registry_from_file(path) {
+                Ok(registry) => {
+                    deployment.checked = true;
+                    *deployment_names = registry.keys().cloned().collect();
+                    validate_required_connections(
+                        "deployment_config",
+                        path,
+                        required,
+                        &registry,
+                        blocking_errors,
+                    );
+                    validate_deployment_matches_local(
+                        path,
+                        required,
+                        local_registry,
+                        &registry,
+                        blocking_errors,
+                    );
+                }
+                Err(issue) => blocking_errors.push(issue),
+            }
+        }
+        Some("terraform") => {
+            let Some(path) = args.tfvars.as_deref() else {
+                blocking_errors.push(validation_issue(
+                    "missing_tfvars",
+                    "deployment-mode=terraform requires --tfvars",
+                    None,
+                ));
+                return;
+            };
+            deployment.canonical_path = Some(path.display().to_string());
+            deployment.canonical_sha256 = file_sha256(path);
+            match load_connection_registry_from_tfvars(path) {
+                Ok(registry) => {
+                    deployment.checked = true;
+                    *deployment_names = registry.keys().cloned().collect();
+                    validate_required_connections(
+                        "tfvars_database_connections_toml",
+                        path,
+                        required,
+                        &registry,
+                        blocking_errors,
+                    );
+                    validate_deployment_matches_local(
+                        path,
+                        required,
+                        local_registry,
+                        &registry,
+                        blocking_errors,
+                    );
+                }
+                Err(issue) => blocking_errors.push(issue),
+            }
+        }
+        Some(mode) => blocking_errors.push(validation_issue(
+            "unsupported_deployment_mode",
+            format!("deployment mode '{mode}' is not supported; use config or terraform"),
+            None,
+        )),
+        None => {
+            if !required.is_empty() {
+                blocking_errors.push(validation_issue(
+                    "missing_deployment_mode",
+                    "draft uses database scopes, but --deployment-mode was not provided",
+                    None,
+                ));
+            }
+        }
+    }
+}
+
+fn validate_required_connections(
+    source: &str,
+    path: &Path,
+    required: &[String],
+    registry: &BTreeMap<String, DbConnectionMetadata>,
+    blocking_errors: &mut Vec<UiValidationIssue>,
+) {
+    for connection in required {
+        let Some(metadata) = registry.get(connection) else {
+            blocking_errors.push(validation_issue(
+                "missing_database_connection",
+                format!("{source} is missing required database connection '{connection}'"),
+                Some(path.display().to_string()),
+            ));
+            continue;
+        };
+        if !metadata.readonly {
+            blocking_errors.push(validation_issue(
+                "database_connection_not_readonly",
+                format!("{source} database connection '{connection}' must set readonly=true"),
+                Some(path.display().to_string()),
+            ));
+        }
+        if !metadata.require_tls {
+            blocking_errors.push(validation_issue(
+                "database_connection_tls_disabled",
+                format!("{source} database connection '{connection}' must keep require_tls=true"),
+                Some(path.display().to_string()),
+            ));
+        }
+        if metadata.accept_invalid_tls_certs {
+            blocking_errors.push(validation_issue(
+                "database_connection_accepts_invalid_tls",
+                format!(
+                    "{source} database connection '{connection}' must keep accept_invalid_tls_certs=false"
+                ),
+                Some(path.display().to_string()),
+            ));
+        }
+        if metadata.skip_tls_hostname_verification {
+            blocking_errors.push(validation_issue(
+                "database_connection_skips_tls_hostname",
+                format!(
+                    "{source} database connection '{connection}' must keep skip_tls_hostname_verification=false"
+                ),
+                Some(path.display().to_string()),
+            ));
+        }
+    }
+}
+
+fn validate_deployment_matches_local(
+    path: &Path,
+    required: &[String],
+    local: &BTreeMap<String, DbConnectionMetadata>,
+    deployment: &BTreeMap<String, DbConnectionMetadata>,
+    blocking_errors: &mut Vec<UiValidationIssue>,
+) {
+    for connection in required {
+        let (Some(local), Some(deployed)) = (local.get(connection), deployment.get(connection))
+        else {
+            continue;
+        };
+        if local != deployed {
+            blocking_errors.push(validation_issue(
+                "database_connection_deploy_drift",
+                format!(
+                    "database connection '{connection}' differs between --db-config and deployment source"
+                ),
+                Some(path.display().to_string()),
+            ));
+        }
+    }
+}
+
+fn load_connection_registry_from_file(
+    path: &Path,
+) -> Result<BTreeMap<String, DbConnectionMetadata>, UiValidationIssue> {
+    let content = fs::read_to_string(path).map_err(|err| {
+        validation_issue(
+            "database_config_unreadable",
+            format!(
+                "database connection config '{}' could not be read: {}",
+                path.display(),
+                err.kind()
+            ),
+            Some(path.display().to_string()),
+        )
+    })?;
+    parse_connection_registry(&content, path)
+}
+
+fn load_connection_registry_from_tfvars(
+    path: &Path,
+) -> Result<BTreeMap<String, DbConnectionMetadata>, UiValidationIssue> {
+    let content = fs::read_to_string(path).map_err(|err| {
+        validation_issue(
+            "tfvars_unreadable",
+            format!(
+                "tfvars '{}' could not be read: {}",
+                path.display(),
+                err.kind()
+            ),
+            Some(path.display().to_string()),
+        )
+    })?;
+    let snippet = extract_tfvars_database_connections_toml(&content).ok_or_else(|| {
+        validation_issue(
+            "tfvars_missing_database_connections_toml",
+            "tfvars does not define database_connections_toml",
+            Some(path.display().to_string()),
+        )
+    })?;
+    parse_connection_registry(&snippet, path)
+}
+
+fn parse_connection_registry(
+    content: &str,
+    path: &Path,
+) -> Result<BTreeMap<String, DbConnectionMetadata>, UiValidationIssue> {
+    let value = content.parse::<toml::Value>().map_err(|err| {
+        validation_issue(
+            "database_config_parse_failed",
+            format!(
+                "database connection TOML '{}' could not be parsed: {err}",
+                path.display()
+            ),
+            Some(path.display().to_string()),
+        )
+    })?;
+    let Some(connections) = value
+        .get("database_connections")
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let mut registry = BTreeMap::new();
+    for (name, raw) in connections {
+        let table = raw.as_table().ok_or_else(|| {
+            validation_issue(
+                "database_connection_not_table",
+                format!("database_connections.{name} must be a table"),
+                Some(path.display().to_string()),
+            )
+        })?;
+        if table.contains_key("username") || table.contains_key("password") {
+            return Err(validation_issue(
+                "database_connection_inline_secret",
+                format!("database_connections.{name} must not contain username or password"),
+                Some(path.display().to_string()),
+            ));
+        }
+        let engine = required_nonempty_toml_string(table, "engine", name, path)?;
+        let host = required_nonempty_toml_string(table, "host", name, path)?;
+        let database = required_nonempty_toml_string(table, "database", name, path)?;
+        let secret_arn = required_toml_string(table, "secret_arn", name, path)?;
+        if secret_arn.trim().is_empty() {
+            return Err(validation_issue(
+                "database_connection_empty_secret_ref",
+                format!("database_connections.{name}.secret_arn must not be empty"),
+                Some(path.display().to_string()),
+            ));
+        }
+        registry.insert(
+            name.clone(),
+            DbConnectionMetadata {
+                engine,
+                host,
+                port: optional_toml_integer(table, "port", 3306, name, path)?,
+                database,
+                secret_arn,
+                readonly: optional_toml_bool(table, "readonly", false, name, path)?,
+                connect_timeout_ms: optional_toml_integer(
+                    table,
+                    "connect_timeout_ms",
+                    3000,
+                    name,
+                    path,
+                )?,
+                statement_timeout_ms: optional_toml_integer(
+                    table,
+                    "statement_timeout_ms",
+                    5000,
+                    name,
+                    path,
+                )?,
+                explain_timeout_ms: optional_toml_integer(
+                    table,
+                    "explain_timeout_ms",
+                    3000,
+                    name,
+                    path,
+                )?,
+                max_connections: optional_toml_integer(table, "max_connections", 4, name, path)?,
+                require_tls: optional_toml_bool(table, "require_tls", true, name, path)?,
+                accept_invalid_tls_certs: optional_toml_bool(
+                    table,
+                    "accept_invalid_tls_certs",
+                    false,
+                    name,
+                    path,
+                )?,
+                skip_tls_hostname_verification: optional_toml_bool(
+                    table,
+                    "skip_tls_hostname_verification",
+                    false,
+                    name,
+                    path,
+                )?,
+            },
+        );
+    }
+    Ok(registry)
+}
+
+fn optional_toml_integer(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    default: i64,
+    name: &str,
+    path: &Path,
+) -> Result<i64, UiValidationIssue> {
+    let Some(value) = table.get(key) else {
+        return Ok(default);
+    };
+    value.as_integer().ok_or_else(|| {
+        validation_issue(
+            "database_connection_invalid_field_type",
+            format!("database_connections.{name}.{key} must be an integer"),
+            Some(path.display().to_string()),
+        )
+    })
+}
+
+fn optional_toml_bool(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    default: bool,
+    name: &str,
+    path: &Path,
+) -> Result<bool, UiValidationIssue> {
+    let Some(value) = table.get(key) else {
+        return Ok(default);
+    };
+    value.as_bool().ok_or_else(|| {
+        validation_issue(
+            "database_connection_invalid_field_type",
+            format!("database_connections.{name}.{key} must be a boolean"),
+            Some(path.display().to_string()),
+        )
+    })
+}
+
+fn required_toml_string(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    name: &str,
+    path: &Path,
+) -> Result<String, UiValidationIssue> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            validation_issue(
+                "database_connection_missing_field",
+                format!("database_connections.{name}.{key} is required"),
+                Some(path.display().to_string()),
+            )
+        })
+}
+
+fn required_nonempty_toml_string(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    name: &str,
+    path: &Path,
+) -> Result<String, UiValidationIssue> {
+    let value = required_toml_string(table, key, name, path)?;
+    if value.trim().is_empty() {
+        return Err(validation_issue(
+            "database_connection_empty_field",
+            format!("database_connections.{name}.{key} must not be empty"),
+            Some(path.display().to_string()),
+        ));
+    }
+    Ok(value)
+}
+
+fn extract_tfvars_database_connections_toml(content: &str) -> Option<String> {
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "database_connections_toml" {
+            continue;
+        }
+        let value = raw_value.trim();
+        if let Some(delimiter) = value
+            .strip_prefix("<<-")
+            .or_else(|| value.strip_prefix("<<"))
+        {
+            let delimiter = delimiter.trim();
+            let mut snippet = String::new();
+            for line in lines.by_ref() {
+                if line.trim() == delimiter {
+                    return Some(snippet);
+                }
+                snippet.push_str(line);
+                snippet.push('\n');
+            }
+            return None;
+        }
+        if value.starts_with('"') {
+            let parsed = format!("value = {value}").parse::<toml::Value>().ok()?;
+            return parsed
+                .get("value")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn validation_issue(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    path: Option<String>,
+) -> UiValidationIssue {
+    UiValidationIssue {
+        code: code.into(),
+        message: message.into(),
+        path,
+    }
+}
+
+fn file_sha256(path: &Path) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .map(|bytes| hex::encode(Sha256::digest(bytes)))
 }
 
 fn explain_request_from_body(
@@ -1555,6 +2278,51 @@ group = "RD"
         let path = catalog_fixture_path(name);
         std::fs::write(&path, &content).unwrap();
         (path, content)
+    }
+
+    fn write_database_config_fixture(name: &str) -> PathBuf {
+        let content = r#"
+[database_connections.orders]
+engine = "mysql"
+host = "orders.example.internal"
+port = 3306
+database = "orders"
+secret_arn = "orders-secret-ref"
+readonly = true
+require_tls = true
+"#
+        .trim_start();
+        let path = catalog_fixture_path(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn write_database_config_fixture_with_database(name: &str, database: &str) -> PathBuf {
+        let content = format!(
+            r#"
+[database_connections.orders]
+engine = "mysql"
+host = "orders.example.internal"
+port = 3306
+database = "{database}"
+secret_arn = "orders-secret-ref"
+readonly = true
+require_tls = true
+"#
+        );
+        let path = catalog_fixture_path(name);
+        std::fs::write(&path, content.trim_start()).unwrap();
+        path
+    }
+
+    fn write_runtime_from_catalog_fixture(name: &str, catalog_content: &str) -> PathBuf {
+        let runtime_path = catalog_fixture_path(name);
+        let generated = Catalog::from_toml_str(catalog_content)
+            .unwrap()
+            .generate_runtime()
+            .unwrap();
+        std::fs::write(&runtime_path, generated.toml).unwrap();
+        runtime_path
     }
 
     fn state_cookie() -> &'static str {
@@ -2142,6 +2910,211 @@ group = "RD"
             .unwrap()
             .contains("--schema must be a lowercase ASCII SQL identifier"));
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_validate_uses_temp_runtime_and_does_not_write_formal_runtime() {
+        let (catalog_path, catalog_content) = write_catalog_fixture("validate-clean-catalog");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("validate-clean-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("validate-clean-db");
+        let deployment_config_path = write_database_config_fixture("validate-clean-deploy");
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/validate")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(validation["command"], "validate");
+        assert_eq!(validation["valid"], true);
+        assert_eq!(
+            validation["generated"]["runtime_path"],
+            runtime_path.display().to_string()
+        );
+        assert_eq!(validation["generated"]["runtime_drift"], false);
+        assert_eq!(validation["generated"]["temp_runtime_removed"], true);
+        assert_eq!(validation["deployment"]["checked"], true);
+        assert!(validation["database_connections"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("orders".to_owned())));
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("orders-secret-ref"));
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn draft_validate_blocks_missing_db_config_without_writing_runtime() {
+        let (catalog_path, _catalog_content) = write_catalog_fixture("validate-missing-db-catalog");
+        let runtime_path = catalog_fixture_path("validate-missing-db-runtime");
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = None;
+        args.deployment_mode = None;
+        args.deployment_config = None;
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/validate")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(validation["valid"], false);
+        let issue_codes = validation["blocking_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|issue| issue["code"].as_str())
+            .collect::<Vec<_>>();
+        assert!(issue_codes.contains(&"missing_db_config"));
+        assert!(issue_codes.contains(&"missing_deployment_mode"));
+        assert!(!runtime_path.exists());
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_validate_blocks_deployment_connection_drift() {
+        let (catalog_path, catalog_content) = write_catalog_fixture("validate-drift-catalog");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("validate-drift-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("validate-drift-db");
+        let deployment_config_path =
+            write_database_config_fixture_with_database("validate-drift-deploy", "orders_archive");
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/validate")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(validation["valid"], false);
+        assert!(validation["blocking_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "database_connection_deploy_drift"));
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn draft_validate_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("validate-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/validate")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[test]
+    fn tfvars_database_connections_toml_heredoc_extracts_connections() {
+        let snippet = r#"
+locals {
+}
+database_connections_toml = <<-TOML
+[database_connections.orders]
+engine = "mysql"
+host = "orders.example.internal"
+database = "orders"
+secret_arn = "orders-secret-ref"
+readonly = true
+TOML
+"#;
+        let toml = extract_tfvars_database_connections_toml(snippet).unwrap();
+        let path = PathBuf::from("terraform.tfvars");
+        let registry = parse_connection_registry(&toml, &path).unwrap();
+        assert!(registry.contains_key("orders"));
+    }
+
+    #[test]
+    fn database_connection_parser_rejects_mistyped_tls_bool() {
+        let content = r#"
+[database_connections.orders]
+engine = "mysql"
+host = "orders.example.internal"
+database = "orders"
+secret_arn = "orders-secret-ref"
+readonly = true
+require_tls = "true"
+"#;
+        let path = PathBuf::from("database_connections.local.toml");
+        let issue = parse_connection_registry(content, &path).unwrap_err();
+        assert_eq!(issue.code, "database_connection_invalid_field_type");
+        assert!(issue.message.contains("require_tls must be a boolean"));
     }
 
     #[tokio::test]

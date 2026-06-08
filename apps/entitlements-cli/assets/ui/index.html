@@ -263,9 +263,13 @@
           </section>
           <section class="validation-block">
             <h3>Validation Status</h3>
-            <strong class="valid-line">✓ Valid</strong>
-            <small id="validation-summary">No blocking issues</small>
-            <span id="validation-detail">Last validated: just now</span>
+            <strong>△ Needs attention</strong>
+            <small id="validation-summary">Validation required</small>
+            <span id="validation-detail">Run Validate before Apply</span>
+            <div class="preview-result" id="validate-result" aria-live="polite">
+              <strong>Validate not run</strong>
+              <small>Run Validate before Apply</small>
+            </div>
             <div class="preview-result" id="preview-result" aria-live="polite">
               <strong>Preview not refreshed</strong>
               <small>Select a group and run Preview</small>
