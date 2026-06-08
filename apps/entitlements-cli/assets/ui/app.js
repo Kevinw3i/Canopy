@@ -1,9 +1,13 @@
 const state = {
-  selectedGroup: "RD",
-  selectedMembers: "12",
+  selectedGroup: null,
+  selectedPackage: null,
+  selectedMembers: "0",
   filter: "all",
+  search: "",
   validatedAt: "just now",
   server: null,
+  draft: null,
+  changes: null,
 };
 
 function setSessionStatus(status, detail) {
@@ -33,6 +37,17 @@ function setValidationStatus(summary, detail, valid = true) {
   }
 }
 
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) {
+    node.className = className;
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
 async function exchangeBootstrapCode(code) {
   const response = await fetch("/api/session/exchange", {
     method: "POST",
@@ -55,12 +70,30 @@ async function loadServerState() {
   return response.json();
 }
 
+async function updateDraftBinding(group, packageId, enabled) {
+  const response = await fetch("/api/draft/bindings", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ group, package: packageId, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft binding update failed");
+  }
+  return response.json();
+}
+
 function applyServerState(payload) {
   state.server = payload;
+  state.draft = payload.draft || null;
+  state.changes = payload.changes || null;
   const mode = payload.mode || "local-auth-shell";
   const catalog = payload.catalog || {};
   const runtime = payload.runtime || {};
   const identity = payload.identity || {};
+  const draft = payload.draft || {};
+  const changes = payload.changes || {};
   const environment = document.querySelector(".env-picker select");
   const applyButton = document.querySelector(".review-actions button[disabled]");
 
@@ -68,7 +101,20 @@ function applyServerState(payload) {
   if (environment && payload.deployment?.mode) {
     environment.value = payload.deployment.mode === "terraform" ? "production" : "staging";
   }
-  if (catalog.exists && runtime.exists) {
+  renderDraft(draft, changes);
+  if (!draft.loaded) {
+    setValidationStatus(
+      "Draft unavailable",
+      draft.error || "catalog draft could not be loaded",
+      false,
+    );
+  } else if ((changes.added_bindings?.length || 0) + (changes.removed_bindings?.length || 0) > 0) {
+    setValidationStatus(
+      "Draft pending review",
+      `${changes.added_bindings?.length || 0} add / ${changes.removed_bindings?.length || 0} remove`,
+      false,
+    );
+  } else if (catalog.exists && runtime.exists) {
     setValidationStatus(
       "Catalog and runtime detected",
       `Identity source: ${identity.source || "unknown"}`,
@@ -90,6 +136,237 @@ function applyServerState(payload) {
   }
 }
 
+function renderDraft(draft, changes) {
+  if (!draft.loaded) {
+    renderChanges(changes || {});
+    return;
+  }
+  const groups = draft.groups || [];
+  const packages = draft.packages || [];
+  if (!state.selectedGroup || !groups.some((group) => group.id === state.selectedGroup)) {
+    state.selectedGroup = draft.selected_group || groups[0]?.id || null;
+  }
+  if (!state.selectedPackage || !packages.some((item) => item.id === state.selectedPackage)) {
+    state.selectedPackage =
+      firstBoundPackage(state.selectedGroup, draft.bindings || []) || packages[0]?.id || null;
+  }
+  renderMatrix(groups, packages, draft.bindings || []);
+  renderInspector(groups, packages, draft.bindings || [], changes || {});
+  renderChanges(changes || {});
+  applyFilters();
+}
+
+function firstBoundPackage(groupId, bindings) {
+  return bindings.find((binding) => binding.group === groupId)?.package || null;
+}
+
+function isBound(groupId, packageId, bindings) {
+  return bindings.some((binding) => binding.group === groupId && binding.package === packageId);
+}
+
+function renderMatrix(groups, packages, bindings) {
+  const matrix = document.querySelector(".matrix");
+  if (!matrix) {
+    return;
+  }
+  const headRow = document.createElement("tr");
+  const groupsHead = document.createElement("th");
+  groupsHead.append(el("strong", "", "Groups"));
+  groupsHead.append(el("small", "", `${groups.length} total`));
+  headRow.append(groupsHead);
+  packages.forEach((pkg) => {
+    const cell = document.createElement("th");
+    cell.dataset.package = pkg.id;
+    cell.append(el("strong", "", pkg.id));
+    const summary = el("small", "", packageSummary(pkg));
+    if (pkg.high_risk_features?.length) {
+      summary.append(" ");
+      summary.append(el("span", "risk", "△"));
+    }
+    cell.append(summary);
+    headRow.append(cell);
+  });
+  const openHead = document.createElement("th");
+  openHead.setAttribute("aria-label", "Open row");
+  headRow.append(openHead);
+  matrix.tHead.replaceChildren(headRow);
+
+  const body = document.createElement("tbody");
+  groups.forEach((group) => {
+    const row = document.createElement("tr");
+    row.dataset.group = group.id;
+    row.dataset.members = String(group.member_count || 0);
+    row.classList.toggle("selected", group.id === state.selectedGroup);
+
+    const heading = document.createElement("th");
+    heading.append(el("span", "person", "♙"));
+    heading.append(el("strong", "", group.id));
+    heading.append(el("small", "", groupSubtitle(group)));
+    row.append(heading);
+
+    packages.forEach((pkg) => {
+      const cell = document.createElement("td");
+      const button = el("button", "check", "");
+      const bound = isBound(group.id, pkg.id, bindings);
+      button.type = "button";
+      button.dataset.package = pkg.id;
+      button.classList.toggle("bound", bound);
+      if (pkg.high_risk_features?.length) {
+        button.dataset.risk = "true";
+      }
+      button.textContent = bound ? "✓" : "";
+      button.setAttribute("aria-label", `${group.id} ${pkg.id} ${bound ? "bound" : "not bound"}`);
+      cell.append(button);
+      row.append(cell);
+    });
+
+    const openCell = document.createElement("td");
+    const openButton = el("button", "row-open", "›");
+    openButton.type = "button";
+    openButton.setAttribute("aria-label", `Open ${group.id}`);
+    openCell.append(openButton);
+    row.append(openCell);
+    body.append(row);
+  });
+  matrix.tBodies[0].replaceWith(body);
+  attachMatrixEvents();
+}
+
+function packageSummary(pkg) {
+  if (pkg.database_scope_count) {
+    return `${pkg.database_scope_count} DB scope${pkg.database_scope_count === 1 ? "" : "s"}`;
+  }
+  if (pkg.mcp_ec2_diagnostic_scope_count) {
+    return `${pkg.mcp_ec2_diagnostic_scope_count} EC2 diagnostic scope${pkg.mcp_ec2_diagnostic_scope_count === 1 ? "" : "s"}`;
+  }
+  return `${pkg.features?.length || 0} feature${pkg.features?.length === 1 ? "" : "s"}`;
+}
+
+function groupSubtitle(group) {
+  const members = `${group.member_count || 0} member${group.member_count === 1 ? "" : "s"}`;
+  const mappings = `${group.external_mapping_count || 0} map${group.external_mapping_count === 1 ? "" : "s"}`;
+  return `${members}, ${mappings}`;
+}
+
+function renderInspector(groups, packages, bindings, changes) {
+  const group = groups.find((item) => item.id === state.selectedGroup) || groups[0];
+  const selectedPackage =
+    packages.find((item) => item.id === state.selectedPackage) ||
+    packages.find((item) => isBound(group?.id, item.id, bindings)) ||
+    packages[0];
+  if (!group || !selectedPackage) {
+    return;
+  }
+  state.selectedGroup = group.id;
+  state.selectedPackage = selectedPackage.id;
+  state.selectedMembers = String(group.member_count || 0);
+
+  document.getElementById("selected-group").textContent = group.id;
+  document.getElementById("selected-count").textContent = "1";
+  document.querySelector(".tabs button:nth-child(2)").textContent = `Permissions (${group.package_count})`;
+  document.querySelector(".tabs button:nth-child(3)").textContent = `Members (${group.member_count})`;
+
+  const packageSelect = document.querySelector(".detail-form select");
+  if (packageSelect) {
+    packageSelect.replaceChildren(
+      ...packages.map((pkg) => {
+        const option = document.createElement("option");
+        option.value = pkg.id;
+        option.textContent = `${pkg.id} (${pkg.features.length} features)`;
+        option.selected = pkg.id === selectedPackage.id;
+        return option;
+      }),
+    );
+    packageSelect.onchange = (event) => {
+      state.selectedPackage = event.target.value;
+      renderInspector(groups, packages, bindings, changes);
+    };
+  }
+
+  const bound = isBound(group.id, selectedPackage.id, bindings);
+  const switchButton = document.querySelector(".switch");
+  const switchLabel = document.querySelector(".switch-row strong");
+  if (switchButton) {
+    switchButton.classList.toggle("on", bound);
+    switchButton.setAttribute("aria-pressed", String(bound));
+  }
+  if (switchLabel) {
+    switchLabel.textContent = bound ? "Enabled" : "Disabled";
+  }
+
+  const inputs = document.querySelectorAll(".detail-form fieldset input");
+  if (inputs[0]) inputs[0].value = selectedPackage.scope;
+  if (inputs[1]) inputs[1].value = selectedPackage.role;
+  if (inputs[2]) inputs[2].value = `${selectedPackage.database_scope_count} database scope(s)`;
+  if (inputs[3]) inputs[3].value = `${selectedPackage.mcp_ec2_diagnostic_scope_count} EC2 diagnostic scope(s)`;
+
+  renderRiskList(selectedPackage, changes);
+}
+
+function renderRiskList(pkg, changes) {
+  const list = document.querySelector(".risk-list");
+  if (!list) {
+    return;
+  }
+  const risks = [...(pkg.high_risk_features || [])];
+  if (changes.added_bindings?.some((change) => change.package === pkg.id && change.high_risk)) {
+    risks.unshift("pending high-risk binding");
+  }
+  const title = document.createElement("h3");
+  title.append("Risk Indicators ");
+  title.append(el("span", "", String(risks.length)));
+  const items = risks.length ? risks.map((risk) => el("p", "", `△ ${risk}`)) : [el("p", "", "No high-risk feature in selected package")];
+  list.replaceChildren(title, ...items);
+}
+
+function renderChanges(changes) {
+  const added = changes.added_bindings || [];
+  const removed = changes.removed_bindings || [];
+  const summaryItems = document.querySelectorAll(".summary-grid strong");
+  if (summaryItems[0]) {
+    summaryItems[0].firstChild.textContent = String(new Set([...added, ...removed].map((change) => change.group)).size);
+  }
+  if (summaryItems[1]) summaryItems[1].firstChild.textContent = String(added.length);
+  if (summaryItems[2]) summaryItems[2].firstChild.textContent = String(removed.length);
+  if (summaryItems[3]) summaryItems[3].firstChild.textContent = "0";
+
+  const pendingTitle = document.querySelector(".pending-block h3");
+  const pendingBody = document.querySelector(".pending-block tbody");
+  if (pendingTitle) {
+    pendingTitle.textContent = `Pending Changes (${added.length + removed.length})`;
+  }
+  if (!pendingBody) {
+    return;
+  }
+  const rows = [
+    ...added.map((change) => changeRow("Add", change)),
+    ...removed.map((change) => changeRow("Remove", change)),
+  ];
+  pendingBody.replaceChildren(...(rows.length ? rows : [emptyChangeRow()]));
+}
+
+function changeRow(type, change) {
+  const row = document.createElement("tr");
+  [type, change.group, change.package, type === "Add" ? "New binding" : "Removed binding", change.features.join(", ") || "package binding"].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 0) {
+      cell.className = type === "Add" ? "add" : "remove";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function emptyChangeRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.textContent = "No pending draft changes";
+  row.append(cell);
+  return row;
+}
+
 async function initializeSession() {
   const bootstrapCode = window.__CANOPY_BOOTSTRAP_CODE__;
   window.__CANOPY_BOOTSTRAP_CODE__ = null;
@@ -109,11 +386,19 @@ function selectGroup(row) {
   document.querySelectorAll(".matrix tbody tr").forEach((item) => {
     item.classList.toggle("selected", item === row);
   });
-  state.selectedGroup = row.dataset.group || "RD";
+  state.selectedGroup = row.dataset.group || state.selectedGroup;
   state.selectedMembers = row.dataset.members || "0";
   document.getElementById("selected-group").textContent = state.selectedGroup;
   document.querySelector(".tabs button:nth-child(3)").textContent = `Members (${state.selectedMembers})`;
   document.getElementById("selected-count").textContent = "1";
+  if (state.draft?.loaded) {
+    renderInspector(
+      state.draft.groups || [],
+      state.draft.packages || [],
+      state.draft.bindings || [],
+      state.changes || {},
+    );
+  }
 }
 
 function setFilter(filter) {
@@ -121,31 +406,57 @@ function setFilter(filter) {
   document.querySelectorAll(".segmented button").forEach((button) => {
     button.classList.toggle("active", button.dataset.filter === filter);
   });
+  applyFilters();
+}
 
+function applyFilters() {
   document.querySelectorAll(".matrix tbody tr").forEach((row) => {
     const highRisk = row.querySelector("[data-risk='true'].bound");
     const database = row.children[1]?.querySelector(".bound");
+    const searchMatch = !state.search || row.dataset.group?.toLowerCase().includes(state.search);
     const visible =
-      filter === "all" ||
-      (filter === "risk" && highRisk) ||
-      (filter === "database" && database);
+      searchMatch &&
+      (state.filter === "all" ||
+        (state.filter === "risk" && highRisk) ||
+        (state.filter === "database" && database));
     row.hidden = !visible;
   });
 }
 
-function toggleBinding(button) {
-  button.classList.toggle("bound");
-  button.textContent = button.classList.contains("bound") ? "✓" : "";
+async function toggleBinding(button, row) {
+  const group = row.dataset.group;
+  const packageId = button.dataset.package;
+  const enabled = !button.classList.contains("bound");
+  if (!state.server?.capabilities?.draft_write || !group || !packageId) {
+    button.classList.toggle("bound", enabled);
+    button.textContent = enabled ? "✓" : "";
+    return;
+  }
+  button.disabled = true;
+  try {
+    const payload = await updateDraftBinding(group, packageId, enabled);
+    state.selectedGroup = group;
+    state.selectedPackage = packageId;
+    applyServerState(payload);
+  } catch (error) {
+    setValidationStatus("Draft update failed", error.message, false);
+  } finally {
+    button.disabled = false;
+  }
 }
 
-document.querySelectorAll(".matrix tbody tr").forEach((row) => {
-  row.addEventListener("click", (event) => {
-    if (event.target.matches(".check")) {
-      toggleBinding(event.target);
-    }
-    selectGroup(row);
+function attachMatrixEvents() {
+  document.querySelectorAll(".matrix tbody tr").forEach((row) => {
+    row.addEventListener("click", (event) => {
+      if (event.target.matches(".check")) {
+        toggleBinding(event.target, row);
+      }
+      selectGroup(row);
+    });
   });
-});
+}
+
+attachMatrixEvents();
 
 document.querySelectorAll(".segmented button").forEach((button) => {
   button.addEventListener("click", () => setFilter(button.dataset.filter));
@@ -154,8 +465,19 @@ document.querySelectorAll(".segmented button").forEach((button) => {
 document.querySelector(".switch")?.addEventListener("click", (event) => {
   const button = event.currentTarget;
   const enabled = !button.classList.contains("on");
-  button.classList.toggle("on", enabled);
-  button.setAttribute("aria-pressed", String(enabled));
+  if (state.selectedGroup && state.selectedPackage && state.server?.capabilities?.draft_write) {
+    updateDraftBinding(state.selectedGroup, state.selectedPackage, enabled)
+      .then(applyServerState)
+      .catch((error) => setValidationStatus("Draft update failed", error.message, false));
+  } else {
+    button.classList.toggle("on", enabled);
+    button.setAttribute("aria-pressed", String(enabled));
+  }
+});
+
+document.querySelector(".search input")?.addEventListener("input", (event) => {
+  state.search = event.target.value.trim().toLowerCase();
+  applyFilters();
 });
 
 document.getElementById("validate-button")?.addEventListener("click", () => {

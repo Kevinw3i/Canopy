@@ -981,7 +981,7 @@ fn apply_catalog_feature(feature: &str, flags: &mut FeatureFlags) -> anyhow::Res
     Ok(())
 }
 
-fn is_high_risk_feature(feature: &str) -> bool {
+pub(crate) fn is_high_risk_feature(feature: &str) -> bool {
     HIGH_RISK_FEATURES.contains(&feature)
 }
 

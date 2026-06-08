@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -11,7 +11,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::rngs::OsRng;
@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+
+use crate::catalog::{self, Catalog, CatalogBinding, CatalogPackage};
 
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
@@ -107,6 +109,7 @@ fn router(state: UiAppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/session/exchange", post(exchange_session))
         .route("/api/state", get(api_state))
+        .route("/api/draft/bindings", put(put_draft_binding))
         .fallback(not_found)
         .with_state(state)
 }
@@ -116,10 +119,12 @@ struct UiAppState {
     args: Arc<UiArgs>,
     bootstrap: Arc<Mutex<BootstrapState>>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
+    draft: Arc<Mutex<DraftState>>,
 }
 
 impl UiAppState {
     fn new(args: UiArgs, code: String, expires_at: Instant) -> Self {
+        let draft = DraftState::load(&args.catalog);
         Self {
             args: Arc::new(args),
             bootstrap: Arc::new(Mutex::new(BootstrapState {
@@ -127,6 +132,7 @@ impl UiAppState {
                 expires_at,
             })),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            draft: Arc::new(Mutex::new(draft)),
         }
     }
 
@@ -147,9 +153,26 @@ struct BootstrapState {
     expires_at: Instant,
 }
 
+#[derive(Debug)]
+struct DraftState {
+    baseline: Option<Catalog>,
+    draft: Option<Catalog>,
+    load_error: Option<String>,
+    dirty: bool,
+    revision: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ExchangeRequest {
     code: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftBindingRequest {
+    group: String,
+    package: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +191,8 @@ struct UiStateResponse {
     database_config: Option<UiFileStatus>,
     identity: UiIdentityState,
     capabilities: UiCapabilities,
+    draft: UiDraftResponse,
+    changes: UiPendingChanges,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,6 +231,62 @@ struct UiCapabilities {
 }
 
 #[derive(Debug, Serialize)]
+struct UiDraftResponse {
+    loaded: bool,
+    status: &'static str,
+    revision: u64,
+    dirty: bool,
+    groups: Vec<UiGroupSummary>,
+    packages: Vec<UiPackageSummary>,
+    bindings: Vec<UiBindingSummary>,
+    selected_group: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiGroupSummary {
+    id: String,
+    member_count: usize,
+    external_mapping_count: usize,
+    package_count: usize,
+    high_risk_package_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct UiPackageSummary {
+    id: String,
+    features: Vec<String>,
+    high_risk_features: Vec<String>,
+    scope: String,
+    role: String,
+    database_scope_count: usize,
+    mcp_ec2_diagnostic_scope_count: usize,
+    max_session_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiBindingSummary {
+    group: String,
+    package: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UiPendingChanges {
+    added_bindings: Vec<UiBindingChange>,
+    removed_bindings: Vec<UiBindingChange>,
+    high_risk_added: usize,
+    high_risk_removed: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct UiBindingChange {
+    group: String,
+    package: String,
+    high_risk: bool,
+    features: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct UiErrorResponse {
     error: UiErrorBody,
 }
@@ -226,6 +307,31 @@ struct UiRequestError {
 impl UiRequestError {
     fn into_response(self) -> Response<Body> {
         error_response(self.status, self.code, self.message)
+    }
+}
+
+#[derive(Debug)]
+struct UiMutationError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl UiMutationError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -314,21 +420,42 @@ async fn api_state(State(state): State<UiAppState>, headers: HeaderMap) -> Respo
     if let Err(err) = validate_local_host(&headers) {
         return err.into_response();
     }
-    let Some(session) = session_cookie(&headers) else {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "missing_session",
-            "UI session cookie is required",
-        );
-    };
-    if !state.validate_session(session) {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "invalid_session",
-            "UI session cookie is invalid or expired",
-        );
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
     }
     json_response(StatusCode::OK, &state.sanitized_state())
+}
+
+async fn put_draft_binding(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftBindingRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_binding_request",
+                "draft binding request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_binding(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
 }
 
 async fn not_found() -> impl IntoResponse {
@@ -429,8 +556,22 @@ impl UiAppState {
         sessions.contains_key(token)
     }
 
+    fn update_binding(&self, request: DraftBindingRequest) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_binding(request)
+    }
+
     fn sanitized_state(&self) -> UiStateResponse {
         let args = self.args.as_ref();
+        let (draft, changes) = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned")
+            .summarize();
+        let draft_write = draft.loaded;
         UiStateResponse {
             status: "ok",
             mode: "local-auth-shell",
@@ -454,11 +595,143 @@ impl UiAppState {
             },
             capabilities: UiCapabilities {
                 state: true,
-                draft_write: false,
+                draft_write,
                 validate: false,
                 apply: false,
             },
+            draft,
+            changes,
         }
+    }
+}
+
+impl DraftState {
+    fn load(path: &Path) -> Self {
+        match Catalog::load(path) {
+            Ok(catalog) => Self {
+                baseline: Some(catalog.clone()),
+                draft: Some(catalog),
+                load_error: None,
+                dirty: false,
+                revision: 0,
+            },
+            Err(_) => Self {
+                baseline: None,
+                draft: None,
+                load_error: Some(format!(
+                    "failed to load catalog draft from '{}'; run canopy-entitlements validate for details",
+                    path.display(),
+                )),
+                dirty: false,
+                revision: 0,
+            },
+        }
+    }
+
+    fn update_binding(&mut self, request: DraftBindingRequest) -> Result<(), UiMutationError> {
+        let group = request.group.trim();
+        let package = request.package.trim();
+        if group.is_empty() || package.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_binding_id",
+                "group and package are required",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        if !known_groups(draft).contains(group) {
+            return Err(UiMutationError::bad_request(
+                "unknown_group",
+                format!("group '{group}' does not exist in the draft"),
+            ));
+        }
+        if !draft
+            .packages
+            .iter()
+            .any(|candidate| candidate.id == package)
+        {
+            return Err(UiMutationError::bad_request(
+                "unknown_package",
+                format!("package '{package}' does not exist in the draft"),
+            ));
+        }
+
+        let existing = draft
+            .bindings
+            .iter()
+            .position(|binding| binding.group == group && binding.package == package);
+        let changed = match (request.enabled, existing) {
+            (true, None) => {
+                draft.bindings.push(CatalogBinding {
+                    group: group.to_owned(),
+                    package: package.to_owned(),
+                });
+                true
+            }
+            (false, Some(index)) => {
+                draft.bindings.remove(index);
+                true
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.dirty = self
+                .baseline
+                .as_ref()
+                .is_some_and(|baseline| binding_set(baseline) != binding_set(draft));
+        }
+        Ok(())
+    }
+
+    fn summarize(&self) -> (UiDraftResponse, UiPendingChanges) {
+        let Some(draft) = self.draft.as_ref() else {
+            return (
+                UiDraftResponse {
+                    loaded: false,
+                    status: "unavailable",
+                    revision: self.revision,
+                    dirty: self.dirty,
+                    groups: Vec::new(),
+                    packages: Vec::new(),
+                    bindings: Vec::new(),
+                    selected_group: None,
+                    error: self.load_error.clone(),
+                },
+                UiPendingChanges::empty(),
+            );
+        };
+
+        let changes = self
+            .baseline
+            .as_ref()
+            .map(|baseline| pending_changes(baseline, draft))
+            .unwrap_or_else(UiPendingChanges::empty);
+        let groups = group_summaries(draft);
+        let selected_group = groups.first().map(|group| group.id.clone());
+        (
+            UiDraftResponse {
+                loaded: true,
+                status: "loaded",
+                revision: self.revision,
+                dirty: self.dirty,
+                groups,
+                packages: package_summaries(draft),
+                bindings: binding_summaries(draft),
+                selected_group,
+                error: None,
+            },
+            changes,
+        )
     }
 }
 
@@ -488,6 +761,194 @@ fn file_status(path: &Path) -> UiFileStatus {
     }
 }
 
+impl UiPendingChanges {
+    fn empty() -> Self {
+        Self {
+            added_bindings: Vec::new(),
+            removed_bindings: Vec::new(),
+            high_risk_added: 0,
+            high_risk_removed: 0,
+        }
+    }
+}
+
+fn known_groups(catalog: &Catalog) -> BTreeSet<String> {
+    catalog
+        .bindings
+        .iter()
+        .map(|binding| binding.group.clone())
+        .chain(
+            catalog
+                .memberships
+                .iter()
+                .map(|membership| membership.group.clone()),
+        )
+        .chain(
+            catalog
+                .group_mappings
+                .iter()
+                .map(|mapping| mapping.canopy_group.clone()),
+        )
+        .collect()
+}
+
+fn package_summaries(catalog: &Catalog) -> Vec<UiPackageSummary> {
+    let scopes_by_id = catalog
+        .scopes
+        .iter()
+        .map(|scope| (scope.id.as_str(), scope))
+        .collect::<BTreeMap<_, _>>();
+    let mut packages = catalog
+        .packages
+        .iter()
+        .map(|package| {
+            let scope = scopes_by_id.get(package.scope.as_str());
+            UiPackageSummary {
+                id: package.id.clone(),
+                features: package.features.clone(),
+                high_risk_features: high_risk_features(package),
+                scope: package.scope.clone(),
+                role: package.role.clone(),
+                database_scope_count: scope.map_or(0, |scope| scope.database_scopes.len()),
+                mcp_ec2_diagnostic_scope_count: scope
+                    .map_or(0, |scope| scope.mcp_ec2_diagnostic_scopes.len()),
+                max_session_seconds: package.max_session_seconds,
+            }
+        })
+        .collect::<Vec<_>>();
+    packages.sort_by(|left, right| left.id.cmp(&right.id));
+    packages
+}
+
+fn group_summaries(catalog: &Catalog) -> Vec<UiGroupSummary> {
+    let package_by_id = catalog
+        .packages
+        .iter()
+        .map(|package| (package.id.as_str(), package))
+        .collect::<BTreeMap<_, _>>();
+    let mut groups = known_groups(catalog)
+        .into_iter()
+        .map(|group| {
+            let bound_packages = catalog
+                .bindings
+                .iter()
+                .filter(|binding| binding.group == group)
+                .filter_map(|binding| package_by_id.get(binding.package.as_str()).copied())
+                .collect::<Vec<_>>();
+            UiGroupSummary {
+                id: group.clone(),
+                member_count: catalog
+                    .memberships
+                    .iter()
+                    .filter(|membership| membership.group == group)
+                    .count(),
+                external_mapping_count: catalog
+                    .group_mappings
+                    .iter()
+                    .filter(|mapping| mapping.canopy_group == group)
+                    .count(),
+                package_count: bound_packages.len(),
+                high_risk_package_count: bound_packages
+                    .iter()
+                    .filter(|package| !high_risk_features(package).is_empty())
+                    .count(),
+            }
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.id.cmp(&right.id));
+    groups
+}
+
+fn binding_summaries(catalog: &Catalog) -> Vec<UiBindingSummary> {
+    let mut bindings = catalog
+        .bindings
+        .iter()
+        .map(|binding| UiBindingSummary {
+            group: binding.group.clone(),
+            package: binding.package.clone(),
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| {
+        left.group
+            .cmp(&right.group)
+            .then_with(|| left.package.cmp(&right.package))
+    });
+    bindings
+}
+
+fn binding_set(catalog: &Catalog) -> BTreeSet<(String, String)> {
+    catalog
+        .bindings
+        .iter()
+        .map(|binding| (binding.group.clone(), binding.package.clone()))
+        .collect()
+}
+
+fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
+    let baseline_bindings = binding_set(baseline);
+    let draft_bindings = binding_set(draft);
+    let draft_packages = package_index(draft);
+    let baseline_packages = package_index(baseline);
+    let added_bindings = draft_bindings
+        .difference(&baseline_bindings)
+        .map(|(group, package)| binding_change(group, package, &draft_packages))
+        .collect::<Vec<_>>();
+    let removed_bindings = baseline_bindings
+        .difference(&draft_bindings)
+        .map(|(group, package)| binding_change(group, package, &baseline_packages))
+        .collect::<Vec<_>>();
+    let high_risk_added = added_bindings
+        .iter()
+        .filter(|change| change.high_risk)
+        .count();
+    let high_risk_removed = removed_bindings
+        .iter()
+        .filter(|change| change.high_risk)
+        .count();
+    UiPendingChanges {
+        added_bindings,
+        removed_bindings,
+        high_risk_added,
+        high_risk_removed,
+    }
+}
+
+fn package_index(catalog: &Catalog) -> BTreeMap<&str, &CatalogPackage> {
+    catalog
+        .packages
+        .iter()
+        .map(|package| (package.id.as_str(), package))
+        .collect()
+}
+
+fn binding_change(
+    group: &str,
+    package: &str,
+    package_by_id: &BTreeMap<&str, &CatalogPackage>,
+) -> UiBindingChange {
+    let features = package_by_id
+        .get(package)
+        .map(|package| package.features.clone())
+        .unwrap_or_default();
+    UiBindingChange {
+        group: group.to_owned(),
+        package: package.to_owned(),
+        high_risk: features
+            .iter()
+            .any(|feature| catalog::is_high_risk_feature(feature)),
+        features,
+    }
+}
+
+fn high_risk_features(package: &CatalogPackage) -> Vec<String> {
+    package
+        .features
+        .iter()
+        .filter(|feature| catalog::is_high_risk_feature(feature))
+        .cloned()
+        .collect()
+}
+
 fn random_url_token() -> String {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -507,6 +968,25 @@ fn session_cookie(headers: &HeaderMap) -> Option<&str> {
         let part = part.trim();
         part.strip_prefix(&format!("{SESSION_COOKIE_NAME}="))
     })
+}
+
+fn validate_session_headers(state: &UiAppState, headers: &HeaderMap) -> Result<(), UiRequestError> {
+    let Some(session) = session_cookie(headers) else {
+        return Err(UiRequestError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "missing_session",
+            message: "UI session cookie is required",
+        });
+    };
+    if state.validate_session(session) {
+        Ok(())
+    } else {
+        Err(UiRequestError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "invalid_session",
+            message: "UI session cookie is invalid or expired",
+        })
+    }
 }
 
 fn validate_local_host(headers: &HeaderMap) -> Result<(), UiRequestError> {
@@ -621,6 +1101,85 @@ mod tests {
 
     fn test_state(code: &str) -> UiAppState {
         UiAppState::for_test(test_args(), code, Instant::now() + BOOTSTRAP_CODE_TTL)
+    }
+
+    fn test_state_with_catalog(catalog: PathBuf) -> UiAppState {
+        let mut args = test_args();
+        args.catalog = catalog;
+        UiAppState::for_test(args, "draft-code", Instant::now() + BOOTSTRAP_CODE_TTL)
+    }
+
+    fn catalog_fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("canopy-ui-{name}-{}.toml", random_url_token()))
+    }
+
+    fn write_catalog_fixture(name: &str) -> (PathBuf, String) {
+        let content = r#"
+[[accounts]]
+id = "prod"
+account_id = "111"
+name = "production"
+
+[[roles]]
+id = "readonly"
+role_arn = "role/{account_id}/readonly"
+
+[[scopes]]
+id = "db-scope"
+accounts = ["prod"]
+regions = ["ap-northeast-1"]
+
+[[scopes.database_scopes]]
+name = "orders_read"
+connection = "orders"
+environment = "production"
+allowed_schemas = ["mart"]
+allowed_tables = ["orders"]
+allowed_actions = ["select"]
+max_rows = 100
+statement_timeout_ms = 5000
+require_explain = true
+max_examined_rows = 10000
+allow_full_table_scan = false
+allow_views = false
+
+[[packages]]
+id = "analytics"
+features = ["cloudwatch:search"]
+scope = "db-scope"
+role = "readonly"
+
+[[packages]]
+id = "mcp-database"
+features = ["mcp:use", "mcp:database"]
+scope = "db-scope"
+role = "readonly"
+
+[[bindings]]
+group = "RD"
+package = "analytics"
+
+[[group_mappings]]
+external_group = "canopy-rd"
+canopy_group = "RD"
+
+[[memberships]]
+user_id = "rd@example.com"
+group = "RD"
+"#
+        .trim_start()
+        .to_owned();
+        let path = catalog_fixture_path(name);
+        std::fs::write(&path, &content).unwrap();
+        (path, content)
+    }
+
+    fn state_cookie() -> &'static str {
+        "canopy_ui_session=session-token"
+    }
+
+    fn install_session(state: &UiAppState) {
+        state.store_session("session-token".to_owned());
     }
 
     #[test]
@@ -750,6 +1309,162 @@ mod tests {
         assert!(!String::from_utf8(body.to_vec())
             .unwrap()
             .contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn state_includes_loaded_draft_matrix_summary() {
+        let (catalog_path, _content) = write_catalog_fixture("state-matrix");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["loaded"], true);
+        assert_eq!(state["capabilities"]["draft_write"], true);
+        assert_eq!(state["draft"]["groups"][0]["id"], "RD");
+        assert!(state["draft"]["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["id"] == "mcp-database"
+                && package["high_risk_features"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::Value::String("mcp:database".to_owned()))));
+        assert_eq!(
+            state["changes"]["added_bindings"].as_array().unwrap().len(),
+            0
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_binding_update_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("missing-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"mcp-database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_binding_update_requires_session_cookie() {
+        let (catalog_path, _content) = write_catalog_fixture("missing-session");
+        let response = router(test_state_with_catalog(catalog_path.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"mcp-database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_binding_update_rejects_unknown_package() {
+        let (catalog_path, _content) = write_catalog_fixture("unknown-package");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"does-not-exist","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "unknown_package");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_binding_update_adds_pending_high_risk_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("binding-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"mcp-database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert_eq!(state["changes"]["high_risk_added"], 1);
+        assert!(state["draft"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|binding| binding["group"] == "RD" && binding["package"] == "mcp-database"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
     }
 
     #[tokio::test]
