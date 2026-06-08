@@ -65,6 +65,7 @@ pub struct UiLaunchStatus {
 
 pub fn run_blocking<W: Write>(args: UiArgs, stdout: &mut W) -> anyhow::Result<()> {
     validate_bind_addr(args.bind)?;
+    validate_ui_file_paths(&args)?;
     let bootstrap_code = random_url_token();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -113,6 +114,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/explain", post(post_explain))
         .route("/api/dry-run", post(post_dry_run))
         .route("/api/validate", post(post_validate))
+        .route("/api/import-runtime", post(post_import_runtime))
         .route("/api/draft/bindings", put(put_draft_binding))
         .fallback(not_found)
         .with_state(state)
@@ -273,6 +275,7 @@ struct UiCapabilities {
     preview: bool,
     explain: bool,
     dry_run: bool,
+    import_runtime: bool,
     draft_write: bool,
     validate: bool,
     apply: bool,
@@ -704,6 +707,26 @@ async fn post_validate(State(state): State<UiAppState>, headers: HeaderMap) -> R
     }
 }
 
+async fn post_import_runtime(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    match state.import_runtime_draft() {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn not_found() -> impl IntoResponse {
     let mut response = static_response("text/plain; charset=utf-8", "not found\n");
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -856,6 +879,32 @@ impl UiAppState {
         Ok(validate_draft_catalog(self.args.as_ref(), &draft, revision))
     }
 
+    fn import_runtime_draft(&self) -> Result<(), UiMutationError> {
+        validate_ui_file_paths(self.args.as_ref()).map_err(|err| {
+            UiMutationError::conflict("import_runtime_path_collision", format!("{err:#}"))
+        })?;
+        let Some(import_runtime) = self.args.import_runtime.as_deref() else {
+            return Err(UiMutationError::conflict(
+                "import_runtime_unconfigured",
+                "start the UI with --import-runtime before calling /api/import-runtime",
+            ));
+        };
+        let imported = catalog::import_runtime_file(import_runtime).map_err(|err| {
+            UiMutationError::conflict(
+                "import_runtime_failed",
+                format!(
+                    "failed to import runtime entitlement file '{}': {err:#}",
+                    import_runtime.display()
+                ),
+            )
+        })?;
+        self.draft
+            .lock()
+            .expect("draft mutex should not be poisoned")
+            .replace_with_imported_catalog(imported);
+        Ok(())
+    }
+
     fn sanitized_state(&self) -> UiStateResponse {
         let args = self.args.as_ref();
         let (draft, changes) = self
@@ -890,6 +939,7 @@ impl UiAppState {
                 preview: draft_write,
                 explain: draft_write,
                 dry_run: draft_write,
+                import_runtime: args.import_runtime.is_some(),
                 draft_write,
                 validate: draft_write,
                 apply: false,
@@ -983,9 +1033,19 @@ impl DraftState {
             self.dirty = self
                 .baseline
                 .as_ref()
-                .is_some_and(|baseline| binding_set(baseline) != binding_set(draft));
+                .is_some_and(|baseline| baseline != draft);
         }
         Ok(())
+    }
+
+    fn replace_with_imported_catalog(&mut self, catalog: Catalog) {
+        self.dirty = self
+            .baseline
+            .as_ref()
+            .is_none_or(|baseline| baseline != &catalog);
+        self.draft = Some(catalog);
+        self.load_error = None;
+        self.revision = self.revision.saturating_add(1);
     }
 
     fn preview_group(
@@ -2210,6 +2270,63 @@ fn validate_bind_addr(addr: SocketAddr) -> anyhow::Result<()> {
     }
 }
 
+fn validate_ui_file_paths(args: &UiArgs) -> anyhow::Result<()> {
+    let catalog = normalized_ui_path(&args.catalog)?;
+    let runtime = normalized_ui_path(&args.runtime)?;
+    if catalog == runtime {
+        anyhow::bail!(
+            "--catalog and --runtime must point to different files: '{}'",
+            args.catalog.display()
+        );
+    }
+
+    if let Some(import_runtime) = args.import_runtime.as_deref() {
+        let import_runtime_normalized = normalized_ui_path(import_runtime)?;
+        if import_runtime_normalized == catalog {
+            anyhow::bail!(
+                "--import-runtime and --catalog must point to different files: '{}'",
+                import_runtime.display()
+            );
+        }
+        if import_runtime_normalized == runtime {
+            anyhow::bail!(
+                "--import-runtime and --runtime must point to different files: '{}'",
+                import_runtime.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn normalized_ui_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current directory for UI path validation")?
+            .join(path)
+    };
+    Ok(lexically_normalized_path(&absolute))
+}
+
+fn lexically_normalized_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub fn bootstrap_prelude_sha256() -> &'static str {
     BOOTSTRAP_PRELUDE_SHA256
 }
@@ -3160,6 +3277,110 @@ require_tls = true
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn import_runtime_rejects_unconfigured_import_source() {
+        let (catalog_path, _content) = write_catalog_fixture("import-unconfigured");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/import-runtime")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "import_runtime_unconfigured");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn import_runtime_updates_memory_draft_without_writing_catalog() {
+        let (source_catalog_path, source_catalog) = write_catalog_fixture("import-source-catalog");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("import-source-runtime", &source_catalog);
+        let catalog_path = catalog_fixture_path("import-target-catalog");
+        let runtime_output_path = catalog_fixture_path("import-generated-runtime");
+        let mut args = test_args();
+        args.catalog = catalog_path.clone();
+        args.runtime = runtime_output_path.clone();
+        args.import_runtime = Some(runtime_path.clone());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/import-runtime")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["loaded"], true);
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert_eq!(state["capabilities"]["draft_write"], true);
+        assert_eq!(state["capabilities"]["import_runtime"], true);
+        assert!(state["draft"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["id"] == "RD"));
+        assert!(state["draft"]["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["features"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String("cloudwatch:search".to_owned()))));
+        assert!(!catalog_path.exists());
+        assert!(!runtime_output_path.exists());
+        let _ = std::fs::remove_file(source_catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+    }
+
+    #[test]
+    fn ui_file_path_validation_rejects_catalog_runtime_and_import_collisions() {
+        let mut args = test_args();
+        args.catalog = PathBuf::from("same.toml");
+        args.runtime = PathBuf::from("./same.toml");
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("--catalog and --runtime"));
+
+        let mut args = test_args();
+        args.catalog = PathBuf::from("catalog.toml");
+        args.runtime = PathBuf::from("generated.toml");
+        args.import_runtime = Some(PathBuf::from("./generated.toml"));
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("--import-runtime and --runtime"));
+
+        let mut args = test_args();
+        args.catalog = PathBuf::from("catalog.toml");
+        args.runtime = PathBuf::from("generated.toml");
+        args.import_runtime = Some(PathBuf::from("./catalog.toml"));
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("--import-runtime and --catalog"));
     }
 
     #[test]

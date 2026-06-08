@@ -44,7 +44,7 @@ const HIGH_RISK_FEATURES: &[&str] = &[
     "ecs:exec",
 ];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Catalog {
     #[serde(default)]
@@ -63,7 +63,7 @@ pub struct Catalog {
     pub memberships: Vec<CatalogMembership>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogAccount {
     pub id: String,
@@ -71,14 +71,14 @@ pub struct CatalogAccount {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogRole {
     pub id: String,
     pub role_arn: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogScope {
     pub id: String,
@@ -112,7 +112,7 @@ pub struct CatalogScope {
     pub metadata: RuleMetadata,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogPackage {
     pub id: String,
@@ -124,14 +124,14 @@ pub struct CatalogPackage {
     pub max_session_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogBinding {
     pub group: String,
     pub package: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogMembership {
     pub user_id: String,
@@ -620,6 +620,120 @@ impl Catalog {
             matched_rule: result.matched_rule,
         })
     }
+
+    pub fn from_runtime_store(store: EntitlementStore) -> anyhow::Result<Self> {
+        store
+            .validate_allowing_organization_account_placeholders()
+            .context("runtime entitlement validation failed")?;
+
+        let mut accounts = Vec::new();
+        let mut account_refs = HashMap::new();
+        let mut account_ids = HashSet::new();
+        let mut roles = Vec::new();
+        let mut role_refs = HashMap::new();
+        let mut role_ids = HashSet::new();
+        let mut scopes = Vec::new();
+        let mut scope_ids = HashSet::new();
+        let mut packages = Vec::new();
+        let mut package_ids = HashSet::new();
+        let mut bindings = Vec::new();
+
+        for rule in store.rules {
+            let role_groups = import_role_groups(&rule);
+            for (index, role_group) in role_groups.iter().enumerate() {
+                let suffix = if role_groups.len() == 1 {
+                    String::new()
+                } else {
+                    format!("-{}", index + 1)
+                };
+                let rule_id = stable_id_part(&rule.id);
+                let scope_id =
+                    unique_catalog_id(format!("{rule_id}-scope{suffix}"), &mut scope_ids);
+                let package_id = unique_catalog_id(format!("{rule_id}{suffix}"), &mut package_ids);
+                let role_id = ensure_import_role(
+                    &role_group.role_arn,
+                    &mut roles,
+                    &mut role_refs,
+                    &mut role_ids,
+                );
+
+                let scope_accounts = role_group
+                    .accounts
+                    .iter()
+                    .map(|account| {
+                        ensure_import_account(
+                            account,
+                            &mut accounts,
+                            &mut account_refs,
+                            &mut account_ids,
+                        )
+                    })
+                    .collect();
+
+                scopes.push(CatalogScope {
+                    id: scope_id.clone(),
+                    accounts: scope_accounts,
+                    regions: rule.allowed_regions.clone(),
+                    log_group_arns: rule.allowed_log_group_arns.clone(),
+                    clusters: rule.allowed_clusters.clone(),
+                    instance_tag_selectors: rule.instance_tag_selectors.clone(),
+                    excluded_tag_selectors: rule.excluded_tag_selectors.clone(),
+                    task_tag_selectors: rule.task_tag_selectors.clone(),
+                    excluded_task_tag_selectors: rule.excluded_task_tag_selectors.clone(),
+                    excluded_container_names: rule.excluded_container_names.clone(),
+                    allow_broad_cluster_discovery: rule.allow_broad_cluster_discovery,
+                    os_users: rule.allowed_os_users.clone(),
+                    database_scopes: rule.database_scopes.clone(),
+                    mcp_ec2_diagnostic_scopes: rule.mcp_ec2_diagnostic_scopes.clone(),
+                    metadata: rule.metadata.clone(),
+                });
+                packages.push(CatalogPackage {
+                    id: package_id.clone(),
+                    features: catalog_features_from_flags(&rule.features),
+                    scope: scope_id,
+                    role: role_id,
+                    max_session_seconds: rule.max_session_seconds,
+                });
+                bindings.push(CatalogBinding {
+                    group: rule.group.clone(),
+                    package: package_id,
+                });
+            }
+        }
+
+        let catalog = Self {
+            accounts,
+            roles,
+            scopes,
+            packages,
+            bindings,
+            group_mappings: store.group_mappings,
+            memberships: store
+                .memberships
+                .into_iter()
+                .map(|membership| CatalogMembership {
+                    user_id: membership.user_id,
+                    group: membership.group,
+                })
+                .collect(),
+        };
+        catalog
+            .generate_runtime()
+            .context("imported catalog generation failed")?;
+        Ok(catalog)
+    }
+}
+
+pub fn import_runtime_file(runtime_path: &Path) -> anyhow::Result<Catalog> {
+    let store =
+        EntitlementStore::load_from_file_allowing_organization_account_placeholders(runtime_path)
+            .with_context(|| {
+            format!(
+                "failed to load runtime entitlement file '{}'",
+                runtime_path.display()
+            )
+        })?;
+    Catalog::from_runtime_store(store)
 }
 
 pub fn generate_runtime_file(
@@ -997,6 +1111,163 @@ fn apply_catalog_feature(feature: &str, flags: &mut FeatureFlags) -> anyhow::Res
 
 pub(crate) fn is_high_risk_feature(feature: &str) -> bool {
     HIGH_RISK_FEATURES.contains(&feature)
+}
+
+#[derive(Debug)]
+struct ImportRoleGroup {
+    key: String,
+    role_arn: String,
+    accounts: Vec<AllowedAccount>,
+}
+
+fn import_role_groups(rule: &EntitlementRule) -> Vec<ImportRoleGroup> {
+    if rule.allowed_accounts.is_empty() {
+        return vec![ImportRoleGroup {
+            key: "direct".to_owned(),
+            role_arn: "direct".to_owned(),
+            accounts: Vec::new(),
+        }];
+    }
+
+    let mut groups: Vec<ImportRoleGroup> = Vec::new();
+    for account in &rule.allowed_accounts {
+        let (key, role_arn) = normalized_import_role_arn(account);
+        if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
+            group.accounts.push(account.clone());
+        } else {
+            groups.push(ImportRoleGroup {
+                key,
+                role_arn,
+                accounts: vec![account.clone()],
+            });
+        }
+    }
+    groups
+}
+
+fn normalized_import_role_arn(account: &AllowedAccount) -> (String, String) {
+    if account.role_arn == "direct"
+        || account.role_arn.starts_with("profile:")
+        || account.role_arn.contains(ORGANIZATION_ACCOUNT_ID_TOKEN)
+    {
+        return (account.role_arn.clone(), account.role_arn.clone());
+    }
+    if !account.account_id.trim().is_empty() && account.role_arn.contains(&account.account_id) {
+        let role_arn = account
+            .role_arn
+            .replace(&account.account_id, ORGANIZATION_ACCOUNT_ID_TOKEN);
+        return (role_arn.clone(), role_arn);
+    }
+    (
+        format!("{}|{}", account.role_arn, account.account_id),
+        account.role_arn.clone(),
+    )
+}
+
+fn ensure_import_account(
+    account: &AllowedAccount,
+    accounts: &mut Vec<CatalogAccount>,
+    account_refs: &mut HashMap<(String, String), String>,
+    account_ids: &mut HashSet<String>,
+) -> String {
+    let key = (account.account_id.clone(), account.account_name.clone());
+    if let Some(id) = account_refs.get(&key) {
+        return id.clone();
+    }
+
+    let base = if account.account_name.trim().is_empty() {
+        stable_id_part(&account.account_id)
+    } else {
+        stable_id_part(&account.account_name)
+    };
+    let id = unique_catalog_id(base, account_ids);
+    accounts.push(CatalogAccount {
+        id: id.clone(),
+        account_id: account.account_id.clone(),
+        name: account.account_name.clone(),
+    });
+    account_refs.insert(key, id.clone());
+    id
+}
+
+fn ensure_import_role(
+    role_arn: &str,
+    roles: &mut Vec<CatalogRole>,
+    role_refs: &mut HashMap<String, String>,
+    role_ids: &mut HashSet<String>,
+) -> String {
+    if let Some(id) = role_refs.get(role_arn) {
+        return id.clone();
+    }
+
+    let base = import_role_base_id(role_arn);
+    let id = unique_catalog_id(base, role_ids);
+    roles.push(CatalogRole {
+        id: id.clone(),
+        role_arn: role_arn.to_owned(),
+    });
+    role_refs.insert(role_arn.to_owned(), id.clone());
+    id
+}
+
+fn import_role_base_id(role_arn: &str) -> String {
+    if role_arn == "direct" {
+        return "direct".to_owned();
+    }
+    if let Some(profile) = role_arn.strip_prefix("profile:") {
+        return format!("profile-{}", stable_id_part(profile));
+    }
+    if let Some((_, role_name)) = role_arn.split_once("role/") {
+        return stable_id_part(role_name);
+    }
+    stable_id_part(role_arn)
+}
+
+fn unique_catalog_id(base: impl Into<String>, used: &mut HashSet<String>) -> String {
+    let base = stable_id_part(&base.into());
+    if used.insert(base.clone()) {
+        return base;
+    }
+
+    let mut counter = 2;
+    loop {
+        let candidate = format!("{base}-{counter}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+fn catalog_features_from_flags(flags: &FeatureFlags) -> Vec<String> {
+    let mut features = Vec::new();
+    for (feature, field) in CATALOG_FEATURE_FIELDS {
+        if feature_flag_value(flags, field) {
+            features.push((*feature).to_owned());
+        }
+    }
+    features
+}
+
+fn feature_flag_value(flags: &FeatureFlags, field: &str) -> bool {
+    match field {
+        "can_view_ec2" => flags.can_view_ec2,
+        "can_use_cloudwatch_search" => flags.can_use_cloudwatch_search,
+        "can_use_cloudwatch_tail" => flags.can_use_cloudwatch_tail,
+        "can_use_ssm" => flags.can_use_ssm,
+        "can_use_ec2_instance_connect" => flags.can_use_ec2_instance_connect,
+        "can_start_ec2" => flags.can_start_ec2,
+        "can_stop_ec2" => flags.can_stop_ec2,
+        "can_reboot_ec2" => flags.can_reboot_ec2,
+        "can_use_mcp" => flags.can_use_mcp,
+        "can_use_mcp_cloudwatch" => flags.can_use_mcp_cloudwatch,
+        "can_view_mcp_raw_audit_plaintext" => flags.can_view_mcp_raw_audit_plaintext,
+        "can_use_mcp_ec2" => flags.can_use_mcp_ec2,
+        "can_use_mcp_database" => flags.can_use_mcp_database,
+        "can_view_ecs" => flags.can_view_ecs,
+        "can_use_ecs_exec" => flags.can_use_ecs_exec,
+        _ => false,
+    }
 }
 
 fn selector_key(selector: &TagSelector) -> String {
@@ -2106,6 +2377,186 @@ mod tests {
     }
 
     #[test]
+    fn import_runtime_file_preserves_generated_runtime_semantics() {
+        let original = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
+        let generated = original.generate_runtime().unwrap();
+        let runtime_path = write_catalog_text_fixture("import-runtime-minimal", &generated.toml);
+
+        let imported = import_runtime_file(&runtime_path).unwrap();
+        let imported_runtime = imported.generate_runtime().unwrap();
+        let rule = imported_runtime
+            .runtime
+            .rules
+            .iter()
+            .find(|rule| rule.group == "platform-engineering")
+            .unwrap();
+
+        assert!(rule.features.can_view_ec2);
+        assert!(rule.features.can_use_cloudwatch_search);
+        assert_eq!(rule.allowed_regions, vec!["ap-northeast-1"]);
+        assert_eq!(rule.allowed_accounts.len(), 1);
+        assert_eq!(rule.allowed_accounts[0].account_id, test_account_a());
+        assert_eq!(
+            rule.allowed_accounts[0].role_arn,
+            iam_role_arn(&test_account_a(), "CanopyRole")
+        );
+        assert_eq!(imported_runtime.runtime.group_mappings.len(), 1);
+        assert_eq!(imported_runtime.runtime.memberships.len(), 1);
+
+        let _ = std::fs::remove_file(runtime_path);
+    }
+
+    #[test]
+    fn import_runtime_file_preserves_database_and_mcp_ec2_scopes() {
+        let database_runtime = Catalog::from_toml_str(DATABASE_CATALOG)
+            .unwrap()
+            .generate_runtime()
+            .unwrap();
+        let database_path =
+            write_catalog_text_fixture("import-runtime-database", &database_runtime.toml);
+        let database_import = import_runtime_file(&database_path).unwrap();
+        assert_eq!(
+            database_import.scopes[0].database_scopes[0].name,
+            "orders_read"
+        );
+        assert_eq!(
+            database_import.scopes[0].database_scopes[0].allowed_tables,
+            vec!["orders"]
+        );
+
+        let mcp_ec2_runtime = Catalog::from_toml_str(MCP_EC2_CATALOG)
+            .unwrap()
+            .generate_runtime()
+            .unwrap();
+        let mcp_ec2_path =
+            write_catalog_text_fixture("import-runtime-mcp-ec2", &mcp_ec2_runtime.toml);
+        let mcp_ec2_import = import_runtime_file(&mcp_ec2_path).unwrap();
+        assert_eq!(
+            mcp_ec2_import.scopes[0].mcp_ec2_diagnostic_scopes[0].id,
+            "app-diagnostics"
+        );
+        assert_eq!(
+            mcp_ec2_import.scopes[0].mcp_ec2_diagnostic_scopes[0].allowed_log_paths[0].path_pattern,
+            "/var/log/app/error.log"
+        );
+
+        let _ = std::fs::remove_file(database_path);
+        let _ = std::fs::remove_file(mcp_ec2_path);
+    }
+
+    #[test]
+    fn import_runtime_merges_equivalent_role_arns() {
+        let account_a = test_account_a();
+        let account_b = test_account_b();
+        let role_a = iam_role_arn(&account_a, "ReadOnly");
+        let role_b = iam_role_arn(&account_b, "ReadOnly");
+        let store: EntitlementStore = toml::from_str(&format!(
+            r#"
+            [[rules]]
+            id = "multi-account"
+            group = "ops"
+            allowed_regions = ["ap-northeast-1"]
+
+            [rules.features]
+            can_view_ec2 = true
+
+            [[rules.allowed_accounts]]
+            account_id = "{account_a}"
+            account_name = "production"
+            role_arn = "{role_a}"
+
+            [[rules.allowed_accounts]]
+            account_id = "{account_b}"
+            account_name = "sandbox"
+            role_arn = "{role_b}"
+
+            [[memberships]]
+            user_id = "ops@example.com"
+            group = "ops"
+            "#
+        ))
+        .unwrap();
+
+        let imported = Catalog::from_runtime_store(store).unwrap();
+
+        assert_eq!(imported.packages.len(), 1);
+        assert_eq!(imported.bindings.len(), 1);
+        assert_eq!(imported.roles.len(), 1);
+        assert_eq!(imported.roles[0].role_arn, iam_role_template("ReadOnly"));
+        assert_eq!(imported.scopes[0].accounts.len(), 2);
+        let generated = imported.generate_runtime().unwrap();
+        assert_eq!(generated.runtime.rules.len(), 1);
+        assert_eq!(generated.runtime.rules[0].allowed_accounts.len(), 2);
+        assert!(generated.runtime.rules[0]
+            .allowed_accounts
+            .iter()
+            .any(|account| account.role_arn == role_a));
+        assert!(generated.runtime.rules[0]
+            .allowed_accounts
+            .iter()
+            .any(|account| account.role_arn == role_b));
+    }
+
+    #[test]
+    fn import_runtime_splits_non_equivalent_role_arns() {
+        let account_a = test_account_a();
+        let account_b = test_account_b();
+        let read_only_role = iam_role_arn(&account_a, "ReadOnly");
+        let break_glass_role = iam_role_arn(&account_b, "BreakGlass");
+        let store: EntitlementStore = toml::from_str(&format!(
+            r#"
+            [[rules]]
+            id = "multi-role"
+            group = "ops"
+            allowed_regions = ["ap-northeast-1"]
+
+            [rules.features]
+            can_view_ec2 = true
+
+            [[rules.allowed_accounts]]
+            account_id = "{account_a}"
+            account_name = "production"
+            role_arn = "{read_only_role}"
+
+            [[rules.allowed_accounts]]
+            account_id = "{account_b}"
+            account_name = "sandbox"
+            role_arn = "{break_glass_role}"
+
+            [[memberships]]
+            user_id = "ops@example.com"
+            group = "ops"
+            "#
+        ))
+        .unwrap();
+
+        let imported = Catalog::from_runtime_store(store).unwrap();
+
+        assert_eq!(imported.packages.len(), 2);
+        assert_eq!(imported.bindings.len(), 2);
+        assert!(imported
+            .roles
+            .iter()
+            .any(|role| { role.role_arn == iam_role_template("ReadOnly") }));
+        assert!(imported
+            .roles
+            .iter()
+            .any(|role| { role.role_arn == iam_role_template("BreakGlass") }));
+        let generated = imported.generate_runtime().unwrap();
+        assert_eq!(generated.runtime.rules.len(), 2);
+        assert!(generated.runtime.rules.iter().any(|rule| {
+            rule.group == "ops"
+                && rule.allowed_accounts[0].account_id == account_a
+                && rule.allowed_accounts[0].role_arn == read_only_role
+        }));
+        assert!(generated.runtime.rules.iter().any(|rule| {
+            rule.group == "ops"
+                && rule.allowed_accounts[0].account_id == account_b
+                && rule.allowed_accounts[0].role_arn == break_glass_role
+        }));
+    }
+
+    #[test]
     fn every_feature_flag_has_catalog_mapping() {
         let low_level_fields: BTreeSet<String> = serde_json::to_value(FeatureFlags::default())
             .unwrap()
@@ -2742,6 +3193,30 @@ mod tests {
         grants
             .into_iter()
             .any(|grant| grant.kind == kind && grant.value == value)
+    }
+
+    fn test_account_a() -> String {
+        ["123456", "789012"].concat()
+    }
+
+    fn test_account_b() -> String {
+        ["210987", "654321"].concat()
+    }
+
+    fn iam_role_arn(account_id: &str, role_name: &str) -> String {
+        format!("{}{}:role/{role_name}", iam_arn_prefix(), account_id)
+    }
+
+    fn iam_role_template(role_name: &str) -> String {
+        format!(
+            "{}{}:role/{role_name}",
+            iam_arn_prefix(),
+            ORGANIZATION_ACCOUNT_ID_TOKEN
+        )
+    }
+
+    fn iam_arn_prefix() -> String {
+        ["arn:", "aws:iam::"].concat()
     }
 
     fn write_catalog_text_fixture(name: &str, catalog_text: &str) -> std::path::PathBuf {
