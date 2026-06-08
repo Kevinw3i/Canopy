@@ -861,6 +861,22 @@ textarea {
   font-size: 20px;
 }
 
+.preview-result {
+  display: grid;
+  gap: 5px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.preview-result strong {
+  font-size: 13px;
+}
+
+.preview-result small {
+  line-height: 1.45;
+}
+
 .review-actions {
   display: grid;
   align-content: start;

@@ -109,6 +109,7 @@ fn router(state: UiAppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/session/exchange", post(exchange_session))
         .route("/api/state", get(api_state))
+        .route("/api/preview", post(post_preview))
         .route("/api/draft/bindings", put(put_draft_binding))
         .fallback(not_found)
         .with_state(state)
@@ -175,6 +176,12 @@ struct DraftBindingRequest {
     enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewRequest {
+    group: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ExchangeResponse {
     status: &'static str,
@@ -225,6 +232,7 @@ struct UiIdentityState {
 #[derive(Debug, Serialize)]
 struct UiCapabilities {
     state: bool,
+    preview: bool,
     draft_write: bool,
     validate: bool,
     apply: bool,
@@ -458,6 +466,38 @@ async fn put_draft_binding(
     }
 }
 
+async fn post_preview(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<PreviewRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_preview_request",
+                "preview request must be valid JSON",
+            );
+        }
+    };
+
+    match state.preview_group(request) {
+        Ok(preview) => json_response(StatusCode::OK, &preview),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn not_found() -> impl IntoResponse {
     let mut response = static_response("text/plain; charset=utf-8", "not found\n");
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -564,6 +604,17 @@ impl UiAppState {
         draft.update_binding(request)
     }
 
+    fn preview_group(
+        &self,
+        request: PreviewRequest,
+    ) -> Result<catalog::PreviewOutput, UiMutationError> {
+        let draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.preview_group(request)
+    }
+
     fn sanitized_state(&self) -> UiStateResponse {
         let args = self.args.as_ref();
         let (draft, changes) = self
@@ -595,6 +646,7 @@ impl UiAppState {
             },
             capabilities: UiCapabilities {
                 state: true,
+                preview: draft_write,
                 draft_write,
                 validate: false,
                 apply: false,
@@ -691,6 +743,42 @@ impl DraftState {
                 .is_some_and(|baseline| binding_set(baseline) != binding_set(draft));
         }
         Ok(())
+    }
+
+    fn preview_group(
+        &self,
+        request: PreviewRequest,
+    ) -> Result<catalog::PreviewOutput, UiMutationError> {
+        let group = request.group.trim();
+        if group.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_preview_group",
+                "group is required",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_ref() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        if !known_groups(draft).contains(group) {
+            return Err(UiMutationError::bad_request(
+                "unknown_group",
+                format!("group '{group}' does not exist in the draft"),
+            ));
+        }
+
+        draft.preview_group(group).map_err(|err| {
+            UiMutationError::conflict(
+                "draft_preview_failed",
+                format!("draft preview failed: {err}"),
+            )
+        })
     }
 
     fn summarize(&self) -> (UiDraftResponse, UiPendingChanges) {
@@ -1019,7 +1107,7 @@ fn validate_local_origin(headers: &HeaderMap) -> Result<(), UiRequestError> {
         return Err(UiRequestError {
             status: StatusCode::FORBIDDEN,
             code: "missing_origin",
-            message: "Origin header is required for session exchange",
+            message: "Origin header is required for local UI API requests",
         });
     };
     let origin_host = origin
@@ -1428,6 +1516,56 @@ group = "RD"
     }
 
     #[tokio::test]
+    async fn draft_preview_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("preview-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/preview")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"group":"RD"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_preview_rejects_unknown_group() {
+        let (catalog_path, _content) = write_catalog_fixture("preview-unknown-group");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/preview")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"group":"finance"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "unknown_group");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
     async fn draft_binding_update_adds_pending_high_risk_without_writing_catalog() {
         let (catalog_path, original_content) = write_catalog_fixture("binding-update");
         let state = test_state_with_catalog(catalog_path.clone());
@@ -1460,6 +1598,70 @@ group = "RD"
             .unwrap()
             .iter()
             .any(|binding| binding["group"] == "RD" && binding["package"] == "mcp-database"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_preview_uses_updated_memory_draft_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("preview-memory-draft");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/bindings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","package":"mcp-database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/preview")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"group":"RD"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(preview["command"], "preview");
+        assert_eq!(preview["group"], "RD");
+        assert!(preview["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| {
+                package["package"] == "mcp-database"
+                    && package["high_risk_features"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::Value::String("mcp:database".to_owned()))
+            }));
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_content

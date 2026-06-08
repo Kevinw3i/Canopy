@@ -8,6 +8,7 @@ const state = {
   server: null,
   draft: null,
   changes: null,
+  preview: null,
 };
 
 function setSessionStatus(status, detail) {
@@ -84,6 +85,20 @@ async function updateDraftBinding(group, packageId, enabled) {
   return response.json();
 }
 
+async function loadDraftPreview(group) {
+  const response = await fetch("/api/preview", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ group }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft preview failed");
+  }
+  return response.json();
+}
+
 function applyServerState(payload) {
   state.server = payload;
   state.draft = payload.draft || null;
@@ -96,12 +111,20 @@ function applyServerState(payload) {
   const changes = payload.changes || {};
   const environment = document.querySelector(".env-picker select");
   const applyButton = document.querySelector(".review-actions button[disabled]");
+  const previewButton = document.getElementById("preview-button");
 
   setSessionStatus("Session active", mode);
   if (environment && payload.deployment?.mode) {
     environment.value = payload.deployment.mode === "terraform" ? "production" : "staging";
   }
   renderDraft(draft, changes);
+  if (
+    state.preview &&
+    (state.preview.revision !== draft.revision || state.preview.group !== state.selectedGroup)
+  ) {
+    state.preview = null;
+  }
+  renderPreviewSummary(state.preview);
   if (!draft.loaded) {
     setValidationStatus(
       "Draft unavailable",
@@ -133,6 +156,9 @@ function applyServerState(payload) {
   }
   if (applyButton) {
     applyButton.textContent = payload.capabilities?.apply ? "▢ Apply" : "▢ Apply (locked)";
+  }
+  if (previewButton) {
+    previewButton.disabled = !payload.capabilities?.preview;
   }
 }
 
@@ -345,6 +371,47 @@ function renderChanges(changes) {
   pendingBody.replaceChildren(...(rows.length ? rows : [emptyChangeRow()]));
 }
 
+function renderPreviewSummary(preview) {
+  const result = document.getElementById("preview-result");
+  if (!result) {
+    return;
+  }
+  if (!preview) {
+    result.replaceChildren(
+      el("strong", "", "Preview not refreshed"),
+      el("small", "", "Select a group and run Preview"),
+    );
+    return;
+  }
+  const packages = preview.packages || [];
+  const highRisk = packages.reduce(
+    (count, pkg) => count + (pkg.high_risk_features?.length || 0),
+    0,
+  );
+  const accountRoles = new Set(
+    packages.flatMap((pkg) =>
+      (pkg.accounts || []).map(
+        (account) => `${account.account_id || ""}|${account.account_name || ""}|${account.role_arn || ""}`,
+      ),
+    ),
+  ).size;
+  const databaseScopes = new Set(
+    packages.flatMap((pkg) => pkg.database_scopes || []),
+  ).size;
+  const mcpEc2Scopes = new Set(
+    packages.flatMap((pkg) => pkg.mcp_ec2_diagnostic_scopes || []),
+  ).size;
+  result.replaceChildren(
+    el("strong", "", `${preview.group}: ${packages.length} package(s)`),
+    el(
+      "small",
+      "",
+      `${accountRoles} account role(s), ${databaseScopes} DB scope(s), ${mcpEc2Scopes} MCP EC2 scope(s)`,
+    ),
+    el("small", "", `${highRisk} high-risk feature(s)`),
+  );
+}
+
 function changeRow(type, change) {
   const row = document.createElement("tr");
   [type, change.group, change.package, type === "Add" ? "New binding" : "Removed binding", change.features.join(", ") || "package binding"].forEach((value, index) => {
@@ -391,6 +458,10 @@ function selectGroup(row) {
   document.getElementById("selected-group").textContent = state.selectedGroup;
   document.querySelector(".tabs button:nth-child(3)").textContent = `Members (${state.selectedMembers})`;
   document.getElementById("selected-count").textContent = "1";
+  if (state.preview?.group !== state.selectedGroup) {
+    state.preview = null;
+    renderPreviewSummary(null);
+  }
   if (state.draft?.loaded) {
     renderInspector(
       state.draft.groups || [],
@@ -485,8 +556,33 @@ document.getElementById("validate-button")?.addEventListener("click", () => {
   document.getElementById("validation-detail").textContent = `Last validated: ${state.validatedAt}`;
 });
 
-document.getElementById("preview-button")?.addEventListener("click", () => {
-  document.getElementById("session-detail").textContent = "preview refreshed";
+document.getElementById("preview-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const group = state.selectedGroup;
+  if (!group || !state.server?.capabilities?.preview) {
+    setValidationStatus("Preview unavailable", "catalog draft is not loaded", false);
+    return;
+  }
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = "◉ Previewing";
+  try {
+    const preview = await loadDraftPreview(group);
+    preview.revision = state.draft?.revision ?? 0;
+    state.preview = preview;
+    renderPreviewSummary(preview);
+    setValidationStatus(
+      "Preview refreshed",
+      `${preview.packages?.length || 0} package(s) for ${preview.group}`,
+      true,
+    );
+    setSessionStatus("Session active", "preview refreshed");
+  } catch (error) {
+    setValidationStatus("Preview failed", error.message, false);
+  } finally {
+    button.disabled = !state.server?.capabilities?.preview;
+    button.textContent = originalLabel;
+  }
 });
 
 initializeSession();
