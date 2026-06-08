@@ -9,9 +9,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 entitlements = { path = "../../crates/entitlements" }
 serde.workspace = true
 serde_json.workspace = true
 shared = { path = "../../crates/shared" }
+tokio.workspace = true
 toml = "0.8"
+
+[dev-dependencies]
+base64.workspace = true
+sha2.workspace = true
+tower.workspace = true

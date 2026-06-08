@@ -246,7 +246,7 @@ fn help_lists_catalog_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     for command in [
-        "generate", "validate", "preview", "diff", "explain", "dry-run",
+        "generate", "validate", "preview", "diff", "explain", "dry-run", "ui",
     ] {
         assert!(
             stdout.contains(command),

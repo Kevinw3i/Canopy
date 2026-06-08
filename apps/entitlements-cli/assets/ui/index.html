@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Canopy Entitlement Catalog</title>
+    <script>(()=>{const h=location.hash.startsWith("#")?location.hash.slice(1):"";const p=new URLSearchParams(h);window.__CANOPY_BOOTSTRAP_CODE__=p.get("code");if(location.hash){history.replaceState(null,"",location.pathname+location.search);}})();</script>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <strong>CANOPY</strong>
+            <small>Operations Console</small>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <a href="#" class="nav-item"><span class="ico">⚡</span>Overview</a>
+          <a href="#" class="nav-item active"><span class="ico">◎</span>Groups</a>
+          <a href="#" class="nav-item"><span class="ico">□</span>Packages</a>
+          <a href="#" class="nav-item"><span class="ico">⌖</span>Scopes</a>
+          <a href="#" class="nav-item"><span class="ico">♙</span>Accounts/Roles</a>
+          <a href="#" class="nav-item"><span class="ico">▤</span>DB Connections</a>
+          <a href="#" class="nav-item"><span class="ico">✓</span>Review &amp; Apply</a>
+        </nav>
+
+        <div class="sidebar-foot">
+          <a href="#" class="nav-item subtle"><span class="ico">?</span>Help</a>
+          <a href="#" class="nav-item subtle"><span class="ico">⚙</span>Settings</a>
+          <button class="operator-button" type="button">
+            <span class="avatar">OP</span>
+            <span>operator</span>
+            <span class="chevron">⌄</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="title-row">
+            <h1>Groups</h1>
+            <span>Entitlement Catalog</span>
+          </div>
+          <div class="topbar-actions">
+            <label class="env-picker">
+              <span>Environment</span>
+              <select aria-label="Environment">
+                <option>production</option>
+                <option>staging</option>
+              </select>
+            </label>
+            <div class="save-state">
+              <span class="state-dot">✓</span>
+              <div>
+                <strong>All changes saved</strong>
+                <small>just now</small>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section class="toolbar" aria-label="View controls">
+          <label class="view-select">
+            <span>View</span>
+            <select aria-label="View">
+              <option>Group-to-Package Matrix</option>
+            </select>
+          </label>
+          <div class="segmented" role="tablist" aria-label="Filter">
+            <button class="active" type="button" data-filter="all">All</button>
+            <button type="button" data-filter="risk">High Risk</button>
+            <button type="button" data-filter="database">Database</button>
+          </div>
+          <label class="search">
+            <span aria-hidden="true">⌕</span>
+            <input type="search" placeholder="Search groups or packages" aria-label="Search groups or packages" />
+          </label>
+          <button class="icon-button" type="button" aria-label="Add binding">+</button>
+          <button class="icon-button" type="button" aria-label="Delete binding">⌫</button>
+        </section>
+
+        <section class="content-grid">
+          <section class="matrix-panel" aria-label="Group package matrix">
+            <table class="matrix">
+              <thead>
+                <tr>
+                  <th>
+                    <strong>Groups</strong>
+                    <small>7 total</small>
+                  </th>
+                  <th data-package="mcp:database">
+                    <strong>mcp:database</strong>
+                    <small>Database Access <span class="risk">△</span></small>
+                  </th>
+                  <th data-package="mcp:ec2">
+                    <strong>mcp:ec2</strong>
+                    <small>EC2 Access <span class="ok">●</span></small>
+                  </th>
+                  <th data-package="ecs:exec">
+                    <strong>ecs:exec</strong>
+                    <small>ECS Exec <span class="risk">△</span></small>
+                  </th>
+                  <th data-package="analytics">
+                    <strong>analytics</strong>
+                    <small>Analytics Tools</small>
+                  </th>
+                  <th aria-label="Open row"></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr class="selected" data-group="RD" data-members="12">
+                  <th><span class="person">♙</span><strong>RD</strong><small>12 members</small></th>
+                  <td><button class="check bound" data-risk="true" aria-label="RD mcp database bound">✓</button></td>
+                  <td><button class="check" aria-label="RD mcp ec2 not bound"></button></td>
+                  <td><button class="check" aria-label="RD ecs exec not bound"></button></td>
+                  <td><button class="check bound" aria-label="RD analytics bound">✓</button></td>
+                  <td><button class="row-open" aria-label="Open RD">›</button></td>
+                </tr>
+                <tr data-group="admin" data-members="5">
+                  <th><span class="person">♙</span><strong>admin</strong><small>5 members</small></th>
+                  <td><button class="check bound" data-risk="true">✓</button></td>
+                  <td><button class="check bound">✓</button></td>
+                  <td><button class="check bound" data-risk="true">✓</button></td>
+                  <td><button class="check bound">✓</button></td>
+                  <td><button class="row-open">›</button></td>
+                </tr>
+                <tr data-group="data-engineers" data-members="18">
+                  <th><span class="person">♙</span><strong>data-engineers</strong><small>18 members</small></th>
+                  <td><button class="check bound" data-risk="true">✓</button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check bound">✓</button></td>
+                  <td><button class="row-open">›</button></td>
+                </tr>
+                <tr data-group="analytics" data-members="20">
+                  <th><span class="person">♙</span><strong>analytics</strong><small>20 members</small></th>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check bound">✓</button></td>
+                  <td><button class="row-open">›</button></td>
+                </tr>
+                <tr data-group="dev-ops" data-members="9">
+                  <th><span class="person">♙</span><strong>dev-ops</strong><small>9 members</small></th>
+                  <td><button class="check"></button></td>
+                  <td><button class="check bound">✓</button></td>
+                  <td><button class="check bound" data-risk="true">✓</button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="row-open">›</button></td>
+                </tr>
+                <tr data-group="read-only" data-members="15">
+                  <th><span class="person">♙</span><strong>read-only</strong><small>15 members</small></th>
+                  <td><button class="check bound">✓</button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="row-open">›</button></td>
+                </tr>
+                <tr data-group="service-accounts" data-members="8">
+                  <th><span class="person">♙</span><strong>service-accounts</strong><small>8 members</small></th>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="check"></button></td>
+                  <td><button class="row-open">›</button></td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div class="legend">
+              <span><i class="legend-bound"></i>Bound</span>
+              <span><i></i>Not bound</span>
+              <span><i class="legend-risk"></i>High risk</span>
+              <span><i class="legend-block"></i>Blocking</span>
+              <strong><span id="selected-count">1</span> row selected</strong>
+            </div>
+          </section>
+
+          <aside class="inspector" aria-label="Selected group inspector">
+            <div class="inspector-title">
+              <div>
+                <h2 id="selected-group">RD</h2>
+                <span class="badge-ok">Valid</span>
+              </div>
+              <div class="icon-row">
+                <button class="ghost-icon" type="button" aria-label="Duplicate binding">□</button>
+                <button class="ghost-icon" type="button" aria-label="Remove binding">⌫</button>
+                <button class="ghost-icon" type="button" aria-label="Close inspector">×</button>
+              </div>
+            </div>
+
+            <div class="tabs" role="tablist">
+              <button class="active" type="button">Details</button>
+              <button type="button">Permissions (3)</button>
+              <button type="button">Members (12)</button>
+              <button type="button">History</button>
+            </div>
+
+            <form class="detail-form">
+              <label>
+                <span>Package</span>
+                <select>
+                  <option>mcp:database (Database Access)</option>
+                  <option>mcp:ec2 (EC2 Access)</option>
+                  <option>ecs:exec (ECS Exec)</option>
+                </select>
+                <em>High Risk</em>
+              </label>
+              <label class="switch-row">
+                <span>Binding</span>
+                <button class="switch on" type="button" aria-pressed="true"><i></i></button>
+                <strong>Enabled</strong>
+              </label>
+              <fieldset>
+                <legend>Scope &amp; Access</legend>
+                <label><span>Scope</span><input value="production" /></label>
+                <label><span>Connection</span><input value="analytics" /></label>
+                <label><span>Schema</span><input value="mart" /></label>
+                <label><span>Table</span><input value="orders" /></label>
+                <label class="actions-line">
+                  <span>Action</span>
+                  <div class="action-options">
+                    <label><input type="checkbox" checked /> Select</label>
+                    <label><input type="checkbox" /> Insert</label>
+                    <label><input type="checkbox" /> Update</label>
+                    <label><input type="checkbox" /> Delete</label>
+                    <label><input type="checkbox" /> DDL</label>
+                  </div>
+                </label>
+                <label><span>Row Filter</span><textarea placeholder="e.g., region = 'ap'"></textarea></label>
+              </fieldset>
+              <div class="risk-list">
+                <h3>Risk Indicators <span>2</span></h3>
+                <p>△ Access to production scope</p>
+                <p>△ Direct table access to mart.orders</p>
+              </div>
+            </form>
+          </aside>
+        </section>
+
+        <footer class="review-strip">
+          <section class="summary-block">
+            <h3>Changes Summary</h3>
+            <div class="summary-grid">
+              <strong>1<small>Groups changed</small></strong>
+              <strong>1<small>Bindings added</small></strong>
+              <strong>0<small>Bindings removed</small></strong>
+              <strong>0<small>Permissions changed</small></strong>
+            </div>
+          </section>
+          <section class="pending-block">
+            <h3>Pending Changes (1)</h3>
+            <table>
+              <thead><tr><th>Type</th><th>Group</th><th>Package</th><th>Change</th><th>Details</th></tr></thead>
+              <tbody><tr><td class="add">Add</td><td>RD</td><td>mcp:database</td><td>New binding</td><td>production / analytics / mart.orders / SELECT</td></tr></tbody>
+            </table>
+          </section>
+          <section class="validation-block">
+            <h3>Validation Status</h3>
+            <strong class="valid-line">✓ Valid</strong>
+            <small>No blocking issues</small>
+            <span>Last validated: just now</span>
+          </section>
+          <section class="review-actions">
+            <button type="button" id="validate-button">✓ Validate</button>
+            <button type="button" id="preview-button">◉ Preview</button>
+            <button type="button" class="disabled" disabled>▢ Apply (0)</button>
+          </section>
+        </footer>
+      </main>
+    </div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

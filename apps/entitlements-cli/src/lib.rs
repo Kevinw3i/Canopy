@@ -5,6 +5,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 pub mod catalog;
+pub mod ui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +33,8 @@ pub enum Command {
     Explain(ExplainArgs),
     /// Statically simulate one scoped operation.
     DryRun(DryRunArgs),
+    /// Serve the local entitlement catalog Web UI.
+    Ui(UiCommandArgs),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, ValueEnum)]
@@ -219,6 +222,77 @@ pub struct DryRunArgs {
 
     #[command(flatten)]
     pub output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct UiCommandArgs {
+    /// High-level catalog source file.
+    #[arg(long, value_name = "PATH", default_value = "entitlements.catalog.toml")]
+    pub catalog: PathBuf,
+
+    /// Generated low-level runtime entitlement file.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "entitlements.generated.toml"
+    )]
+    pub runtime: PathBuf,
+
+    /// Existing runtime entitlement file to import into a draft.
+    #[arg(long = "import-runtime", value_name = "PATH")]
+    pub import_runtime: Option<PathBuf>,
+
+    /// Deployment source mode for future validate/apply checks.
+    #[arg(long = "deployment-mode")]
+    pub deployment_mode: Option<String>,
+
+    /// Terraform tfvars file for future deployment consistency checks.
+    #[arg(long, value_name = "PATH")]
+    pub tfvars: Option<PathBuf>,
+
+    /// Canonical deployment config for future deployment consistency checks.
+    #[arg(long = "deployment-config", value_name = "PATH")]
+    pub deployment_config: Option<PathBuf>,
+
+    /// Local database connection snippet used by the UI draft workflow.
+    #[arg(long = "db-config", value_name = "PATH")]
+    pub db_config: Option<PathBuf>,
+
+    /// Development-only admin group for local preview flows.
+    #[arg(long = "dev-admin-group", default_value = "admin")]
+    pub dev_admin_group: String,
+
+    /// Operator identity source.
+    #[arg(long = "identity-source", default_value = "dev-claims")]
+    pub identity_source: String,
+
+    /// Operator JWT file path. The first full auth slice validates this path.
+    #[arg(long = "operator-jwt", value_name = "PATH")]
+    pub operator_jwt: Option<PathBuf>,
+
+    /// Allow development identity claims for the local static shell.
+    #[arg(long = "allow-dev-identity", default_value_t = false)]
+    pub allow_dev_identity: bool,
+
+    /// Development operator subject.
+    #[arg(long = "dev-operator-sub")]
+    pub dev_operator_sub: Option<String>,
+
+    /// Development operator email.
+    #[arg(long = "dev-operator-email")]
+    pub dev_operator_email: Option<String>,
+
+    /// Mark the development operator email as verified.
+    #[arg(long = "dev-operator-email-verified", default_value_t = false)]
+    pub dev_operator_email_verified: bool,
+
+    /// Development external group claim. Repeat for multiple groups.
+    #[arg(long = "dev-operator-external-group", action = ArgAction::Append)]
+    pub dev_operator_external_groups: Vec<String>,
+
+    /// Local address for the UI server. Must be loopback.
+    #[arg(long, default_value = "127.0.0.1:0")]
+    pub bind: std::net::SocketAddr,
 }
 
 #[derive(Debug, Serialize)]
@@ -489,6 +563,38 @@ where
                 }
             }
         }
+        Command::Ui(args) => {
+            let ui_args = ui::UiArgs {
+                catalog: args.catalog,
+                runtime: args.runtime,
+                import_runtime: args.import_runtime,
+                deployment_mode: args.deployment_mode,
+                tfvars: args.tfvars,
+                deployment_config: args.deployment_config,
+                db_config: args.db_config,
+                dev_admin_group: args.dev_admin_group,
+                identity_source: args.identity_source,
+                operator_jwt: args.operator_jwt,
+                allow_dev_identity: args.allow_dev_identity,
+                dev_operator_sub: args.dev_operator_sub,
+                dev_operator_email: args.dev_operator_email,
+                dev_operator_email_verified: args.dev_operator_email_verified,
+                dev_operator_external_groups: args.dev_operator_external_groups,
+                bind: args.bind,
+            };
+            match ui::run_blocking(ui_args, stdout) {
+                Ok(()) => 0,
+                Err(err) => {
+                    let status = CommandStatus {
+                        status: "error",
+                        command: "ui",
+                        message: format!("{err:#}"),
+                    };
+                    let _ = write_output(OutputFormat::Human, stderr, &status);
+                    1
+                }
+            }
+        }
     }
 }
 
@@ -547,6 +653,57 @@ mod tests {
             args.external_groups,
             vec!["canopy-platform-engineering", "canopy-readonly-ops"]
         );
+    }
+
+    #[test]
+    fn parses_ui_command_shape() {
+        let cli = Cli::try_parse_from([
+            "canopy-entitlements",
+            "ui",
+            "--catalog",
+            "entitlements.catalog.toml",
+            "--runtime",
+            "entitlements.generated.toml",
+            "--import-runtime",
+            "entitlements.toml",
+            "--deployment-mode",
+            "terraform",
+            "--tfvars",
+            "infra/terraform.tfvars",
+            "--deployment-config",
+            "config.toml",
+            "--db-config",
+            "database_connections.local.toml",
+            "--dev-admin-group",
+            "admin",
+            "--identity-source",
+            "dev-claims",
+            "--allow-dev-identity",
+            "--dev-operator-sub",
+            "operator-sub",
+            "--dev-operator-email",
+            "operator@example.com",
+            "--dev-operator-email-verified",
+            "--dev-operator-external-group",
+            "admin",
+            "--bind",
+            "127.0.0.1:0",
+        ])
+        .unwrap();
+
+        let Command::Ui(args) = cli.command else {
+            panic!("expected ui command");
+        };
+        assert_eq!(args.catalog, PathBuf::from("entitlements.catalog.toml"));
+        assert_eq!(args.runtime, PathBuf::from("entitlements.generated.toml"));
+        assert_eq!(
+            args.import_runtime,
+            Some(PathBuf::from("entitlements.toml"))
+        );
+        assert_eq!(args.deployment_mode.as_deref(), Some("terraform"));
+        assert_eq!(args.dev_operator_external_groups, vec!["admin"]);
+        assert!(args.allow_dev_identity);
+        assert!(args.bind.ip().is_loopback());
     }
 
     #[test]
