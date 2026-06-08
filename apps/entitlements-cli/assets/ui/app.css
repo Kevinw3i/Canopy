@@ -47,7 +47,7 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 232px minmax(960px, 1fr);
+  grid-template-columns: 232px minmax(0, 1fr);
   min-height: 100vh;
 }
 
@@ -183,6 +183,7 @@ button {
 .workspace {
   display: grid;
   grid-template-rows: 76px 104px minmax(520px, 1fr) 196px;
+  min-width: 0;
   min-height: 100vh;
   background: var(--bg);
 }
@@ -191,6 +192,8 @@ button {
 .toolbar,
 .content-grid,
 .review-strip {
+  width: 100%;
+  min-width: 0;
   border-bottom: 1px solid var(--line);
 }
 
@@ -373,7 +376,7 @@ button:focus-visible {
 
 .content-grid {
   display: grid;
-  grid-template-columns: minmax(680px, 1fr) 470px;
+  grid-template-columns: minmax(600px, 1fr) minmax(370px, 420px);
   min-height: 0;
   background: var(--panel);
 }
@@ -547,7 +550,8 @@ button:focus-visible {
 }
 
 .inspector {
-  padding: 22px 28px;
+  min-width: 0;
+  padding: 22px 24px;
   overflow: auto;
   background: var(--panel);
 }
@@ -760,13 +764,18 @@ textarea {
 
 .review-strip {
   display: grid;
-  grid-template-columns: 260px minmax(460px, 1fr) 250px 220px;
+  grid-template-columns:
+    minmax(180px, 220px)
+    minmax(320px, 1fr)
+    minmax(180px, 220px)
+    minmax(160px, 190px);
   border-top: 1px solid var(--line);
   background: var(--panel);
 }
 
 .review-strip section {
-  padding: 20px 22px;
+  min-width: 0;
+  padding: 18px 18px;
   border-right: 1px solid var(--line);
 }
 
@@ -804,7 +813,7 @@ textarea {
 }
 
 .pending-block h3 {
-  padding: 0 22px;
+  padding: 0 18px;
 }
 
 .pending-block table {
@@ -815,7 +824,7 @@ textarea {
 
 .pending-block th,
 .pending-block td {
-  padding: 12px 18px;
+  padding: 11px 14px;
   border-top: 1px solid var(--line);
   text-align: left;
 }

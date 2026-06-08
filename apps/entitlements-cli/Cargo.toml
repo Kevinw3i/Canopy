@@ -10,15 +10,18 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 entitlements = { path = "../../crates/entitlements" }
+hex.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 shared = { path = "../../crates/shared" }
+subtle.workspace = true
 tokio.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
-base64.workspace = true
-sha2.workspace = true
 tower.workspace = true

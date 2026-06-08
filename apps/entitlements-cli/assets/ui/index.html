@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Canopy Entitlement Catalog</title>
-    <script>(()=>{const h=location.hash.startsWith("#")?location.hash.slice(1):"";const p=new URLSearchParams(h);window.__CANOPY_BOOTSTRAP_CODE__=p.get("code");if(location.hash){history.replaceState(null,"",location.pathname+location.search);}})();</script>
+    <script>(()=>{const h=location.hash.startsWith("#")?location.hash.slice(1):"";const p=new URLSearchParams(h);window.__CANOPY_BOOTSTRAP_CODE__=p.get("code");if(location.hash){history.replaceState(null,"",location.pathname);}})();</script>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
@@ -58,8 +58,8 @@
             <div class="save-state">
               <span class="state-dot">✓</span>
               <div>
-                <strong>All changes saved</strong>
-                <small>just now</small>
+                <strong id="session-status">Checking session</strong>
+                <small id="session-detail">local auth shell</small>
               </div>
             </div>
           </div>
@@ -124,51 +124,51 @@
                 </tr>
                 <tr data-group="admin" data-members="5">
                   <th><span class="person">♙</span><strong>admin</strong><small>5 members</small></th>
-                  <td><button class="check bound" data-risk="true">✓</button></td>
-                  <td><button class="check bound">✓</button></td>
-                  <td><button class="check bound" data-risk="true">✓</button></td>
-                  <td><button class="check bound">✓</button></td>
-                  <td><button class="row-open">›</button></td>
+                  <td><button class="check bound" data-risk="true" aria-label="admin mcp database bound">✓</button></td>
+                  <td><button class="check bound" aria-label="admin mcp ec2 bound">✓</button></td>
+                  <td><button class="check bound" data-risk="true" aria-label="admin ecs exec bound">✓</button></td>
+                  <td><button class="check bound" aria-label="admin analytics bound">✓</button></td>
+                  <td><button class="row-open" aria-label="Open admin">›</button></td>
                 </tr>
                 <tr data-group="data-engineers" data-members="18">
                   <th><span class="person">♙</span><strong>data-engineers</strong><small>18 members</small></th>
-                  <td><button class="check bound" data-risk="true">✓</button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check bound">✓</button></td>
-                  <td><button class="row-open">›</button></td>
+                  <td><button class="check bound" data-risk="true" aria-label="data engineers mcp database bound">✓</button></td>
+                  <td><button class="check" aria-label="data engineers mcp ec2 not bound"></button></td>
+                  <td><button class="check" aria-label="data engineers ecs exec not bound"></button></td>
+                  <td><button class="check bound" aria-label="data engineers analytics bound">✓</button></td>
+                  <td><button class="row-open" aria-label="Open data-engineers">›</button></td>
                 </tr>
                 <tr data-group="analytics" data-members="20">
                   <th><span class="person">♙</span><strong>analytics</strong><small>20 members</small></th>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check bound">✓</button></td>
-                  <td><button class="row-open">›</button></td>
+                  <td><button class="check" aria-label="analytics mcp database not bound"></button></td>
+                  <td><button class="check" aria-label="analytics mcp ec2 not bound"></button></td>
+                  <td><button class="check" aria-label="analytics ecs exec not bound"></button></td>
+                  <td><button class="check bound" aria-label="analytics analytics bound">✓</button></td>
+                  <td><button class="row-open" aria-label="Open analytics">›</button></td>
                 </tr>
                 <tr data-group="dev-ops" data-members="9">
                   <th><span class="person">♙</span><strong>dev-ops</strong><small>9 members</small></th>
-                  <td><button class="check"></button></td>
-                  <td><button class="check bound">✓</button></td>
-                  <td><button class="check bound" data-risk="true">✓</button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="row-open">›</button></td>
+                  <td><button class="check" aria-label="dev ops mcp database not bound"></button></td>
+                  <td><button class="check bound" aria-label="dev ops mcp ec2 bound">✓</button></td>
+                  <td><button class="check bound" data-risk="true" aria-label="dev ops ecs exec bound">✓</button></td>
+                  <td><button class="check" aria-label="dev ops analytics not bound"></button></td>
+                  <td><button class="row-open" aria-label="Open dev-ops">›</button></td>
                 </tr>
                 <tr data-group="read-only" data-members="15">
                   <th><span class="person">♙</span><strong>read-only</strong><small>15 members</small></th>
-                  <td><button class="check bound">✓</button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="row-open">›</button></td>
+                  <td><button class="check bound" aria-label="read only mcp database bound">✓</button></td>
+                  <td><button class="check" aria-label="read only mcp ec2 not bound"></button></td>
+                  <td><button class="check" aria-label="read only ecs exec not bound"></button></td>
+                  <td><button class="check" aria-label="read only analytics not bound"></button></td>
+                  <td><button class="row-open" aria-label="Open read-only">›</button></td>
                 </tr>
                 <tr data-group="service-accounts" data-members="8">
                   <th><span class="person">♙</span><strong>service-accounts</strong><small>8 members</small></th>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="check"></button></td>
-                  <td><button class="row-open">›</button></td>
+                  <td><button class="check" aria-label="service accounts mcp database not bound"></button></td>
+                  <td><button class="check" aria-label="service accounts mcp ec2 not bound"></button></td>
+                  <td><button class="check" aria-label="service accounts ecs exec not bound"></button></td>
+                  <td><button class="check" aria-label="service accounts analytics not bound"></button></td>
+                  <td><button class="row-open" aria-label="Open service-accounts">›</button></td>
                 </tr>
               </tbody>
             </table>
@@ -264,8 +264,8 @@
           <section class="validation-block">
             <h3>Validation Status</h3>
             <strong class="valid-line">✓ Valid</strong>
-            <small>No blocking issues</small>
-            <span>Last validated: just now</span>
+            <small id="validation-summary">No blocking issues</small>
+            <span id="validation-detail">Last validated: just now</span>
           </section>
           <section class="review-actions">
             <button type="button" id="validate-button">✓ Validate</button>
