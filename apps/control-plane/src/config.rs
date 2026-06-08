@@ -950,9 +950,10 @@ mod tests {
 
     #[test]
     fn mcp_config_debug_redacts_ec2_command_spec_key() {
-        let mut config = McpConfig::default();
-        config.ec2_diagnostic_command_spec_key =
-            Some("test-only-command-spec-key-material-32".into());
+        let config = McpConfig {
+            ec2_diagnostic_command_spec_key: Some("test-only-command-spec-key-material-32".into()),
+            ..Default::default()
+        };
 
         let debug = format!("{config:?}");
         assert!(!debug.contains("test-only-command-spec-key-material-32"));

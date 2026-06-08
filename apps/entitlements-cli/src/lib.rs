@@ -17,6 +17,7 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Generate a low-level runtime entitlement file from a catalog.
@@ -33,17 +34,12 @@ pub enum Command {
     DryRun(DryRunArgs),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
+    #[default]
     Human,
     Json,
-}
-
-impl Default for OutputFormat {
-    fn default() -> Self {
-        Self::Human
-    }
 }
 
 #[derive(Clone, Debug, Args)]
@@ -196,6 +192,30 @@ pub struct DryRunArgs {
     /// Container name for ECS exec dry-runs.
     #[arg(long)]
     pub container: Option<String>,
+
+    /// Database scope name for MCP database dry-runs.
+    #[arg(long)]
+    pub scope: Option<String>,
+
+    /// Database connection name for MCP database dry-runs.
+    #[arg(long)]
+    pub connection: Option<String>,
+
+    /// Database environment for MCP database dry-runs.
+    #[arg(long)]
+    pub environment: Option<String>,
+
+    /// Database schema for MCP database dry-runs.
+    #[arg(long)]
+    pub schema: Option<String>,
+
+    /// Database table for MCP database dry-runs.
+    #[arg(long)]
+    pub table: Option<String>,
+
+    /// Database action for MCP database dry-runs.
+    #[arg(long)]
+    pub action: Option<String>,
 
     #[command(flatten)]
     pub output: OutputArgs,
@@ -443,6 +463,12 @@ where
                 instance_tags: args.instance_tags,
                 task_tags: args.task_tags,
                 container: args.container,
+                scope: args.scope,
+                connection: args.connection,
+                environment: args.environment,
+                schema: args.schema,
+                table: args.table,
+                action: args.action,
             };
             match catalog::dry_run_catalog_file(&args.catalog, request) {
                 Ok(output) => match write_output(format, stdout, &output) {

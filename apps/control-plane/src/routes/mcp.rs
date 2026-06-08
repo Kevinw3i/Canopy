@@ -6389,7 +6389,7 @@ async fn authorize_mcp_ec2_diagnostic_command(
     }
 
     let grants = ent_service
-        .mcp_ec2_diagnostic_scope_grants_for_target(&claims, &req.account_id, &req.region)
+        .mcp_ec2_diagnostic_scope_grants_for_target(claims, &req.account_id, &req.region)
         .await;
     if grants.is_empty() {
         return Err("no_matching_rule_scope");
@@ -6425,7 +6425,7 @@ async fn authorize_mcp_ec2_diagnostic_result_record(
     record: &McpEc2DiagnosticCommandRecord,
 ) -> Result<AuthorizedMcpEc2DiagnosticCommand, &'static str> {
     let matching_grants = ent_service
-        .mcp_ec2_diagnostic_scope_grants_for_target(&claims, &record.account_id, &record.region)
+        .mcp_ec2_diagnostic_scope_grants_for_target(claims, &record.account_id, &record.region)
         .await
         .into_iter()
         .filter(|grant| {

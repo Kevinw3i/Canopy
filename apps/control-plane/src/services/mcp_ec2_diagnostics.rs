@@ -556,6 +556,7 @@ pub fn open_mcp_ec2_diagnostic_command_spec_ref(
     Ok(payload)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open_mcp_ec2_diagnostic_command_spec_ref_for_helper(
     key_material: &str,
     command_spec_ref: &str,
@@ -1793,7 +1794,7 @@ fn contains_sensitive_assignment(lower_line: &str) -> bool {
         while let Some(relative) = lower_line[search_from..].find(key) {
             let start = search_from + relative;
             let after = lower_line[start + key.len()..]
-                .trim_start_matches(|ch| ch == '"' || ch == '\'' || ch == '\\')
+                .trim_start_matches(['"', '\'', '\\'])
                 .trim_start();
             if after.starts_with('=') || after.starts_with(':') {
                 return true;
@@ -3091,11 +3092,12 @@ mod tests {
     }
 
     fn ssm_dispatch_config() -> McpConfig {
-        let mut config = McpConfig::default();
-        config.ec2_diagnostic_ssm_document_name = Some("Canopy-Ec2Diagnostics".into());
-        config.ec2_diagnostic_ssm_document_version = Some("7".into());
-        config.ec2_diagnostic_helper_version = Some(MCP_EC2_COMMAND_SPEC_HELPER_VERSION.into());
-        config
+        McpConfig {
+            ec2_diagnostic_ssm_document_name: Some("Canopy-Ec2Diagnostics".into()),
+            ec2_diagnostic_ssm_document_version: Some("7".into()),
+            ec2_diagnostic_helper_version: Some(MCP_EC2_COMMAND_SPEC_HELPER_VERSION.into()),
+            ..Default::default()
+        }
     }
 
     #[test]

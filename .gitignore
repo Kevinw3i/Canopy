@@ -5,6 +5,10 @@
 config.toml
 *.pem
 *.key
+*.jwt
+*.token
+operator*.jwt
+operator*.token
 audit.dev.jsonl
 
 # 本機設定（含真實 AWS 帳號資訊），只保留 .sample 範本
@@ -13,6 +17,13 @@ config.local-aws.toml
 entitlements.toml
 entitlements.dev.toml
 entitlements.local-aws.toml
+entitlements.catalog.toml
+entitlements.generated.toml
+database_connections.local.toml
+*.bak
+*.bak.*
+*.tmp
+.canopy-entitlements-transaction-*
 docs/TODO.md
 docs/zh-TW/LOCAL_CONTROL_PLANE_DEPLOY.md
 DockerBuildFlow.md

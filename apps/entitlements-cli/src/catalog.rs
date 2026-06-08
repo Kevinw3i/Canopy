@@ -162,14 +162,14 @@ impl GeneratedRuntime {
 }
 
 impl Catalog {
-    pub fn from_str(input: &str) -> anyhow::Result<Self> {
+    pub fn from_toml_str(input: &str) -> anyhow::Result<Self> {
         toml::from_str(input).context("failed to parse entitlement catalog")
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read catalog file '{}'", path.display()))?;
-        Self::from_str(&content)
+        Self::from_toml_str(&content)
     }
 
     pub fn generate_runtime(&self) -> anyhow::Result<GeneratedRuntime> {
@@ -603,8 +603,9 @@ impl Catalog {
                 )?
             }
             "ecs-exec" => dry_run_ecs_exec(&store, &resolved_groups, &request)?,
+            "mcp-database" => dry_run_mcp_database(&store, &resolved_groups, &request)?,
             other => anyhow::bail!(
-                "unsupported dry-run operation '{}'; supported operations: ec2-view, ec2-start, ec2-stop, ec2-reboot, cloudwatch-search, ssm-shell, ecs-exec",
+                "unsupported dry-run operation '{}'; supported operations: ec2-view, ec2-start, ec2-stop, ec2-reboot, cloudwatch-search, ssm-shell, ecs-exec, mcp-database",
                 other
             ),
         };
@@ -863,6 +864,12 @@ pub struct DryRunRequest {
     pub instance_tags: Vec<String>,
     pub task_tags: Vec<String>,
     pub container: Option<String>,
+    pub scope: Option<String>,
+    pub connection: Option<String>,
+    pub environment: Option<String>,
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1178,11 +1185,113 @@ fn dry_run_ecs_exec(
     ))
 }
 
+fn dry_run_mcp_database(
+    store: &EntitlementStore,
+    groups: &[String],
+    request: &DryRunRequest,
+) -> anyhow::Result<DryRunDecision> {
+    let scope_name = required(&request.scope, "--scope")?;
+    let connection = required(&request.connection, "--connection")?;
+    let environment = required(&request.environment, "--environment")?;
+    let schema = canonical_sql_identifier(required(&request.schema, "--schema")?, "--schema")?;
+    let table = canonical_sql_identifier(required(&request.table, "--table")?, "--table")?;
+    let action = required(&request.action, "--action")?;
+    if !action.eq_ignore_ascii_case("select") {
+        return Ok(deny(format!(
+            "mcp:database denied: action '{}' is not supported; only select is supported",
+            action
+        )));
+    }
+    let mut matching_scope_rule_ids = Vec::new();
+    for rule in store.rules.iter().filter(|rule| {
+        groups.contains(&rule.group)
+            && rule.features.can_use_mcp
+            && rule.features.can_use_mcp_database
+    }) {
+        for database_scope in &rule.database_scopes {
+            if database_scope.name == scope_name
+                && database_scope.connection == connection
+                && database_scope.environment == environment
+            {
+                matching_scope_rule_ids.push((rule.id.as_str(), database_scope));
+            }
+        }
+    }
+
+    let Some((rule_id, database_scope)) = matching_scope_rule_ids.first().copied() else {
+        return Ok(deny(
+            "mcp:database denied: no resolved group has one rule matching the requested database scope, connection, and environment",
+        ));
+    };
+
+    if matching_scope_rule_ids
+        .iter()
+        .any(|(_, scope)| *scope != database_scope)
+    {
+        return Ok(deny(
+            "mcp:database denied: multiple matching database scopes disagree for the requested scope, connection, and environment",
+        ));
+    }
+
+    if !database_scope
+        .allowed_actions
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(action))
+    {
+        return Ok(deny(format!(
+            "mcp:database denied: action '{}' is not allowed by database scope '{}'",
+            action, scope_name
+        )));
+    }
+
+    if !database_scope
+        .allowed_tables
+        .iter()
+        .any(|allowed| allowed == table)
+    {
+        return Ok(deny(format!(
+            "mcp:database denied: table '{}' is not allowed by database scope '{}'",
+            table, scope_name
+        )));
+    }
+
+    if database_scope.allowed_schemas.is_empty() {
+        return Ok(deny(format!(
+            "mcp:database denied: database scope '{}' has no explicit allowed_schemas; static dry-run cannot prove default schema access",
+            scope_name
+        )));
+    }
+
+    if !database_scope
+        .allowed_schemas
+        .iter()
+        .any(|allowed| allowed == schema)
+    {
+        return Ok(deny(format!(
+            "mcp:database denied: schema '{}' is not allowed by database scope '{}'",
+            schema, scope_name
+        )));
+    }
+
+    Ok(allow("mcp:database allowed by one matching rule", rule_id))
+}
+
 fn required<'a>(value: &'a Option<String>, name: &str) -> anyhow::Result<&'a str> {
     value
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("{name} is required for this dry-run operation"))
+}
+
+fn canonical_sql_identifier<'a>(value: &'a str, flag: &str) -> anyhow::Result<&'a str> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
+        anyhow::bail!("{flag} must be a lowercase ASCII SQL identifier");
+    }
+    Ok(value)
 }
 
 fn parse_key_values(values: &[String], flag: &str) -> anyhow::Result<HashMap<String, String>> {
@@ -1351,7 +1460,7 @@ mod tests {
 
     #[test]
     fn generate_runtime_compiles_binding_to_one_rule() {
-        let catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         let generated = catalog.generate_runtime().unwrap();
 
         assert_eq!(generated.runtime.rules.len(), 1);
@@ -1373,7 +1482,7 @@ mod tests {
 
     #[test]
     fn catalog_generates_mcp_ec2_diagnostic_scopes_on_same_rule() {
-        let catalog = Catalog::from_str(
+        let catalog = Catalog::from_toml_str(
             r#"
             [[accounts]]
             id = "prod"
@@ -1465,7 +1574,7 @@ mod tests {
 
     #[test]
     fn generated_toml_loads_through_entitlement_core() {
-        let catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         let generated = catalog.generate_runtime().unwrap();
         let store: EntitlementStore = toml::from_str(&generated.toml).unwrap();
 
@@ -1500,7 +1609,7 @@ mod tests {
 
     #[test]
     fn unknown_catalog_feature_fails() {
-        let mut catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let mut catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         catalog.packages[0].features.push("not:a-feature".into());
 
         let err = format!("{:#}", catalog.generate_runtime().unwrap_err());
@@ -1509,7 +1618,7 @@ mod tests {
 
     #[test]
     fn membership_email_field_fails_catalog_parse() {
-        let err = Catalog::from_str(
+        let err = Catalog::from_toml_str(
             r#"
             [[memberships]]
             user_id = "alice"
@@ -1525,7 +1634,7 @@ mod tests {
 
     #[test]
     fn concrete_role_must_match_scope_account() {
-        let mut catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let mut catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         catalog.roles[0].role_arn = "arn:aws:iam::999999999999:role/CanopyRole".into();
 
         let err = format!("{:#}", catalog.generate_runtime().unwrap_err());
@@ -1534,7 +1643,7 @@ mod tests {
 
     #[test]
     fn organization_placeholder_account_preserves_role_template() {
-        let mut catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let mut catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         catalog.accounts[0].account_id = "*".into();
 
         let generated = catalog.generate_runtime().unwrap();
@@ -1551,7 +1660,7 @@ mod tests {
 
     #[test]
     fn preview_group_includes_packages_roles_and_high_risk_features() {
-        let mut catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let mut catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         catalog.packages[0].features.push("ec2:start".into());
 
         let preview = catalog.preview_group("platform-engineering").unwrap();
@@ -1569,8 +1678,8 @@ mod tests {
 
     #[test]
     fn diff_catalogs_reports_added_high_risk_feature() {
-        let old = Catalog::from_str(MINIMAL_CATALOG).unwrap();
-        let mut new = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let old = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
+        let mut new = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
         new.packages[0].features.push("ec2:start".into());
 
         let old_path = write_catalog_fixture("diff-old", &old);
@@ -1609,7 +1718,7 @@ mod tests {
 
     #[test]
     fn explain_resolves_external_groups_and_effective_entitlements() {
-        let catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
 
         let output = catalog
             .explain(ExplainRequest {
@@ -1629,7 +1738,7 @@ mod tests {
 
     #[test]
     fn dry_run_ec2_view_uses_resolved_groups_and_core_scope_check() {
-        let catalog = Catalog::from_str(MINIMAL_CATALOG).unwrap();
+        let catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
 
         let output = catalog
             .dry_run(DryRunRequest {
@@ -1646,6 +1755,12 @@ mod tests {
                 instance_tags: vec![],
                 task_tags: vec![],
                 container: None,
+                scope: None,
+                connection: None,
+                environment: None,
+                schema: None,
+                table: None,
+                action: None,
             })
             .unwrap();
 
@@ -1666,7 +1781,7 @@ mod tests {
         let marker_path = temp_dir.join("script-args.txt");
 
         std::fs::write(&catalog_path, MINIMAL_CATALOG).unwrap();
-        let generated = Catalog::from_str(MINIMAL_CATALOG)
+        let generated = Catalog::from_toml_str(MINIMAL_CATALOG)
             .unwrap()
             .generate_runtime()
             .unwrap();
@@ -1707,7 +1822,7 @@ mod tests {
         let script_path = temp_dir.join("validate-entitlements.sh");
 
         std::fs::write(&catalog_path, MINIMAL_CATALOG).unwrap();
-        let generated = Catalog::from_str(MINIMAL_CATALOG)
+        let generated = Catalog::from_toml_str(MINIMAL_CATALOG)
             .unwrap()
             .generate_runtime()
             .unwrap();
@@ -1742,7 +1857,7 @@ mod tests {
         let script_path = temp_dir.join("validate-entitlements.sh");
 
         std::fs::write(&catalog_path, MINIMAL_CATALOG).unwrap();
-        let generated = Catalog::from_str(MINIMAL_CATALOG)
+        let generated = Catalog::from_toml_str(MINIMAL_CATALOG)
             .unwrap()
             .generate_runtime()
             .unwrap();
