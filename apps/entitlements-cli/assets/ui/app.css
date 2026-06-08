@@ -880,6 +880,11 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.preview-result .mono-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
 .review-actions {
   display: grid;
   align-content: start;

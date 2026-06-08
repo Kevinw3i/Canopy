@@ -512,17 +512,73 @@ function renderValidateSummary(validation) {
   const blocking = validation.blocking_errors || [];
   const warnings = validation.warnings || [];
   const generated = validation.generated || {};
+  const deployment = validation.deployment || {};
+  const dbConnections = validation.database_connections || {};
   const issue = blocking[0] || warnings[0] || null;
   result.replaceChildren(
     el("strong", "", validation.valid ? "Validate clean" : "Validate blocked"),
     el("small", "", `${blocking.length} blocking, ${warnings.length} warning(s)`),
-    el("small", "", `Runtime: ${generated.runtime_path || "not generated"}`),
+    el(
+      "small",
+      "mono-detail",
+      `Runtime: ${generated.runtime_path || "not generated"} (${runtimeStateLabel(generated)})`,
+    ),
+    el("small", "mono-detail", deploymentStateLabel(deployment)),
+    el("small", "", databaseConnectionStateLabel(dbConnections)),
     el(
       "small",
       "",
       issue ? `${issue.code}: ${issue.message}` : "Temp runtime generated and removed",
     ),
   );
+}
+
+function shortSha(value) {
+  if (!value) {
+    return "sha unavailable";
+  }
+  if (value.length <= 20) {
+    return value;
+  }
+  return `${value.slice(0, 12)}...${value.slice(-8)}`;
+}
+
+function runtimeStateLabel(generated) {
+  if (!generated?.runtime_exists) {
+    return "runtime missing";
+  }
+  return generated.runtime_drift ? "runtime drift" : "runtime matches draft";
+}
+
+function deploymentStateLabel(deployment) {
+  if (!deployment?.checked) {
+    return `Deployment: ${deployment?.mode || "not configured"} not checked`;
+  }
+  const mode = deployment.mode || "unknown";
+  const path = deployment.canonical_path || "path unavailable";
+  return `Deployment: ${mode} ${path} (${shortSha(deployment.canonical_sha256)})`;
+}
+
+function listPreview(items) {
+  const values = Array.isArray(items) ? items : [];
+  if (!values.length) {
+    return "none";
+  }
+  if (values.length <= 3) {
+    return values.join(", ");
+  }
+  return `${values.slice(0, 3).join(", ")} +${values.length - 3} more`;
+}
+
+function databaseConnectionStateLabel(connections) {
+  const required = connections.required || [];
+  const local = connections.local_config || [];
+  const deployment = connections.deployment_source || [];
+  return [
+    `DB connections: required ${required.length} (${listPreview(required)})`,
+    `local ${local.length}`,
+    `deployment ${deployment.length}`,
+  ].join(", ");
 }
 
 function renderExplainSummary(explain) {
