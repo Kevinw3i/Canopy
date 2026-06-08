@@ -443,12 +443,12 @@ impl Catalog {
                 ));
             }
             for database_scope in &scope.database_scopes {
-                grants.insert(SemanticGrant::new(
+                insert_database_scope_semantic_grants(
+                    &mut grants,
                     &binding.group,
                     &package.id,
-                    "database_scope",
-                    &database_scope.name,
-                ));
+                    database_scope,
+                );
             }
             for ec2_scope in &scope.mcp_ec2_diagnostic_scopes {
                 grants.insert(SemanticGrant::new(
@@ -708,7 +708,7 @@ pub fn diff_catalog_files(old_path: &Path, new_path: &Path) -> anyhow::Result<Di
     let removed: Vec<_> = old_grants.difference(&new_grants).cloned().collect();
     let high_risk_changes = added
         .iter()
-        .filter(|grant| grant.kind == "feature" && is_high_risk_feature(&grant.value))
+        .filter(|grant| is_high_risk_added_grant(grant, &old_grants))
         .cloned()
         .collect();
 
@@ -994,6 +994,164 @@ fn selector_key(selector: &TagSelector) -> String {
     }
     parts.sort();
     parts.join(",")
+}
+
+fn insert_database_scope_semantic_grants(
+    grants: &mut BTreeSet<SemanticGrant>,
+    group: &str,
+    package: &str,
+    database_scope: &DatabaseScope,
+) {
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope",
+        &database_scope.name,
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_connection",
+        database_scope_grant_value(&database_scope.name, &database_scope.connection),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_environment",
+        database_scope_grant_value(&database_scope.name, &database_scope.environment),
+    ));
+    for schema in &database_scope.allowed_schemas {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "database_scope_allowed_schema",
+            database_scope_grant_value(&database_scope.name, schema),
+        ));
+    }
+    for table in &database_scope.allowed_tables {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "database_scope_allowed_table",
+            database_scope_grant_value(&database_scope.name, table),
+        ));
+    }
+    for action in &database_scope.allowed_actions {
+        grants.insert(SemanticGrant::new(
+            group,
+            package,
+            "database_scope_allowed_action",
+            database_scope_grant_value(&database_scope.name, action),
+        ));
+    }
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_max_rows",
+        database_scope_grant_value(&database_scope.name, database_scope.max_rows),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_statement_timeout_ms",
+        database_scope_grant_value(&database_scope.name, database_scope.statement_timeout_ms),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_require_explain",
+        database_scope_grant_value(&database_scope.name, database_scope.require_explain),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_max_examined_rows",
+        database_scope_grant_value(&database_scope.name, database_scope.max_examined_rows),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_allow_full_table_scan",
+        database_scope_grant_value(&database_scope.name, database_scope.allow_full_table_scan),
+    ));
+    grants.insert(SemanticGrant::new(
+        group,
+        package,
+        "database_scope_allow_views",
+        database_scope_grant_value(&database_scope.name, database_scope.allow_views),
+    ));
+}
+
+fn database_scope_grant_value(scope_name: &str, value: impl std::fmt::Display) -> String {
+    format!("{scope_name}|{value}")
+}
+
+fn is_high_risk_added_grant(grant: &SemanticGrant, old_grants: &BTreeSet<SemanticGrant>) -> bool {
+    match grant.kind.as_str() {
+        "feature" => is_high_risk_feature(&grant.value),
+        "database_scope"
+        | "database_scope_connection"
+        | "database_scope_environment"
+        | "database_scope_allowed_schema"
+        | "database_scope_allowed_table"
+        | "database_scope_allowed_action" => true,
+        "database_scope_max_rows"
+        | "database_scope_statement_timeout_ms"
+        | "database_scope_max_examined_rows" => {
+            database_scope_numeric_field_increased(grant, old_grants)
+        }
+        "database_scope_require_explain" => database_scope_bool_field_equals(grant, false),
+        "database_scope_allow_full_table_scan" | "database_scope_allow_views" => {
+            database_scope_bool_field_equals(grant, true)
+        }
+        _ => false,
+    }
+}
+
+fn database_scope_numeric_field_increased(
+    grant: &SemanticGrant,
+    old_grants: &BTreeSet<SemanticGrant>,
+) -> bool {
+    let Some((_, new_value)) = database_scope_field_parts(&grant.value) else {
+        return true;
+    };
+    let Ok(new_value) = new_value.parse::<u64>() else {
+        return true;
+    };
+    let Some(old_value) = old_database_scope_field_value(grant, old_grants) else {
+        return true;
+    };
+
+    old_value
+        .parse::<u64>()
+        .map_or(true, |old_value| new_value > old_value)
+}
+
+fn database_scope_bool_field_equals(grant: &SemanticGrant, expected: bool) -> bool {
+    database_scope_field_parts(&grant.value)
+        .and_then(|(_, value)| value.parse::<bool>().ok())
+        .is_some_and(|value| value == expected)
+}
+
+fn old_database_scope_field_value<'a>(
+    grant: &SemanticGrant,
+    old_grants: &'a BTreeSet<SemanticGrant>,
+) -> Option<&'a str> {
+    let (scope_name, _) = database_scope_field_parts(&grant.value)?;
+    old_grants.iter().find_map(|old_grant| {
+        if old_grant.group != grant.group
+            || old_grant.package != grant.package
+            || old_grant.kind != grant.kind
+        {
+            return None;
+        }
+        let (old_scope_name, old_value) = database_scope_field_parts(&old_grant.value)?;
+        (old_scope_name == scope_name).then_some(old_value)
+    })
+}
+
+fn database_scope_field_parts(value: &str) -> Option<(&str, &str)> {
+    value.split_once('|')
 }
 
 struct DryRunDecision {
@@ -1458,6 +1616,44 @@ mod tests {
         group = "platform-engineering"
     "#;
 
+    const DATABASE_CATALOG: &str = r#"
+        [[roles]]
+        id = "direct"
+        role_arn = "direct"
+
+        [[scopes]]
+        id = "database"
+        regions = ["ap-northeast-1"]
+
+        [[scopes.database_scopes]]
+        name = "orders_read"
+        connection = "orders"
+        environment = "production"
+        allowed_schemas = ["mart"]
+        allowed_tables = ["orders"]
+        allowed_actions = ["select"]
+        max_rows = 100
+        statement_timeout_ms = 5000
+        require_explain = true
+        max_examined_rows = 10000
+        allow_full_table_scan = false
+        allow_views = false
+
+        [[packages]]
+        id = "mcp-database"
+        features = ["mcp:use", "mcp:database"]
+        scope = "database"
+        role = "direct"
+
+        [[bindings]]
+        group = "rd"
+        package = "mcp-database"
+
+        [[memberships]]
+        user_id = "rd@example.com"
+        group = "rd"
+    "#;
+
     #[test]
     fn generate_runtime_compiles_binding_to_one_rule() {
         let catalog = Catalog::from_toml_str(MINIMAL_CATALOG).unwrap();
@@ -1699,6 +1895,108 @@ mod tests {
     }
 
     #[test]
+    fn semantic_grants_include_database_scope_fields() {
+        let catalog = Catalog::from_toml_str(DATABASE_CATALOG).unwrap();
+
+        let grants = catalog.semantic_grants().unwrap();
+
+        for (kind, value) in [
+            ("database_scope", "orders_read"),
+            ("database_scope_connection", "orders_read|orders"),
+            ("database_scope_environment", "orders_read|production"),
+            ("database_scope_allowed_schema", "orders_read|mart"),
+            ("database_scope_allowed_table", "orders_read|orders"),
+            ("database_scope_allowed_action", "orders_read|select"),
+            ("database_scope_max_rows", "orders_read|100"),
+            ("database_scope_statement_timeout_ms", "orders_read|5000"),
+            ("database_scope_require_explain", "orders_read|true"),
+            ("database_scope_max_examined_rows", "orders_read|10000"),
+            ("database_scope_allow_full_table_scan", "orders_read|false"),
+            ("database_scope_allow_views", "orders_read|false"),
+        ] {
+            assert!(
+                has_grant(grants.iter(), kind, value),
+                "missing {kind}={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_catalogs_reports_database_scope_expansion_as_high_risk() {
+        let old_path = write_catalog_text_fixture("diff-db-old", DATABASE_CATALOG);
+        let new_text = DATABASE_CATALOG
+            .replace(
+                r#"allowed_schemas = ["mart"]"#,
+                r#"allowed_schemas = ["mart", "audit"]"#,
+            )
+            .replace(
+                r#"allowed_tables = ["orders"]"#,
+                r#"allowed_tables = ["orders", "payments"]"#,
+            )
+            .replace("max_rows = 100", "max_rows = 500")
+            .replace(
+                "statement_timeout_ms = 5000",
+                "statement_timeout_ms = 10000",
+            )
+            .replace("require_explain = true", "require_explain = false")
+            .replace("max_examined_rows = 10000", "max_examined_rows = 20000")
+            .replace(
+                "allow_full_table_scan = false",
+                "allow_full_table_scan = true",
+            )
+            .replace("allow_views = false", "allow_views = true");
+        let new_path = write_catalog_text_fixture("diff-db-new", &new_text);
+
+        let diff = diff_catalog_files(&old_path, &new_path).unwrap();
+
+        for (kind, value) in [
+            ("database_scope_allowed_schema", "orders_read|audit"),
+            ("database_scope_allowed_table", "orders_read|payments"),
+            ("database_scope_max_rows", "orders_read|500"),
+            ("database_scope_statement_timeout_ms", "orders_read|10000"),
+            ("database_scope_require_explain", "orders_read|false"),
+            ("database_scope_max_examined_rows", "orders_read|20000"),
+            ("database_scope_allow_full_table_scan", "orders_read|true"),
+            ("database_scope_allow_views", "orders_read|true"),
+        ] {
+            assert!(
+                has_grant(diff.added.iter(), kind, value),
+                "missing added {kind}={value}"
+            );
+            assert!(
+                has_grant(diff.high_risk_changes.iter(), kind, value),
+                "missing high-risk {kind}={value}"
+            );
+        }
+
+        let _ = std::fs::remove_file(old_path);
+        let _ = std::fs::remove_file(new_path);
+    }
+
+    #[test]
+    fn diff_catalogs_does_not_mark_tightened_database_row_limit_high_risk() {
+        let old_path = write_catalog_text_fixture("diff-db-tighten-old", DATABASE_CATALOG);
+        let new_text = DATABASE_CATALOG.replace("max_rows = 100", "max_rows = 50");
+        let new_path = write_catalog_text_fixture("diff-db-tighten-new", &new_text);
+
+        let diff = diff_catalog_files(&old_path, &new_path).unwrap();
+
+        assert!(has_grant(
+            diff.added.iter(),
+            "database_scope_max_rows",
+            "orders_read|50"
+        ));
+        assert!(!has_grant(
+            diff.high_risk_changes.iter(),
+            "database_scope_max_rows",
+            "orders_read|50"
+        ));
+
+        let _ = std::fs::remove_file(old_path);
+        let _ = std::fs::remove_file(new_path);
+    }
+
+    #[test]
     fn selector_key_is_deterministic() {
         let selector = TagSelector {
             tags: HashMap::from([
@@ -1902,6 +2200,29 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    fn has_grant<'a>(
+        grants: impl IntoIterator<Item = &'a SemanticGrant>,
+        kind: &str,
+        value: &str,
+    ) -> bool {
+        grants
+            .into_iter()
+            .any(|grant| grant.kind == kind && grant.value == value)
+    }
+
+    fn write_catalog_text_fixture(name: &str, catalog_text: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "canopy-entitlements-{name}-{}-{}.toml",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, catalog_text).unwrap();
+        path
     }
 
     fn write_catalog_fixture(name: &str, catalog: &Catalog) -> std::path::PathBuf {
