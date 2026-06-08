@@ -281,13 +281,21 @@
             </div>
 
             <div class="db-detail-grid">
-              <label><span>Engine</span><input id="db-engine" readonly /></label>
-              <label><span>Host</span><input id="db-host" readonly /></label>
-              <label><span>Port</span><input id="db-port" readonly /></label>
-              <label><span>Database</span><input id="db-name" readonly /></label>
-              <label><span>Secret Ref</span><input id="db-secret-ref" readonly /></label>
-              <label><span>Limits</span><input id="db-limits" readonly /></label>
+              <label><span>Connection</span><input id="db-connection-name" readonly /></label>
+              <label><span>Engine</span><input id="db-engine" autocomplete="off" /></label>
+              <label><span>Host</span><input id="db-host" autocomplete="off" /></label>
+              <label><span>Port</span><input id="db-port" inputmode="numeric" autocomplete="off" /></label>
+              <label><span>Database</span><input id="db-name" autocomplete="off" /></label>
+              <label><span>Secret Ref</span><input id="db-secret-ref" autocomplete="off" /></label>
+              <label><span>Connect</span><input id="db-connect-timeout" inputmode="numeric" autocomplete="off" /></label>
+              <label><span>Statement</span><input id="db-statement-timeout" inputmode="numeric" autocomplete="off" /></label>
+              <label><span>Explain</span><input id="db-explain-timeout" inputmode="numeric" autocomplete="off" /></label>
+              <label><span>Max Conn</span><input id="db-max-connections" inputmode="numeric" autocomplete="off" /></label>
+              <label class="db-check-row"><span>Readonly</span><input id="db-readonly" type="checkbox" checked disabled /></label>
+              <label class="db-check-row"><span>TLS</span><input id="db-require-tls" type="checkbox" checked disabled /></label>
             </div>
+
+            <button class="db-save-button" id="db-save-button" type="button">Save Draft</button>
 
             <div class="db-safety-list" id="db-safety-list">
               <h3>Safety Checks <span>0</span></h3>

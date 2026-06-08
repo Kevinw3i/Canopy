@@ -876,7 +876,7 @@ textarea {
 
 .db-detail-grid {
   display: grid;
-  gap: 12px;
+  gap: 10px;
   margin-top: 24px;
 }
 
@@ -898,6 +898,45 @@ textarea {
   padding: 8px 10px;
   background: var(--panel-soft);
   color: var(--text);
+}
+
+.db-detail-grid input:disabled {
+  cursor: not-allowed;
+  background: #e7eaee;
+  color: #7f8894;
+}
+
+.db-detail-grid input::placeholder {
+  color: #8b96a3;
+}
+
+.db-check-row {
+  grid-template-columns: 94px 20px minmax(0, 1fr) !important;
+}
+
+.db-check-row::after {
+  color: var(--muted);
+  content: "enforced";
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.db-save-button {
+  width: 100%;
+  height: 42px;
+  margin-top: 16px;
+  border: 1px solid var(--green);
+  border-radius: 6px;
+  background: var(--green);
+  color: #fff;
+  font-weight: 760;
+}
+
+.db-save-button:disabled {
+  cursor: not-allowed;
+  border-color: var(--line-strong);
+  background: #dfe4e9;
+  color: #778290;
 }
 
 .db-safety-list {

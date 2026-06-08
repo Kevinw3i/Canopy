@@ -90,6 +90,20 @@ async function updateDraftBinding(group, packageId, enabled) {
   return response.json();
 }
 
+async function updateDatabaseConnection(request) {
+  const response = await fetch("/api/draft/db-connections", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft database connection update failed");
+  }
+  return response.json();
+}
+
 async function loadDraftPreview(group) {
   const response = await fetch("/api/preview", {
     method: "POST",
@@ -315,7 +329,7 @@ function renderDatabaseConnections(connections) {
 
   if (summary) {
     summary.textContent = connections?.configured
-      ? `${local.length} local connection(s), ${missing.length} missing required`
+      ? `${local.length} draft connection(s), ${missing.length} missing required${connections?.dirty ? ", unsaved" : ""}`
       : "No --db-config configured for this UI session";
   }
   if (requiredCount) {
@@ -419,17 +433,36 @@ function renderDbConnectionInspector(connections) {
     (connection) => connection === state.selectedDbConnection,
   );
   const issues = connections?.issues || [];
-  setInputValue("db-engine", selected?.engine || "");
+  const editable = selected || missing;
+  setInputValue("db-connection-name", selected?.name || missing || "");
+  setInputValue("db-engine", selected?.engine || (missing ? "mysql" : ""));
   setInputValue("db-host", selected?.host || "");
-  setInputValue("db-port", selected ? String(selected.port) : "");
-  setInputValue("db-name", selected?.database || missing || "");
-  setInputValue("db-secret-ref", selected ? (selected.secret_ref_configured ? "configured" : "missing") : "");
-  setInputValue(
-    "db-limits",
-    selected
-      ? `${selected.max_connections}c; stmt ${selected.statement_timeout_ms}; ex ${selected.explain_timeout_ms}`
-      : "",
+  setInputValue("db-port", selected ? String(selected.port) : missing ? "3306" : "");
+  setInputValue("db-name", selected?.database || "");
+  setInputValue("db-secret-ref", "");
+  setInputPlaceholder(
+    "db-secret-ref",
+    selected?.secret_ref_configured ? "configured; paste ref" : "required secret ref",
   );
+  setInputValue(
+    "db-connect-timeout",
+    selected ? String(selected.connect_timeout_ms) : missing ? "3000" : "",
+  );
+  setInputValue(
+    "db-statement-timeout",
+    selected ? String(selected.statement_timeout_ms) : missing ? "5000" : "",
+  );
+  setInputValue(
+    "db-explain-timeout",
+    selected ? String(selected.explain_timeout_ms) : missing ? "3000" : "",
+  );
+  setInputValue(
+    "db-max-connections",
+    selected ? String(selected.max_connections) : missing ? "4" : "",
+  );
+  setCheckedValue("db-readonly", true);
+  setCheckedValue("db-require-tls", true);
+  setDbEditorDisabled(!editable);
   const name = document.getElementById("db-selected-name");
   const badge = document.getElementById("db-selected-safety");
   if (name) {
@@ -443,10 +476,44 @@ function renderDbConnectionInspector(connections) {
   renderDbSafetyList(selected, missing, issues);
 }
 
+function setDbEditorDisabled(disabled) {
+  [
+    "db-engine",
+    "db-host",
+    "db-port",
+    "db-name",
+    "db-secret-ref",
+    "db-connect-timeout",
+    "db-statement-timeout",
+    "db-explain-timeout",
+    "db-max-connections",
+    "db-save-button",
+  ].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) {
+      input.disabled = disabled;
+    }
+  });
+}
+
 function setInputValue(id, value) {
   const input = document.getElementById(id);
   if (input) {
     input.value = value;
+  }
+}
+
+function setInputPlaceholder(id, value) {
+  const input = document.getElementById(id);
+  if (input) {
+    input.placeholder = value;
+  }
+}
+
+function setCheckedValue(id, value) {
+  const input = document.getElementById(id);
+  if (input) {
+    input.checked = value;
   }
 }
 
@@ -469,6 +536,30 @@ function renderDbSafetyList(connection, missing, issues) {
     ? relevantIssues.map((issue) => el("p", "", `△ ${issue.code}: ${issue.message}`))
     : [el("p", "", connection ? "Readonly TLS connection metadata is clean" : "No connection selected")];
   list.replaceChildren(title, ...items);
+}
+
+function dbConnectionDraftRequestFromForm() {
+  const name = document.getElementById("db-connection-name")?.value.trim() || "";
+  const secretArn = document.getElementById("db-secret-ref")?.value.trim() || "";
+  const request = {
+    name,
+    engine: document.getElementById("db-engine")?.value.trim() || "",
+    host: document.getElementById("db-host")?.value.trim() || "",
+    port: Number(document.getElementById("db-port")?.value || 0),
+    database: document.getElementById("db-name")?.value.trim() || "",
+    readonly: true,
+    connect_timeout_ms: Number(document.getElementById("db-connect-timeout")?.value || 0),
+    statement_timeout_ms: Number(document.getElementById("db-statement-timeout")?.value || 0),
+    explain_timeout_ms: Number(document.getElementById("db-explain-timeout")?.value || 0),
+    max_connections: Number(document.getElementById("db-max-connections")?.value || 0),
+    require_tls: true,
+    accept_invalid_tls_certs: false,
+    skip_tls_hostname_verification: false,
+  };
+  if (secretArn) {
+    request.secret_arn = secretArn;
+  }
+  return request;
 }
 
 function firstBoundPackage(groupId, bindings) {
@@ -1071,6 +1162,31 @@ document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
     event.preventDefault();
     setActiveView(item.dataset.view || "groups");
   });
+});
+
+document.getElementById("db-save-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const request = dbConnectionDraftRequestFromForm();
+  if (!request.name) {
+    setValidationStatus("DB connection not selected", "select a connection row before saving", false);
+    return;
+  }
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  button.textContent = "Saving";
+  try {
+    const payload = await updateDatabaseConnection(request);
+    applyServerState(payload);
+    state.selectedDbConnection = request.name;
+    renderDatabaseConnections(state.databaseConnections);
+    setActiveView("db-connections");
+    setValidationStatus("DB connection draft saved", `${request.name} is staged in memory`, true);
+  } catch (error) {
+    setValidationStatus("DB connection save failed", error.message, false);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
 });
 
 document.getElementById("validate-button")?.addEventListener("click", async (event) => {

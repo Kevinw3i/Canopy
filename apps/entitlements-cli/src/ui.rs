@@ -116,6 +116,10 @@ fn router(state: UiAppState) -> Router {
         .route("/api/validate", post(post_validate))
         .route("/api/import-runtime", post(post_import_runtime))
         .route("/api/draft/bindings", put(put_draft_binding))
+        .route(
+            "/api/draft/db-connections",
+            put(put_draft_database_connection),
+        )
         .fallback(not_found)
         .with_state(state)
 }
@@ -126,11 +130,13 @@ struct UiAppState {
     bootstrap: Arc<Mutex<BootstrapState>>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     draft: Arc<Mutex<DraftState>>,
+    database_connections: Arc<Mutex<DatabaseConnectionsDraftState>>,
 }
 
 impl UiAppState {
     fn new(args: UiArgs, code: String, expires_at: Instant) -> Self {
         let draft = DraftState::load(&args.catalog);
+        let database_connections = DatabaseConnectionsDraftState::load(args.db_config.as_deref());
         Self {
             args: Arc::new(args),
             bootstrap: Arc::new(Mutex::new(BootstrapState {
@@ -139,6 +145,7 @@ impl UiAppState {
             })),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             draft: Arc::new(Mutex::new(draft)),
+            database_connections: Arc::new(Mutex::new(database_connections)),
         }
     }
 
@@ -168,6 +175,16 @@ struct DraftState {
     revision: u64,
 }
 
+#[derive(Debug)]
+struct DatabaseConnectionsDraftState {
+    source_path: Option<PathBuf>,
+    baseline: BTreeMap<String, DbConnectionMetadata>,
+    draft: BTreeMap<String, DbConnectionMetadata>,
+    load_error: Option<UiValidationIssue>,
+    dirty: bool,
+    revision: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct ExchangeRequest {
     code: String,
@@ -179,6 +196,25 @@ struct DraftBindingRequest {
     group: String,
     package: String,
     enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftDatabaseConnectionRequest {
+    name: String,
+    engine: String,
+    host: String,
+    port: i64,
+    database: String,
+    secret_arn: Option<String>,
+    readonly: bool,
+    connect_timeout_ms: i64,
+    statement_timeout_ms: i64,
+    explain_timeout_ms: i64,
+    max_connections: i64,
+    require_tls: bool,
+    accept_invalid_tls_certs: bool,
+    skip_tls_hostname_verification: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,6 +362,9 @@ struct UiValidateDatabaseConnections {
 #[derive(Debug, Serialize)]
 struct UiDatabaseConnectionsState {
     configured: bool,
+    dirty: bool,
+    revision: u64,
+    source_path: Option<String>,
     required: Vec<String>,
     missing_required: Vec<String>,
     local: Vec<UiDatabaseConnectionSummary>,
@@ -624,6 +663,38 @@ async fn put_draft_binding(
     }
 }
 
+async fn put_draft_database_connection(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftDatabaseConnectionRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_database_connection_request",
+                "draft database connection request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_database_connection(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn post_preview(
     State(state): State<UiAppState>,
     headers: HeaderMap,
@@ -863,6 +934,16 @@ impl UiAppState {
         draft.update_binding(request)
     }
 
+    fn update_database_connection(
+        &self,
+        request: DraftDatabaseConnectionRequest,
+    ) -> Result<(), UiMutationError> {
+        self.database_connections
+            .lock()
+            .expect("database connection draft mutex should not be poisoned")
+            .update_connection(request)
+    }
+
     fn preview_group(
         &self,
         request: PreviewRequest,
@@ -906,7 +987,17 @@ impl UiAppState {
                 .expect("draft mutex should not be poisoned");
             draft.clone_draft()?
         };
-        Ok(validate_draft_catalog(self.args.as_ref(), &draft, revision))
+        let database_connections = self
+            .database_connections
+            .lock()
+            .expect("database connection draft mutex should not be poisoned")
+            .snapshot();
+        Ok(validate_draft_catalog(
+            self.args.as_ref(),
+            &draft,
+            revision,
+            &database_connections,
+        ))
     }
 
     fn import_runtime_draft(&self) -> Result<(), UiMutationError> {
@@ -946,6 +1037,11 @@ impl UiAppState {
             let (draft, changes) = draft.summarize();
             (draft, changes, draft_catalog)
         };
+        let database_connections = self
+            .database_connections
+            .lock()
+            .expect("database connection draft mutex should not be poisoned")
+            .snapshot();
         let draft_write = draft.loaded;
         UiStateResponse {
             status: "ok",
@@ -959,7 +1055,10 @@ impl UiAppState {
                 deployment_config: args.deployment_config.as_deref().map(file_status),
             },
             database_config: args.db_config.as_deref().map(file_status),
-            database_connections: database_connections_state(args, draft_catalog.as_ref()),
+            database_connections: database_connections_state(
+                &database_connections,
+                draft_catalog.as_ref(),
+            ),
             identity: UiIdentityState {
                 source: args.identity_source.clone(),
                 dev_identity_allowed: args.allow_dev_identity,
@@ -1213,6 +1312,215 @@ impl DraftState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DatabaseConnectionsSnapshot {
+    source_path: Option<PathBuf>,
+    draft: BTreeMap<String, DbConnectionMetadata>,
+    load_error: Option<UiValidationIssue>,
+    dirty: bool,
+    revision: u64,
+}
+
+impl DatabaseConnectionsDraftState {
+    fn load(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
+            return Self {
+                source_path: None,
+                baseline: BTreeMap::new(),
+                draft: BTreeMap::new(),
+                load_error: None,
+                dirty: false,
+                revision: 0,
+            };
+        };
+        match load_connection_registry_from_file(path) {
+            Ok(registry) => Self {
+                source_path: Some(path.to_path_buf()),
+                baseline: registry.clone(),
+                draft: registry,
+                load_error: None,
+                dirty: false,
+                revision: 0,
+            },
+            Err(issue) => Self {
+                source_path: Some(path.to_path_buf()),
+                baseline: BTreeMap::new(),
+                draft: BTreeMap::new(),
+                load_error: Some(issue),
+                dirty: false,
+                revision: 0,
+            },
+        }
+    }
+
+    fn snapshot(&self) -> DatabaseConnectionsSnapshot {
+        DatabaseConnectionsSnapshot {
+            source_path: self.source_path.clone(),
+            draft: self.draft.clone(),
+            load_error: self.load_error.clone(),
+            dirty: self.dirty,
+            revision: self.revision,
+        }
+    }
+
+    fn update_connection(
+        &mut self,
+        request: DraftDatabaseConnectionRequest,
+    ) -> Result<(), UiMutationError> {
+        let name = request.name.trim().to_owned();
+        validate_database_connection_name(&name)?;
+        let existing = self.draft.get(&name);
+        let metadata = database_metadata_from_request(&name, existing, request)?;
+        let changed = self.draft.get(&name) != Some(&metadata);
+        self.draft.insert(name, metadata);
+        self.load_error = None;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+            self.dirty = self.baseline != self.draft;
+        }
+        Ok(())
+    }
+}
+
+fn validate_database_connection_name(name: &str) -> Result<(), UiMutationError> {
+    if name.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_database_connection_name",
+            "database connection name is required",
+        ));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(UiMutationError::bad_request(
+            "empty_database_connection_name",
+            "database connection name is required",
+        ));
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_connection_name",
+            "database connection name must start with a lowercase ASCII letter or digit",
+        ));
+    }
+    if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_connection_name",
+            "database connection name may only contain lowercase ASCII letters, digits, '_' or '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn database_metadata_from_request(
+    name: &str,
+    existing: Option<&DbConnectionMetadata>,
+    request: DraftDatabaseConnectionRequest,
+) -> Result<DbConnectionMetadata, UiMutationError> {
+    let engine = required_nonempty_request_string("engine", request.engine)?;
+    if engine != "mysql" {
+        return Err(UiMutationError::bad_request(
+            "unsupported_database_engine",
+            "only mysql database connections are supported",
+        ));
+    }
+    let host = required_nonempty_request_string("host", request.host)?;
+    let database = required_nonempty_request_string("database", request.database)?;
+    if request.port <= 0 || request.port > 65535 {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_connection_port",
+            "database connection port must be between 1 and 65535",
+        ));
+    }
+    validate_positive_limit("connect_timeout_ms", request.connect_timeout_ms)?;
+    validate_positive_limit("statement_timeout_ms", request.statement_timeout_ms)?;
+    validate_positive_limit("explain_timeout_ms", request.explain_timeout_ms)?;
+    validate_positive_limit("max_connections", request.max_connections)?;
+
+    if !request.readonly {
+        return Err(UiMutationError::bad_request(
+            "database_connection_not_readonly",
+            format!("database connection '{name}' must set readonly=true"),
+        ));
+    }
+    if !request.require_tls {
+        return Err(UiMutationError::bad_request(
+            "database_connection_tls_disabled",
+            format!("database connection '{name}' must keep require_tls=true"),
+        ));
+    }
+    if request.accept_invalid_tls_certs {
+        return Err(UiMutationError::bad_request(
+            "database_connection_accepts_invalid_tls",
+            format!("database connection '{name}' must keep accept_invalid_tls_certs=false"),
+        ));
+    }
+    if request.skip_tls_hostname_verification {
+        return Err(UiMutationError::bad_request(
+            "database_connection_skips_tls_hostname",
+            format!("database connection '{name}' must keep skip_tls_hostname_verification=false"),
+        ));
+    }
+
+    let secret_arn = match request.secret_arn {
+        Some(secret_arn) if !secret_arn.trim().is_empty() => secret_arn.trim().to_owned(),
+        Some(_) => {
+            return Err(UiMutationError::bad_request(
+                "database_connection_empty_secret_ref",
+                format!("database connection '{name}' secret_arn must not be empty"),
+            ));
+        }
+        None => existing
+            .map(|metadata| metadata.secret_arn.clone())
+            .filter(|secret_arn| !secret_arn.trim().is_empty())
+            .ok_or_else(|| {
+                UiMutationError::bad_request(
+                    "database_connection_missing_secret_ref",
+                    format!("database connection '{name}' requires a secret_arn reference"),
+                )
+            })?,
+    };
+
+    Ok(DbConnectionMetadata {
+        engine,
+        host,
+        port: request.port,
+        database,
+        secret_arn,
+        readonly: true,
+        connect_timeout_ms: request.connect_timeout_ms,
+        statement_timeout_ms: request.statement_timeout_ms,
+        explain_timeout_ms: request.explain_timeout_ms,
+        max_connections: request.max_connections,
+        require_tls: true,
+        accept_invalid_tls_certs: false,
+        skip_tls_hostname_verification: false,
+    })
+}
+
+fn required_nonempty_request_string(
+    field: &'static str,
+    value: String,
+) -> Result<String, UiMutationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_database_connection_field",
+            format!("database connection {field} is required"),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_positive_limit(field: &'static str, value: i64) -> Result<(), UiMutationError> {
+    if value <= 0 {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_connection_limit",
+            format!("database connection {field} must be greater than zero"),
+        ));
+    }
+    Ok(())
+}
+
 fn file_status(path: &Path) -> UiFileStatus {
     match fs::read(path) {
         Ok(bytes) => UiFileStatus {
@@ -1240,12 +1548,29 @@ fn file_status(path: &Path) -> UiFileStatus {
 }
 
 fn database_connections_state(
-    args: &UiArgs,
+    database_connections: &DatabaseConnectionsSnapshot,
     draft: Option<&Catalog>,
 ) -> UiDatabaseConnectionsState {
     let required_counts = required_database_connection_counts(draft);
     let required = required_counts.keys().cloned().collect::<Vec<_>>();
-    let Some(path) = args.db_config.as_deref() else {
+    let source_path = database_connections
+        .source_path
+        .as_deref()
+        .map(|path| path.display().to_string());
+    if let Some(issue) = database_connections.load_error.clone() {
+        return UiDatabaseConnectionsState {
+            configured: database_connections.source_path.is_some(),
+            dirty: database_connections.dirty,
+            revision: database_connections.revision,
+            source_path,
+            missing_required: required.clone(),
+            required,
+            local: Vec::new(),
+            issues: vec![issue],
+        };
+    }
+
+    if database_connections.source_path.is_none() && database_connections.draft.is_empty() {
         let issues = if required.is_empty() {
             Vec::new()
         } else {
@@ -1257,23 +1582,21 @@ fn database_connections_state(
         };
         return UiDatabaseConnectionsState {
             configured: false,
+            dirty: database_connections.dirty,
+            revision: database_connections.revision,
+            source_path,
             missing_required: required.clone(),
             required,
             local: Vec::new(),
             issues,
         };
-    };
-
-    match load_connection_registry_from_file(path) {
-        Ok(registry) => database_connections_state_from_registry(path, &required_counts, &registry),
-        Err(issue) => UiDatabaseConnectionsState {
-            configured: true,
-            missing_required: required.clone(),
-            required,
-            local: Vec::new(),
-            issues: vec![issue],
-        },
     }
+
+    database_connections_state_from_registry(
+        database_connections,
+        &required_counts,
+        &database_connections.draft,
+    )
 }
 
 fn required_database_connection_counts(draft: Option<&Catalog>) -> BTreeMap<String, usize> {
@@ -1292,11 +1615,18 @@ fn required_database_connection_counts(draft: Option<&Catalog>) -> BTreeMap<Stri
 }
 
 fn database_connections_state_from_registry(
-    path: &Path,
+    database_connections: &DatabaseConnectionsSnapshot,
     required_counts: &BTreeMap<String, usize>,
     registry: &BTreeMap<String, DbConnectionMetadata>,
 ) -> UiDatabaseConnectionsState {
     let required = required_counts.keys().cloned().collect::<Vec<_>>();
+    let source_path = database_connections
+        .source_path
+        .as_deref()
+        .map(|path| path.display().to_string());
+    let issue_path = source_path
+        .clone()
+        .unwrap_or_else(|| "database connection draft".to_owned());
     let missing_required = required
         .iter()
         .filter(|connection| !registry.contains_key(*connection))
@@ -1307,7 +1637,7 @@ fn database_connections_state_from_registry(
         issues.push(validation_issue(
             "missing_database_connection",
             format!("db_config is missing required database connection '{connection}'"),
-            Some(path.display().to_string()),
+            Some(issue_path.clone()),
         ));
     }
     let local = registry
@@ -1315,7 +1645,7 @@ fn database_connections_state_from_registry(
         .map(|(name, metadata)| {
             collect_database_connection_safety_issues(
                 "db_config",
-                path,
+                &issue_path,
                 name,
                 metadata,
                 &mut issues,
@@ -1352,6 +1682,9 @@ fn database_connections_state_from_registry(
         .collect();
     UiDatabaseConnectionsState {
         configured: true,
+        dirty: database_connections.dirty,
+        revision: database_connections.revision,
+        source_path,
         required,
         missing_required,
         local,
@@ -1361,7 +1694,7 @@ fn database_connections_state_from_registry(
 
 fn collect_database_connection_safety_issues(
     source: &str,
-    path: &Path,
+    path: &str,
     name: &str,
     metadata: &DbConnectionMetadata,
     issues: &mut Vec<UiValidationIssue>,
@@ -1370,14 +1703,14 @@ fn collect_database_connection_safety_issues(
         issues.push(validation_issue(
             "database_connection_not_readonly",
             format!("{source} database connection '{name}' must set readonly=true"),
-            Some(path.display().to_string()),
+            Some(path.to_owned()),
         ));
     }
     if !metadata.require_tls {
         issues.push(validation_issue(
             "database_connection_tls_disabled",
             format!("{source} database connection '{name}' must keep require_tls=true"),
-            Some(path.display().to_string()),
+            Some(path.to_owned()),
         ));
     }
     if metadata.accept_invalid_tls_certs {
@@ -1386,7 +1719,7 @@ fn collect_database_connection_safety_issues(
             format!(
                 "{source} database connection '{name}' must keep accept_invalid_tls_certs=false"
             ),
-            Some(path.display().to_string()),
+            Some(path.to_owned()),
         ));
     }
     if metadata.skip_tls_hostname_verification {
@@ -1395,7 +1728,7 @@ fn collect_database_connection_safety_issues(
             format!(
                 "{source} database connection '{name}' must keep skip_tls_hostname_verification=false"
             ),
-            Some(path.display().to_string()),
+            Some(path.to_owned()),
         ));
     }
 }
@@ -1407,7 +1740,12 @@ fn connection_has_blocking_safety_issue(metadata: &DbConnectionMetadata) -> bool
         || metadata.skip_tls_hostname_verification
 }
 
-fn validate_draft_catalog(args: &UiArgs, draft: &Catalog, revision: u64) -> UiValidateOutput {
+fn validate_draft_catalog(
+    args: &UiArgs,
+    draft: &Catalog,
+    revision: u64,
+    database_connections: &DatabaseConnectionsSnapshot,
+) -> UiValidateOutput {
     let mut blocking_errors = Vec::new();
     let mut warnings = Vec::new();
     let mut generated_summary = None;
@@ -1520,21 +1858,22 @@ fn validate_draft_catalog(args: &UiArgs, draft: &Catalog, revision: u64) -> UiVa
                 None,
             ));
         }
-    } else if let Some(path) = args.db_config.as_deref() {
-        match load_connection_registry_from_file(path) {
-            Ok(registry) => {
-                local_config_names = registry.keys().cloned().collect();
-                validate_required_connections(
-                    "db_config",
-                    path,
-                    &required,
-                    &registry,
-                    &mut blocking_errors,
-                );
-                local_registry = registry;
-            }
-            Err(issue) => blocking_errors.push(issue),
-        }
+    } else if let Some(issue) = database_connections.load_error.clone() {
+        blocking_errors.push(issue);
+    } else if database_connections.source_path.is_some() || !database_connections.draft.is_empty() {
+        local_config_names = database_connections.draft.keys().cloned().collect();
+        let local_path = database_connections
+            .source_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("database connection draft"));
+        validate_required_connections(
+            "db_config",
+            &local_path,
+            &required,
+            &database_connections.draft,
+            &mut blocking_errors,
+        );
+        local_registry = database_connections.draft.clone();
     } else {
         blocking_errors.push(validation_issue(
             "missing_db_config",
@@ -2964,6 +3303,220 @@ skip_tls_hostname_verification = true
         assert!(!String::from_utf8(body.to_vec())
             .unwrap()
             .contains(&secret_ref));
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(db_config_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_connection_update_uses_memory_draft_without_writing_config() {
+        let (catalog_path, catalog_content) = write_catalog_fixture("draft-db-update-catalog");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("draft-db-update-runtime", &catalog_content);
+        let db_config_path =
+            write_database_config_fixture_with_database("draft-db-update-local", "orders_archive");
+        let deployment_config_path = write_database_config_fixture("draft-db-update-deploy");
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.catalog = catalog_path.clone();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        let state = UiAppState::for_test(args, "draft-code", Instant::now() + BOOTSTRAP_CODE_TTL);
+        install_session(&state);
+        let existing_secret_ref = ["orders", "-secret", "-ref"].concat();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/db-connections")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "orders",
+                            "engine": "mysql",
+                            "host": "orders.example.internal",
+                            "port": 3306,
+                            "database": "orders",
+                            "readonly": true,
+                            "connect_timeout_ms": 3000,
+                            "statement_timeout_ms": 5000,
+                            "explain_timeout_ms": 3000,
+                            "max_connections": 4,
+                            "require_tls": true,
+                            "accept_invalid_tls_certs": false,
+                            "skip_tls_hostname_verification": false
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state_json["database_connections"]["dirty"], true);
+        assert_eq!(
+            state_json["database_connections"]["local"][0]["database"],
+            "orders"
+        );
+        assert_eq!(
+            state_json["database_connections"]["local"][0]["secret_ref_configured"],
+            true
+        );
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&existing_secret_ref));
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/validate")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let validation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(validation["valid"], true);
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&existing_secret_ref));
+
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_connection_update_adds_missing_required_connection() {
+        let (catalog_path, _content) = write_catalog_fixture("draft-db-add-catalog");
+        let mut args = test_args();
+        args.db_config = None;
+        args.deployment_mode = None;
+        args.deployment_config = None;
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let secret_ref = ["new", "-secret", "-ref"].concat();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/db-connections")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "orders",
+                            "engine": "mysql",
+                            "host": "orders.example.internal",
+                            "port": 3306,
+                            "database": "orders",
+                            "secret_arn": secret_ref,
+                            "readonly": true,
+                            "connect_timeout_ms": 3000,
+                            "statement_timeout_ms": 5000,
+                            "explain_timeout_ms": 3000,
+                            "max_connections": 4,
+                            "require_tls": true,
+                            "accept_invalid_tls_certs": false,
+                            "skip_tls_hostname_verification": false
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state_json["database_connections"]["configured"], true);
+        assert_eq!(state_json["database_connections"]["dirty"], true);
+        assert!(state_json["database_connections"]["missing_required"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state_json["database_connections"]["local"][0]["name"],
+            "orders"
+        );
+        assert_eq!(
+            state_json["database_connections"]["local"][0]["safety"],
+            "required"
+        );
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&["new", "-secret", "-ref"].concat()));
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_connection_update_rejects_unsafe_readwrite_request() {
+        let (catalog_path, _content) = write_catalog_fixture("draft-db-unsafe-catalog");
+        let db_config_path = write_database_config_fixture("draft-db-unsafe-local");
+        let mut args = test_args();
+        args.db_config = Some(db_config_path.clone());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/db-connections")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "orders",
+                            "engine": "mysql",
+                            "host": "orders.example.internal",
+                            "port": 3306,
+                            "database": "orders",
+                            "readonly": false,
+                            "connect_timeout_ms": 3000,
+                            "statement_timeout_ms": 5000,
+                            "explain_timeout_ms": 3000,
+                            "max_connections": 4,
+                            "require_tls": true,
+                            "accept_invalid_tls_certs": false,
+                            "skip_tls_hostname_verification": false
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "database_connection_not_readonly");
         let _ = std::fs::remove_file(catalog_path);
         let _ = std::fs::remove_file(db_config_path);
     }
