@@ -400,6 +400,15 @@ struct UiPendingChanges {
     removed_bindings: Vec<UiBindingChange>,
     high_risk_added: usize,
     high_risk_removed: usize,
+    semantic_diff: UiSemanticDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct UiSemanticDiff {
+    added: Vec<catalog::SemanticGrant>,
+    removed: Vec<catalog::SemanticGrant>,
+    high_risk: Vec<catalog::SemanticGrant>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1853,6 +1862,27 @@ impl UiPendingChanges {
             removed_bindings: Vec::new(),
             high_risk_added: 0,
             high_risk_removed: 0,
+            semantic_diff: UiSemanticDiff::empty(),
+        }
+    }
+}
+
+impl UiSemanticDiff {
+    fn empty() -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+            high_risk: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn error(error: anyhow::Error) -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+            high_risk: Vec::new(),
+            error: Some(format!("{error:#}")),
         }
     }
 }
@@ -2006,11 +2036,25 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
         .iter()
         .filter(|change| change.high_risk)
         .count();
+    let semantic_diff = semantic_diff(baseline, draft);
     UiPendingChanges {
         added_bindings,
         removed_bindings,
         high_risk_added,
         high_risk_removed,
+        semantic_diff,
+    }
+}
+
+fn semantic_diff(baseline: &Catalog, draft: &Catalog) -> UiSemanticDiff {
+    match catalog::diff_catalogs(baseline, draft, "baseline catalog", "draft catalog") {
+        Ok(diff) => UiSemanticDiff {
+            added: diff.added,
+            removed: diff.removed,
+            high_risk: diff.high_risk_changes,
+            error: None,
+        },
+        Err(err) => UiSemanticDiff::error(err),
     }
 }
 
@@ -2511,6 +2555,20 @@ require_tls = true
             state["changes"]["added_bindings"].as_array().unwrap().len(),
             0
         );
+        assert_eq!(
+            state["changes"]["semantic_diff"]["added"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            state["changes"]["semantic_diff"]["high_risk"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         let _ = std::fs::remove_file(catalog_path);
     }
 
@@ -2747,6 +2805,30 @@ require_tls = true
         assert_eq!(state["draft"]["dirty"], true);
         assert_eq!(state["draft"]["revision"], 1);
         assert_eq!(state["changes"]["high_risk_added"], 1);
+        assert!(state["changes"]["semantic_diff"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["group"] == "RD"
+                && grant["package"] == "mcp-database"
+                && grant["kind"] == "feature"
+                && grant["value"] == "mcp:database"));
+        assert!(state["changes"]["semantic_diff"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["group"] == "RD"
+                && grant["package"] == "mcp-database"
+                && grant["kind"] == "database_scope_allowed_table"
+                && grant["value"] == "orders_read|orders"));
+        assert!(state["changes"]["semantic_diff"]["high_risk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["group"] == "RD"
+                && grant["package"] == "mcp-database"
+                && grant["kind"] == "feature"
+                && grant["value"] == "mcp:database"));
         assert!(state["draft"]["bindings"]
             .as_array()
             .unwrap()

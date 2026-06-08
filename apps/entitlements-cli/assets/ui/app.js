@@ -433,18 +433,31 @@ function renderRiskList(pkg, changes) {
 function renderChanges(changes) {
   const added = changes.added_bindings || [];
   const removed = changes.removed_bindings || [];
+  const semantic = changes.semantic_diff || {};
+  const semanticAdded = semantic.added || [];
+  const semanticRemoved = semantic.removed || [];
+  const highRisk = semantic.high_risk || [];
+  const semanticCount = semanticAdded.length + semanticRemoved.length;
+  const highRiskKeys = new Set(highRisk.map(grantKey));
   const summaryItems = document.querySelectorAll(".summary-grid strong");
+  const changedGroups = new Set([
+    ...added.map((change) => change.group),
+    ...removed.map((change) => change.group),
+    ...semanticAdded.map((grant) => grant.group),
+    ...semanticRemoved.map((grant) => grant.group),
+  ]);
   if (summaryItems[0]) {
-    summaryItems[0].firstChild.textContent = String(new Set([...added, ...removed].map((change) => change.group)).size);
+    summaryItems[0].firstChild.textContent = String(changedGroups.size);
   }
   if (summaryItems[1]) summaryItems[1].firstChild.textContent = String(added.length);
   if (summaryItems[2]) summaryItems[2].firstChild.textContent = String(removed.length);
-  if (summaryItems[3]) summaryItems[3].firstChild.textContent = "0";
+  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount);
 
   const pendingTitle = document.querySelector(".pending-block h3");
   const pendingBody = document.querySelector(".pending-block tbody");
   if (pendingTitle) {
-    pendingTitle.textContent = `Pending Changes (${added.length + removed.length})`;
+    const riskLabel = highRisk.length ? `, ${highRisk.length} high risk` : "";
+    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount}${riskLabel})`;
   }
   if (!pendingBody) {
     return;
@@ -452,7 +465,14 @@ function renderChanges(changes) {
   const rows = [
     ...added.map((change) => changeRow("Add", change)),
     ...removed.map((change) => changeRow("Remove", change)),
+    ...semanticAdded.map((grant) =>
+      semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
+    ),
+    ...semanticRemoved.map((grant) => semanticGrantRow("Revoke", grant, false)),
   ];
+  if (semantic.error) {
+    rows.unshift(semanticErrorRow(semantic.error));
+  }
   pendingBody.replaceChildren(...(rows.length ? rows : [emptyChangeRow()]));
 }
 
@@ -662,6 +682,45 @@ function changeRow(type, change) {
     }
     row.append(cell);
   });
+  return row;
+}
+
+function grantKey(grant) {
+  return `${grant.group || ""}|${grant.package || ""}|${grant.kind || ""}|${grant.value || ""}`;
+}
+
+function semanticGrantRow(type, grant, highRisk) {
+  const row = document.createElement("tr");
+  if (highRisk) {
+    row.classList.add("risk-row");
+  }
+  [
+    highRisk ? "High risk" : type,
+    grant.group || "",
+    grant.package || "",
+    grant.kind || "",
+    grant.value || "",
+  ].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 0) {
+      cell.className = highRisk ? "risk" : type === "Grant" ? "add" : "remove";
+    }
+    if (index === 3 || index === 4) {
+      cell.classList.add("grant-detail");
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function semanticErrorRow(error) {
+  const row = document.createElement("tr");
+  row.classList.add("risk-row");
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.textContent = `Semantic diff unavailable: ${error}`;
+  row.append(cell);
   return row;
 }
 

@@ -701,6 +701,20 @@ pub fn preview_catalog_file(catalog_path: &Path, group: &str) -> anyhow::Result<
 pub fn diff_catalog_files(old_path: &Path, new_path: &Path) -> anyhow::Result<DiffOutput> {
     let old = Catalog::load(old_path)?;
     let new = Catalog::load(new_path)?;
+    diff_catalogs(
+        &old,
+        &new,
+        old_path.display().to_string(),
+        new_path.display().to_string(),
+    )
+}
+
+pub fn diff_catalogs(
+    old: &Catalog,
+    new: &Catalog,
+    old_label: impl Into<String>,
+    new_label: impl Into<String>,
+) -> anyhow::Result<DiffOutput> {
     let old_grants = old.semantic_grants()?;
     let new_grants = new.semantic_grants()?;
 
@@ -715,8 +729,8 @@ pub fn diff_catalog_files(old_path: &Path, new_path: &Path) -> anyhow::Result<Di
     Ok(DiffOutput {
         status: "ok",
         command: "diff",
-        old: old_path.display().to_string(),
-        new: new_path.display().to_string(),
+        old: old_label.into(),
+        new: new_label.into(),
         added,
         removed,
         high_risk_changes,

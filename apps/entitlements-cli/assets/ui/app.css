@@ -814,6 +814,7 @@ textarea {
 .pending-block {
   padding-left: 0 !important;
   padding-right: 0 !important;
+  overflow: auto;
 }
 
 .pending-block h3 {
@@ -822,6 +823,7 @@ textarea {
 
 .pending-block table {
   width: 100%;
+  min-width: 820px;
   border-collapse: collapse;
   font-size: 12px;
 }
@@ -831,6 +833,8 @@ textarea {
   padding: 11px 14px;
   border-top: 1px solid var(--line);
   text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
 }
 
 .pending-block th {
@@ -841,6 +845,21 @@ textarea {
 .add {
   color: var(--green);
   font-weight: 750;
+}
+
+.remove {
+  color: var(--red);
+  font-weight: 750;
+}
+
+.risk-row {
+  background: #fffaf0;
+}
+
+.grant-detail {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .validation-block {
