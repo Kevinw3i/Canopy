@@ -434,6 +434,8 @@ struct UiDraftResponse {
     revision: u64,
     dirty: bool,
     groups: Vec<UiGroupSummary>,
+    accounts: Vec<UiAccountSummary>,
+    roles: Vec<UiRoleSummary>,
     packages: Vec<UiPackageSummary>,
     available_features: Vec<UiFeatureSummary>,
     scopes: Vec<UiScopeSummary>,
@@ -449,6 +451,25 @@ struct UiGroupSummary {
     external_mapping_count: usize,
     package_count: usize,
     high_risk_package_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct UiAccountSummary {
+    id: String,
+    account_id: String,
+    name: String,
+    scopes: Vec<String>,
+    packages: Vec<String>,
+    roles: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiRoleSummary {
+    id: String,
+    role_arn: String,
+    mode: &'static str,
+    accounts: Vec<String>,
+    packages: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1456,6 +1477,8 @@ impl DraftState {
                     revision: self.revision,
                     dirty: self.dirty,
                     groups: Vec::new(),
+                    accounts: Vec::new(),
+                    roles: Vec::new(),
                     packages: Vec::new(),
                     available_features: feature_summaries(),
                     scopes: Vec::new(),
@@ -1481,6 +1504,8 @@ impl DraftState {
                 revision: self.revision,
                 dirty: self.dirty,
                 groups,
+                accounts: account_summaries(draft),
+                roles: role_summaries(draft),
                 packages: package_summaries(draft),
                 available_features: feature_summaries(),
                 scopes: scope_summaries(draft),
@@ -2690,6 +2715,115 @@ fn known_groups(catalog: &Catalog) -> BTreeSet<String> {
         .collect()
 }
 
+fn account_summaries(catalog: &Catalog) -> Vec<UiAccountSummary> {
+    let scopes_by_account = catalog.scopes.iter().fold(
+        BTreeMap::<&str, BTreeSet<String>>::new(),
+        |mut accounts, scope| {
+            for account in &scope.accounts {
+                accounts
+                    .entry(account.as_str())
+                    .or_default()
+                    .insert(scope.id.clone());
+            }
+            accounts
+        },
+    );
+    let scope_by_id = catalog
+        .scopes
+        .iter()
+        .map(|scope| (scope.id.as_str(), scope))
+        .collect::<BTreeMap<_, _>>();
+    let mut packages_by_account = BTreeMap::<&str, BTreeSet<String>>::new();
+    let mut roles_by_account = BTreeMap::<&str, BTreeSet<String>>::new();
+    for package in &catalog.packages {
+        let Some(scope) = scope_by_id.get(package.scope.as_str()) else {
+            continue;
+        };
+        for account in &scope.accounts {
+            packages_by_account
+                .entry(account.as_str())
+                .or_default()
+                .insert(package.id.clone());
+            roles_by_account
+                .entry(account.as_str())
+                .or_default()
+                .insert(package.role.clone());
+        }
+    }
+
+    let mut accounts = catalog
+        .accounts
+        .iter()
+        .map(|account| UiAccountSummary {
+            id: account.id.clone(),
+            account_id: account.account_id.clone(),
+            name: account.name.clone(),
+            scopes: map_set_values(&scopes_by_account, account.id.as_str()),
+            packages: map_set_values(&packages_by_account, account.id.as_str()),
+            roles: map_set_values(&roles_by_account, account.id.as_str()),
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_by(|left, right| left.id.cmp(&right.id));
+    accounts
+}
+
+fn role_summaries(catalog: &Catalog) -> Vec<UiRoleSummary> {
+    let scope_by_id = catalog
+        .scopes
+        .iter()
+        .map(|scope| (scope.id.as_str(), scope))
+        .collect::<BTreeMap<_, _>>();
+    let mut accounts_by_role = BTreeMap::<&str, BTreeSet<String>>::new();
+    let mut packages_by_role = BTreeMap::<&str, BTreeSet<String>>::new();
+    for package in &catalog.packages {
+        packages_by_role
+            .entry(package.role.as_str())
+            .or_default()
+            .insert(package.id.clone());
+        let Some(scope) = scope_by_id.get(package.scope.as_str()) else {
+            continue;
+        };
+        for account in &scope.accounts {
+            accounts_by_role
+                .entry(package.role.as_str())
+                .or_default()
+                .insert(account.clone());
+        }
+    }
+
+    let mut roles = catalog
+        .roles
+        .iter()
+        .map(|role| UiRoleSummary {
+            id: role.id.clone(),
+            role_arn: role.role_arn.clone(),
+            mode: role_mode(&role.role_arn),
+            accounts: map_set_values(&accounts_by_role, role.id.as_str()),
+            packages: map_set_values(&packages_by_role, role.id.as_str()),
+        })
+        .collect::<Vec<_>>();
+    roles.sort_by(|left, right| left.id.cmp(&right.id));
+    roles
+}
+
+fn map_set_values(map: &BTreeMap<&str, BTreeSet<String>>, key: &str) -> Vec<String> {
+    map.get(key)
+        .map(|values| values.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn role_mode(role_arn: &str) -> &'static str {
+    if role_arn == "direct" {
+        "direct"
+    } else if role_arn.starts_with("profile:") {
+        "profile"
+    } else if role_arn.contains("{account_id}") {
+        "template"
+    } else {
+        "concrete"
+    }
+}
+
 fn package_summaries(catalog: &Catalog) -> Vec<UiPackageSummary> {
     let scopes_by_id = catalog
         .scopes
@@ -3564,6 +3698,21 @@ skip_tls_hostname_verification = true
         assert!(APP_CSS.contains(".scope-detail-block"));
     }
 
+    #[test]
+    fn embedded_accounts_roles_assets_expose_inspector() {
+        assert!(INDEX_HTML.contains(r#"data-view="accounts-roles""#));
+        assert!(INDEX_HTML.contains(r#"class="accounts-roles-view""#));
+        assert!(INDEX_HTML.contains(r#"id="account-role-detail-list""#));
+
+        assert!(APP_JS.contains("function renderAccountsRoles("));
+        assert!(APP_JS.contains("function renderAccountRoleInspector("));
+        assert!(APP_JS.contains("accountRoleDetailBlock"));
+
+        assert!(APP_CSS.contains(".workspace.account-role-mode"));
+        assert!(APP_CSS.contains(".account-role-table"));
+        assert!(APP_CSS.contains(".account-role-detail-block"));
+    }
+
     #[tokio::test]
     async fn unknown_ui_route_returns_secured_404() {
         let response = router(test_state("missing-route-code"))
@@ -3719,6 +3868,66 @@ skip_tls_hostname_verification = true
                 .len(),
             0
         );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn state_includes_account_role_summaries() {
+        let (catalog_path, _content) = write_catalog_fixture("state-accounts-roles");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let account = state["draft"]["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|account| account["id"] == "prod")
+            .unwrap();
+        assert_eq!(account["account_id"], "111");
+        assert_eq!(account["name"], "production");
+        assert!(account["scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("db-scope".to_owned())));
+        assert!(account["packages"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("mcp-database".to_owned())));
+        assert!(account["roles"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("readonly".to_owned())));
+
+        let role = state["draft"]["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|role| role["id"] == "readonly")
+            .unwrap();
+        assert_eq!(role["mode"], "template");
+        assert_eq!(role["role_arn"], "role/{account_id}/readonly");
+        assert!(role["accounts"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("prod".to_owned())));
+        assert!(role["packages"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("analytics".to_owned())));
         let _ = std::fs::remove_file(catalog_path);
     }
 

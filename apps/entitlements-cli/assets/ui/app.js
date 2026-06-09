@@ -3,6 +3,9 @@ const state = {
   selectedPackage: null,
   selectedMembers: "0",
   selectedScope: null,
+  selectedAccount: null,
+  selectedRole: null,
+  accountRoleSelection: "account",
   selectedDbConnection: null,
   currentView: "groups",
   filter: "all",
@@ -290,6 +293,7 @@ function setActiveView(view) {
   const groupGrid = document.querySelector(".content-grid");
   const packagesView = document.querySelector(".packages-view");
   const scopesView = document.querySelector(".scopes-view");
+  const accountsRolesView = document.querySelector(".accounts-roles-view");
   const dbView = document.querySelector(".db-connections-view");
   const reviewView = document.querySelector(".review-apply-view");
   const toolbar = document.querySelector(".toolbar");
@@ -299,6 +303,7 @@ function setActiveView(view) {
   workspace?.classList.toggle("review-mode", view === "review-apply");
   workspace?.classList.toggle("package-mode", view === "packages");
   workspace?.classList.toggle("scope-mode", view === "scopes");
+  workspace?.classList.toggle("account-role-mode", view === "accounts-roles");
   if (groupGrid) {
     groupGrid.hidden = view !== "groups";
   }
@@ -307,6 +312,9 @@ function setActiveView(view) {
   }
   if (scopesView) {
     scopesView.hidden = view !== "scopes";
+  }
+  if (accountsRolesView) {
+    accountsRolesView.hidden = view !== "accounts-roles";
   }
   if (dbView) {
     dbView.hidden = view !== "db-connections";
@@ -327,6 +335,8 @@ function setActiveView(view) {
             ? "Packages"
             : view === "scopes"
               ? "Scopes"
+              : view === "accounts-roles"
+                ? "Accounts/Roles"
           : "Groups";
   }
   if (subtitle) {
@@ -339,6 +349,8 @@ function setActiveView(view) {
             ? "Feature Toggles"
             : view === "scopes"
               ? "Resource Boundaries"
+              : view === "accounts-roles"
+                ? "Identity Targets"
           : "Entitlement Catalog";
   }
   document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
@@ -351,6 +363,7 @@ function renderDraft(draft, changes) {
     renderChanges(changes || {});
     renderPackages([], []);
     renderScopes([]);
+    renderAccountsRoles([], []);
     return;
   }
   const groups = draft.groups || [];
@@ -367,6 +380,7 @@ function renderDraft(draft, changes) {
   renderChanges(changes || {});
   renderPackages(packages, draft.available_features || []);
   renderScopes(draft.scopes || []);
+  renderAccountsRoles(draft.accounts || [], draft.roles || []);
   applyFilters();
 }
 
@@ -936,6 +950,216 @@ function mcpEc2ScopeLine(scope) {
     `denylist ${scope.denylist_version || "none"}`,
     `unsafe outputs ${scope.unsafe_output_count}`,
   ].join("; ");
+}
+
+function renderAccountsRoles(accounts, roles) {
+  const accountRows = document.getElementById("account-rows");
+  const roleRows = document.getElementById("role-rows");
+  if (!accountRows || !roleRows) {
+    return;
+  }
+  const summary = document.getElementById("account-role-summary");
+  const accountCount = document.getElementById("account-count");
+  const roleCount = document.getElementById("role-count");
+  const accountUsage = document.getElementById("account-usage-summary");
+  const roleUsage = document.getElementById("role-usage-summary");
+  const totalAccountScopes = accounts.reduce((count, account) => count + (account.scopes?.length || 0), 0);
+  const totalRolePackages = roles.reduce((count, role) => count + (role.packages?.length || 0), 0);
+  if (summary) {
+    summary.textContent = `${accounts.length} account(s), ${roles.length} role target(s)`;
+  }
+  if (accountCount) {
+    accountCount.textContent = `${accounts.length} accounts`;
+  }
+  if (roleCount) {
+    roleCount.textContent = `${roles.length} roles`;
+  }
+  if (accountUsage) {
+    accountUsage.textContent = `${totalAccountScopes} scope binding(s)`;
+  }
+  if (roleUsage) {
+    roleUsage.textContent = `${totalRolePackages} package binding(s)`;
+  }
+
+  if (!state.selectedAccount || !accounts.some((account) => account.id === state.selectedAccount)) {
+    state.selectedAccount = accounts[0]?.id || null;
+  }
+  if (!state.selectedRole || !roles.some((role) => role.id === state.selectedRole)) {
+    state.selectedRole = roles[0]?.id || null;
+  }
+  if (state.accountRoleSelection === "role" && !state.selectedRole) {
+    state.accountRoleSelection = "account";
+  }
+  if (state.accountRoleSelection === "account" && !state.selectedAccount && state.selectedRole) {
+    state.accountRoleSelection = "role";
+  }
+
+  accountRows.replaceChildren(
+    ...(accounts.length ? accounts.map(accountRow) : [emptyAccountRoleRow(5, "No accounts to display")]),
+  );
+  roleRows.replaceChildren(
+    ...(roles.length ? roles.map(roleRow) : [emptyAccountRoleRow(5, "No roles to display")]),
+  );
+  renderAccountRoleInspector(accounts, roles);
+}
+
+function accountRow(account) {
+  const row = document.createElement("tr");
+  row.dataset.account = account.id;
+  row.classList.toggle(
+    "selected",
+    state.accountRoleSelection === "account" && account.id === state.selectedAccount,
+  );
+  row.addEventListener("click", () => {
+    state.accountRoleSelection = "account";
+    state.selectedAccount = account.id;
+    renderAccountsRoles(state.draft?.accounts || [], state.draft?.roles || []);
+  });
+  [
+    account.id,
+    account.name,
+    account.account_id,
+    String(account.scopes?.length || 0),
+    String(account.packages?.length || 0),
+  ].forEach((value) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    row.append(cell);
+  });
+  return row;
+}
+
+function roleRow(role) {
+  const row = document.createElement("tr");
+  row.dataset.role = role.id;
+  row.classList.toggle(
+    "selected",
+    state.accountRoleSelection === "role" && role.id === state.selectedRole,
+  );
+  row.addEventListener("click", () => {
+    state.accountRoleSelection = "role";
+    state.selectedRole = role.id;
+    renderAccountsRoles(state.draft?.accounts || [], state.draft?.roles || []);
+  });
+  [
+    role.id,
+    role.mode,
+    listPreview(role.accounts),
+    String(role.packages?.length || 0),
+    role.role_arn,
+  ].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 4) {
+      cell.className = "mono-detail";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function emptyAccountRoleRow(colSpan, message) {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = colSpan;
+  cell.textContent = message;
+  row.append(cell);
+  return row;
+}
+
+function renderAccountRoleInspector(accounts, roles) {
+  const selectedAccount = accounts.find((account) => account.id === state.selectedAccount) || null;
+  const selectedRole = roles.find((role) => role.id === state.selectedRole) || null;
+  const showRole = state.accountRoleSelection === "role" && selectedRole;
+  const title = document.getElementById("account-role-selected-name");
+  const badge = document.getElementById("account-role-selected-mode");
+  const detailList = document.getElementById("account-role-detail-list");
+  if (!detailList) {
+    return;
+  }
+
+  if (showRole) {
+    if (title) {
+      title.textContent = selectedRole.id;
+    }
+    if (badge) {
+      badge.textContent = selectedRole.mode;
+      badge.classList.toggle("badge-risk", selectedRole.mode === "concrete");
+    }
+    setText("#account-role-primary-label", "Role ARN");
+    setText("#account-role-primary-value", selectedRole.role_arn || "-");
+    setText("#account-role-secondary-label", "Mode");
+    setText("#account-role-secondary-value", selectedRole.mode || "-");
+    setText("#account-role-scope-label", "Scopes");
+    setText("#account-role-scope-count", "-");
+    setText("#account-role-package-label", "Packages");
+    setText("#account-role-package-count", String(selectedRole.packages?.length || 0));
+    setText("#account-role-account-label", "Accounts");
+    setText("#account-role-account-count", String(selectedRole.accounts?.length || 0));
+    setText("#account-role-role-label", "Role Type");
+    setText("#account-role-role-count", selectedRole.mode || "-");
+    const blocks = [
+      accountRoleDetailBlock("Role ARN", selectedRole.role_arn ? [selectedRole.role_arn] : []),
+      accountRoleDetailBlock("Applies To Accounts", selectedRole.accounts || []),
+      accountRoleDetailBlock("Packages", selectedRole.packages || []),
+    ];
+    const heading = accountRoleDetailHeading("Role Details", blocks.length);
+    detailList.replaceChildren(heading, ...blocks);
+    return;
+  }
+
+  if (title) {
+    title.textContent = selectedAccount?.id || "Account";
+  }
+  if (badge) {
+    badge.textContent = "Account";
+    badge.classList.remove("badge-risk");
+  }
+  setText("#account-role-primary-label", "Account ID");
+  setText("#account-role-primary-value", selectedAccount?.account_id || "-");
+  setText("#account-role-secondary-label", "Name");
+  setText("#account-role-secondary-value", selectedAccount?.name || "-");
+  setText("#account-role-scope-label", "Scopes");
+  setText("#account-role-scope-count", String(selectedAccount?.scopes?.length || 0));
+  setText("#account-role-package-label", "Packages");
+  setText("#account-role-package-count", String(selectedAccount?.packages?.length || 0));
+  setText("#account-role-account-label", "Roles");
+  setText("#account-role-account-count", String(selectedAccount?.roles?.length || 0));
+  setText("#account-role-role-label", "AWS Account");
+  setText("#account-role-role-count", selectedAccount?.account_id || "-");
+  if (!selectedAccount) {
+    detailList.replaceChildren(accountRoleDetailHeading("Account Details", 0), el("p", "", "No account selected"));
+    return;
+  }
+  const blocks = [
+    accountRoleDetailBlock("Account", [selectedAccount.account_id, selectedAccount.name]),
+    accountRoleDetailBlock("Scopes", selectedAccount.scopes || []),
+    accountRoleDetailBlock("Packages", selectedAccount.packages || []),
+    accountRoleDetailBlock("Roles", selectedAccount.roles || []),
+  ];
+  const heading = accountRoleDetailHeading("Account Details", blocks.length);
+  detailList.replaceChildren(heading, ...blocks);
+}
+
+function accountRoleDetailHeading(title, count) {
+  const heading = document.createElement("h3");
+  heading.append(`${title} `);
+  heading.append(el("span", "", String(count)));
+  return heading;
+}
+
+function accountRoleDetailBlock(title, values) {
+  const block = document.createElement("section");
+  block.className = "account-role-detail-block";
+  block.append(el("h4", "", title));
+  if (!values.length) {
+    block.append(el("p", "", "none"));
+    return block;
+  }
+  values.forEach((value) => {
+    block.append(el("p", "", value));
+  });
+  return block;
 }
 
 function firstBoundPackage(groupId, bindings) {

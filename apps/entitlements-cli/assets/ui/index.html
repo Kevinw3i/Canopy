@@ -25,7 +25,7 @@
           <a href="#" class="nav-item active" data-view="groups"><span class="ico">◎</span>Groups</a>
           <a href="#" class="nav-item" data-view="packages"><span class="ico">□</span>Packages</a>
           <a href="#" class="nav-item" data-view="scopes"><span class="ico">⌖</span>Scopes</a>
-          <a href="#" class="nav-item"><span class="ico">♙</span>Accounts/Roles</a>
+          <a href="#" class="nav-item" data-view="accounts-roles"><span class="ico">♙</span>Accounts/Roles</a>
           <a href="#" class="nav-item" data-view="db-connections"><span class="ico">▤</span>DB Connections</a>
           <a href="#" class="nav-item" data-view="review-apply"><span class="ico">✓</span>Review &amp; Apply</a>
         </nav>
@@ -354,6 +354,86 @@
             <div class="scope-detail-list" id="scope-detail-list">
               <h3>Scope Details <span>0</span></h3>
               <p>No scope selected</p>
+            </div>
+          </aside>
+        </section>
+
+        <section class="accounts-roles-view" aria-label="Accounts and roles" hidden>
+          <section class="account-role-panel">
+            <div class="account-role-panel-head">
+              <div>
+                <h2>Accounts/Roles</h2>
+                <small id="account-role-summary">No account metadata loaded</small>
+              </div>
+              <div class="account-role-status-stack">
+                <strong id="account-count">0 accounts</strong>
+                <small id="role-count">0 roles</small>
+              </div>
+            </div>
+
+            <section class="account-role-section" aria-label="Accounts">
+              <div class="account-role-section-head">
+                <h3>Accounts</h3>
+                <small id="account-usage-summary">0 scope bindings</small>
+              </div>
+              <table class="account-role-table">
+                <thead>
+                  <tr>
+                    <th>Account</th>
+                    <th>Name</th>
+                    <th>AWS Account</th>
+                    <th>Scopes</th>
+                    <th>Packages</th>
+                  </tr>
+                </thead>
+                <tbody id="account-rows">
+                  <tr><td colspan="5">Loading accounts</td></tr>
+                </tbody>
+              </table>
+            </section>
+
+            <section class="account-role-section" aria-label="Roles">
+              <div class="account-role-section-head">
+                <h3>Roles</h3>
+                <small id="role-usage-summary">0 package bindings</small>
+              </div>
+              <table class="account-role-table role-table">
+                <thead>
+                  <tr>
+                    <th>Role</th>
+                    <th>Mode</th>
+                    <th>Applies To</th>
+                    <th>Packages</th>
+                    <th>Role ARN</th>
+                  </tr>
+                </thead>
+                <tbody id="role-rows">
+                  <tr><td colspan="5">Loading roles</td></tr>
+                </tbody>
+              </table>
+            </section>
+          </section>
+
+          <aside class="account-role-inspector" aria-label="Account and role inspector">
+            <div class="inspector-title">
+              <div>
+                <h2 id="account-role-selected-name">Account</h2>
+                <span class="badge-ok" id="account-role-selected-mode">Account</span>
+              </div>
+            </div>
+
+            <div class="account-role-meta-grid">
+              <div><span id="account-role-primary-label">Account ID</span><strong id="account-role-primary-value">-</strong></div>
+              <div><span id="account-role-secondary-label">Name</span><strong id="account-role-secondary-value">-</strong></div>
+              <div><span id="account-role-scope-label">Scopes</span><strong id="account-role-scope-count">0</strong></div>
+              <div><span id="account-role-package-label">Packages</span><strong id="account-role-package-count">0</strong></div>
+              <div><span id="account-role-account-label">Accounts</span><strong id="account-role-account-count">0</strong></div>
+              <div><span id="account-role-role-label">Roles</span><strong id="account-role-role-count">0</strong></div>
+            </div>
+
+            <div class="account-role-detail-list" id="account-role-detail-list">
+              <h3>Account Details <span>0</span></h3>
+              <p>No account selected</p>
             </div>
           </aside>
         </section>

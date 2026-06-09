@@ -200,6 +200,10 @@ button {
   grid-template-rows: 76px minmax(624px, 1fr) 196px;
 }
 
+.workspace.account-role-mode {
+  grid-template-rows: 76px minmax(624px, 1fr) 196px;
+}
+
 .workspace.review-mode {
   grid-template-rows: 76px minmax(680px, 1fr);
 }
@@ -213,6 +217,7 @@ button {
 .content-grid,
 .packages-view,
 .scopes-view,
+.accounts-roles-view,
 .db-connections-view,
 .review-apply-view,
 .review-strip {
@@ -1353,6 +1358,202 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.accounts-roles-view {
+  display: grid;
+  grid-template-columns: minmax(680px, 1fr) minmax(360px, 430px);
+  min-height: 0;
+  background: var(--panel);
+}
+
+.account-role-panel {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+}
+
+.account-role-panel-head,
+.account-role-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.account-role-panel-head {
+  min-height: 84px;
+  padding: 18px 26px;
+  background: #fafcfd;
+}
+
+.account-role-panel-head h2 {
+  font-size: 22px;
+}
+
+.account-role-panel-head small,
+.account-role-status-stack small,
+.account-role-section-head small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+}
+
+.account-role-status-stack {
+  text-align: right;
+}
+
+.account-role-status-stack strong {
+  color: var(--green);
+}
+
+.account-role-section {
+  min-width: 0;
+}
+
+.account-role-section-head {
+  min-height: 48px;
+  padding: 0 26px;
+  background: var(--panel);
+}
+
+.account-role-section-head h3 {
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.account-role-table {
+  width: 100%;
+  min-width: 860px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.role-table {
+  min-width: 940px;
+}
+
+.account-role-table th,
+.account-role-table td {
+  height: 54px;
+  padding: 0 18px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  text-align: left;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.account-role-table th {
+  height: 42px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.account-role-table tr {
+  cursor: pointer;
+}
+
+.account-role-table tr.selected td {
+  background: var(--green-soft);
+}
+
+.account-role-table tr.selected td:first-child {
+  box-shadow: inset 4px 0 0 var(--green);
+}
+
+.account-role-inspector {
+  min-width: 0;
+  padding: 22px 24px;
+  overflow: auto;
+  background: var(--panel);
+}
+
+.account-role-meta-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.account-role-meta-grid div {
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.account-role-meta-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 660;
+}
+
+.account-role-meta-grid strong {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-role-detail-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.account-role-detail-list > h3 {
+  font-size: 14px;
+}
+
+.account-role-detail-list > h3 span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  height: 20px;
+  margin-left: 8px;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 12px;
+}
+
+.account-role-detail-block {
+  display: grid;
+  gap: 6px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.account-role-detail-block:last-child {
+  border-bottom: 0;
+}
+
+.account-role-detail-block h4 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.account-role-detail-block p {
+  color: #394352;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .review-apply-view {
   display: grid;
   grid-template-columns: minmax(640px, 1fr) minmax(340px, 410px);
@@ -1773,6 +1974,7 @@ textarea {
   .content-grid,
   .packages-view,
   .scopes-view,
+  .accounts-roles-view,
   .db-connections-view,
   .review-apply-view,
   .review-strip {
@@ -1796,6 +1998,12 @@ textarea {
   }
 
   .scopes-view {
+    display: block;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  .accounts-roles-view {
     display: block;
     overflow-x: hidden;
     max-width: 100%;
@@ -1853,6 +2061,11 @@ textarea {
     min-width: 0;
   }
 
+  .account-role-panel {
+    width: 100%;
+    min-width: 0;
+  }
+
   .db-connections-panel {
     width: 100%;
     min-width: 0;
@@ -1874,11 +2087,23 @@ textarea {
     min-width: 780px;
   }
 
+  .account-role-table {
+    min-width: 820px;
+  }
+
+  .role-table {
+    min-width: 900px;
+  }
+
   .package-meta-grid {
     grid-template-columns: 1fr;
   }
 
   .scope-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .account-role-meta-grid {
     grid-template-columns: 1fr;
   }
 
