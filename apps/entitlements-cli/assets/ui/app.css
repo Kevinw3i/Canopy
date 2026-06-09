@@ -586,6 +586,25 @@ button:focus-visible {
   margin-top: 6px;
 }
 
+.overview-import-button {
+  width: 100%;
+  min-height: 36px;
+  margin-top: 12px;
+  border: 1px solid #0f7a43;
+  border-radius: 6px;
+  background: var(--green);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.overview-import-button:disabled {
+  border-color: var(--line-strong);
+  background: #e7eaee;
+  color: #8b97a5;
+  cursor: not-allowed;
+}
+
 .overview-actions {
   display: grid;
   gap: 8px;

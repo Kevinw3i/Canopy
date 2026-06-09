@@ -178,6 +178,20 @@ async function validateDraft() {
   return response.json();
 }
 
+async function importRuntimeDraft() {
+  const response = await fetch("/api/import-runtime", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "runtime import failed");
+  }
+  return response.json();
+}
+
 function applyServerState(payload) {
   state.server = payload;
   state.draft = payload.draft || null;
@@ -196,6 +210,7 @@ function applyServerState(payload) {
   const previewButton = document.getElementById("preview-button");
   const explainButton = document.getElementById("explain-button");
   const dryRunButton = document.getElementById("dry-run-button");
+  const importRuntimeButton = document.getElementById("import-runtime-button");
 
   setSessionStatus("Session active", mode);
   if (environment && payload.deployment?.mode) {
@@ -283,6 +298,9 @@ function applyServerState(payload) {
   }
   if (dryRunButton) {
     dryRunButton.disabled = !payload.capabilities?.dry_run;
+  }
+  if (importRuntimeButton) {
+    importRuntimeButton.disabled = !canImportRuntime(payload);
   }
   renderReviewApply();
   renderOverview();
@@ -1547,6 +1565,25 @@ function fileStatusKind(file) {
   return "ok";
 }
 
+function canImportRuntime(server) {
+  const importRuntime = server?.import_runtime;
+  return Boolean(
+    server?.capabilities?.import_runtime &&
+      importRuntime?.exists &&
+      importRuntime?.readable,
+  );
+}
+
+function resetDraftSelection() {
+  state.selectedGroup = null;
+  state.selectedPackage = null;
+  state.selectedMembers = "0";
+  state.selectedScope = null;
+  state.selectedAccount = null;
+  state.selectedRole = null;
+  state.selectedDbConnection = null;
+}
+
 function overviewStatusRow(label, status, detail, kind = "ok") {
   const row = el("div", `overview-status-row ${kind}`);
   row.append(el("span", "", label), el("strong", "", status), el("small", "", detail));
@@ -1589,7 +1626,9 @@ function renderOverview() {
   const deployment = validation?.deployment || server.deployment || {};
   const generated = validation?.generated || {};
   const runtime = server.runtime || {};
+  const importRuntime = server.import_runtime || null;
   const identity = server.identity || {};
+  const importButton = document.getElementById("import-runtime-button");
 
   setText(
     "#overview-summary",
@@ -1628,6 +1667,20 @@ function renderOverview() {
     "#overview-deployment-detail",
     validation ? deploymentStateLabel(deployment) : deployment.mode || "Deployment not checked",
   );
+  setText(
+    "#overview-import-detail",
+    importRuntime ? fileStateLabel(importRuntime) : "Not configured",
+  );
+  setText(
+    "#overview-import-path",
+    importRuntime?.path || "Start with --import-runtime to enable import.",
+  );
+  if (importButton) {
+    importButton.disabled = !canImportRuntime(server);
+    importButton.textContent = canImportRuntime(server)
+      ? "Import Runtime Draft"
+      : "Import Unavailable";
+  }
   setText(
     "#overview-db-detail",
     databaseConnections.configured
@@ -2181,6 +2234,43 @@ document.querySelectorAll("[data-overview-target]").forEach((button) => {
   button.addEventListener("click", () => {
     setActiveView(button.dataset.overviewTarget || "groups");
   });
+});
+
+document.getElementById("import-runtime-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (!canImportRuntime(state.server)) {
+    setValidationStatus(
+      "Import unavailable",
+      "start the UI with a readable --import-runtime path",
+      false,
+    );
+    return;
+  }
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Importing";
+  try {
+    const payload = await importRuntimeDraft();
+    resetDraftSelection();
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("overview");
+    setValidationStatus(
+      "Runtime imported",
+      "draft was replaced in memory; run Validate before Apply",
+      false,
+    );
+  } catch (error) {
+    setValidationStatus("Runtime import failed", error.message, false);
+  } finally {
+    button.disabled = !canImportRuntime(state.server);
+    button.textContent = canImportRuntime(state.server)
+      ? originalLabel
+      : "Import Unavailable";
+  }
 });
 
 document.getElementById("db-save-button")?.addEventListener("click", async (event) => {

@@ -3674,14 +3674,20 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"class="workspace overview-mode""#));
         assert!(INDEX_HTML.contains(r#"class="overview-view""#));
         assert!(INDEX_HTML.contains(r#"id="overview-status-list""#));
+        assert!(INDEX_HTML.contains(r#"id="import-runtime-button""#));
         assert!(INDEX_HTML.contains(r#"data-overview-target="review-apply""#));
 
         assert!(APP_JS.contains("function renderOverview()"));
         assert!(APP_JS.contains("function overviewStatusRow("));
+        assert!(APP_JS.contains("function importRuntimeDraft()"));
+        assert!(APP_JS.contains("function canImportRuntime("));
+        assert!(APP_JS.contains("function resetDraftSelection()"));
+        assert!(APP_JS.contains("/api/import-runtime"));
         assert!(APP_JS.contains("data-overview-target"));
 
         assert!(APP_CSS.contains(".workspace.overview-mode"));
         assert!(APP_CSS.contains(".overview-view"));
+        assert!(APP_CSS.contains(".overview-import-button"));
         assert!(APP_CSS.contains(".overview-status-list"));
         assert!(APP_CSS.contains(".overview-status-row"));
     }
@@ -5068,6 +5074,28 @@ private_target_ref = "service:app-api"
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], "import_runtime_unconfigured");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn import_runtime_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("import-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/import-runtime")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let _ = std::fs::remove_file(catalog_path);
     }
 
