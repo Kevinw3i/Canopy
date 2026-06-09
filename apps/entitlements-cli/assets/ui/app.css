@@ -984,6 +984,68 @@ legend {
   font-weight: 560;
 }
 
+.identity-fieldset {
+  gap: 12px;
+}
+
+.identity-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px;
+  gap: 8px;
+  min-width: 0;
+}
+
+.identity-editor button {
+  min-height: 38px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.identity-list {
+  display: grid;
+  gap: 6px;
+  margin-left: 110px;
+}
+
+.identity-list p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.identity-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.identity-list-row span {
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 10px;
+  color: #394352;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identity-list-row button {
+  height: 28px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+}
+
 input[type="checkbox"] {
   width: 17px;
   height: 17px;
@@ -2236,6 +2298,10 @@ textarea {
   .overview-side-panel {
     width: 100%;
     min-width: 0;
+  }
+
+  .identity-list {
+    margin-left: 0;
   }
 
   .content-grid {

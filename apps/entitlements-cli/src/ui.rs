@@ -21,7 +21,10 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
-use crate::catalog::{self, Catalog, CatalogBinding, CatalogPackage, CatalogScope};
+use crate::catalog::{
+    self, Catalog, CatalogBinding, CatalogMembership, CatalogPackage, CatalogScope,
+};
+use entitlements::GroupMapping;
 
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
@@ -116,6 +119,8 @@ fn router(state: UiAppState) -> Router {
         .route("/api/validate", post(post_validate))
         .route("/api/import-runtime", post(post_import_runtime))
         .route("/api/draft/bindings", put(put_draft_binding))
+        .route("/api/draft/memberships", put(put_draft_membership))
+        .route("/api/draft/group-mappings", put(put_draft_group_mapping))
         .route(
             "/api/draft/packages/features",
             put(put_draft_package_feature),
@@ -199,6 +204,22 @@ struct ExchangeRequest {
 struct DraftBindingRequest {
     group: String,
     package: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftMembershipRequest {
+    group: String,
+    user_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftGroupMappingRequest {
+    group: String,
+    external_group: String,
     enabled: bool,
 }
 
@@ -451,6 +472,8 @@ struct UiGroupSummary {
     external_mapping_count: usize,
     package_count: usize,
     high_risk_package_count: usize,
+    members: Vec<String>,
+    external_mappings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -558,9 +581,25 @@ struct UiBindingSummary {
 struct UiPendingChanges {
     added_bindings: Vec<UiBindingChange>,
     removed_bindings: Vec<UiBindingChange>,
+    added_memberships: Vec<UiMembershipChange>,
+    removed_memberships: Vec<UiMembershipChange>,
+    added_group_mappings: Vec<UiGroupMappingChange>,
+    removed_group_mappings: Vec<UiGroupMappingChange>,
     high_risk_added: usize,
     high_risk_removed: usize,
     semantic_diff: UiSemanticDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMembershipChange {
+    group: String,
+    user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UiGroupMappingChange {
+    group: String,
+    external_group: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -746,6 +785,70 @@ async fn put_draft_binding(
     };
 
     match state.update_binding(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn put_draft_membership(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftMembershipRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_membership_request",
+                "draft membership request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_membership(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn put_draft_group_mapping(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftGroupMappingRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_group_mapping_request",
+                "draft group mapping request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_group_mapping(request) {
         Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
         Err(err) => error_response(err.status, err.code, err.message),
     }
@@ -1054,6 +1157,25 @@ impl UiAppState {
         draft.update_binding(request)
     }
 
+    fn update_membership(&self, request: DraftMembershipRequest) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_membership(request)
+    }
+
+    fn update_group_mapping(
+        &self,
+        request: DraftGroupMappingRequest,
+    ) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_group_mapping(request)
+    }
+
     fn update_package_feature(
         &self,
         request: DraftPackageFeatureRequest,
@@ -1294,11 +1416,111 @@ impl DraftState {
         };
 
         if changed {
-            self.revision = self.revision.saturating_add(1);
-            self.dirty = self
-                .baseline
-                .as_ref()
-                .is_some_and(|baseline| baseline != draft);
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    fn update_membership(
+        &mut self,
+        request: DraftMembershipRequest,
+    ) -> Result<(), UiMutationError> {
+        let group = request.group.trim();
+        let user_id = request.user_id.trim();
+        if group.is_empty() || user_id.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_membership_id",
+                "group and user_id are required",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let existing = draft
+            .memberships
+            .iter()
+            .position(|membership| membership.group == group && membership.user_id == user_id);
+        let changed = match (request.enabled, existing) {
+            (true, None) => {
+                draft.memberships.push(CatalogMembership {
+                    user_id: user_id.to_owned(),
+                    group: group.to_owned(),
+                });
+                true
+            }
+            (false, Some(index)) => {
+                draft.memberships.remove(index);
+                true
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    fn update_group_mapping(
+        &mut self,
+        request: DraftGroupMappingRequest,
+    ) -> Result<(), UiMutationError> {
+        let group = request.group.trim();
+        let external_group = request.external_group.trim();
+        if group.is_empty() || external_group.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_group_mapping_id",
+                "group and external_group are required",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let existing = draft
+            .group_mappings
+            .iter()
+            .position(|mapping| mapping.external_group == external_group);
+        let changed = match (request.enabled, existing) {
+            (true, None) => {
+                draft.group_mappings.push(GroupMapping {
+                    external_group: external_group.to_owned(),
+                    canopy_group: group.to_owned(),
+                });
+                true
+            }
+            (true, Some(index)) if draft.group_mappings[index].canopy_group == group => false,
+            (true, Some(index)) => {
+                let existing_group = draft.group_mappings[index].canopy_group.clone();
+                return Err(UiMutationError::bad_request(
+                    "duplicate_external_group_mapping",
+                    format!(
+                        "external_group '{external_group}' is already mapped to group '{existing_group}'",
+                    ),
+                ));
+            }
+            (false, Some(index)) if draft.group_mappings[index].canopy_group == group => {
+                draft.group_mappings.remove(index);
+                true
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.mark_changed();
         }
         Ok(())
     }
@@ -1361,11 +1583,7 @@ impl DraftState {
 
         if package.features != next_features {
             package.features = next_features;
-            self.revision = self.revision.saturating_add(1);
-            self.dirty = self
-                .baseline
-                .as_ref()
-                .is_some_and(|baseline| baseline != draft);
+            self.mark_changed();
         }
         Ok(())
     }
@@ -1378,6 +1596,14 @@ impl DraftState {
         self.draft = Some(catalog);
         self.load_error = None;
         self.revision = self.revision.saturating_add(1);
+    }
+
+    fn mark_changed(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+        self.dirty = self
+            .baseline
+            .as_ref()
+            .is_none_or(|baseline| self.draft.as_ref().is_some_and(|draft| baseline != draft));
     }
 
     fn preview_group(
@@ -2668,6 +2894,10 @@ impl UiPendingChanges {
         Self {
             added_bindings: Vec::new(),
             removed_bindings: Vec::new(),
+            added_memberships: Vec::new(),
+            removed_memberships: Vec::new(),
+            added_group_mappings: Vec::new(),
+            removed_group_mappings: Vec::new(),
             high_risk_added: 0,
             high_risk_removed: 0,
             semantic_diff: UiSemanticDiff::empty(),
@@ -2901,6 +3131,18 @@ fn group_summaries(catalog: &Catalog) -> Vec<UiGroupSummary> {
                     .iter()
                     .filter(|mapping| mapping.canopy_group == group)
                     .count(),
+                members: catalog
+                    .memberships
+                    .iter()
+                    .filter(|membership| membership.group == group)
+                    .map(|membership| membership.user_id.clone())
+                    .collect(),
+                external_mappings: catalog
+                    .group_mappings
+                    .iter()
+                    .filter(|mapping| mapping.canopy_group == group)
+                    .map(|mapping| mapping.external_group.clone())
+                    .collect(),
                 package_count: bound_packages.len(),
                 high_risk_package_count: bound_packages
                     .iter()
@@ -3175,6 +3417,10 @@ fn binding_set(catalog: &Catalog) -> BTreeSet<(String, String)> {
 fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
     let baseline_bindings = binding_set(baseline);
     let draft_bindings = binding_set(draft);
+    let baseline_memberships = membership_set(baseline);
+    let draft_memberships = membership_set(draft);
+    let baseline_group_mappings = group_mapping_set(baseline);
+    let draft_group_mappings = group_mapping_set(draft);
     let draft_packages = package_index(draft);
     let baseline_packages = package_index(baseline);
     let added_bindings = draft_bindings
@@ -3184,6 +3430,34 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
     let removed_bindings = baseline_bindings
         .difference(&draft_bindings)
         .map(|(group, package)| binding_change(group, package, &baseline_packages))
+        .collect::<Vec<_>>();
+    let added_memberships = draft_memberships
+        .difference(&baseline_memberships)
+        .map(|(group, user_id)| UiMembershipChange {
+            group: group.clone(),
+            user_id: user_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let removed_memberships = baseline_memberships
+        .difference(&draft_memberships)
+        .map(|(group, user_id)| UiMembershipChange {
+            group: group.clone(),
+            user_id: user_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    let added_group_mappings = draft_group_mappings
+        .difference(&baseline_group_mappings)
+        .map(|(group, external_group)| UiGroupMappingChange {
+            group: group.clone(),
+            external_group: external_group.clone(),
+        })
+        .collect::<Vec<_>>();
+    let removed_group_mappings = baseline_group_mappings
+        .difference(&draft_group_mappings)
+        .map(|(group, external_group)| UiGroupMappingChange {
+            group: group.clone(),
+            external_group: external_group.clone(),
+        })
         .collect::<Vec<_>>();
     let high_risk_added = added_bindings
         .iter()
@@ -3197,6 +3471,10 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
     UiPendingChanges {
         added_bindings,
         removed_bindings,
+        added_memberships,
+        removed_memberships,
+        added_group_mappings,
+        removed_group_mappings,
         high_risk_added,
         high_risk_removed,
         semantic_diff,
@@ -3220,6 +3498,22 @@ fn package_index(catalog: &Catalog) -> BTreeMap<&str, &CatalogPackage> {
         .packages
         .iter()
         .map(|package| (package.id.as_str(), package))
+        .collect()
+}
+
+fn membership_set(catalog: &Catalog) -> BTreeSet<(String, String)> {
+    catalog
+        .memberships
+        .iter()
+        .map(|membership| (membership.group.clone(), membership.user_id.clone()))
+        .collect()
+}
+
+fn group_mapping_set(catalog: &Catalog) -> BTreeSet<(String, String)> {
+    catalog
+        .group_mappings
+        .iter()
+        .map(|mapping| (mapping.canopy_group.clone(), mapping.external_group.clone()))
         .collect()
 }
 
@@ -3675,18 +3969,27 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"class="overview-view""#));
         assert!(INDEX_HTML.contains(r#"id="overview-status-list""#));
         assert!(INDEX_HTML.contains(r#"id="import-runtime-button""#));
+        assert!(INDEX_HTML.contains(r#"id="membership-add-button""#));
+        assert!(INDEX_HTML.contains(r#"id="group-mapping-add-button""#));
         assert!(INDEX_HTML.contains(r#"data-overview-target="review-apply""#));
 
         assert!(APP_JS.contains("function renderOverview()"));
         assert!(APP_JS.contains("function overviewStatusRow("));
+        assert!(APP_JS.contains("function updateDraftMembership("));
+        assert!(APP_JS.contains("function updateDraftGroupMapping("));
+        assert!(APP_JS.contains("function renderIdentityWiring("));
         assert!(APP_JS.contains("function importRuntimeDraft()"));
         assert!(APP_JS.contains("function canImportRuntime("));
         assert!(APP_JS.contains("function resetDraftSelection()"));
+        assert!(APP_JS.contains("/api/draft/memberships"));
+        assert!(APP_JS.contains("/api/draft/group-mappings"));
         assert!(APP_JS.contains("/api/import-runtime"));
         assert!(APP_JS.contains("data-overview-target"));
 
         assert!(APP_CSS.contains(".workspace.overview-mode"));
         assert!(APP_CSS.contains(".overview-view"));
+        assert!(APP_CSS.contains(".identity-editor"));
+        assert!(APP_CSS.contains(".identity-list-row"));
         assert!(APP_CSS.contains(".overview-import-button"));
         assert!(APP_CSS.contains(".overview-status-list"));
         assert!(APP_CSS.contains(".overview-status-row"));
@@ -4414,6 +4717,108 @@ private_target_ref = "service:app-api"
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], "unknown_package");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_membership_update_adds_member_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("membership-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/memberships")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"QA","user_id":"qa@example.com","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert!(state["draft"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["id"] == "QA"
+                && group["members"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::Value::String("qa@example.com".to_owned()))));
+        assert!(state["changes"]["added_memberships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["group"] == "QA" && change["user_id"] == "qa@example.com"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_membership_update_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("membership-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/memberships")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"RD","user_id":"qa@example.com","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_group_mapping_update_rejects_duplicate_external_group() {
+        let (catalog_path, _content) = write_catalog_fixture("mapping-duplicate");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/group-mappings")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"admin","external_group":"canopy-rd","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "duplicate_external_group_mapping");
         let _ = std::fs::remove_file(catalog_path);
     }
 

@@ -304,6 +304,29 @@
                 </label>
                 <label><span>Row Filter</span><textarea placeholder="e.g., region = 'ap'"></textarea></label>
               </fieldset>
+              <fieldset class="identity-fieldset">
+                <legend>Identity Wiring</legend>
+                <label>
+                  <span>Direct Member</span>
+                  <div class="identity-editor">
+                    <input id="membership-user-input" autocomplete="off" placeholder="user sub or verified email" />
+                    <button id="membership-add-button" type="button">Add</button>
+                  </div>
+                </label>
+                <div class="identity-list" id="membership-list">
+                  <p>No direct members</p>
+                </div>
+                <label>
+                  <span>External Group</span>
+                  <div class="identity-editor">
+                    <input id="group-mapping-input" autocomplete="off" placeholder="IdP group claim" />
+                    <button id="group-mapping-add-button" type="button">Add</button>
+                  </div>
+                </label>
+                <div class="identity-list" id="group-mapping-list">
+                  <p>No external mappings</p>
+                </div>
+              </fieldset>
               <div class="risk-list">
                 <h3>Risk Indicators <span>2</span></h3>
                 <p>△ Access to production scope</p>
@@ -645,7 +668,7 @@
               <strong>1<small>Groups changed</small></strong>
               <strong>1<small>Bindings added</small></strong>
               <strong>0<small>Bindings removed</small></strong>
-              <strong>0<small>Semantic grants</small></strong>
+              <strong>0<small>Identity/Semantic</small></strong>
             </div>
           </section>
           <section class="pending-block">

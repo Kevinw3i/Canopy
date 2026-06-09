@@ -94,6 +94,34 @@ async function updateDraftBinding(group, packageId, enabled) {
   return response.json();
 }
 
+async function updateDraftMembership(group, userId, enabled) {
+  const response = await fetch("/api/draft/memberships", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ group, user_id: userId, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft membership update failed");
+  }
+  return response.json();
+}
+
+async function updateDraftGroupMapping(group, externalGroup, enabled) {
+  const response = await fetch("/api/draft/group-mappings", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ group, external_group: externalGroup, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft group mapping update failed");
+  }
+  return response.json();
+}
+
 async function updateDraftPackageFeature(packageId, feature, enabled) {
   const response = await fetch("/api/draft/packages/features", {
     method: "PUT",
@@ -1329,7 +1357,38 @@ function renderInspector(groups, packages, bindings, changes) {
   if (inputs[2]) inputs[2].value = `${selectedPackage.database_scope_count} database scope(s)`;
   if (inputs[3]) inputs[3].value = `${selectedPackage.mcp_ec2_diagnostic_scope_count} EC2 diagnostic scope(s)`;
 
+  renderIdentityWiring(group);
   renderRiskList(selectedPackage, changes);
+}
+
+function renderIdentityWiring(group) {
+  renderIdentityList("membership-list", group.members || [], "membership");
+  renderIdentityList("group-mapping-list", group.external_mappings || [], "group-mapping");
+}
+
+function renderIdentityList(listId, values, kind) {
+  const list = document.getElementById(listId);
+  if (!list) {
+    return;
+  }
+  const items = [...values].sort();
+  if (!items.length) {
+    list.replaceChildren(el("p", "", kind === "membership" ? "No direct members" : "No external mappings"));
+    return;
+  }
+  list.replaceChildren(
+    ...items.map((value) => {
+      const row = el("div", "identity-list-row");
+      row.append(el("span", "", value));
+      const removeButton = el("button", "", "×");
+      removeButton.type = "button";
+      removeButton.dataset.identityKind = kind;
+      removeButton.dataset.identityValue = value;
+      removeButton.setAttribute("aria-label", `Remove ${value}`);
+      row.append(removeButton);
+      return row;
+    }),
+  );
 }
 
 function renderRiskList(pkg, changes) {
@@ -1356,6 +1415,15 @@ function renderChanges(changes) {
   const semanticRemoved = semantic.removed || [];
   const highRisk = semantic.high_risk || [];
   const semanticCount = semanticAdded.length + semanticRemoved.length;
+  const addedMemberships = changes.added_memberships || [];
+  const removedMemberships = changes.removed_memberships || [];
+  const addedMappings = changes.added_group_mappings || [];
+  const removedMappings = changes.removed_group_mappings || [];
+  const identityCount =
+    addedMemberships.length +
+    removedMemberships.length +
+    addedMappings.length +
+    removedMappings.length;
   const highRiskKeys = new Set(highRisk.map(grantKey));
   const summaryItems = document.querySelectorAll(".summary-grid strong");
   const changedGroups = new Set([
@@ -1363,19 +1431,23 @@ function renderChanges(changes) {
     ...removed.map((change) => change.group),
     ...semanticAdded.map((grant) => grant.group),
     ...semanticRemoved.map((grant) => grant.group),
+    ...addedMemberships.map((change) => change.group),
+    ...removedMemberships.map((change) => change.group),
+    ...addedMappings.map((change) => change.group),
+    ...removedMappings.map((change) => change.group),
   ]);
   if (summaryItems[0]) {
     summaryItems[0].firstChild.textContent = String(changedGroups.size);
   }
   if (summaryItems[1]) summaryItems[1].firstChild.textContent = String(added.length);
   if (summaryItems[2]) summaryItems[2].firstChild.textContent = String(removed.length);
-  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount);
+  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount + identityCount);
 
   const pendingTitle = document.querySelector(".pending-block h3");
   const pendingBody = document.querySelector(".pending-block tbody");
   if (pendingTitle) {
     const riskLabel = highRisk.length ? `, ${highRisk.length} high risk` : "";
-    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount}${riskLabel})`;
+    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount + identityCount}${riskLabel})`;
   }
   if (!pendingBody) {
     return;
@@ -1383,6 +1455,10 @@ function renderChanges(changes) {
   const rows = [
     ...added.map((change) => changeRow("Add", change)),
     ...removed.map((change) => changeRow("Remove", change)),
+    ...addedMemberships.map((change) => identityChangeRow("Add", "Direct membership", change.group, change.user_id)),
+    ...removedMemberships.map((change) => identityChangeRow("Remove", "Direct membership", change.group, change.user_id)),
+    ...addedMappings.map((change) => identityChangeRow("Add", "External mapping", change.group, change.external_group)),
+    ...removedMappings.map((change) => identityChangeRow("Remove", "External mapping", change.group, change.external_group)),
     ...semanticAdded.map((grant) =>
       semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
     ),
@@ -1613,7 +1689,12 @@ function renderOverview() {
   const added = changes.added_bindings || [];
   const removed = changes.removed_bindings || [];
   const semanticCount = semanticAdded.length + semanticRemoved.length;
-  const pendingCount = added.length + removed.length + semanticCount;
+  const identityCount =
+    (changes.added_memberships?.length || 0) +
+    (changes.removed_memberships?.length || 0) +
+    (changes.added_group_mappings?.length || 0) +
+    (changes.removed_group_mappings?.length || 0);
+  const pendingCount = added.length + removed.length + semanticCount + identityCount;
   const packageHighRisk = packages.reduce(
     (count, pkg) => count + (pkg.high_risk_features?.length || 0),
     0,
@@ -1779,7 +1860,16 @@ function renderReviewApply() {
   const semanticRemoved = semantic.removed || [];
   const highRisk = semantic.high_risk || [];
   const semanticCount = semanticAdded.length + semanticRemoved.length;
-  const pendingCount = added.length + removed.length + semanticCount;
+  const addedMemberships = changes.added_memberships || [];
+  const removedMemberships = changes.removed_memberships || [];
+  const addedMappings = changes.added_group_mappings || [];
+  const removedMappings = changes.removed_group_mappings || [];
+  const identityCount =
+    addedMemberships.length +
+    removedMemberships.length +
+    addedMappings.length +
+    removedMappings.length;
+  const pendingCount = added.length + removed.length + semanticCount + identityCount;
   const blocking = validation?.blocking_errors || [];
   const warnings = validation?.warnings || [];
   const dbIssues = databaseConnections.issues || [];
@@ -1858,6 +1948,18 @@ function renderReviewApply() {
   const rows = [
     ...added.map((change) => changeRow("Add", change)),
     ...removed.map((change) => changeRow("Remove", change)),
+    ...addedMemberships.map((change) =>
+      identityChangeRow("Add", "Direct membership", change.group, change.user_id),
+    ),
+    ...removedMemberships.map((change) =>
+      identityChangeRow("Remove", "Direct membership", change.group, change.user_id),
+    ),
+    ...addedMappings.map((change) =>
+      identityChangeRow("Add", "External mapping", change.group, change.external_group),
+    ),
+    ...removedMappings.map((change) =>
+      identityChangeRow("Remove", "External mapping", change.group, change.external_group),
+    ),
     ...semanticAdded.map((grant) =>
       semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
     ),
@@ -2014,6 +2116,22 @@ function changeRow(type, change) {
     cell.textContent = value;
     if (index === 0) {
       cell.className = type === "Add" ? "add" : "remove";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function identityChangeRow(type, changeLabel, group, value) {
+  const row = document.createElement("tr");
+  [type, group, "identity", changeLabel, value].forEach((cellValue, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = cellValue;
+    if (index === 0) {
+      cell.className = type === "Add" ? "add" : "remove";
+    }
+    if (index === 4) {
+      cell.classList.add("grant-detail");
     }
     row.append(cell);
   });
@@ -2234,6 +2352,63 @@ document.querySelectorAll("[data-overview-target]").forEach((button) => {
   button.addEventListener("click", () => {
     setActiveView(button.dataset.overviewTarget || "groups");
   });
+});
+
+async function updateIdentityWiring(kind, value, enabled) {
+  const group = state.selectedGroup;
+  const trimmedValue = value.trim();
+  if (!group || !trimmedValue) {
+    setValidationStatus("Identity update unavailable", "select a group and enter an identity value", false);
+    return;
+  }
+  try {
+    const payload =
+      kind === "membership"
+        ? await updateDraftMembership(group, trimmedValue, enabled)
+        : await updateDraftGroupMapping(group, trimmedValue, enabled);
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("groups");
+    setValidationStatus(
+      enabled ? "Identity wiring added" : "Identity wiring removed",
+      `${trimmedValue} ${enabled ? "is staged for" : "was removed from"} ${group}`,
+      false,
+    );
+  } catch (error) {
+    setValidationStatus("Identity update failed", error.message, false);
+  }
+}
+
+document.getElementById("membership-add-button")?.addEventListener("click", async () => {
+  const input = document.getElementById("membership-user-input");
+  const value = input?.value || "";
+  await updateIdentityWiring("membership", value, true);
+  if (input) {
+    input.value = "";
+  }
+});
+
+document.getElementById("group-mapping-add-button")?.addEventListener("click", async () => {
+  const input = document.getElementById("group-mapping-input");
+  const value = input?.value || "";
+  await updateIdentityWiring("group-mapping", value, true);
+  if (input) {
+    input.value = "";
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const button = event.target.closest("[data-identity-kind]");
+  if (!button) {
+    return;
+  }
+  updateIdentityWiring(button.dataset.identityKind, button.dataset.identityValue || "", false);
 });
 
 document.getElementById("import-runtime-button")?.addEventListener("click", async (event) => {
