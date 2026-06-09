@@ -23,7 +23,7 @@
         <nav class="nav-list">
           <a href="#" class="nav-item"><span class="ico">⚡</span>Overview</a>
           <a href="#" class="nav-item active" data-view="groups"><span class="ico">◎</span>Groups</a>
-          <a href="#" class="nav-item"><span class="ico">□</span>Packages</a>
+          <a href="#" class="nav-item" data-view="packages"><span class="ico">□</span>Packages</a>
           <a href="#" class="nav-item"><span class="ico">⌖</span>Scopes</a>
           <a href="#" class="nav-item"><span class="ico">♙</span>Accounts/Roles</a>
           <a href="#" class="nav-item" data-view="db-connections"><span class="ico">▤</span>DB Connections</a>
@@ -241,6 +241,68 @@
                 <p>△ Direct table access to mart.orders</p>
               </div>
             </form>
+          </aside>
+        </section>
+
+        <section class="packages-view" aria-label="Packages" hidden>
+          <section class="packages-panel">
+            <div class="packages-panel-head">
+              <div>
+                <h2>Packages</h2>
+                <small id="package-summary">No package metadata loaded</small>
+              </div>
+              <div class="package-status-stack">
+                <strong id="package-feature-count">0 features</strong>
+                <small id="package-risk-count">0 high risk</small>
+              </div>
+            </div>
+            <table class="packages-table">
+              <thead>
+                <tr>
+                  <th>Package</th>
+                  <th>Scope</th>
+                  <th>Role</th>
+                  <th>Features</th>
+                  <th>Risk</th>
+                </tr>
+              </thead>
+              <tbody id="package-rows">
+                <tr><td colspan="5">Loading packages</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <aside class="package-inspector" aria-label="Package feature inspector">
+            <div class="inspector-title">
+              <div>
+                <h2 id="package-selected-name">Package</h2>
+                <span class="badge-ok" id="package-selected-risk">No risk</span>
+              </div>
+            </div>
+
+            <div class="package-meta-grid">
+              <div>
+                <span>Scope</span>
+                <strong id="package-selected-scope">-</strong>
+              </div>
+              <div>
+                <span>Role</span>
+                <strong id="package-selected-role">-</strong>
+              </div>
+              <div>
+                <span>DB Scopes</span>
+                <strong id="package-selected-db">0</strong>
+              </div>
+              <div>
+                <span>Session Cap</span>
+                <strong id="package-selected-session">default</strong>
+              </div>
+            </div>
+
+            <div class="feature-toggle-list" id="package-feature-toggles">
+              <h3>Feature Toggles <span>0</span></h3>
+              <p>No package selected</p>
+            </div>
           </aside>
         </section>
 

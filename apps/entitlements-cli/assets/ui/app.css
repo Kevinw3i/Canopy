@@ -192,6 +192,10 @@ button {
   grid-template-rows: 76px minmax(624px, 1fr) 196px;
 }
 
+.workspace.package-mode {
+  grid-template-rows: 76px minmax(624px, 1fr) 196px;
+}
+
 .workspace.review-mode {
   grid-template-rows: 76px minmax(680px, 1fr);
 }
@@ -203,6 +207,7 @@ button {
 .topbar,
 .toolbar,
 .content-grid,
+.packages-view,
 .db-connections-view,
 .review-apply-view,
 .review-strip {
@@ -978,6 +983,195 @@ textarea {
   line-height: 1.45;
 }
 
+.packages-view {
+  display: grid;
+  grid-template-columns: minmax(640px, 1fr) minmax(350px, 420px);
+  min-height: 0;
+  background: var(--panel);
+}
+
+.packages-panel {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+}
+
+.packages-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 84px;
+  padding: 18px 26px;
+  border-bottom: 1px solid var(--line);
+  background: #fafcfd;
+}
+
+.packages-panel-head h2 {
+  font-size: 22px;
+}
+
+.packages-panel-head small,
+.package-status-stack small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+}
+
+.package-status-stack {
+  text-align: right;
+}
+
+.package-status-stack strong {
+  color: var(--green);
+}
+
+.packages-table {
+  width: 100%;
+  min-width: 840px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.packages-table th,
+.packages-table td {
+  height: 58px;
+  padding: 0 18px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  text-align: left;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.packages-table th {
+  height: 48px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.packages-table tr {
+  cursor: pointer;
+}
+
+.packages-table tr.selected td {
+  background: var(--green-soft);
+}
+
+.packages-table tr.selected td:first-child {
+  box-shadow: inset 4px 0 0 var(--green);
+}
+
+.package-risk-row td:first-child {
+  box-shadow: inset 4px 0 0 #d89800;
+}
+
+.package-inspector {
+  min-width: 0;
+  padding: 22px 24px;
+  overflow: auto;
+  background: var(--panel);
+}
+
+.package-meta-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.package-meta-grid div {
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.package-meta-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 660;
+}
+
+.package-meta-grid strong {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feature-toggle-list {
+  display: grid;
+  gap: 9px;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.feature-toggle-list h3 {
+  font-size: 14px;
+}
+
+.feature-toggle-list h3 span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  height: 20px;
+  margin-left: 8px;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 12px;
+}
+
+.feature-toggle {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-width: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.feature-toggle:last-child {
+  border-bottom: 0;
+}
+
+.feature-toggle input {
+  margin-top: 2px;
+}
+
+.feature-toggle strong,
+.feature-toggle small {
+  display: block;
+}
+
+.feature-toggle strong {
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.feature-toggle small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.feature-risk strong {
+  color: #7a5400;
+}
+
 .review-apply-view {
   display: grid;
   grid-template-columns: minmax(640px, 1fr) minmax(340px, 410px);
@@ -1396,6 +1590,7 @@ textarea {
 
   .toolbar,
   .content-grid,
+  .packages-view,
   .db-connections-view,
   .review-apply-view,
   .review-strip {
@@ -1407,6 +1602,12 @@ textarea {
   }
 
   .content-grid {
+    display: block;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  .packages-view {
     display: block;
     overflow-x: hidden;
     max-width: 100%;
@@ -1454,6 +1655,11 @@ textarea {
     min-width: 0;
   }
 
+  .packages-panel {
+    width: 100%;
+    min-width: 0;
+  }
+
   .db-connections-panel {
     width: 100%;
     min-width: 0;
@@ -1465,6 +1671,14 @@ textarea {
 
   .db-table {
     min-width: 760px;
+  }
+
+  .packages-table {
+    min-width: 760px;
+  }
+
+  .package-meta-grid {
+    grid-template-columns: 1fr;
   }
 
   .review-change-table {

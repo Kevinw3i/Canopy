@@ -90,6 +90,20 @@ async function updateDraftBinding(group, packageId, enabled) {
   return response.json();
 }
 
+async function updateDraftPackageFeature(packageId, feature, enabled) {
+  const response = await fetch("/api/draft/packages/features", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ package: packageId, feature, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft package feature update failed");
+  }
+  return response.json();
+}
+
 async function updateDatabaseConnection(request) {
   const response = await fetch("/api/draft/db-connections", {
     method: "PUT",
@@ -273,6 +287,7 @@ function setActiveView(view) {
   state.currentView = view;
   const workspace = document.querySelector(".workspace");
   const groupGrid = document.querySelector(".content-grid");
+  const packagesView = document.querySelector(".packages-view");
   const dbView = document.querySelector(".db-connections-view");
   const reviewView = document.querySelector(".review-apply-view");
   const toolbar = document.querySelector(".toolbar");
@@ -280,8 +295,12 @@ function setActiveView(view) {
   const subtitle = document.querySelector(".title-row span");
   workspace?.classList.toggle("db-mode", view === "db-connections");
   workspace?.classList.toggle("review-mode", view === "review-apply");
+  workspace?.classList.toggle("package-mode", view === "packages");
   if (groupGrid) {
     groupGrid.hidden = view !== "groups";
+  }
+  if (packagesView) {
+    packagesView.hidden = view !== "packages";
   }
   if (dbView) {
     dbView.hidden = view !== "db-connections";
@@ -298,6 +317,8 @@ function setActiveView(view) {
         ? "DB Connections"
         : view === "review-apply"
           ? "Review & Apply"
+          : view === "packages"
+            ? "Packages"
           : "Groups";
   }
   if (subtitle) {
@@ -306,6 +327,8 @@ function setActiveView(view) {
         ? "Connection Safety"
         : view === "review-apply"
           ? "Draft Gate"
+          : view === "packages"
+            ? "Feature Toggles"
           : "Entitlement Catalog";
   }
   document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
@@ -316,6 +339,7 @@ function setActiveView(view) {
 function renderDraft(draft, changes) {
   if (!draft.loaded) {
     renderChanges(changes || {});
+    renderPackages([], []);
     return;
   }
   const groups = draft.groups || [];
@@ -330,6 +354,7 @@ function renderDraft(draft, changes) {
   renderMatrix(groups, packages, draft.bindings || []);
   renderInspector(groups, packages, draft.bindings || [], changes || {});
   renderChanges(changes || {});
+  renderPackages(packages, draft.available_features || []);
   applyFilters();
 }
 
@@ -579,6 +604,145 @@ function dbConnectionDraftRequestFromForm() {
     request.secret_arn = secretArn;
   }
   return request;
+}
+
+function renderPackages(packages, availableFeatures) {
+  const rowsNode = document.getElementById("package-rows");
+  if (!rowsNode) {
+    return;
+  }
+  const summary = document.getElementById("package-summary");
+  const featureCount = document.getElementById("package-feature-count");
+  const riskCount = document.getElementById("package-risk-count");
+  const highRiskPackages = packages.filter((pkg) => pkg.high_risk_features?.length);
+  const totalFeatures = packages.reduce((count, pkg) => count + (pkg.features?.length || 0), 0);
+  if (summary) {
+    summary.textContent = `${packages.length} package(s), ${highRiskPackages.length} high-risk package(s)`;
+  }
+  if (featureCount) {
+    featureCount.textContent = `${totalFeatures} enabled feature(s)`;
+  }
+  if (riskCount) {
+    riskCount.textContent = `${highRiskPackages.length} high risk`;
+  }
+
+  const hasSelected = packages.some((pkg) => pkg.id === state.selectedPackage);
+  if (!state.selectedPackage || !hasSelected) {
+    state.selectedPackage = packages[0]?.id || null;
+  }
+
+  rowsNode.replaceChildren(
+    ...(packages.length ? packages.map(packageRow) : [emptyPackageRow()]),
+  );
+  renderPackageInspector(packages, availableFeatures);
+}
+
+function packageRow(pkg) {
+  const row = document.createElement("tr");
+  row.dataset.package = pkg.id;
+  row.classList.toggle("selected", pkg.id === state.selectedPackage);
+  row.classList.toggle("package-risk-row", Boolean(pkg.high_risk_features?.length));
+  row.addEventListener("click", () => {
+    state.selectedPackage = pkg.id;
+    renderPackages(state.draft?.packages || [], state.draft?.available_features || []);
+  });
+  [
+    pkg.id,
+    pkg.scope,
+    pkg.role,
+    `${pkg.features?.length || 0} enabled`,
+    pkg.high_risk_features?.length ? pkg.high_risk_features.join(", ") : "none",
+  ].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 4 && pkg.high_risk_features?.length) {
+      cell.className = "risk";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function emptyPackageRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.textContent = "No packages to display";
+  row.append(cell);
+  return row;
+}
+
+function renderPackageInspector(packages, availableFeatures) {
+  const selected = packages.find((pkg) => pkg.id === state.selectedPackage) || null;
+  const name = document.getElementById("package-selected-name");
+  const badge = document.getElementById("package-selected-risk");
+  setText("#package-selected-scope", selected?.scope || "-");
+  setText("#package-selected-role", selected?.role || "-");
+  setText("#package-selected-db", String(selected?.database_scope_count || 0));
+  setText(
+    "#package-selected-session",
+    selected?.max_session_seconds ? `${selected.max_session_seconds}s` : "default",
+  );
+  if (name) {
+    name.textContent = selected?.id || "Package";
+  }
+  if (badge) {
+    const riskCount = selected?.high_risk_features?.length || 0;
+    badge.textContent = riskCount ? `${riskCount} high risk` : "No risk";
+    badge.classList.toggle("badge-risk", riskCount > 0);
+  }
+
+  const list = document.getElementById("package-feature-toggles");
+  if (!list) {
+    return;
+  }
+  const title = document.createElement("h3");
+  title.append("Feature Toggles ");
+  title.append(el("span", "", String(availableFeatures.length)));
+  if (!selected) {
+    list.replaceChildren(title, el("p", "", "No package selected"));
+    return;
+  }
+  const enabled = new Set(selected.features || []);
+  const toggles = availableFeatures.map((feature) =>
+    packageFeatureToggle(selected.id, feature, enabled.has(feature.id)),
+  );
+  list.replaceChildren(title, ...toggles);
+}
+
+function packageFeatureToggle(packageId, feature, checked) {
+  const label = document.createElement("label");
+  label.className = feature.high_risk ? "feature-toggle feature-risk" : "feature-toggle";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = checked;
+  input.disabled = !state.server?.capabilities?.draft_write;
+  input.dataset.package = packageId;
+  input.dataset.feature = feature.id;
+  input.addEventListener("change", (event) => {
+    togglePackageFeature(event.currentTarget);
+  });
+  const text = document.createElement("span");
+  text.append(el("strong", "", feature.id));
+  text.append(el("small", "", feature.high_risk ? "High-risk entitlement" : featureSummary(feature.id)));
+  label.append(input, text);
+  return label;
+}
+
+function featureSummary(feature) {
+  if (feature.startsWith("mcp:")) {
+    return "MCP access feature";
+  }
+  if (feature.startsWith("ecs:")) {
+    return "ECS access feature";
+  }
+  if (feature.startsWith("ec2:")) {
+    return "EC2 access feature";
+  }
+  if (feature.startsWith("cloudwatch:")) {
+    return "CloudWatch access feature";
+  }
+  return "Catalog feature";
 }
 
 function firstBoundPackage(groupId, bindings) {
@@ -1324,6 +1488,32 @@ async function toggleBinding(button, row) {
     setValidationStatus("Draft update failed", error.message, false);
   } finally {
     button.disabled = false;
+  }
+}
+
+async function togglePackageFeature(input) {
+  const packageId = input.dataset.package;
+  const feature = input.dataset.feature;
+  const enabled = input.checked;
+  if (!state.server?.capabilities?.draft_write || !packageId || !feature) {
+    input.checked = !enabled;
+    return;
+  }
+  input.disabled = true;
+  try {
+    const payload = await updateDraftPackageFeature(packageId, feature, enabled);
+    state.selectedPackage = packageId;
+    state.validation = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("packages");
+  } catch (error) {
+    input.checked = !enabled;
+    renderPackages(state.draft?.packages || [], state.draft?.available_features || []);
+    setValidationStatus("Package feature update failed", error.message, false);
+  } finally {
+    input.disabled = !state.server?.capabilities?.draft_write;
   }
 }
 

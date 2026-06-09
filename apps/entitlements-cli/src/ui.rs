@@ -117,6 +117,10 @@ fn router(state: UiAppState) -> Router {
         .route("/api/import-runtime", post(post_import_runtime))
         .route("/api/draft/bindings", put(put_draft_binding))
         .route(
+            "/api/draft/packages/features",
+            put(put_draft_package_feature),
+        )
+        .route(
             "/api/draft/db-connections",
             put(put_draft_database_connection),
         )
@@ -195,6 +199,14 @@ struct ExchangeRequest {
 struct DraftBindingRequest {
     group: String,
     package: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPackageFeatureRequest {
+    package: String,
+    feature: String,
     enabled: bool,
 }
 
@@ -423,6 +435,7 @@ struct UiDraftResponse {
     dirty: bool,
     groups: Vec<UiGroupSummary>,
     packages: Vec<UiPackageSummary>,
+    available_features: Vec<UiFeatureSummary>,
     bindings: Vec<UiBindingSummary>,
     selected_group: Option<String>,
     error: Option<String>,
@@ -448,6 +461,12 @@ struct UiPackageSummary {
     database_scopes: Vec<UiDatabaseScopeSummary>,
     mcp_ec2_diagnostic_scope_count: usize,
     max_session_seconds: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiFeatureSummary {
+    id: &'static str,
+    high_risk: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -658,6 +677,38 @@ async fn put_draft_binding(
     };
 
     match state.update_binding(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn put_draft_package_feature(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftPackageFeatureRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_package_feature_request",
+                "draft package feature request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_package_feature(request) {
         Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
         Err(err) => error_response(err.status, err.code, err.message),
     }
@@ -934,6 +985,17 @@ impl UiAppState {
         draft.update_binding(request)
     }
 
+    fn update_package_feature(
+        &self,
+        request: DraftPackageFeatureRequest,
+    ) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_package_feature(request)
+    }
+
     fn update_database_connection(
         &self,
         request: DraftDatabaseConnectionRequest,
@@ -1172,6 +1234,73 @@ impl DraftState {
         Ok(())
     }
 
+    fn update_package_feature(
+        &mut self,
+        request: DraftPackageFeatureRequest,
+    ) -> Result<(), UiMutationError> {
+        let package_id = request.package.trim();
+        let feature = request.feature.trim();
+        if package_id.is_empty() || feature.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_package_feature_id",
+                "package and feature are required",
+            ));
+        }
+        if !known_catalog_feature(feature) {
+            return Err(UiMutationError::bad_request(
+                "unknown_catalog_feature",
+                format!("feature '{feature}' is not supported by the catalog model"),
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let Some(package) = draft
+            .packages
+            .iter_mut()
+            .find(|candidate| candidate.id == package_id)
+        else {
+            return Err(UiMutationError::bad_request(
+                "unknown_package",
+                format!("package '{package_id}' does not exist in the draft"),
+            ));
+        };
+
+        let mut next_features = package.features.clone();
+        if request.enabled {
+            if let Some(required) = required_base_feature(feature) {
+                add_feature_once(&mut next_features, required);
+            }
+            add_feature_once(&mut next_features, feature);
+        } else {
+            if disabling_required_base(feature, &next_features) {
+                return Err(UiMutationError::bad_request(
+                    "required_base_feature",
+                    format!("feature '{feature}' is required by another enabled package feature"),
+                ));
+            }
+            next_features.retain(|candidate| candidate != feature);
+        }
+        order_catalog_features(&mut next_features);
+
+        if package.features != next_features {
+            package.features = next_features;
+            self.revision = self.revision.saturating_add(1);
+            self.dirty = self
+                .baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline != draft);
+        }
+        Ok(())
+    }
+
     fn replace_with_imported_catalog(&mut self, catalog: Catalog) {
         self.dirty = self
             .baseline
@@ -1280,6 +1409,7 @@ impl DraftState {
                     dirty: self.dirty,
                     groups: Vec::new(),
                     packages: Vec::new(),
+                    available_features: feature_summaries(),
                     bindings: Vec::new(),
                     selected_group: None,
                     error: self.load_error.clone(),
@@ -1303,6 +1433,7 @@ impl DraftState {
                 dirty: self.dirty,
                 groups,
                 packages: package_summaries(draft),
+                available_features: feature_summaries(),
                 bindings: binding_summaries(draft),
                 selected_group,
                 error: None,
@@ -2609,6 +2740,72 @@ fn binding_summaries(catalog: &Catalog) -> Vec<UiBindingSummary> {
     bindings
 }
 
+fn feature_summaries() -> Vec<UiFeatureSummary> {
+    catalog::feature_field_names()
+        .iter()
+        .map(|(feature, _)| UiFeatureSummary {
+            id: feature,
+            high_risk: catalog::is_high_risk_feature(feature),
+        })
+        .collect()
+}
+
+fn known_catalog_feature(feature: &str) -> bool {
+    catalog::feature_field_names()
+        .iter()
+        .any(|(candidate, _)| *candidate == feature)
+}
+
+fn required_base_feature(feature: &str) -> Option<&'static str> {
+    match feature {
+        "mcp:cloudwatch" | "mcp:raw-audit-plaintext" | "mcp:ec2" | "mcp:database" => {
+            Some("mcp:use")
+        }
+        "ecs:exec" => Some("ecs:view"),
+        "ec2:instance-connect" | "ec2:start" | "ec2:stop" | "ec2:reboot" => Some("ec2:view"),
+        _ => None,
+    }
+}
+
+fn disabling_required_base(feature: &str, features: &[String]) -> bool {
+    match feature {
+        "mcp:use" => features
+            .iter()
+            .any(|candidate| candidate.starts_with("mcp:") && candidate != "mcp:use"),
+        "ecs:view" => features.iter().any(|candidate| candidate == "ecs:exec"),
+        "ec2:view" => features.iter().any(|candidate| {
+            matches!(
+                candidate.as_str(),
+                "ec2:instance-connect" | "ec2:start" | "ec2:stop" | "ec2:reboot"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn add_feature_once(features: &mut Vec<String>, feature: &str) {
+    if !features.iter().any(|candidate| candidate == feature) {
+        features.push(feature.to_owned());
+    }
+}
+
+fn order_catalog_features(features: &mut Vec<String>) {
+    let order = catalog::feature_field_names()
+        .iter()
+        .enumerate()
+        .map(|(index, (feature, _))| (*feature, index))
+        .collect::<BTreeMap<_, _>>();
+    features.sort_by(|left, right| {
+        order
+            .get(left.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+            .cmp(&order.get(right.as_str()).copied().unwrap_or(usize::MAX))
+            .then_with(|| left.cmp(right))
+    });
+    features.dedup();
+}
+
 fn binding_set(catalog: &Catalog) -> BTreeSet<(String, String)> {
     catalog
         .bindings
@@ -3111,6 +3308,21 @@ skip_tls_hostname_verification = true
         assert!(APP_CSS.contains(".workspace.review-mode .review-strip"));
         assert!(APP_CSS.contains(".review-change-table"));
         assert!(APP_CSS.contains(".review-apply-view"));
+    }
+
+    #[test]
+    fn embedded_packages_assets_expose_feature_toggles() {
+        assert!(INDEX_HTML.contains(r#"data-view="packages""#));
+        assert!(INDEX_HTML.contains(r#"class="packages-view""#));
+        assert!(INDEX_HTML.contains(r#"id="package-feature-toggles""#));
+
+        assert!(APP_JS.contains("function renderPackages("));
+        assert!(APP_JS.contains("function togglePackageFeature("));
+        assert!(APP_JS.contains("/api/draft/packages/features"));
+
+        assert!(APP_CSS.contains(".workspace.package-mode"));
+        assert!(APP_CSS.contains(".packages-table"));
+        assert!(APP_CSS.contains(".feature-toggle"));
     }
 
     #[tokio::test]
@@ -3800,6 +4012,127 @@ skip_tls_hostname_verification = true
             .unwrap()
             .iter()
             .any(|binding| binding["group"] == "RD" && binding["package"] == "mcp-database"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_feature_update_adds_high_risk_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("package-feature-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages/features")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"package":"analytics","feature":"mcp:database","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        let package = state["draft"]["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["id"] == "analytics")
+            .unwrap();
+        assert!(package["features"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("mcp:use".to_owned())));
+        assert!(package["features"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("mcp:database".to_owned())));
+        assert!(state["changes"]["semantic_diff"]["high_risk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["package"] == "analytics"
+                && grant["kind"] == "feature"
+                && grant["value"] == "mcp:database"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_feature_update_rejects_unknown_feature() {
+        let (catalog_path, original_content) = write_catalog_fixture("package-feature-unknown");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages/features")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"package":"analytics","feature":"not:a-feature","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "unknown_catalog_feature");
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_feature_update_rejects_disabling_required_base() {
+        let (catalog_path, original_content) = write_catalog_fixture("package-feature-base");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages/features")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"package":"mcp-database","feature":"mcp:use","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "required_base_feature");
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_content
