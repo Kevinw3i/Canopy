@@ -3096,6 +3096,23 @@ skip_tls_hostname_verification = true
         }
     }
 
+    #[test]
+    fn embedded_review_apply_assets_expose_draft_gate() {
+        assert!(INDEX_HTML.contains(r#"data-view="review-apply""#));
+        assert!(INDEX_HTML.contains(r#"class="review-apply-view""#));
+        assert!(INDEX_HTML.contains(r#"id="review-validate-button""#));
+        assert!(INDEX_HTML.contains(r#"id="review-change-rows""#));
+
+        assert!(APP_JS.contains("function renderReviewApply()"));
+        assert!(APP_JS.contains("function runValidation(button)"));
+        assert!(APP_JS.contains("review-validate-button"));
+
+        assert!(APP_CSS.contains(".workspace.review-mode"));
+        assert!(APP_CSS.contains(".workspace.review-mode .review-strip"));
+        assert!(APP_CSS.contains(".review-change-table"));
+        assert!(APP_CSS.contains(".review-apply-view"));
+    }
+
     #[tokio::test]
     async fn unknown_ui_route_returns_secured_404() {
         let response = router(test_state("missing-route-code"))

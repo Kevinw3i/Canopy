@@ -27,7 +27,7 @@
           <a href="#" class="nav-item"><span class="ico">⌖</span>Scopes</a>
           <a href="#" class="nav-item"><span class="ico">♙</span>Accounts/Roles</a>
           <a href="#" class="nav-item" data-view="db-connections"><span class="ico">▤</span>DB Connections</a>
-          <a href="#" class="nav-item"><span class="ico">✓</span>Review &amp; Apply</a>
+          <a href="#" class="nav-item" data-view="review-apply"><span class="ico">✓</span>Review &amp; Apply</a>
         </nav>
 
         <div class="sidebar-foot">
@@ -301,6 +301,77 @@
               <h3>Safety Checks <span>0</span></h3>
               <p>No connection selected</p>
             </div>
+          </aside>
+        </section>
+
+        <section class="review-apply-view" aria-label="Review and apply" hidden>
+          <section class="review-stage">
+            <div class="review-stage-main">
+              <h2>Review &amp; Apply</h2>
+              <p id="review-apply-status">Validation has not run for this draft.</p>
+            </div>
+            <div class="review-gate-grid">
+              <div>
+                <span>Apply Gate</span>
+                <strong id="review-apply-gate">Locked</strong>
+              </div>
+              <div>
+                <span>Runtime</span>
+                <strong id="review-runtime-state">Not checked</strong>
+              </div>
+              <div>
+                <span>Deployment</span>
+                <strong id="review-deployment-state">Not checked</strong>
+              </div>
+              <div>
+                <span>DB References</span>
+                <strong id="review-db-state">Not checked</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="review-main-panel">
+            <div class="review-panel-head">
+              <div>
+                <h2>Pending Changes</h2>
+                <small id="review-change-summary">No pending draft changes</small>
+              </div>
+              <strong id="review-high-risk-count">0 high risk</strong>
+            </div>
+            <table class="review-change-table">
+              <thead>
+                <tr><th>Type</th><th>Group</th><th>Package</th><th>Change</th><th>Details</th></tr>
+              </thead>
+              <tbody id="review-change-rows">
+                <tr><td colspan="5">No pending draft changes</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <aside class="review-side-panel">
+            <section>
+              <h3>Validation</h3>
+              <strong id="review-validation-summary">Not run</strong>
+              <small id="review-validation-detail">Run Validate before Apply</small>
+            </section>
+            <section>
+              <h3>Runtime Path</h3>
+              <strong id="review-runtime-path">entitlements.generated.toml</strong>
+              <small id="review-runtime-digest">Digest unavailable</small>
+            </section>
+            <section>
+              <h3>Admin Gate</h3>
+              <strong id="review-admin-gate">Apply disabled</strong>
+              <small id="review-admin-detail">Production apply gate is not enabled in this local shell.</small>
+            </section>
+            <section>
+              <h3>Issues</h3>
+              <div class="review-issue-list" id="review-issue-list">
+                <p>No validation result yet.</p>
+              </div>
+            </section>
+            <button type="button" id="review-validate-button">✓ Validate</button>
+            <button type="button" class="disabled" disabled>▢ Apply locked</button>
           </aside>
         </section>
 

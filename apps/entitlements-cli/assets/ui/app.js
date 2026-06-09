@@ -174,6 +174,7 @@ function applyServerState(payload) {
   const environment = document.querySelector(".env-picker select");
   const applyButton = document.querySelector(".review-actions button[disabled]");
   const validateButton = document.getElementById("validate-button");
+  const reviewValidateButton = document.getElementById("review-validate-button");
   const previewButton = document.getElementById("preview-button");
   const explainButton = document.getElementById("explain-button");
   const dryRunButton = document.getElementById("dry-run-button");
@@ -253,6 +254,9 @@ function applyServerState(payload) {
   if (validateButton) {
     validateButton.disabled = !payload.capabilities?.validate;
   }
+  if (reviewValidateButton) {
+    reviewValidateButton.disabled = !payload.capabilities?.validate;
+  }
   if (previewButton) {
     previewButton.disabled = !payload.capabilities?.preview;
   }
@@ -262,6 +266,7 @@ function applyServerState(payload) {
   if (dryRunButton) {
     dryRunButton.disabled = !payload.capabilities?.dry_run;
   }
+  renderReviewApply();
 }
 
 function setActiveView(view) {
@@ -269,25 +274,39 @@ function setActiveView(view) {
   const workspace = document.querySelector(".workspace");
   const groupGrid = document.querySelector(".content-grid");
   const dbView = document.querySelector(".db-connections-view");
+  const reviewView = document.querySelector(".review-apply-view");
   const toolbar = document.querySelector(".toolbar");
   const title = document.querySelector(".title-row h1");
   const subtitle = document.querySelector(".title-row span");
   workspace?.classList.toggle("db-mode", view === "db-connections");
+  workspace?.classList.toggle("review-mode", view === "review-apply");
   if (groupGrid) {
     groupGrid.hidden = view !== "groups";
   }
   if (dbView) {
     dbView.hidden = view !== "db-connections";
   }
+  if (reviewView) {
+    reviewView.hidden = view !== "review-apply";
+  }
   if (toolbar) {
     toolbar.hidden = view !== "groups";
   }
   if (title) {
-    title.textContent = view === "db-connections" ? "DB Connections" : "Groups";
+    title.textContent =
+      view === "db-connections"
+        ? "DB Connections"
+        : view === "review-apply"
+          ? "Review & Apply"
+          : "Groups";
   }
   if (subtitle) {
     subtitle.textContent =
-      view === "db-connections" ? "Connection Safety" : "Entitlement Catalog";
+      view === "db-connections"
+        ? "Connection Safety"
+        : view === "review-apply"
+          ? "Draft Gate"
+          : "Entitlement Catalog";
   }
   document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
     item.classList.toggle("active", item.dataset.view === view);
@@ -898,6 +917,197 @@ function databaseConnectionStateLabel(connections) {
   ].join(", ");
 }
 
+function reviewDatabaseState(validationConnections, draftConnections, issueCount) {
+  const required = validationConnections?.required || draftConnections.required || [];
+  const local =
+    validationConnections?.local_config || (draftConnections.local || []).map((item) => item.name);
+  const deployment = validationConnections?.deployment_source || [];
+  const deploymentLabel = validationConnections ? `, ${deployment.length} deploy` : "";
+  return `${required.length} required, ${local.length} local${deploymentLabel}, ${issueCount} issue(s)`;
+}
+
+function isDatabaseIssue(issue) {
+  const code = issue?.code || "";
+  return code.includes("database") || code.includes("db_") || code.includes("tfvars");
+}
+
+function setText(selector, value) {
+  const node = document.querySelector(selector);
+  if (node) {
+    node.textContent = value;
+  }
+}
+
+function renderReviewApply() {
+  const view = document.querySelector(".review-apply-view");
+  if (!view) {
+    return;
+  }
+  const changes = state.changes || {};
+  const validation = state.validation;
+  const server = state.server || {};
+  const databaseConnections = state.databaseConnections || {};
+  const added = changes.added_bindings || [];
+  const removed = changes.removed_bindings || [];
+  const semantic = changes.semantic_diff || {};
+  const semanticAdded = semantic.added || [];
+  const semanticRemoved = semantic.removed || [];
+  const highRisk = semantic.high_risk || [];
+  const semanticCount = semanticAdded.length + semanticRemoved.length;
+  const pendingCount = added.length + removed.length + semanticCount;
+  const blocking = validation?.blocking_errors || [];
+  const warnings = validation?.warnings || [];
+  const dbIssues = databaseConnections.issues || [];
+  const validationDatabaseConnections = validation?.database_connections || null;
+  const validationDbIssueCount = [...blocking, ...warnings].filter(isDatabaseIssue).length;
+  const dbIssueCount = dbIssues.length + validationDbIssueCount;
+  const generated = validation?.generated || {};
+  const deployment = validation?.deployment || server.deployment || {};
+  const runtime = server.runtime || {};
+
+  setText(
+    "#review-apply-status",
+    validation
+      ? validation.valid
+        ? "Validation is clean for the current draft."
+        : "Validation found blocking issues before apply."
+      : pendingCount
+        ? "Draft has pending changes that need validation."
+        : "No pending draft changes; validation has not run.",
+  );
+  setText(
+    "#review-apply-gate",
+    server.capabilities?.apply ? "Ready" : "Locked",
+  );
+  setText(
+    "#review-runtime-state",
+    validation ? runtimeStateLabel(generated) : runtime.exists ? "Loaded" : "Missing",
+  );
+  setText(
+    "#review-deployment-state",
+    validation ? deploymentStateLabel(deployment) : deployment.mode || "Not configured",
+  );
+  setText(
+    "#review-db-state",
+    reviewDatabaseState(validationDatabaseConnections, databaseConnections, dbIssueCount),
+  );
+  setText(
+    "#review-change-summary",
+    `${pendingCount} pending change(s), ${highRisk.length} high-risk grant(s)`,
+  );
+  setText("#review-high-risk-count", `${highRisk.length} high risk`);
+  setText(
+    "#review-validation-summary",
+    validation ? (validation.valid ? "Validation clean" : "Validation blocked") : "Not run",
+  );
+  setText(
+    "#review-validation-detail",
+    validation
+      ? `${blocking.length} blocking, ${warnings.length} warning(s)`
+      : "Run Validate before Apply",
+  );
+  setText(
+    "#review-runtime-path",
+    generated.runtime_path || runtime.path || "entitlements.generated.toml",
+  );
+  setText(
+    "#review-runtime-digest",
+    generated.temp_runtime_sha256
+      ? `Temp digest ${shortSha(generated.temp_runtime_sha256)}`
+      : runtime.sha256
+        ? `Current digest ${shortSha(runtime.sha256)}`
+        : "Digest unavailable",
+  );
+  setText(
+    "#review-admin-gate",
+    server.capabilities?.apply ? "Admin gate passed" : "Apply disabled",
+  );
+  setText(
+    "#review-admin-detail",
+    server.capabilities?.apply
+      ? "Operator identity can apply this draft."
+      : "Production apply gate and transaction protocol are not enabled yet.",
+  );
+
+  const highRiskKeys = new Set(highRisk.map(grantKey));
+  const rows = [
+    ...added.map((change) => changeRow("Add", change)),
+    ...removed.map((change) => changeRow("Remove", change)),
+    ...semanticAdded.map((grant) =>
+      semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
+    ),
+    ...semanticRemoved.map((grant) => semanticGrantRow("Revoke", grant, false)),
+  ];
+  if (semantic.error) {
+    rows.unshift(semanticErrorRow(semantic.error));
+  }
+  const reviewBody = document.getElementById("review-change-rows");
+  if (reviewBody) {
+    reviewBody.replaceChildren(...(rows.length ? rows : [emptyChangeRow()]));
+  }
+
+  const issues = [
+    ...blocking.map((issue) => ({ ...issue, severity: "blocking" })),
+    ...warnings.map((issue) => ({ ...issue, severity: "warning" })),
+    ...dbIssues.map((issue) => ({ ...issue, severity: "db" })),
+  ];
+  const issueList = document.getElementById("review-issue-list");
+  if (issueList) {
+    issueList.replaceChildren(
+      ...(issues.length
+        ? issues.slice(0, 8).map((issue) =>
+            el("p", issue.severity === "blocking" ? "risk" : "", `${issue.code}: ${issue.message}`),
+          )
+        : [el("p", "", validation ? "No blocking issues." : "No validation result yet.")]),
+    );
+  }
+}
+
+function validationButtons() {
+  return ["validate-button", "review-validate-button"]
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+}
+
+async function runValidation(button) {
+  if (!state.server?.capabilities?.validate) {
+    setValidationStatus("Validate unavailable", "catalog draft is not loaded", false);
+    renderReviewApply();
+    return;
+  }
+  const originalLabel = button.textContent;
+  validationButtons().forEach((item) => {
+    item.disabled = true;
+  });
+  button.textContent = "✓ Validating";
+  try {
+    const validation = await validateDraft();
+    validation.revision = state.draft?.revision ?? 0;
+    state.validation = validation;
+    renderValidateSummary(validation);
+    renderReviewApply();
+    const blocking = validation.blocking_errors?.length || 0;
+    const warnings = validation.warnings?.length || 0;
+    setValidationStatus(
+      validation.valid ? "Validation clean" : "Validation blocked",
+      validation.valid
+        ? `${validation.generated?.generated_rules || 0} runtime rule(s), ${warnings} warning(s)`
+        : `${blocking} blocking issue(s), ${warnings} warning(s)`,
+      validation.valid,
+    );
+  } catch (error) {
+    state.validation = null;
+    renderValidateSummary(null);
+    renderReviewApply();
+    setValidationStatus("Validation failed", error.message, false);
+  } finally {
+    validationButtons().forEach((item) => {
+      item.disabled = !state.server?.capabilities?.validate;
+    });
+    button.textContent = originalLabel;
+  }
+}
+
 function renderExplainSummary(explain) {
   const result = document.getElementById("explain-result");
   if (!result) {
@@ -1189,35 +1399,12 @@ document.getElementById("db-save-button")?.addEventListener("click", async (even
   }
 });
 
-document.getElementById("validate-button")?.addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  if (!state.server?.capabilities?.validate) {
-    setValidationStatus("Validate unavailable", "catalog draft is not loaded", false);
-    return;
-  }
-  button.disabled = true;
-  const originalLabel = button.textContent;
-  button.textContent = "✓ Validating";
-  try {
-    const validation = await validateDraft();
-    validation.revision = state.draft?.revision ?? 0;
-    state.validation = validation;
-    renderValidateSummary(validation);
-    const blocking = validation.blocking_errors?.length || 0;
-    const warnings = validation.warnings?.length || 0;
-    setValidationStatus(
-      validation.valid ? "Validation clean" : "Validation blocked",
-      validation.valid
-        ? `${validation.generated?.generated_rules || 0} runtime rule(s), ${warnings} warning(s)`
-        : `${blocking} blocking issue(s), ${warnings} warning(s)`,
-      validation.valid,
-    );
-  } catch (error) {
-    setValidationStatus("Validation failed", error.message, false);
-  } finally {
-    button.disabled = !state.server?.capabilities?.validate;
-    button.textContent = originalLabel;
-  }
+document.getElementById("validate-button")?.addEventListener("click", (event) => {
+  runValidation(event.currentTarget);
+});
+
+document.getElementById("review-validate-button")?.addEventListener("click", (event) => {
+  runValidation(event.currentTarget);
 });
 
 document.getElementById("preview-button")?.addEventListener("click", async (event) => {
