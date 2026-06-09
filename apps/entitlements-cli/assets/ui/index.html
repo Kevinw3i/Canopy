@@ -21,8 +21,8 @@
         </div>
 
         <nav class="nav-list">
-          <a href="#" class="nav-item"><span class="ico">⚡</span>Overview</a>
-          <a href="#" class="nav-item active" data-view="groups"><span class="ico">◎</span>Groups</a>
+          <a href="#" class="nav-item active" data-view="overview"><span class="ico">⚡</span>Overview</a>
+          <a href="#" class="nav-item" data-view="groups"><span class="ico">◎</span>Groups</a>
           <a href="#" class="nav-item" data-view="packages"><span class="ico">□</span>Packages</a>
           <a href="#" class="nav-item" data-view="scopes"><span class="ico">⌖</span>Scopes</a>
           <a href="#" class="nav-item" data-view="accounts-roles"><span class="ico">♙</span>Accounts/Roles</a>
@@ -41,11 +41,11 @@
         </div>
       </aside>
 
-      <main class="workspace">
+      <main class="workspace overview-mode">
         <header class="topbar">
           <div class="title-row">
-            <h1>Groups</h1>
-            <span>Entitlement Catalog</span>
+            <h1>Overview</h1>
+            <span>Catalog Health</span>
           </div>
           <div class="topbar-actions">
             <label class="env-picker">
@@ -65,7 +65,70 @@
           </div>
         </header>
 
-        <section class="toolbar" aria-label="View controls">
+        <section class="overview-view" aria-label="Overview">
+          <section class="overview-main-panel">
+            <div class="overview-panel-head">
+              <div>
+                <h2>Catalog Overview</h2>
+                <small id="overview-summary">Waiting for local session state.</small>
+              </div>
+              <div class="overview-status-stack" aria-label="Current gates">
+                <span id="overview-validation-state">Validation not run</span>
+                <strong id="overview-apply-state">Apply locked</strong>
+              </div>
+            </div>
+
+            <div class="overview-metric-grid" aria-label="Catalog inventory">
+              <div><span>Groups</span><strong id="overview-group-count">0</strong></div>
+              <div><span>Packages</span><strong id="overview-package-count">0</strong></div>
+              <div><span>Scopes</span><strong id="overview-scope-count">0</strong></div>
+              <div><span>Accounts</span><strong id="overview-account-count">0</strong></div>
+              <div><span>Roles</span><strong id="overview-role-count">0</strong></div>
+              <div><span>DB Conn</span><strong id="overview-db-count">0</strong></div>
+              <div><span>Pending</span><strong id="overview-pending-count">0</strong></div>
+              <div><span>High Risk</span><strong id="overview-high-risk-count">0</strong></div>
+            </div>
+
+            <div class="overview-status-list" id="overview-status-list" aria-label="System status">
+              <div class="overview-status-row">
+                <span>Catalog</span>
+                <strong>Not loaded</strong>
+                <small>Session state has not been fetched.</small>
+              </div>
+            </div>
+          </section>
+
+          <aside class="overview-side-panel">
+            <section>
+              <h3>Draft</h3>
+              <strong id="overview-draft-detail">No draft loaded</strong>
+              <small id="overview-change-detail">No pending changes</small>
+            </section>
+            <section>
+              <h3>Runtime</h3>
+              <strong id="overview-runtime-detail">Not checked</strong>
+              <small id="overview-deployment-detail">Deployment not checked</small>
+            </section>
+            <section>
+              <h3>Database</h3>
+              <strong id="overview-db-detail">No local DB config</strong>
+              <small id="overview-db-issue-detail">No DB issues loaded</small>
+            </section>
+            <section>
+              <h3>Next</h3>
+              <div class="overview-actions">
+                <button type="button" data-overview-target="groups">Groups</button>
+                <button type="button" data-overview-target="packages">Packages</button>
+                <button type="button" data-overview-target="scopes">Scopes</button>
+                <button type="button" data-overview-target="accounts-roles">Accounts/Roles</button>
+                <button type="button" data-overview-target="db-connections">DB Connections</button>
+                <button type="button" data-overview-target="review-apply">Review &amp; Apply</button>
+              </div>
+            </section>
+          </aside>
+        </section>
+
+        <section class="toolbar" aria-label="View controls" hidden>
           <label class="view-select">
             <span>View</span>
             <select aria-label="View">
@@ -85,7 +148,7 @@
           <button class="icon-button" type="button" aria-label="Delete binding">⌫</button>
         </section>
 
-        <section class="content-grid">
+        <section class="content-grid" hidden>
           <section class="matrix-panel" aria-label="Group package matrix">
             <table class="matrix">
               <thead>

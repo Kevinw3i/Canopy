@@ -7,7 +7,7 @@ const state = {
   selectedRole: null,
   accountRoleSelection: "account",
   selectedDbConnection: null,
-  currentView: "groups",
+  currentView: "overview",
   filter: "all",
   search: "",
   server: null,
@@ -285,11 +285,14 @@ function applyServerState(payload) {
     dryRunButton.disabled = !payload.capabilities?.dry_run;
   }
   renderReviewApply();
+  renderOverview();
+  setActiveView(state.currentView || "overview");
 }
 
 function setActiveView(view) {
   state.currentView = view;
   const workspace = document.querySelector(".workspace");
+  const overviewView = document.querySelector(".overview-view");
   const groupGrid = document.querySelector(".content-grid");
   const packagesView = document.querySelector(".packages-view");
   const scopesView = document.querySelector(".scopes-view");
@@ -299,11 +302,33 @@ function setActiveView(view) {
   const toolbar = document.querySelector(".toolbar");
   const title = document.querySelector(".title-row h1");
   const subtitle = document.querySelector(".title-row span");
+  const titles = {
+    overview: "Overview",
+    groups: "Groups",
+    packages: "Packages",
+    scopes: "Scopes",
+    "accounts-roles": "Accounts/Roles",
+    "db-connections": "DB Connections",
+    "review-apply": "Review & Apply",
+  };
+  const subtitles = {
+    overview: "Catalog Health",
+    groups: "Entitlement Catalog",
+    packages: "Feature Toggles",
+    scopes: "Resource Boundaries",
+    "accounts-roles": "Identity Targets",
+    "db-connections": "Connection Safety",
+    "review-apply": "Draft Gate",
+  };
+  workspace?.classList.toggle("overview-mode", view === "overview");
   workspace?.classList.toggle("db-mode", view === "db-connections");
   workspace?.classList.toggle("review-mode", view === "review-apply");
   workspace?.classList.toggle("package-mode", view === "packages");
   workspace?.classList.toggle("scope-mode", view === "scopes");
   workspace?.classList.toggle("account-role-mode", view === "accounts-roles");
+  if (overviewView) {
+    overviewView.hidden = view !== "overview";
+  }
   if (groupGrid) {
     groupGrid.hidden = view !== "groups";
   }
@@ -326,32 +351,10 @@ function setActiveView(view) {
     toolbar.hidden = view !== "groups";
   }
   if (title) {
-    title.textContent =
-      view === "db-connections"
-        ? "DB Connections"
-        : view === "review-apply"
-          ? "Review & Apply"
-          : view === "packages"
-            ? "Packages"
-            : view === "scopes"
-              ? "Scopes"
-              : view === "accounts-roles"
-                ? "Accounts/Roles"
-          : "Groups";
+    title.textContent = titles[view] || titles.groups;
   }
   if (subtitle) {
-    subtitle.textContent =
-      view === "db-connections"
-        ? "Connection Safety"
-        : view === "review-apply"
-          ? "Draft Gate"
-          : view === "packages"
-            ? "Feature Toggles"
-            : view === "scopes"
-              ? "Resource Boundaries"
-              : view === "accounts-roles"
-                ? "Identity Targets"
-          : "Entitlement Catalog";
+    subtitle.textContent = subtitles[view] || subtitles.groups;
   }
   document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
     item.classList.toggle("active", item.dataset.view === view);
@@ -1524,6 +1527,189 @@ function setText(selector, value) {
   }
 }
 
+function fileStateLabel(file) {
+  if (!file) {
+    return "Not configured";
+  }
+  if (!file.exists) {
+    return "Missing";
+  }
+  if (!file.readable) {
+    return "Unreadable";
+  }
+  return file.sha256 ? `Loaded ${shortSha(file.sha256)}` : "Loaded";
+}
+
+function fileStatusKind(file) {
+  if (!file?.exists || !file?.readable) {
+    return "risk";
+  }
+  return "ok";
+}
+
+function overviewStatusRow(label, status, detail, kind = "ok") {
+  const row = el("div", `overview-status-row ${kind}`);
+  row.append(el("span", "", label), el("strong", "", status), el("small", "", detail));
+  return row;
+}
+
+function renderOverview() {
+  const view = document.querySelector(".overview-view");
+  if (!view) {
+    return;
+  }
+  const server = state.server || {};
+  const draft = state.draft || {};
+  const changes = state.changes || {};
+  const validation = state.validation;
+  const databaseConnections = state.databaseConnections || {};
+  const groups = draft.groups || [];
+  const packages = draft.packages || [];
+  const scopes = draft.scopes || [];
+  const accounts = draft.accounts || [];
+  const roles = draft.roles || [];
+  const localDbConnections = databaseConnections.local || [];
+  const semantic = changes.semantic_diff || {};
+  const semanticAdded = semantic.added || [];
+  const semanticRemoved = semantic.removed || [];
+  const highRisk = semantic.high_risk || [];
+  const added = changes.added_bindings || [];
+  const removed = changes.removed_bindings || [];
+  const semanticCount = semanticAdded.length + semanticRemoved.length;
+  const pendingCount = added.length + removed.length + semanticCount;
+  const packageHighRisk = packages.reduce(
+    (count, pkg) => count + (pkg.high_risk_features?.length || 0),
+    0,
+  );
+  const blocking = validation?.blocking_errors || [];
+  const warnings = validation?.warnings || [];
+  const dbIssues = databaseConnections.issues || [];
+  const missingDb = databaseConnections.missing_required || [];
+  const validationDb = validation?.database_connections || null;
+  const deployment = validation?.deployment || server.deployment || {};
+  const generated = validation?.generated || {};
+  const runtime = server.runtime || {};
+  const identity = server.identity || {};
+
+  setText(
+    "#overview-summary",
+    draft.loaded
+      ? `${groups.length} group(s), ${packages.length} package(s), ${scopes.length} scope(s)`
+      : draft.error || "Catalog draft is not loaded.",
+  );
+  setText(
+    "#overview-validation-state",
+    validation ? (validation.valid ? "Validation clean" : "Validation blocked") : "Validation not run",
+  );
+  setText("#overview-apply-state", server.capabilities?.apply ? "Apply ready" : "Apply locked");
+  setText("#overview-group-count", String(groups.length));
+  setText("#overview-package-count", String(packages.length));
+  setText("#overview-scope-count", String(scopes.length));
+  setText("#overview-account-count", String(accounts.length));
+  setText("#overview-role-count", String(roles.length));
+  setText("#overview-db-count", String(localDbConnections.length));
+  setText("#overview-pending-count", String(pendingCount));
+  setText("#overview-high-risk-count", String(highRisk.length + packageHighRisk));
+  setText(
+    "#overview-draft-detail",
+    draft.loaded ? `Revision ${draft.revision ?? 0}` : "No draft loaded",
+  );
+  setText(
+    "#overview-change-detail",
+    pendingCount
+      ? `${pendingCount} pending change(s), ${highRisk.length} high-risk grant(s)`
+      : "No pending changes",
+  );
+  setText(
+    "#overview-runtime-detail",
+    validation ? runtimeStateLabel(generated) : fileStateLabel(runtime),
+  );
+  setText(
+    "#overview-deployment-detail",
+    validation ? deploymentStateLabel(deployment) : deployment.mode || "Deployment not checked",
+  );
+  setText(
+    "#overview-db-detail",
+    databaseConnections.configured
+      ? `${localDbConnections.length} local connection(s)`
+      : "No local DB config",
+  );
+  setText(
+    "#overview-db-issue-detail",
+    `${missingDb.length} missing, ${dbIssues.length} local issue(s)`,
+  );
+
+  const statusList = document.getElementById("overview-status-list");
+  if (!statusList) {
+    return;
+  }
+  const validationKind = validation ? (validation.valid ? "ok" : "risk") : "warn";
+  const dbKind = dbIssues.length || missingDb.length ? "risk" : databaseConnections.configured ? "ok" : "warn";
+  const deploymentKind = validation
+    ? deployment.checked
+      ? "ok"
+      : "warn"
+    : deployment.mode
+      ? "warn"
+      : "risk";
+  statusList.replaceChildren(
+    overviewStatusRow(
+      "Catalog",
+      fileStateLabel(server.catalog),
+      server.catalog?.path || "catalog path unavailable",
+      fileStatusKind(server.catalog),
+    ),
+    overviewStatusRow(
+      "Runtime",
+      validation ? runtimeStateLabel(generated) : fileStateLabel(runtime),
+      validation
+        ? `${generated.generated_rules || 0} generated rule(s)`
+        : runtime.path || "runtime path unavailable",
+      validation ? (generated.runtime_drift ? "warn" : "ok") : fileStatusKind(runtime),
+    ),
+    overviewStatusRow(
+      "Import Runtime",
+      server.import_runtime ? fileStateLabel(server.import_runtime) : "Not configured",
+      server.import_runtime?.path || "runtime import is optional",
+      server.import_runtime ? fileStatusKind(server.import_runtime) : "warn",
+    ),
+    overviewStatusRow(
+      "Deployment",
+      validation ? deploymentStateLabel(deployment) : deployment.mode || "Not configured",
+      deployment.canonical_path || "Production validate/apply needs canonical deployment input",
+      deploymentKind,
+    ),
+    overviewStatusRow(
+      "DB Connections",
+      databaseConnections.configured
+        ? `${localDbConnections.length} local, ${missingDb.length} missing`
+        : "Not configured",
+      `${databaseConnections.required?.length || 0} required, ${dbIssues.length} issue(s)`,
+      dbKind,
+    ),
+    overviewStatusRow(
+      "Validation",
+      validation ? (validation.valid ? "Clean" : "Blocked") : "Not run",
+      validation
+        ? `${blocking.length} blocking, ${warnings.length} warning(s)`
+        : "Run validation before apply",
+      validationKind,
+    ),
+    overviewStatusRow(
+      "Identity",
+      identity.source || "Unknown",
+      `${identity.operator_external_group_count || 0} external group(s), dev identity ${identity.dev_identity_allowed ? "enabled" : "disabled"}`,
+      identity.source ? "ok" : "warn",
+    ),
+    overviewStatusRow(
+      "Database Deploy Check",
+      validationDb ? databaseConnectionStateLabel(validationDb) : "Not checked",
+      "Validated against generated runtime and deployment source when available",
+      validationDb ? "ok" : "warn",
+    ),
+  );
+}
+
 function renderReviewApply() {
   const view = document.querySelector(".review-apply-view");
   if (!view) {
@@ -1659,6 +1845,7 @@ async function runValidation(button) {
   if (!state.server?.capabilities?.validate) {
     setValidationStatus("Validate unavailable", "catalog draft is not loaded", false);
     renderReviewApply();
+    renderOverview();
     return;
   }
   const originalLabel = button.textContent;
@@ -1672,6 +1859,7 @@ async function runValidation(button) {
     state.validation = validation;
     renderValidateSummary(validation);
     renderReviewApply();
+    renderOverview();
     const blocking = validation.blocking_errors?.length || 0;
     const warnings = validation.warnings?.length || 0;
     setValidationStatus(
@@ -1685,6 +1873,7 @@ async function runValidation(button) {
     state.validation = null;
     renderValidateSummary(null);
     renderReviewApply();
+    renderOverview();
     setValidationStatus("Validation failed", error.message, false);
   } finally {
     validationButtons().forEach((item) => {
@@ -1838,6 +2027,8 @@ async function initializeSession() {
   } catch (_error) {
     setSessionStatus("Session required", "open the one-time local URL");
     setValidationStatus("Local session unavailable", "API state is hidden until session exchange", false);
+    renderOverview();
+    setActiveView(state.currentView || "overview");
   }
 }
 
@@ -1983,6 +2174,12 @@ document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
   item.addEventListener("click", (event) => {
     event.preventDefault();
     setActiveView(item.dataset.view || "groups");
+  });
+});
+
+document.querySelectorAll("[data-overview-target]").forEach((button) => {
+  button.addEventListener("click", () => {
+    setActiveView(button.dataset.overviewTarget || "groups");
   });
 });
 

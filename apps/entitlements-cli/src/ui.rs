@@ -3669,6 +3669,24 @@ skip_tls_hostname_verification = true
     }
 
     #[test]
+    fn embedded_overview_assets_expose_dashboard() {
+        assert!(INDEX_HTML.contains(r#"data-view="overview""#));
+        assert!(INDEX_HTML.contains(r#"class="workspace overview-mode""#));
+        assert!(INDEX_HTML.contains(r#"class="overview-view""#));
+        assert!(INDEX_HTML.contains(r#"id="overview-status-list""#));
+        assert!(INDEX_HTML.contains(r#"data-overview-target="review-apply""#));
+
+        assert!(APP_JS.contains("function renderOverview()"));
+        assert!(APP_JS.contains("function overviewStatusRow("));
+        assert!(APP_JS.contains("data-overview-target"));
+
+        assert!(APP_CSS.contains(".workspace.overview-mode"));
+        assert!(APP_CSS.contains(".overview-view"));
+        assert!(APP_CSS.contains(".overview-status-list"));
+        assert!(APP_CSS.contains(".overview-status-row"));
+    }
+
+    #[test]
     fn embedded_packages_assets_expose_feature_toggles() {
         assert!(INDEX_HTML.contains(r#"data-view="packages""#));
         assert!(INDEX_HTML.contains(r#"class="packages-view""#));
