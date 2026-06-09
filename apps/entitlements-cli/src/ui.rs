@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
-use crate::catalog::{self, Catalog, CatalogBinding, CatalogPackage};
+use crate::catalog::{self, Catalog, CatalogBinding, CatalogPackage, CatalogScope};
 
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
@@ -436,6 +436,7 @@ struct UiDraftResponse {
     groups: Vec<UiGroupSummary>,
     packages: Vec<UiPackageSummary>,
     available_features: Vec<UiFeatureSummary>,
+    scopes: Vec<UiScopeSummary>,
     bindings: Vec<UiBindingSummary>,
     selected_group: Option<String>,
     error: Option<String>,
@@ -470,6 +471,27 @@ struct UiFeatureSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct UiScopeSummary {
+    id: String,
+    description: Option<String>,
+    business_scopes: Vec<String>,
+    accounts: Vec<String>,
+    regions: Vec<String>,
+    log_group_arns: Vec<String>,
+    clusters: Vec<String>,
+    os_users: Vec<String>,
+    instance_tag_selectors: Vec<String>,
+    excluded_tag_selectors: Vec<String>,
+    task_tag_selectors: Vec<String>,
+    excluded_task_tag_selectors: Vec<String>,
+    excluded_container_names: Vec<String>,
+    allow_broad_cluster_discovery: bool,
+    database_scopes: Vec<UiDatabaseScopeSummary>,
+    mcp_ec2_diagnostic_scopes: Vec<UiMcpEc2ScopeSummary>,
+    packages: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct UiDatabaseScopeSummary {
     name: String,
     connection: String,
@@ -477,6 +499,32 @@ struct UiDatabaseScopeSummary {
     allowed_schemas: Vec<String>,
     allowed_tables: Vec<String>,
     allowed_actions: Vec<String>,
+    max_rows: u64,
+    statement_timeout_ms: u64,
+    require_explain: bool,
+    max_examined_rows: u64,
+    allow_full_table_scan: bool,
+    allow_views: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMcpEc2ScopeSummary {
+    id: String,
+    log_paths: Vec<String>,
+    journal_units: Vec<String>,
+    http_urls: Vec<String>,
+    tcp_targets: Vec<String>,
+    dns_targets: Vec<String>,
+    private_target_refs: Vec<String>,
+    max_lines: u16,
+    max_since_seconds: u64,
+    max_timeout_seconds: u8,
+    max_matches: u16,
+    connectivity_probe_budget_per_window: u32,
+    budget_window_seconds: u64,
+    denylist_version: String,
+    allowlist_rule_id: String,
+    unsafe_output_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1410,6 +1458,7 @@ impl DraftState {
                     groups: Vec::new(),
                     packages: Vec::new(),
                     available_features: feature_summaries(),
+                    scopes: Vec::new(),
                     bindings: Vec::new(),
                     selected_group: None,
                     error: self.load_error.clone(),
@@ -1434,6 +1483,7 @@ impl DraftState {
                 groups,
                 packages: package_summaries(draft),
                 available_features: feature_summaries(),
+                scopes: scope_summaries(draft),
                 bindings: binding_summaries(draft),
                 selected_group,
                 error: None,
@@ -2670,6 +2720,12 @@ fn package_summaries(catalog: &Catalog) -> Vec<UiPackageSummary> {
                                 allowed_schemas: database_scope.allowed_schemas.clone(),
                                 allowed_tables: database_scope.allowed_tables.clone(),
                                 allowed_actions: database_scope.allowed_actions.clone(),
+                                max_rows: database_scope.max_rows,
+                                statement_timeout_ms: database_scope.statement_timeout_ms,
+                                require_explain: database_scope.require_explain,
+                                max_examined_rows: database_scope.max_examined_rows,
+                                allow_full_table_scan: database_scope.allow_full_table_scan,
+                                allow_views: database_scope.allow_views,
                             })
                             .collect()
                     })
@@ -2738,6 +2794,174 @@ fn binding_summaries(catalog: &Catalog) -> Vec<UiBindingSummary> {
             .then_with(|| left.package.cmp(&right.package))
     });
     bindings
+}
+
+fn scope_summaries(catalog: &Catalog) -> Vec<UiScopeSummary> {
+    let packages_by_scope = catalog.packages.iter().fold(
+        BTreeMap::<&str, Vec<String>>::new(),
+        |mut scopes, package| {
+            scopes
+                .entry(package.scope.as_str())
+                .or_default()
+                .push(package.id.clone());
+            scopes
+        },
+    );
+    let mut scopes = catalog
+        .scopes
+        .iter()
+        .map(|scope| scope_summary(scope, &packages_by_scope))
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| left.id.cmp(&right.id));
+    scopes
+}
+
+fn scope_summary(
+    scope: &CatalogScope,
+    packages_by_scope: &BTreeMap<&str, Vec<String>>,
+) -> UiScopeSummary {
+    UiScopeSummary {
+        id: scope.id.clone(),
+        description: scope.metadata.description.clone(),
+        business_scopes: scope
+            .metadata
+            .scopes
+            .iter()
+            .map(|metadata| {
+                let aliases = if metadata.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", metadata.aliases.join(", "))
+                };
+                format!(
+                    "{} / {}{}",
+                    metadata.platform, metadata.environment, aliases
+                )
+            })
+            .collect(),
+        accounts: scope.accounts.clone(),
+        regions: scope.regions.clone(),
+        log_group_arns: scope.log_group_arns.clone(),
+        clusters: scope.clusters.clone(),
+        os_users: scope.os_users.clone(),
+        instance_tag_selectors: tag_selector_summaries(&scope.instance_tag_selectors),
+        excluded_tag_selectors: tag_selector_summaries(&scope.excluded_tag_selectors),
+        task_tag_selectors: tag_selector_summaries(&scope.task_tag_selectors),
+        excluded_task_tag_selectors: tag_selector_summaries(&scope.excluded_task_tag_selectors),
+        excluded_container_names: scope.excluded_container_names.clone(),
+        allow_broad_cluster_discovery: scope.allow_broad_cluster_discovery,
+        database_scopes: scope
+            .database_scopes
+            .iter()
+            .map(|database_scope| UiDatabaseScopeSummary {
+                name: database_scope.name.clone(),
+                connection: database_scope.connection.clone(),
+                environment: database_scope.environment.clone(),
+                allowed_schemas: database_scope.allowed_schemas.clone(),
+                allowed_tables: database_scope.allowed_tables.clone(),
+                allowed_actions: database_scope.allowed_actions.clone(),
+                max_rows: database_scope.max_rows,
+                statement_timeout_ms: database_scope.statement_timeout_ms,
+                require_explain: database_scope.require_explain,
+                max_examined_rows: database_scope.max_examined_rows,
+                allow_full_table_scan: database_scope.allow_full_table_scan,
+                allow_views: database_scope.allow_views,
+            })
+            .collect(),
+        mcp_ec2_diagnostic_scopes: scope
+            .mcp_ec2_diagnostic_scopes
+            .iter()
+            .map(|ec2_scope| UiMcpEc2ScopeSummary {
+                id: ec2_scope.id.clone(),
+                log_paths: ec2_scope
+                    .allowed_log_paths
+                    .iter()
+                    .map(|path| path.path_pattern.clone())
+                    .collect(),
+                journal_units: ec2_scope
+                    .allowed_journal_units
+                    .iter()
+                    .map(|unit| unit.unit.clone())
+                    .collect(),
+                http_urls: ec2_scope
+                    .allowed_http_urls
+                    .iter()
+                    .map(|url| url.normalized_url.clone())
+                    .collect(),
+                tcp_targets: ec2_scope
+                    .allowed_tcp_targets
+                    .iter()
+                    .map(|target| format!("{}:{}", target.host, target.port))
+                    .collect(),
+                dns_targets: ec2_scope
+                    .allowed_dns_targets
+                    .iter()
+                    .map(|target| {
+                        let records = target
+                            .record_types
+                            .iter()
+                            .map(|record| format!("{record:?}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        format!("{} [{}]", target.host, records)
+                    })
+                    .collect(),
+                private_target_refs: ec2_scope.private_target_refs.clone(),
+                max_lines: ec2_scope.max_lines,
+                max_since_seconds: ec2_scope.max_since_seconds,
+                max_timeout_seconds: ec2_scope.max_timeout_seconds,
+                max_matches: ec2_scope.max_matches,
+                connectivity_probe_budget_per_window: ec2_scope
+                    .connectivity_probe_budget_per_window,
+                budget_window_seconds: ec2_scope.budget_window_seconds,
+                denylist_version: ec2_scope.denylist_version.clone(),
+                allowlist_rule_id: ec2_scope.allowlist_rule_id.clone(),
+                unsafe_output_count: ec2_unsafe_output_count(ec2_scope),
+            })
+            .collect(),
+        packages: packages_by_scope
+            .get(scope.id.as_str())
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+fn tag_selector_summaries(selectors: &[shared::dto::entitlements::TagSelector]) -> Vec<String> {
+    selectors
+        .iter()
+        .map(|selector| {
+            let mut entries = selector.tags.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            entries
+                .into_iter()
+                .map(|(key, values)| format!("{key}={}", values.join("|")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect()
+}
+
+fn ec2_unsafe_output_count(scope: &shared::dto::entitlements::McpEc2DiagnosticScope) -> usize {
+    scope
+        .allowed_log_paths
+        .iter()
+        .filter(|path| !path.safe_for_mcp_output)
+        .count()
+        + scope
+            .allowed_journal_units
+            .iter()
+            .filter(|unit| !unit.safe_for_mcp_output)
+            .count()
+        + scope
+            .allowed_http_urls
+            .iter()
+            .filter(|url| !url.safe_for_mcp_output)
+            .count()
+        + scope
+            .allowed_dns_targets
+            .iter()
+            .filter(|target| !target.safe_for_mcp_output)
+            .count()
 }
 
 fn feature_summaries() -> Vec<UiFeatureSummary> {
@@ -3325,6 +3549,21 @@ skip_tls_hostname_verification = true
         assert!(APP_CSS.contains(".feature-toggle"));
     }
 
+    #[test]
+    fn embedded_scopes_assets_expose_scope_inspector() {
+        assert!(INDEX_HTML.contains(r#"data-view="scopes""#));
+        assert!(INDEX_HTML.contains(r#"class="scopes-view""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-detail-list""#));
+
+        assert!(APP_JS.contains("function renderScopes("));
+        assert!(APP_JS.contains("function renderScopeInspector("));
+        assert!(APP_JS.contains("mcpEc2ScopeLine"));
+
+        assert!(APP_CSS.contains(".workspace.scope-mode"));
+        assert!(APP_CSS.contains(".scopes-table"));
+        assert!(APP_CSS.contains(".scope-detail-block"));
+    }
+
     #[tokio::test]
     async fn unknown_ui_route_returns_secured_404() {
         let response = router(test_state("missing-route-code"))
@@ -3478,6 +3717,124 @@ skip_tls_hostname_verification = true
                 .as_array()
                 .unwrap()
                 .len(),
+            0
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn state_includes_sanitized_scope_summaries() {
+        let (catalog_path, content) = write_catalog_fixture("state-scopes");
+        let enriched = content.replacen(
+            "\n[[packages]]",
+            r#"
+[[scopes.instance_tag_selectors]]
+[scopes.instance_tag_selectors.tags]
+Environment = ["production"]
+
+[[scopes.mcp_ec2_diagnostic_scopes]]
+id = "app-diagnostics"
+private_target_refs = ["service:app-api"]
+max_lines = 200
+max_since_seconds = 900
+max_timeout_seconds = 30
+max_matches = 20
+connectivity_probe_budget_per_window = 4
+budget_window_seconds = 60
+denylist_version = "builtin-v1"
+allowlist_rule_id = "app-diagnostics-v1"
+
+[[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+path_pattern = "/var/log/app/error.log"
+canonical_safe_prefix = "/var/log/app/"
+safe_for_mcp_output = true
+
+[[scopes.mcp_ec2_diagnostic_scopes.allowed_http_urls]]
+normalized_url = "https://10.0.1.20/health"
+query_policy = "no_query"
+safe_for_mcp_output = true
+private_target_ref = "service:app-api"
+
+[[scopes.mcp_ec2_diagnostic_scopes.allowed_tcp_targets]]
+host = "10.0.1.20"
+port = 443
+private_target_ref = "service:app-api"
+
+[[packages]]
+"#,
+            1,
+        );
+        std::fs::write(&catalog_path, enriched).unwrap();
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/state")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let scopes = state["draft"]["scopes"].as_array().unwrap();
+        let scope = scopes
+            .iter()
+            .find(|scope| scope["id"] == "db-scope")
+            .unwrap();
+        assert!(scope["accounts"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("prod".to_owned())));
+        assert!(scope["instance_tag_selectors"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String(
+                "Environment=production".to_owned()
+            )));
+        assert_eq!(scope["database_scopes"][0]["max_rows"], 100);
+        assert_eq!(scope["database_scopes"][0]["require_explain"], true);
+        assert_eq!(scope["database_scopes"][0]["allow_views"], false);
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["id"],
+            "app-diagnostics"
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["private_target_refs"][0],
+            "service:app-api"
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["log_paths"][0],
+            "/var/log/app/error.log"
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["http_urls"][0],
+            "https://10.0.1.20/health"
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["tcp_targets"][0],
+            "10.0.1.20:443"
+        );
+        assert_eq!(scope["mcp_ec2_diagnostic_scopes"][0]["max_lines"], 200);
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["connectivity_probe_budget_per_window"],
+            4
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["denylist_version"],
+            "builtin-v1"
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["allowlist_rule_id"],
+            "app-diagnostics-v1"
+        );
+        assert_eq!(
+            scope["mcp_ec2_diagnostic_scopes"][0]["unsafe_output_count"],
             0
         );
         let _ = std::fs::remove_file(catalog_path);

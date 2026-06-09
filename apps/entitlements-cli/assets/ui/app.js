@@ -2,6 +2,7 @@ const state = {
   selectedGroup: null,
   selectedPackage: null,
   selectedMembers: "0",
+  selectedScope: null,
   selectedDbConnection: null,
   currentView: "groups",
   filter: "all",
@@ -288,6 +289,7 @@ function setActiveView(view) {
   const workspace = document.querySelector(".workspace");
   const groupGrid = document.querySelector(".content-grid");
   const packagesView = document.querySelector(".packages-view");
+  const scopesView = document.querySelector(".scopes-view");
   const dbView = document.querySelector(".db-connections-view");
   const reviewView = document.querySelector(".review-apply-view");
   const toolbar = document.querySelector(".toolbar");
@@ -296,11 +298,15 @@ function setActiveView(view) {
   workspace?.classList.toggle("db-mode", view === "db-connections");
   workspace?.classList.toggle("review-mode", view === "review-apply");
   workspace?.classList.toggle("package-mode", view === "packages");
+  workspace?.classList.toggle("scope-mode", view === "scopes");
   if (groupGrid) {
     groupGrid.hidden = view !== "groups";
   }
   if (packagesView) {
     packagesView.hidden = view !== "packages";
+  }
+  if (scopesView) {
+    scopesView.hidden = view !== "scopes";
   }
   if (dbView) {
     dbView.hidden = view !== "db-connections";
@@ -319,6 +325,8 @@ function setActiveView(view) {
           ? "Review & Apply"
           : view === "packages"
             ? "Packages"
+            : view === "scopes"
+              ? "Scopes"
           : "Groups";
   }
   if (subtitle) {
@@ -329,6 +337,8 @@ function setActiveView(view) {
           ? "Draft Gate"
           : view === "packages"
             ? "Feature Toggles"
+            : view === "scopes"
+              ? "Resource Boundaries"
           : "Entitlement Catalog";
   }
   document.querySelectorAll(".nav-item[data-view]").forEach((item) => {
@@ -340,6 +350,7 @@ function renderDraft(draft, changes) {
   if (!draft.loaded) {
     renderChanges(changes || {});
     renderPackages([], []);
+    renderScopes([]);
     return;
   }
   const groups = draft.groups || [];
@@ -355,6 +366,7 @@ function renderDraft(draft, changes) {
   renderInspector(groups, packages, draft.bindings || [], changes || {});
   renderChanges(changes || {});
   renderPackages(packages, draft.available_features || []);
+  renderScopes(draft.scopes || []);
   applyFilters();
 }
 
@@ -745,6 +757,187 @@ function featureSummary(feature) {
   return "Catalog feature";
 }
 
+function renderScopes(scopes) {
+  const rowsNode = document.getElementById("scope-rows");
+  if (!rowsNode) {
+    return;
+  }
+  const summary = document.getElementById("scope-summary");
+  const resourceCount = document.getElementById("scope-resource-count");
+  const guardrailCount = document.getElementById("scope-guardrail-count");
+  const totalResources = scopes.reduce((count, scope) => count + scopeResourceCount(scope), 0);
+  const totalGuardrails = scopes.reduce((count, scope) => count + scopeGuardrailCount(scope), 0);
+  if (summary) {
+    summary.textContent = `${scopes.length} scope(s), ${totalResources} resource boundary item(s)`;
+  }
+  if (resourceCount) {
+    resourceCount.textContent = `${totalResources} resources`;
+  }
+  if (guardrailCount) {
+    guardrailCount.textContent = `${totalGuardrails} guardrails`;
+  }
+
+  const hasSelected = scopes.some((scope) => scope.id === state.selectedScope);
+  if (!state.selectedScope || !hasSelected) {
+    state.selectedScope = scopes[0]?.id || null;
+  }
+  rowsNode.replaceChildren(...(scopes.length ? scopes.map(scopeRow) : [emptyScopeRow()]));
+  renderScopeInspector(scopes);
+}
+
+function scopeResourceCount(scope) {
+  return (
+    (scope.accounts?.length || 0) +
+    (scope.regions?.length || 0) +
+    (scope.log_group_arns?.length || 0) +
+    (scope.clusters?.length || 0) +
+    (scope.os_users?.length || 0) +
+    (scope.database_scopes?.length || 0) +
+    (scope.mcp_ec2_diagnostic_scopes?.length || 0)
+  );
+}
+
+function scopeGuardrailCount(scope) {
+  return (
+    (scope.instance_tag_selectors?.length || 0) +
+    (scope.excluded_tag_selectors?.length || 0) +
+    (scope.task_tag_selectors?.length || 0) +
+    (scope.excluded_task_tag_selectors?.length || 0) +
+    (scope.excluded_container_names?.length || 0) +
+    (scope.allow_broad_cluster_discovery ? 1 : 0)
+  );
+}
+
+function scopeRow(scope) {
+  const row = document.createElement("tr");
+  row.dataset.scope = scope.id;
+  row.classList.toggle("selected", scope.id === state.selectedScope);
+  row.classList.toggle("scope-risk-row", scope.allow_broad_cluster_discovery);
+  row.addEventListener("click", () => {
+    state.selectedScope = scope.id;
+    renderScopes(state.draft?.scopes || []);
+  });
+  [
+    scope.id,
+    listPreview(scope.accounts),
+    listPreview(scope.regions),
+    listPreview(scope.packages),
+    `${scopeResourceCount(scope)} resources, ${scopeGuardrailCount(scope)} guardrails`,
+  ].forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    if (index === 4 && scope.allow_broad_cluster_discovery) {
+      cell.className = "risk";
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function emptyScopeRow() {
+  const row = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 5;
+  cell.textContent = "No scopes to display";
+  row.append(cell);
+  return row;
+}
+
+function renderScopeInspector(scopes) {
+  const selected = scopes.find((scope) => scope.id === state.selectedScope) || null;
+  const name = document.getElementById("scope-selected-name");
+  const badge = document.getElementById("scope-selected-mode");
+  if (name) {
+    name.textContent = selected?.id || "Scope";
+  }
+  if (badge) {
+    badge.textContent = selected?.allow_broad_cluster_discovery ? "Broad cluster" : "Guarded";
+    badge.classList.toggle("badge-risk", Boolean(selected?.allow_broad_cluster_discovery));
+  }
+  setText("#scope-selected-accounts", String(selected?.accounts?.length || 0));
+  setText("#scope-selected-regions", String(selected?.regions?.length || 0));
+  setText("#scope-selected-logs", String(selected?.log_group_arns?.length || 0));
+  setText("#scope-selected-ecs", String(selected?.clusters?.length || 0));
+  setText("#scope-selected-db", String(selected?.database_scopes?.length || 0));
+  setText("#scope-selected-mcp-ec2", String(selected?.mcp_ec2_diagnostic_scopes?.length || 0));
+
+  const list = document.getElementById("scope-detail-list");
+  if (!list) {
+    return;
+  }
+  const title = document.createElement("h3");
+  title.append("Scope Details ");
+  title.append(el("span", "", String(selected ? scopeResourceCount(selected) : 0)));
+  if (!selected) {
+    list.replaceChildren(title, el("p", "", "No scope selected"));
+    return;
+  }
+  const blocks = [
+    scopeDetailBlock("Description", selected.description ? [selected.description] : []),
+    scopeDetailBlock("Business Scope", selected.business_scopes || []),
+    scopeDetailBlock("Packages", selected.packages || []),
+    scopeDetailBlock("Accounts", selected.accounts || []),
+    scopeDetailBlock("Regions", selected.regions || []),
+    scopeDetailBlock("Log Groups", selected.log_group_arns || []),
+    scopeDetailBlock("ECS Clusters", selected.clusters || []),
+    scopeDetailBlock("Instance Tags", selected.instance_tag_selectors || []),
+    scopeDetailBlock("Excluded Instance Tags", selected.excluded_tag_selectors || []),
+    scopeDetailBlock("Task Tags", selected.task_tag_selectors || []),
+    scopeDetailBlock("Excluded Task Tags", selected.excluded_task_tag_selectors || []),
+    scopeDetailBlock("Excluded Containers", selected.excluded_container_names || []),
+    scopeDetailBlock("OS Users", selected.os_users || []),
+    scopeDetailBlock("Database Scopes", (selected.database_scopes || []).map(databaseScopeLine)),
+    scopeDetailBlock(
+      "MCP EC2 Diagnostics",
+      (selected.mcp_ec2_diagnostic_scopes || []).map(mcpEc2ScopeLine),
+    ),
+  ];
+  list.replaceChildren(title, ...blocks);
+}
+
+function scopeDetailBlock(title, values) {
+  const block = document.createElement("section");
+  block.className = "scope-detail-block";
+  block.append(el("h4", "", title));
+  if (!values.length) {
+    block.append(el("p", "", "none"));
+    return block;
+  }
+  values.forEach((value) => {
+    block.append(el("p", "", value));
+  });
+  return block;
+}
+
+function databaseScopeLine(scope) {
+  return [
+    `${scope.name}: ${scope.connection}/${scope.environment}`,
+    `schemas ${listFull(scope.allowed_schemas)}`,
+    `tables ${listFull(scope.allowed_tables)}`,
+    `actions ${listFull(scope.allowed_actions)}`,
+    `${scope.max_rows} rows, ${scope.max_examined_rows} examined, ${scope.statement_timeout_ms}ms`,
+    scope.require_explain ? "explain required" : "explain optional",
+    scope.allow_full_table_scan ? "full scan allowed" : "full scan blocked",
+    scope.allow_views ? "views allowed" : "views blocked",
+  ].join("; ");
+}
+
+function mcpEc2ScopeLine(scope) {
+  return [
+    `${scope.id}: logs ${listFull(scope.log_paths)}`,
+    `journals ${listFull(scope.journal_units)}`,
+    `http ${listFull(scope.http_urls)}`,
+    `tcp ${listFull(scope.tcp_targets)}`,
+    `dns ${listFull(scope.dns_targets)}`,
+    `private refs ${listFull(scope.private_target_refs)}`,
+    `limits ${scope.max_lines} lines, ${scope.max_matches} matches, ${scope.max_since_seconds}s since, ${scope.max_timeout_seconds}s timeout`,
+    `budget ${scope.connectivity_probe_budget_per_window}/${scope.budget_window_seconds}s`,
+    `allowlist ${scope.allowlist_rule_id || "none"}`,
+    `denylist ${scope.denylist_version || "none"}`,
+    `unsafe outputs ${scope.unsafe_output_count}`,
+  ].join("; ");
+}
+
 function firstBoundPackage(groupId, bindings) {
   return bindings.find((binding) => binding.group === groupId)?.package || null;
 }
@@ -1068,6 +1261,11 @@ function listPreview(items) {
     return values.join(", ");
   }
   return `${values.slice(0, 3).join(", ")} +${values.length - 3} more`;
+}
+
+function listFull(items) {
+  const values = Array.isArray(items) ? items : [];
+  return values.length ? values.join(", ") : "none";
 }
 
 function databaseConnectionStateLabel(connections) {

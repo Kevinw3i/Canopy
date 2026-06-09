@@ -196,6 +196,10 @@ button {
   grid-template-rows: 76px minmax(624px, 1fr) 196px;
 }
 
+.workspace.scope-mode {
+  grid-template-rows: 76px minmax(624px, 1fr) 196px;
+}
+
 .workspace.review-mode {
   grid-template-rows: 76px minmax(680px, 1fr);
 }
@@ -208,6 +212,7 @@ button {
 .toolbar,
 .content-grid,
 .packages-view,
+.scopes-view,
 .db-connections-view,
 .review-apply-view,
 .review-strip {
@@ -1172,6 +1177,182 @@ textarea {
   color: #7a5400;
 }
 
+.scopes-view {
+  display: grid;
+  grid-template-columns: minmax(640px, 1fr) minmax(360px, 430px);
+  min-height: 0;
+  background: var(--panel);
+}
+
+.scopes-panel {
+  min-width: 0;
+  overflow: auto;
+  border-right: 1px solid var(--line);
+}
+
+.scopes-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 84px;
+  padding: 18px 26px;
+  border-bottom: 1px solid var(--line);
+  background: #fafcfd;
+}
+
+.scopes-panel-head h2 {
+  font-size: 22px;
+}
+
+.scopes-panel-head small,
+.scope-status-stack small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+}
+
+.scope-status-stack {
+  text-align: right;
+}
+
+.scope-status-stack strong {
+  color: var(--green);
+}
+
+.scopes-table {
+  width: 100%;
+  min-width: 860px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.scopes-table th,
+.scopes-table td {
+  height: 58px;
+  padding: 0 18px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  text-align: left;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.scopes-table th {
+  height: 48px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.scopes-table tr {
+  cursor: pointer;
+}
+
+.scopes-table tr.selected td {
+  background: var(--green-soft);
+}
+
+.scopes-table tr.selected td:first-child {
+  box-shadow: inset 4px 0 0 var(--green);
+}
+
+.scope-risk-row td:first-child {
+  box-shadow: inset 4px 0 0 #d89800;
+}
+
+.scope-inspector {
+  min-width: 0;
+  padding: 22px 24px;
+  overflow: auto;
+  background: var(--panel);
+}
+
+.scope-meta-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.scope-meta-grid div {
+  min-width: 0;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.scope-meta-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 660;
+}
+
+.scope-meta-grid strong {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-detail-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.scope-detail-list > h3 {
+  font-size: 14px;
+}
+
+.scope-detail-list > h3 span {
+  display: inline-grid;
+  place-items: center;
+  min-width: 24px;
+  height: 20px;
+  margin-left: 8px;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 12px;
+}
+
+.scope-detail-block {
+  display: grid;
+  gap: 6px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.scope-detail-block:last-child {
+  border-bottom: 0;
+}
+
+.scope-detail-block h4 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.scope-detail-block p {
+  color: #394352;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .review-apply-view {
   display: grid;
   grid-template-columns: minmax(640px, 1fr) minmax(340px, 410px);
@@ -1591,6 +1772,7 @@ textarea {
   .toolbar,
   .content-grid,
   .packages-view,
+  .scopes-view,
   .db-connections-view,
   .review-apply-view,
   .review-strip {
@@ -1608,6 +1790,12 @@ textarea {
   }
 
   .packages-view {
+    display: block;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  .scopes-view {
     display: block;
     overflow-x: hidden;
     max-width: 100%;
@@ -1660,6 +1848,11 @@ textarea {
     min-width: 0;
   }
 
+  .scopes-panel {
+    width: 100%;
+    min-width: 0;
+  }
+
   .db-connections-panel {
     width: 100%;
     min-width: 0;
@@ -1677,7 +1870,15 @@ textarea {
     min-width: 760px;
   }
 
+  .scopes-table {
+    min-width: 780px;
+  }
+
   .package-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .scope-meta-grid {
     grid-template-columns: 1fr;
   }
 

@@ -24,7 +24,7 @@
           <a href="#" class="nav-item"><span class="ico">⚡</span>Overview</a>
           <a href="#" class="nav-item active" data-view="groups"><span class="ico">◎</span>Groups</a>
           <a href="#" class="nav-item" data-view="packages"><span class="ico">□</span>Packages</a>
-          <a href="#" class="nav-item"><span class="ico">⌖</span>Scopes</a>
+          <a href="#" class="nav-item" data-view="scopes"><span class="ico">⌖</span>Scopes</a>
           <a href="#" class="nav-item"><span class="ico">♙</span>Accounts/Roles</a>
           <a href="#" class="nav-item" data-view="db-connections"><span class="ico">▤</span>DB Connections</a>
           <a href="#" class="nav-item" data-view="review-apply"><span class="ico">✓</span>Review &amp; Apply</a>
@@ -302,6 +302,58 @@
             <div class="feature-toggle-list" id="package-feature-toggles">
               <h3>Feature Toggles <span>0</span></h3>
               <p>No package selected</p>
+            </div>
+          </aside>
+        </section>
+
+        <section class="scopes-view" aria-label="Scopes" hidden>
+          <section class="scopes-panel">
+            <div class="scopes-panel-head">
+              <div>
+                <h2>Scopes</h2>
+                <small id="scope-summary">No scope metadata loaded</small>
+              </div>
+              <div class="scope-status-stack">
+                <strong id="scope-resource-count">0 resources</strong>
+                <small id="scope-guardrail-count">0 guardrails</small>
+              </div>
+            </div>
+            <table class="scopes-table">
+              <thead>
+                <tr>
+                  <th>Scope</th>
+                  <th>Accounts</th>
+                  <th>Regions</th>
+                  <th>Packages</th>
+                  <th>Resources</th>
+                </tr>
+              </thead>
+              <tbody id="scope-rows">
+                <tr><td colspan="5">Loading scopes</td></tr>
+              </tbody>
+            </table>
+          </section>
+
+          <aside class="scope-inspector" aria-label="Scope inspector">
+            <div class="inspector-title">
+              <div>
+                <h2 id="scope-selected-name">Scope</h2>
+                <span class="badge-ok" id="scope-selected-mode">Guarded</span>
+              </div>
+            </div>
+
+            <div class="scope-meta-grid">
+              <div><span>Accounts</span><strong id="scope-selected-accounts">0</strong></div>
+              <div><span>Regions</span><strong id="scope-selected-regions">0</strong></div>
+              <div><span>Log Groups</span><strong id="scope-selected-logs">0</strong></div>
+              <div><span>ECS</span><strong id="scope-selected-ecs">0</strong></div>
+              <div><span>DB Scopes</span><strong id="scope-selected-db">0</strong></div>
+              <div><span>MCP EC2</span><strong id="scope-selected-mcp-ec2">0</strong></div>
+            </div>
+
+            <div class="scope-detail-list" id="scope-detail-list">
+              <h3>Scope Details <span>0</span></h3>
+              <p>No scope selected</p>
             </div>
           </aside>
         </section>
