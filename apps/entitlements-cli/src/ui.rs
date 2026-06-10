@@ -242,6 +242,13 @@ struct ApplyFileDigest {
 #[derive(Debug, Deserialize)]
 struct UiAuthConfigFile {
     admin_group: Option<String>,
+    os_allowlist: Option<UiAuthOsAllowlist>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UiAuthOsAllowlist {
+    #[serde(default)]
+    users: Vec<String>,
 }
 
 impl ApplyBaselineSnapshot {
@@ -4124,6 +4131,19 @@ fn canonical_admin_group(args: &UiArgs) -> Result<String, String> {
     let Some(path) = args.auth_config.as_deref() else {
         return Ok("admin".to_owned());
     };
+    let config = load_auth_config(path)?;
+    let admin_group = config.admin_group.unwrap_or_else(|| "admin".to_owned());
+    let admin_group = admin_group.trim();
+    if admin_group.is_empty() {
+        return Err(format!(
+            "canonical auth config '{}' has an empty admin_group",
+            path.display()
+        ));
+    }
+    Ok(admin_group.to_owned())
+}
+
+fn load_auth_config(path: &Path) -> Result<UiAuthConfigFile, String> {
     validate_auth_config_file_path(path).map_err(|err| {
         format!(
             "canonical auth config '{}' failed protected file validation: {err:#}",
@@ -4142,18 +4162,16 @@ fn canonical_admin_group(args: &UiArgs) -> Result<String, String> {
             path.display()
         )
     })?;
-    let admin_group = config.admin_group.unwrap_or_else(|| "admin".to_owned());
-    let admin_group = admin_group.trim();
-    if admin_group.is_empty() {
-        return Err(format!(
-            "canonical auth config '{}' has an empty admin_group",
-            path.display()
-        ));
-    }
-    Ok(admin_group.to_owned())
+    Ok(config)
 }
 
 fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
+    if args.identity_source == "os-allowlist"
+        && args.auth_config.is_some()
+        && !args.allow_dev_identity
+    {
+        return os_allowlist_operator_explain_request(args);
+    }
     explain_request_from_body(
         args,
         ExplainRequestBody {
@@ -4164,6 +4182,45 @@ fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainReq
         },
     )
     .map_err(|err| err.message)
+}
+
+fn os_allowlist_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
+    let path = args
+        .auth_config
+        .as_deref()
+        .ok_or_else(|| "os-allowlist identity requires --auth-config".to_owned())?;
+    let config = load_auth_config(path)?;
+    let allowlist = config.os_allowlist.ok_or_else(|| {
+        format!(
+            "canonical auth config '{}' is missing [os_allowlist]",
+            path.display()
+        )
+    })?;
+    let os_user = current_os_user()?;
+    if !allowlist.users.iter().any(|user| user.trim() == os_user) {
+        return Err(format!(
+            "OS user '{os_user}' is not present in canonical auth config '{}' os_allowlist.users",
+            path.display()
+        ));
+    }
+    Ok(catalog::ExplainRequest {
+        sub: os_user,
+        email: None,
+        email_verified: false,
+        external_groups: Vec::new(),
+    })
+}
+
+fn current_os_user() -> Result<String, String> {
+    let user = std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .unwrap_or_default();
+    let user = user.trim();
+    if user.is_empty() {
+        return Err("failed to resolve current OS user for os-allowlist identity".to_owned());
+    }
+    Ok(user.to_owned())
 }
 
 fn validate_deployment_source(
@@ -5993,8 +6050,26 @@ group = "{group}"
     }
 
     fn write_auth_config_fixture(name: &str, admin_group: &str) -> PathBuf {
+        let os_user = current_os_user().unwrap_or_else(|_| "operator".to_owned());
+        write_auth_config_fixture_with_os_users(name, admin_group, &[os_user])
+    }
+
+    fn write_auth_config_fixture_with_os_users(
+        name: &str,
+        admin_group: &str,
+        users: &[String],
+    ) -> PathBuf {
         let path = catalog_fixture_path(name);
-        std::fs::write(&path, format!("admin_group = \"{admin_group}\"\n")).unwrap();
+        let users = users
+            .iter()
+            .map(|user| format!("\"{user}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            &path,
+            format!("admin_group = \"{admin_group}\"\n\n[os_allowlist]\nusers = [{users}]\n"),
+        )
+        .unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
@@ -9145,10 +9220,11 @@ package = "mcp-ec2-diagnostics"
 
     #[tokio::test]
     async fn apply_uses_auth_config_admin_group_against_baseline_catalog() {
+        let os_user = current_os_user().unwrap();
         let (catalog_path, catalog_content) = write_catalog_fixture_with_group_member(
             "apply-auth-config-admin-catalog",
             "ops-admin",
-            "operator",
+            &os_user,
         );
         let runtime_path =
             write_runtime_from_catalog_fixture("apply-auth-config-admin-runtime", &catalog_content);
@@ -9169,7 +9245,7 @@ package = "mcp-ec2-diagnostics"
         args.identity_source = "os-allowlist".to_owned();
         args.allow_dev_identity = false;
         args.dev_admin_group = "admin".to_owned();
-        args.dev_operator_sub = Some("operator".to_owned());
+        args.dev_operator_sub = Some("ignored-dev-operator".to_owned());
         let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
         install_session(&state);
 
@@ -9220,10 +9296,11 @@ package = "mcp-ec2-diagnostics"
     #[cfg(unix)]
     #[tokio::test]
     async fn apply_rejects_auth_config_that_becomes_group_writable() {
+        let os_user = current_os_user().unwrap();
         let (catalog_path, catalog_content) = write_catalog_fixture_with_group_member(
             "apply-auth-config-writable-catalog",
             "ops-admin",
-            "operator",
+            &os_user,
         );
         let runtime_path = write_runtime_from_catalog_fixture(
             "apply-auth-config-writable-runtime",
@@ -9245,7 +9322,7 @@ package = "mcp-ec2-diagnostics"
         args.auth_config = Some(auth_config_path.clone());
         args.identity_source = "os-allowlist".to_owned();
         args.allow_dev_identity = false;
-        args.dev_operator_sub = Some("operator".to_owned());
+        args.dev_operator_sub = Some("ignored-dev-operator".to_owned());
         let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
         install_session(&state);
         std::fs::set_permissions(&auth_config_path, std::fs::Permissions::from_mode(0o620))
@@ -9278,6 +9355,95 @@ package = "mcp-ec2-diagnostics"
             .as_str()
             .unwrap()
             .contains("must not be group/world writable"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(auth_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_os_user_removed_from_auth_config_allowlist() {
+        let os_user = current_os_user().unwrap();
+        let (catalog_path, catalog_content) = write_catalog_fixture_with_group_member(
+            "apply-auth-config-allowlist-catalog",
+            "ops-admin",
+            &os_user,
+        );
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "apply-auth-config-allowlist-runtime",
+            &catalog_content,
+        );
+        let db_config_path = write_database_config_fixture("apply-auth-config-allowlist-db");
+        let deployment_config_path =
+            write_database_config_fixture("apply-auth-config-allowlist-deploy");
+        let auth_config_path =
+            write_auth_config_fixture("apply-auth-config-allowlist-auth", "ops-admin");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.auth_config = Some(auth_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("ignored-dev-operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let removed_user = format!("{os_user}-removed");
+        std::fs::write(
+            &auth_config_path,
+            format!(
+                "admin_group = \"ops-admin\"\n\n[os_allowlist]\nusers = [\"{removed_user}\"]\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&auth_config_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_blocked");
+        assert_eq!(
+            apply["gate"]["reason_code"],
+            "operator_identity_unavailable"
+        );
+        assert!(apply["gate"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not present in canonical auth config"));
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
