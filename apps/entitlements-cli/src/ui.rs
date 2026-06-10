@@ -256,16 +256,15 @@ impl ApplyBaselineSnapshot {
                 baseline_mismatches.push(mismatch);
             }
         }
-        let state = if baseline_mismatches.is_empty() {
+        let (lock_path, manifest_path) = transaction_artifact_paths(&args.catalog);
+        let (lock_exists, lock_error) = transaction_lock_status(&lock_path);
+        let state = if lock_exists || lock_error.is_some() {
+            "lock_blocked"
+        } else if baseline_mismatches.is_empty() {
             "not_started"
         } else {
             "baseline_mismatch"
         };
-        let artifact_dir = args
-            .catalog
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
         UiApplyTransactionStatus {
             state,
             catalog_path: args.catalog.display().to_string(),
@@ -274,18 +273,10 @@ impl ApplyBaselineSnapshot {
                 .db_config
                 .as_deref()
                 .map(|path| path.display().to_string()),
-            lock_path: Some(
-                artifact_dir
-                    .join(".canopy-entitlements-transaction-lock")
-                    .display()
-                    .to_string(),
-            ),
-            manifest_path: Some(
-                artifact_dir
-                    .join(".canopy-entitlements-transaction-manifest.json")
-                    .display()
-                    .to_string(),
-            ),
+            lock_path: Some(lock_path.display().to_string()),
+            manifest_path: Some(manifest_path.display().to_string()),
+            lock_exists,
+            lock_error,
             baseline,
             baseline_mismatches,
         }
@@ -673,6 +664,8 @@ struct UiApplyTransactionStatus {
     db_config_path: Option<String>,
     lock_path: Option<String>,
     manifest_path: Option<String>,
+    lock_exists: bool,
+    lock_error: Option<String>,
     baseline: Vec<UiApplyBaselineDigest>,
     baseline_mismatches: Vec<UiApplyBaselineMismatch>,
 }
@@ -4042,6 +4035,26 @@ fn apply_gate_status(
         }
     }
 
+    if transaction.lock_exists {
+        gate.state = "transaction_blocked";
+        gate.reason_code = "transaction_lock_exists";
+        gate.message = format!(
+            "Apply requires exclusive transaction ownership, but lock file '{}' already exists; recover or remove the incomplete transaction before retrying.",
+            transaction.lock_path.as_deref().unwrap_or("unknown")
+        );
+        return (StatusCode::CONFLICT, "blocked", gate);
+    }
+
+    if let Some(lock_error) = transaction.lock_error.as_deref() {
+        gate.state = "transaction_blocked";
+        gate.reason_code = "transaction_lock_unavailable";
+        gate.message = format!(
+            "Apply could not inspect transaction lock file '{}': {lock_error}.",
+            transaction.lock_path.as_deref().unwrap_or("unknown")
+        );
+        return (StatusCode::CONFLICT, "blocked", gate);
+    }
+
     if !transaction.baseline_mismatches.is_empty() {
         gate.state = "transaction_blocked";
         gate.reason_code = "baseline_digest_mismatch";
@@ -4505,6 +4518,27 @@ fn file_sha256(path: &Path) -> Option<String> {
     fs::read(path)
         .ok()
         .map(|bytes| hex::encode(Sha256::digest(bytes)))
+}
+
+fn transaction_artifact_paths(catalog_path: &Path) -> (PathBuf, PathBuf) {
+    let artifact_dir = catalog_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let digest = hex::encode(Sha256::digest(catalog_path.display().to_string()));
+    let prefix = format!(".canopy-entitlements-transaction-{}", &digest[..16]);
+    (
+        artifact_dir.join(format!("{prefix}.lock")),
+        artifact_dir.join(format!("{prefix}.manifest.json")),
+    )
+}
+
+fn transaction_lock_status(lock_path: &Path) -> (bool, Option<String>) {
+    match fs::symlink_metadata(lock_path) {
+        Ok(_) => (true, None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => (false, None),
+        Err(err) => (false, Some(err.kind().to_string())),
+    }
 }
 
 fn explain_request_from_body(
@@ -5888,6 +5922,32 @@ skip_tls_hostname_verification = true
             format!("sha256-{}", STANDARD.encode(digest)),
             bootstrap_prelude_sha256()
         );
+    }
+
+    #[test]
+    fn transaction_artifact_paths_are_catalog_specific() {
+        let first = catalog_fixture_path("transaction-artifact-first");
+        let second = catalog_fixture_path("transaction-artifact-second");
+        let (first_lock, first_manifest) = transaction_artifact_paths(&first);
+        let (second_lock, second_manifest) = transaction_artifact_paths(&second);
+
+        assert_ne!(first_lock, second_lock);
+        assert_ne!(first_manifest, second_manifest);
+        assert!(first_lock
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".canopy-entitlements-transaction-"));
+        assert!(first_lock
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".lock"));
+        assert!(first_manifest
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".manifest.json"));
     }
 
     #[tokio::test]
@@ -8888,6 +8948,7 @@ package = "mcp-ec2-diagnostics"
         );
         assert_eq!(apply["validation"]["valid"], true);
         assert_eq!(apply["transaction"]["state"], "not_started");
+        assert_eq!(apply["transaction"]["lock_exists"], false);
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
@@ -8900,6 +8961,77 @@ package = "mcp-ec2-diagnostics"
             std::fs::read_to_string(&db_config_path).unwrap(),
             original_db_config
         );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_existing_transaction_lock_without_writing_files() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-lock-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-lock-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-lock-db");
+        let deployment_config_path = write_database_config_fixture("apply-lock-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let (lock_path, _manifest_path) = transaction_artifact_paths(&catalog_path);
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        std::fs::write(&lock_path, "pending transaction").unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["status"], "blocked");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["gate"]["state"], "transaction_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "transaction_lock_exists");
+        assert_eq!(apply["transaction"]["state"], "lock_blocked");
+        assert_eq!(apply["transaction"]["lock_exists"], true);
+        assert_eq!(
+            apply["transaction"]["lock_path"],
+            lock_path.display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(lock_path);
         let _ = std::fs::remove_file(catalog_path);
         let _ = std::fs::remove_file(runtime_path);
         let _ = std::fs::remove_file(db_config_path);
