@@ -4,6 +4,7 @@ const state = {
   selectedMembers: "0",
   selectedScope: null,
   selectedScopeResourceField: "accounts",
+  selectedDatabaseScopeName: "",
   selectedAccount: null,
   selectedRole: null,
   accountRoleSelection: "account",
@@ -134,6 +135,20 @@ async function updateDraftScopeResource(scope, field, value, enabled) {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.error?.message || "draft scope resource update failed");
+  }
+  return response.json();
+}
+
+async function updateDraftDatabaseScope(scope, request) {
+  const response = await fetch("/api/draft/scopes/database", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope, ...request }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft database scope update failed");
   }
   return response.json();
 }
@@ -1024,6 +1039,7 @@ function scopeRow(scope) {
   row.classList.toggle("scope-risk-row", scope.allow_broad_cluster_discovery);
   row.addEventListener("click", () => {
     state.selectedScope = scope.id;
+    state.selectedDatabaseScopeName = "";
     renderScopes(state.draft?.scopes || []);
   });
   [
@@ -1070,6 +1086,7 @@ function renderScopeInspector(scopes) {
   setText("#scope-selected-db", String(selected?.database_scopes?.length || 0));
   setText("#scope-selected-mcp-ec2", String(selected?.mcp_ec2_diagnostic_scopes?.length || 0));
   renderScopeResourceEditor(selected);
+  renderScopeDatabaseEditor(selected);
 
   const list = document.getElementById("scope-detail-list");
   if (!list) {
@@ -1151,6 +1168,110 @@ function renderScopeResourceEditor(scope) {
       return row;
     }),
   );
+}
+
+function renderScopeDatabaseEditor(scope) {
+  const canWrite = Boolean(scope && state.server?.capabilities?.draft_write);
+  const databaseScopes = scope?.database_scopes || [];
+  const selector = document.getElementById("scope-db-template");
+  const selectedName = databaseScopes.some((item) => item.name === state.selectedDatabaseScopeName)
+    ? state.selectedDatabaseScopeName
+    : databaseScopes[0]?.name || "";
+  state.selectedDatabaseScopeName = selectedName;
+  const selected = databaseScopes.find((item) => item.name === selectedName) || null;
+
+  if (selector instanceof HTMLSelectElement) {
+    selector.replaceChildren(
+      optionElement("", "New database scope"),
+      ...databaseScopes.map((item) => optionElement(item.name, item.name)),
+    );
+    selector.value = selectedName;
+    selector.disabled = !scope;
+  }
+
+  setFormInputValue("scope-db-name", selected?.name || "", !canWrite);
+  setFormInputValue("scope-db-connection", selected?.connection || suggestedDbConnectionName(), !canWrite);
+  setFormInputValue("scope-db-environment", selected?.environment || "production", !canWrite);
+  setFormInputValue("scope-db-schemas", (selected?.allowed_schemas || []).join(", "), !canWrite);
+  setFormInputValue("scope-db-tables", (selected?.allowed_tables || []).join(", "), !canWrite);
+  setFormInputValue("scope-db-actions", (selected?.allowed_actions || ["select"]).join(", "), !canWrite);
+  setFormInputValue("scope-db-max-rows", selected ? String(selected.max_rows) : "100", !canWrite);
+  setFormInputValue(
+    "scope-db-statement-timeout",
+    selected ? String(selected.statement_timeout_ms) : "5000",
+    !canWrite,
+  );
+  setFormInputValue(
+    "scope-db-max-examined",
+    selected ? String(selected.max_examined_rows) : "10000",
+    !canWrite,
+  );
+  setFormCheckedValue("scope-db-require-explain", true, true);
+  setFormCheckedValue("scope-db-full-scan", Boolean(selected?.allow_full_table_scan), !canWrite);
+  setFormCheckedValue("scope-db-allow-views", Boolean(selected?.allow_views), !canWrite);
+  const saveButton = document.getElementById("scope-db-save-button");
+  if (saveButton) {
+    saveButton.disabled = !canWrite;
+  }
+}
+
+function optionElement(value, label) {
+  const option = document.createElement("option");
+  option.value = value;
+  option.textContent = label;
+  return option;
+}
+
+function setFormInputValue(id, value, disabled) {
+  const input = document.getElementById(id);
+  if (input instanceof HTMLInputElement) {
+    input.value = value;
+    input.disabled = disabled;
+  }
+}
+
+function setFormCheckedValue(id, checked, disabled) {
+  const input = document.getElementById(id);
+  if (input instanceof HTMLInputElement) {
+    input.checked = checked;
+    input.disabled = disabled;
+  }
+}
+
+function suggestedDbConnectionName() {
+  const connections = state.databaseConnections || {};
+  return connections.local?.[0]?.name || connections.missing_required?.[0] || "";
+}
+
+function csvValues(id) {
+  const raw = document.getElementById(id)?.value || "";
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+function positiveIntegerFromInput(id) {
+  const value = Number(document.getElementById(id)?.value || 0);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function databaseScopeDraftRequestFromForm() {
+  return {
+    name: document.getElementById("scope-db-name")?.value.trim() || "",
+    connection: document.getElementById("scope-db-connection")?.value.trim() || "",
+    environment: document.getElementById("scope-db-environment")?.value.trim() || "",
+    allowed_schemas: csvValues("scope-db-schemas"),
+    allowed_tables: csvValues("scope-db-tables"),
+    allowed_actions: csvValues("scope-db-actions"),
+    max_rows: positiveIntegerFromInput("scope-db-max-rows"),
+    statement_timeout_ms: positiveIntegerFromInput("scope-db-statement-timeout"),
+    require_explain: true,
+    max_examined_rows: positiveIntegerFromInput("scope-db-max-examined"),
+    allow_full_table_scan: Boolean(document.getElementById("scope-db-full-scan")?.checked),
+    allow_views: Boolean(document.getElementById("scope-db-allow-views")?.checked),
+    enabled: true,
+  };
 }
 
 function scopeDetailBlock(title, values) {
@@ -2877,6 +2998,64 @@ document.getElementById("scope-resource-add-button")?.addEventListener("click", 
   await updateScopeResource(field, value, true);
   if (input) {
     input.value = "";
+  }
+});
+
+document.getElementById("scope-db-template")?.addEventListener("change", (event) => {
+  if (!(event.target instanceof HTMLSelectElement)) {
+    return;
+  }
+  state.selectedDatabaseScopeName = event.target.value;
+  renderScopeInspector(state.draft?.scopes || []);
+});
+
+document.getElementById("scope-db-save-button")?.addEventListener("click", async (event) => {
+  const scope = state.selectedScope;
+  const request = databaseScopeDraftRequestFromForm();
+  if (!scope || !request.name) {
+    setValidationStatus("DB scope update unavailable", "select a scope and enter a DB scope name", false);
+    return;
+  }
+  if (
+    !request.connection ||
+    !request.environment ||
+    !request.allowed_schemas.length ||
+    !request.allowed_tables.length ||
+    !request.allowed_actions.length ||
+    !request.max_rows ||
+    !request.statement_timeout_ms ||
+    !request.max_examined_rows
+  ) {
+    setValidationStatus(
+      "DB scope update unavailable",
+      "connection, environment, schemas, tables, actions, and positive limits are required",
+      false,
+    );
+    return;
+  }
+  const button = event.currentTarget;
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Saving";
+  try {
+    const payload = await updateDraftDatabaseScope(scope, request);
+    state.selectedDatabaseScopeName = request.name;
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("scopes");
+    setValidationStatus(
+      "DB scope draft saved",
+      `${request.name} is staged for ${scope}`,
+      !(request.allow_full_table_scan || request.allow_views),
+    );
+  } catch (error) {
+    setValidationStatus("DB scope update failed", error.message, false);
+  } finally {
+    button.textContent = originalLabel;
+    renderScopeInspector(state.draft?.scopes || []);
   }
 });
 

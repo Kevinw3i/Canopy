@@ -26,6 +26,7 @@ use crate::catalog::{
     CatalogScope,
 };
 use entitlements::GroupMapping;
+use shared::dto::entitlements::DatabaseScope;
 
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
@@ -125,6 +126,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/draft/memberships", put(put_draft_membership))
         .route("/api/draft/group-mappings", put(put_draft_group_mapping))
         .route("/api/draft/scopes/resources", put(put_draft_scope_resource))
+        .route("/api/draft/scopes/database", put(put_draft_database_scope))
         .route("/api/draft/packages", put(put_draft_package))
         .route(
             "/api/draft/packages/features",
@@ -261,6 +263,25 @@ struct DraftScopeResourceRequest {
     scope: String,
     field: String,
     value: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftDatabaseScopeRequest {
+    scope: String,
+    name: String,
+    connection: String,
+    environment: String,
+    allowed_schemas: Vec<String>,
+    allowed_tables: Vec<String>,
+    allowed_actions: Vec<String>,
+    max_rows: u64,
+    statement_timeout_ms: u64,
+    require_explain: bool,
+    max_examined_rows: u64,
+    allow_full_table_scan: bool,
+    allow_views: bool,
     enabled: bool,
 }
 
@@ -967,6 +988,38 @@ async fn put_draft_scope_resource(
     }
 }
 
+async fn put_draft_database_scope(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftDatabaseScopeRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_database_scope_request",
+                "draft database scope request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_database_scope(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn put_draft_package_feature(
     State(state): State<UiAppState>,
     headers: HeaderMap,
@@ -1410,6 +1463,17 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned");
         draft.update_scope_resource(request)
+    }
+
+    fn update_database_scope(
+        &self,
+        request: DraftDatabaseScopeRequest,
+    ) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_database_scope(request)
     }
 
     fn update_package_feature(
@@ -1973,6 +2037,70 @@ impl DraftState {
         Ok(())
     }
 
+    fn update_database_scope(
+        &mut self,
+        request: DraftDatabaseScopeRequest,
+    ) -> Result<(), UiMutationError> {
+        let scope_id = request.scope.trim().to_owned();
+        let name = request.name.trim().to_owned();
+        if scope_id.is_empty() || name.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_database_scope_id",
+                "scope and database scope name are required",
+            ));
+        }
+        validate_database_scope_key("database scope name", &name)?;
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let Some(scope) = draft
+            .scopes
+            .iter_mut()
+            .find(|candidate| candidate.id == scope_id)
+        else {
+            return Err(UiMutationError::bad_request(
+                "unknown_scope",
+                format!("scope '{scope_id}' does not exist in the draft"),
+            ));
+        };
+
+        let existing = scope
+            .database_scopes
+            .iter()
+            .position(|database_scope| database_scope.name == name);
+        let changed = if request.enabled {
+            let next = database_scope_from_request(&name, request)?;
+            match existing {
+                Some(index) if scope.database_scopes[index] == next => false,
+                Some(index) => {
+                    scope.database_scopes[index] = next;
+                    true
+                }
+                None => {
+                    scope.database_scopes.push(next);
+                    true
+                }
+            }
+        } else if let Some(index) = existing {
+            scope.database_scopes.remove(index);
+            true
+        } else {
+            false
+        };
+
+        if changed {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
     fn update_package_feature(
         &mut self,
         request: DraftPackageFeatureRequest,
@@ -2371,6 +2499,139 @@ fn validate_database_connection_name(name: &str) -> Result<(), UiMutationError> 
     Ok(())
 }
 
+fn database_scope_from_request(
+    name: &str,
+    request: DraftDatabaseScopeRequest,
+) -> Result<DatabaseScope, UiMutationError> {
+    let connection = required_nonempty_request_string("connection", request.connection)?;
+    let environment = required_nonempty_request_string("environment", request.environment)?;
+    validate_database_scope_key("database scope connection", &connection)?;
+    validate_database_scope_key("database scope environment", &environment)?;
+
+    let allowed_schemas =
+        normalize_database_scope_identifiers("allowed_schemas", request.allowed_schemas)?;
+    let allowed_tables =
+        normalize_database_scope_identifiers("allowed_tables", request.allowed_tables)?;
+    let allowed_actions = normalize_database_scope_actions(request.allowed_actions)?;
+
+    validate_positive_u64_limit("max_rows", request.max_rows)?;
+    validate_positive_u64_limit("statement_timeout_ms", request.statement_timeout_ms)?;
+    validate_positive_u64_limit("max_examined_rows", request.max_examined_rows)?;
+
+    if !request.require_explain {
+        return Err(UiMutationError::bad_request(
+            "database_scope_explain_disabled",
+            format!("database scope '{name}' must keep require_explain=true"),
+        ));
+    }
+
+    Ok(DatabaseScope {
+        name: name.to_owned(),
+        connection,
+        environment,
+        allowed_schemas,
+        allowed_tables,
+        allowed_actions,
+        max_rows: request.max_rows,
+        statement_timeout_ms: request.statement_timeout_ms,
+        require_explain: true,
+        max_examined_rows: request.max_examined_rows,
+        allow_full_table_scan: request.allow_full_table_scan,
+        allow_views: request.allow_views,
+    })
+}
+
+fn validate_database_scope_key(field: &'static str, value: &str) -> Result<(), UiMutationError> {
+    if value.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_database_scope_field",
+            format!("{field} is required"),
+        ));
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(UiMutationError::bad_request(
+            "empty_database_scope_field",
+            format!("{field} is required"),
+        ));
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_scope_identifier",
+            format!("{field} must start with a lowercase ASCII letter or digit"),
+        ));
+    }
+    if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_scope_identifier",
+            format!("{field} may only contain lowercase ASCII letters, digits, '_' or '-'"),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_database_scope_identifiers(
+    field: &'static str,
+    values: Vec<String>,
+) -> Result<Vec<String>, UiMutationError> {
+    let mut normalized = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_database_scope_field",
+                format!("{field} must not contain empty values"),
+            ));
+        }
+        if !value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        {
+            return Err(UiMutationError::bad_request(
+                "invalid_database_scope_identifier",
+                format!(
+                    "{field} value '{value}' may only contain lowercase ASCII letters, digits, or '_'"
+                ),
+            ));
+        }
+        normalized.insert(value.to_owned());
+    }
+    if normalized.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_database_scope_field",
+            format!("{field} requires at least one value"),
+        ));
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn normalize_database_scope_actions(values: Vec<String>) -> Result<Vec<String>, UiMutationError> {
+    let mut normalized = BTreeSet::new();
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_database_scope_field",
+                "allowed_actions must not contain empty values",
+            ));
+        }
+        if value != "select" {
+            return Err(UiMutationError::bad_request(
+                "unsupported_database_scope_action",
+                "only select is supported for MCP database scopes",
+            ));
+        }
+        normalized.insert(value);
+    }
+    if normalized.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_database_scope_field",
+            "allowed_actions requires at least one value",
+        ));
+    }
+    Ok(normalized.into_iter().collect())
+}
+
 fn database_metadata_from_request(
     name: &str,
     existing: Option<&DbConnectionMetadata>,
@@ -2476,6 +2737,16 @@ fn validate_positive_limit(field: &'static str, value: i64) -> Result<(), UiMuta
         return Err(UiMutationError::bad_request(
             "invalid_database_connection_limit",
             format!("database connection {field} must be greater than zero"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_positive_u64_limit(field: &'static str, value: u64) -> Result<(), UiMutationError> {
+    if value == 0 {
+        return Err(UiMutationError::bad_request(
+            "invalid_database_scope_limit",
+            format!("database scope {field} must be greater than zero"),
         ));
     }
     Ok(())
@@ -4731,18 +5002,24 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"id="scope-detail-list""#));
         assert!(INDEX_HTML.contains(r#"id="scope-resource-field""#));
         assert!(INDEX_HTML.contains(r#"id="scope-resource-add-button""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-db-template""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-db-save-button""#));
 
         assert!(APP_JS.contains("function renderScopes("));
         assert!(APP_JS.contains("function renderScopeInspector("));
         assert!(APP_JS.contains("function updateDraftScopeResource("));
+        assert!(APP_JS.contains("function updateDraftDatabaseScope("));
         assert!(APP_JS.contains("function renderScopeResourceEditor("));
+        assert!(APP_JS.contains("function renderScopeDatabaseEditor("));
         assert!(APP_JS.contains("mcpEc2ScopeLine"));
         assert!(APP_JS.contains("/api/draft/scopes/resources"));
+        assert!(APP_JS.contains("/api/draft/scopes/database"));
 
         assert!(APP_CSS.contains(".workspace.scope-mode"));
         assert!(APP_CSS.contains(".scopes-table"));
         assert!(APP_CSS.contains(".scope-resource-editor"));
         assert!(APP_CSS.contains(".scope-resource-list-row"));
+        assert!(APP_CSS.contains(".scope-db-fieldset"));
         assert!(APP_CSS.contains(".scope-detail-block"));
     }
 
@@ -5815,6 +6092,158 @@ private_target_ref = "service:app-api"
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], "unknown_account");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_scope_update_adds_scope_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("database-scope-add");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/database")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "scope": "db-scope",
+                            "name": "customer_read",
+                            "connection": "orders",
+                            "environment": "production",
+                            "allowed_schemas": ["mart", "audit"],
+                            "allowed_tables": ["customers"],
+                            "allowed_actions": ["select"],
+                            "max_rows": 200,
+                            "statement_timeout_ms": 4000,
+                            "require_explain": true,
+                            "max_examined_rows": 20000,
+                            "allow_full_table_scan": false,
+                            "allow_views": true,
+                            "enabled": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        let db_scope = state["draft"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == "db-scope")
+            .unwrap()["database_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["name"] == "customer_read")
+            .unwrap()
+            .clone();
+        assert_eq!(db_scope["connection"], "orders");
+        assert_eq!(db_scope["max_rows"], 200);
+        assert_eq!(db_scope["allow_views"], true);
+        assert!(db_scope["allowed_schemas"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("audit".to_owned())));
+        assert!(state["changes"]["semantic_diff"]["high_risk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["kind"] == "database_scope_allow_views"
+                && grant["value"] == "customer_read|true"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_scope_update_requires_session_cookie() {
+        let (catalog_path, _content) = write_catalog_fixture("database-scope-session");
+        let response = router(test_state_with_catalog(catalog_path.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/database")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","name":"customer_read","connection":"orders","environment":"production","allowed_schemas":["mart"],"allowed_tables":["customers"],"allowed_actions":["select"],"max_rows":100,"statement_timeout_ms":5000,"require_explain":true,"max_examined_rows":10000,"allow_full_table_scan":false,"allow_views":false,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_scope_update_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("database-scope-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/database")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","name":"customer_read","connection":"orders","environment":"production","allowed_schemas":["mart"],"allowed_tables":["customers"],"allowed_actions":["select"],"max_rows":100,"statement_timeout_ms":5000,"require_explain":true,"max_examined_rows":10000,"allow_full_table_scan":false,"allow_views":false,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_scope_update_rejects_mixed_case_identifier() {
+        let (catalog_path, _content) = write_catalog_fixture("database-scope-mixed-case");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/database")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","name":"customer_read","connection":"orders","environment":"production","allowed_schemas":["Mart"],"allowed_tables":["customers"],"allowed_actions":["select"],"max_rows":100,"statement_timeout_ms":5000,"require_explain":true,"max_examined_rows":10000,"allow_full_table_scan":false,"allow_views":false,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "invalid_database_scope_identifier");
         let _ = std::fs::remove_file(catalog_path);
     }
 

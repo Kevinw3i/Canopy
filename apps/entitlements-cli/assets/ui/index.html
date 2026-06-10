@@ -491,6 +491,33 @@
               </div>
             </fieldset>
 
+            <fieldset class="scope-db-fieldset">
+              <legend>DB Scope Draft</legend>
+              <label>
+                <span>Template</span>
+                <select id="scope-db-template">
+                  <option value="">New database scope</option>
+                </select>
+              </label>
+              <div class="scope-db-grid">
+                <label><span>Name</span><input id="scope-db-name" autocomplete="off" /></label>
+                <label><span>Connection</span><input id="scope-db-connection" autocomplete="off" /></label>
+                <label><span>Environment</span><input id="scope-db-environment" autocomplete="off" /></label>
+                <label><span>Schemas</span><input id="scope-db-schemas" autocomplete="off" placeholder="mart, audit" /></label>
+                <label><span>Tables</span><input id="scope-db-tables" autocomplete="off" placeholder="orders, order_items" /></label>
+                <label><span>Actions</span><input id="scope-db-actions" autocomplete="off" value="select" /></label>
+                <label><span>Max Rows</span><input id="scope-db-max-rows" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Statement</span><input id="scope-db-statement-timeout" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Examined</span><input id="scope-db-max-examined" inputmode="numeric" autocomplete="off" /></label>
+              </div>
+              <div class="scope-db-checks">
+                <label><input id="scope-db-require-explain" type="checkbox" checked disabled /><span>Require EXPLAIN</span></label>
+                <label><input id="scope-db-full-scan" type="checkbox" /><span>Allow full scan</span></label>
+                <label><input id="scope-db-allow-views" type="checkbox" /><span>Allow views</span></label>
+              </div>
+              <button id="scope-db-save-button" type="button">Save DB Scope</button>
+            </fieldset>
+
             <div class="scope-detail-list" id="scope-detail-list">
               <h3>Scope Details <span>0</span></h3>
               <p>No scope selected</p>
