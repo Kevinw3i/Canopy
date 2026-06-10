@@ -149,6 +149,7 @@ fn router(state: UiAppState) -> Router {
 #[derive(Clone, Debug)]
 struct UiAppState {
     args: Arc<UiArgs>,
+    apply_baseline: Arc<ApplyBaselineSnapshot>,
     bootstrap: Arc<Mutex<BootstrapState>>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     draft: Arc<Mutex<DraftState>>,
@@ -157,9 +158,11 @@ struct UiAppState {
 
 impl UiAppState {
     fn new(args: UiArgs, code: String, expires_at: Instant) -> Self {
+        let apply_baseline = ApplyBaselineSnapshot::capture(&args);
         let draft = DraftState::load(&args.catalog);
         let database_connections = DatabaseConnectionsDraftState::load(args.db_config.as_deref());
         Self {
+            apply_baseline: Arc::new(apply_baseline),
             args: Arc::new(args),
             bootstrap: Arc::new(Mutex::new(BootstrapState {
                 code: Some(code),
@@ -205,6 +208,164 @@ struct DatabaseConnectionsDraftState {
     load_error: Option<UiValidationIssue>,
     dirty: bool,
     revision: u64,
+}
+
+#[derive(Debug)]
+struct ApplyBaselineSnapshot {
+    catalog: ApplyFileBaseline,
+    runtime: ApplyFileBaseline,
+    db_config: Option<ApplyFileBaseline>,
+}
+
+#[derive(Debug)]
+struct ApplyFileBaseline {
+    artifact: &'static str,
+    path: PathBuf,
+    digest: ApplyFileDigest,
+}
+
+#[derive(Clone, Debug)]
+struct ApplyFileDigest {
+    exists: bool,
+    sha256: Option<String>,
+    error: Option<String>,
+}
+
+impl ApplyBaselineSnapshot {
+    fn capture(args: &UiArgs) -> Self {
+        Self {
+            catalog: ApplyFileBaseline::capture("catalog", &args.catalog),
+            runtime: ApplyFileBaseline::capture("runtime", &args.runtime),
+            db_config: args
+                .db_config
+                .as_deref()
+                .map(|path| ApplyFileBaseline::capture("db_config", path)),
+        }
+    }
+
+    fn transaction_status(&self, args: &UiArgs) -> UiApplyTransactionStatus {
+        let mut baseline = Vec::new();
+        let mut baseline_mismatches = Vec::new();
+        for file in [&self.catalog, &self.runtime]
+            .into_iter()
+            .chain(self.db_config.as_ref())
+        {
+            let (digest, mismatch) = file.current_digest();
+            baseline.push(digest);
+            if let Some(mismatch) = mismatch {
+                baseline_mismatches.push(mismatch);
+            }
+        }
+        let state = if baseline_mismatches.is_empty() {
+            "not_started"
+        } else {
+            "baseline_mismatch"
+        };
+        let artifact_dir = args
+            .catalog
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        UiApplyTransactionStatus {
+            state,
+            catalog_path: args.catalog.display().to_string(),
+            runtime_path: args.runtime.display().to_string(),
+            db_config_path: args
+                .db_config
+                .as_deref()
+                .map(|path| path.display().to_string()),
+            lock_path: Some(
+                artifact_dir
+                    .join(".canopy-entitlements-transaction-lock")
+                    .display()
+                    .to_string(),
+            ),
+            manifest_path: Some(
+                artifact_dir
+                    .join(".canopy-entitlements-transaction-manifest.json")
+                    .display()
+                    .to_string(),
+            ),
+            baseline,
+            baseline_mismatches,
+        }
+    }
+}
+
+impl ApplyFileBaseline {
+    fn capture(artifact: &'static str, path: &Path) -> Self {
+        Self {
+            artifact,
+            path: path.to_path_buf(),
+            digest: ApplyFileDigest::read(path),
+        }
+    }
+
+    fn current_digest(&self) -> (UiApplyBaselineDigest, Option<UiApplyBaselineMismatch>) {
+        let current = ApplyFileDigest::read(&self.path);
+        let digest = UiApplyBaselineDigest {
+            artifact: self.artifact,
+            path: self.path.display().to_string(),
+            startup_exists: self.digest.exists,
+            current_exists: current.exists,
+            startup_sha256: self.digest.sha256.clone(),
+            current_sha256: current.sha256.clone(),
+            startup_error: self.digest.error.clone(),
+            current_error: current.error.clone(),
+        };
+        let mismatch = self.baseline_mismatch(&current);
+        (digest, mismatch)
+    }
+
+    fn baseline_mismatch(&self, current: &ApplyFileDigest) -> Option<UiApplyBaselineMismatch> {
+        let (reason_code, detail) = if self.digest.exists && self.digest.sha256.is_none() {
+            ("baseline_unreadable", "was unreadable when the UI started")
+        } else if current.exists && current.sha256.is_none() {
+            ("current_unreadable", "is unreadable now")
+        } else if self.digest.exists && !current.exists {
+            ("baseline_file_deleted", "was deleted after the UI started")
+        } else if !self.digest.exists && current.exists {
+            ("baseline_file_created", "was created after the UI started")
+        } else if self.digest.sha256 != current.sha256 {
+            ("baseline_digest_mismatch", "changed after the UI started")
+        } else {
+            return None;
+        };
+        Some(UiApplyBaselineMismatch {
+            artifact: self.artifact,
+            path: self.path.display().to_string(),
+            reason_code,
+            message: format!(
+                "{} file '{}' {detail}; restart or refresh the UI after reviewing the external change.",
+                self.artifact,
+                self.path.display()
+            ),
+            startup_sha256: self.digest.sha256.clone(),
+            current_sha256: current.sha256.clone(),
+        })
+    }
+}
+
+impl ApplyFileDigest {
+    fn read(path: &Path) -> Self {
+        match fs::read(path) {
+            Ok(bytes) => Self {
+                exists: true,
+                sha256: Some(hex::encode(Sha256::digest(bytes))),
+                error: None,
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Self {
+                exists: false,
+                sha256: None,
+                error: None,
+            },
+            Err(err) => Self {
+                exists: true,
+                sha256: None,
+                error: Some(err.kind().to_string()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +673,30 @@ struct UiApplyTransactionStatus {
     db_config_path: Option<String>,
     lock_path: Option<String>,
     manifest_path: Option<String>,
+    baseline: Vec<UiApplyBaselineDigest>,
+    baseline_mismatches: Vec<UiApplyBaselineMismatch>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyBaselineDigest {
+    artifact: &'static str,
+    path: String,
+    startup_exists: bool,
+    current_exists: bool,
+    startup_sha256: Option<String>,
+    current_sha256: Option<String>,
+    startup_error: Option<String>,
+    current_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyBaselineMismatch {
+    artifact: &'static str,
+    path: String,
+    reason_code: &'static str,
+    message: String,
+    startup_sha256: Option<String>,
+    current_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1729,25 +1914,19 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned")
             .clone_baseline();
-        let (status, apply_status, gate) =
-            apply_gate_status(self.args.as_ref(), &validation, baseline.as_ref());
+        let transaction = self.apply_baseline.transaction_status(self.args.as_ref());
+        let (status, apply_status, gate) = apply_gate_status(
+            self.args.as_ref(),
+            &validation,
+            baseline.as_ref(),
+            &transaction,
+        );
         let output = UiApplyOutput {
             status: apply_status,
             command: "apply",
             applied: false,
             revision: validation.revision,
-            transaction: UiApplyTransactionStatus {
-                state: "not_started",
-                catalog_path: self.args.catalog.display().to_string(),
-                runtime_path: self.args.runtime.display().to_string(),
-                db_config_path: self
-                    .args
-                    .db_config
-                    .as_deref()
-                    .map(|path| path.display().to_string()),
-                lock_path: None,
-                manifest_path: None,
-            },
+            transaction,
             gate,
             validation,
         };
@@ -3789,6 +3968,7 @@ fn apply_gate_status(
     args: &UiArgs,
     validation: &UiValidateOutput,
     baseline: Option<&Catalog>,
+    transaction: &UiApplyTransactionStatus,
 ) -> (StatusCode, &'static str, UiApplyGate) {
     let admin_group = if args.allow_dev_identity {
         args.dev_admin_group.clone()
@@ -3860,6 +4040,13 @@ fn apply_gate_status(
             gate.message = format!("baseline admin gate resolution failed: {err}");
             return (StatusCode::CONFLICT, "blocked", gate);
         }
+    }
+
+    if !transaction.baseline_mismatches.is_empty() {
+        gate.state = "transaction_blocked";
+        gate.reason_code = "baseline_digest_mismatch";
+        gate.message = "Apply requires catalog, runtime, and DB config files to match the startup baseline digest; restart or refresh the UI after reviewing external changes.".to_owned();
+        return (StatusCode::CONFLICT, "blocked", gate);
     }
 
     gate.state = "admin_ready";
@@ -8712,6 +8899,236 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(
             std::fs::read_to_string(&db_config_path).unwrap(),
             original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_catalog_baseline_digest_mismatch_without_writing_files() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-catalog-mismatch-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-catalog-mismatch-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-catalog-mismatch-db");
+        let deployment_config_path = write_database_config_fixture("apply-catalog-mismatch-deploy");
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let external_catalog = format!("{catalog_content}\n# external update after UI startup\n");
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        std::fs::write(&catalog_path, &external_catalog).unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["status"], "blocked");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["gate"]["state"], "transaction_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "baseline_digest_mismatch");
+        assert_eq!(apply["transaction"]["state"], "baseline_mismatch");
+        assert_eq!(
+            apply["transaction"]["baseline_mismatches"][0]["artifact"],
+            "catalog"
+        );
+        assert_eq!(
+            apply["transaction"]["baseline_mismatches"][0]["reason_code"],
+            "baseline_digest_mismatch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            external_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_runtime_baseline_digest_mismatch_without_writing_files() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-runtime-mismatch-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-runtime-mismatch-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-runtime-mismatch-db");
+        let deployment_config_path = write_database_config_fixture("apply-runtime-mismatch-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let external_runtime = format!(
+            "{}\n# external update after UI startup\n",
+            std::fs::read_to_string(&runtime_path).unwrap()
+        );
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        std::fs::write(&runtime_path, &external_runtime).unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["status"], "blocked");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["gate"]["state"], "transaction_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "baseline_digest_mismatch");
+        assert_eq!(apply["transaction"]["state"], "baseline_mismatch");
+        assert_eq!(
+            apply["transaction"]["baseline_mismatches"][0]["artifact"],
+            "runtime"
+        );
+        assert_eq!(
+            apply["transaction"]["baseline_mismatches"][0]["reason_code"],
+            "baseline_digest_mismatch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            external_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_db_config_baseline_digest_mismatch_without_writing_files() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-db-mismatch-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-db-mismatch-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-db-mismatch-db");
+        let deployment_config_path = write_database_config_fixture("apply-db-mismatch-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let external_db_config = r#"
+[database_connections.orders]
+engine = "mysql"
+host = "orders.example.internal"
+port = 3306
+database = "orders"
+secret_arn = "orders-secret-ref-updated"
+readonly = true
+require_tls = true
+"#
+        .trim_start()
+        .to_owned();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        std::fs::write(&db_config_path, &external_db_config).unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["status"], "blocked");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["gate"]["state"], "transaction_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "baseline_digest_mismatch");
+        assert_eq!(apply["transaction"]["state"], "baseline_mismatch");
+        assert_eq!(
+            apply["transaction"]["baseline_mismatches"][0]["artifact"],
+            "db_config"
+        );
+        assert_eq!(
+            apply["transaction"]["baseline_mismatches"][0]["reason_code"],
+            "baseline_digest_mismatch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            external_db_config
         );
         let _ = std::fs::remove_file(catalog_path);
         let _ = std::fs::remove_file(runtime_path);
