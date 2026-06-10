@@ -443,6 +443,30 @@
               <div><span>MCP EC2</span><strong id="scope-selected-mcp-ec2">0</strong></div>
             </div>
 
+            <fieldset class="scope-resource-fieldset">
+              <legend>Resource Wiring</legend>
+              <label>
+                <span>Resource</span>
+                <select id="scope-resource-field">
+                  <option value="accounts">Accounts</option>
+                  <option value="regions">Regions</option>
+                  <option value="log_group_arns">Log Groups</option>
+                  <option value="clusters">ECS Clusters</option>
+                  <option value="os_users">OS Users</option>
+                </select>
+              </label>
+              <label>
+                <span>Value</span>
+                <div class="scope-resource-editor">
+                  <input id="scope-resource-input" autocomplete="off" placeholder="resource id or pattern" />
+                  <button id="scope-resource-add-button" type="button">Add</button>
+                </div>
+              </label>
+              <div class="scope-resource-list" id="scope-resource-list">
+                <p>No resources</p>
+              </div>
+            </fieldset>
+
             <div class="scope-detail-list" id="scope-detail-list">
               <h3>Scope Details <span>0</span></h3>
               <p>No scope selected</p>
@@ -665,10 +689,10 @@
           <section class="summary-block">
             <h3>Changes Summary</h3>
             <div class="summary-grid">
-              <strong>1<small>Groups changed</small></strong>
+              <strong>1<small>Objects changed</small></strong>
               <strong>1<small>Bindings added</small></strong>
               <strong>0<small>Bindings removed</small></strong>
-              <strong>0<small>Identity/Semantic</small></strong>
+              <strong>0<small>Scope/Identity/Semantic</small></strong>
             </div>
           </section>
           <section class="pending-block">

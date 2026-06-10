@@ -1589,6 +1589,88 @@ textarea {
   white-space: nowrap;
 }
 
+.scope-resource-fieldset {
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.scope-resource-fieldset label {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+
+.scope-resource-fieldset label > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.scope-resource-fieldset select,
+.scope-resource-fieldset input {
+  width: 100%;
+  min-width: 0;
+}
+
+.scope-resource-editor {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px;
+  gap: 8px;
+  min-width: 0;
+}
+
+.scope-resource-editor button {
+  min-height: 38px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.scope-resource-list {
+  display: grid;
+  gap: 6px;
+  margin-left: 108px;
+}
+
+.scope-resource-list p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.scope-resource-list-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  align-items: center;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+}
+
+.scope-resource-list-row span {
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 10px;
+  color: #394352;
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scope-resource-list-row button {
+  height: 28px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+}
+
 .scope-detail-list {
   display: grid;
   gap: 10px;
@@ -2300,7 +2382,8 @@ textarea {
     min-width: 0;
   }
 
-  .identity-list {
+  .identity-list,
+  .scope-resource-list {
     margin-left: 0;
   }
 

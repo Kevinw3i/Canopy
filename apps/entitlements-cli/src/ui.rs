@@ -121,6 +121,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/draft/bindings", put(put_draft_binding))
         .route("/api/draft/memberships", put(put_draft_membership))
         .route("/api/draft/group-mappings", put(put_draft_group_mapping))
+        .route("/api/draft/scopes/resources", put(put_draft_scope_resource))
         .route(
             "/api/draft/packages/features",
             put(put_draft_package_feature),
@@ -220,6 +221,15 @@ struct DraftMembershipRequest {
 struct DraftGroupMappingRequest {
     group: String,
     external_group: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftScopeResourceRequest {
+    scope: String,
+    field: String,
+    value: String,
     enabled: bool,
 }
 
@@ -585,9 +595,18 @@ struct UiPendingChanges {
     removed_memberships: Vec<UiMembershipChange>,
     added_group_mappings: Vec<UiGroupMappingChange>,
     removed_group_mappings: Vec<UiGroupMappingChange>,
+    added_scope_resources: Vec<UiScopeResourceChange>,
+    removed_scope_resources: Vec<UiScopeResourceChange>,
     high_risk_added: usize,
     high_risk_removed: usize,
     semantic_diff: UiSemanticDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct UiScopeResourceChange {
+    scope: String,
+    field: String,
+    value: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -849,6 +868,38 @@ async fn put_draft_group_mapping(
     };
 
     match state.update_group_mapping(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn put_draft_scope_resource(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftScopeResourceRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_scope_resource_request",
+                "draft scope resource request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_scope_resource(request) {
         Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
         Err(err) => error_response(err.status, err.code, err.message),
     }
@@ -1174,6 +1225,17 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned");
         draft.update_group_mapping(request)
+    }
+
+    fn update_scope_resource(
+        &self,
+        request: DraftScopeResourceRequest,
+    ) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_scope_resource(request)
     }
 
     fn update_package_feature(
@@ -1514,6 +1576,83 @@ impl DraftState {
             }
             (false, Some(index)) if draft.group_mappings[index].canopy_group == group => {
                 draft.group_mappings.remove(index);
+                true
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    fn update_scope_resource(
+        &mut self,
+        request: DraftScopeResourceRequest,
+    ) -> Result<(), UiMutationError> {
+        let scope_id = request.scope.trim();
+        let field = request.field.trim();
+        let value = request.value.trim();
+        if scope_id.is_empty() || field.is_empty() || value.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_scope_resource_id",
+                "scope, field, and value are required",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        if request.enabled
+            && field == "accounts"
+            && !draft.accounts.iter().any(|account| account.id == value)
+        {
+            return Err(UiMutationError::bad_request(
+                "unknown_account",
+                format!("account '{value}' does not exist in the draft"),
+            ));
+        }
+
+        let Some(scope) = draft
+            .scopes
+            .iter_mut()
+            .find(|candidate| candidate.id == scope_id)
+        else {
+            return Err(UiMutationError::bad_request(
+                "unknown_scope",
+                format!("scope '{scope_id}' does not exist in the draft"),
+            ));
+        };
+
+        let values = match field {
+            "accounts" => &mut scope.accounts,
+            "regions" => &mut scope.regions,
+            "log_group_arns" => &mut scope.log_group_arns,
+            "clusters" => &mut scope.clusters,
+            "os_users" => &mut scope.os_users,
+            _ => {
+                return Err(UiMutationError::bad_request(
+                    "unknown_scope_resource_field",
+                    format!("scope resource field '{field}' is not editable"),
+                ));
+            }
+        };
+
+        let exists = values.iter().any(|candidate| candidate == value);
+        let changed = match (request.enabled, exists) {
+            (true, false) => {
+                values.push(value.to_owned());
+                true
+            }
+            (false, true) => {
+                values.retain(|candidate| candidate != value);
                 true
             }
             _ => false,
@@ -2898,6 +3037,8 @@ impl UiPendingChanges {
             removed_memberships: Vec::new(),
             added_group_mappings: Vec::new(),
             removed_group_mappings: Vec::new(),
+            added_scope_resources: Vec::new(),
+            removed_scope_resources: Vec::new(),
             high_risk_added: 0,
             high_risk_removed: 0,
             semantic_diff: UiSemanticDiff::empty(),
@@ -3421,6 +3562,8 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
     let draft_memberships = membership_set(draft);
     let baseline_group_mappings = group_mapping_set(baseline);
     let draft_group_mappings = group_mapping_set(draft);
+    let baseline_scope_resources = scope_resource_set(baseline);
+    let draft_scope_resources = scope_resource_set(draft);
     let draft_packages = package_index(draft);
     let baseline_packages = package_index(baseline);
     let added_bindings = draft_bindings
@@ -3459,6 +3602,22 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
             external_group: external_group.clone(),
         })
         .collect::<Vec<_>>();
+    let added_scope_resources = draft_scope_resources
+        .difference(&baseline_scope_resources)
+        .map(|(scope, field, value)| UiScopeResourceChange {
+            scope: scope.clone(),
+            field: field.clone(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    let removed_scope_resources = baseline_scope_resources
+        .difference(&draft_scope_resources)
+        .map(|(scope, field, value)| UiScopeResourceChange {
+            scope: scope.clone(),
+            field: field.clone(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
     let high_risk_added = added_bindings
         .iter()
         .filter(|change| change.high_risk)
@@ -3475,6 +3634,8 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
         removed_memberships,
         added_group_mappings,
         removed_group_mappings,
+        added_scope_resources,
+        removed_scope_resources,
         high_risk_added,
         high_risk_removed,
         semantic_diff,
@@ -3499,6 +3660,34 @@ fn package_index(catalog: &Catalog) -> BTreeMap<&str, &CatalogPackage> {
         .iter()
         .map(|package| (package.id.as_str(), package))
         .collect()
+}
+
+fn scope_resource_set(catalog: &Catalog) -> BTreeSet<(String, String, String)> {
+    let mut resources = BTreeSet::new();
+    for scope in &catalog.scopes {
+        add_scope_resource_values(&mut resources, &scope.id, "accounts", &scope.accounts);
+        add_scope_resource_values(&mut resources, &scope.id, "regions", &scope.regions);
+        add_scope_resource_values(
+            &mut resources,
+            &scope.id,
+            "log_group_arns",
+            &scope.log_group_arns,
+        );
+        add_scope_resource_values(&mut resources, &scope.id, "clusters", &scope.clusters);
+        add_scope_resource_values(&mut resources, &scope.id, "os_users", &scope.os_users);
+    }
+    resources
+}
+
+fn add_scope_resource_values(
+    resources: &mut BTreeSet<(String, String, String)>,
+    scope: &str,
+    field: &str,
+    values: &[String],
+) {
+    for value in values {
+        resources.insert((scope.to_owned(), field.to_owned(), value.clone()));
+    }
 }
 
 fn membership_set(catalog: &Catalog) -> BTreeSet<(String, String)> {
@@ -4015,13 +4204,20 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"data-view="scopes""#));
         assert!(INDEX_HTML.contains(r#"class="scopes-view""#));
         assert!(INDEX_HTML.contains(r#"id="scope-detail-list""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-resource-field""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-resource-add-button""#));
 
         assert!(APP_JS.contains("function renderScopes("));
         assert!(APP_JS.contains("function renderScopeInspector("));
+        assert!(APP_JS.contains("function updateDraftScopeResource("));
+        assert!(APP_JS.contains("function renderScopeResourceEditor("));
         assert!(APP_JS.contains("mcpEc2ScopeLine"));
+        assert!(APP_JS.contains("/api/draft/scopes/resources"));
 
         assert!(APP_CSS.contains(".workspace.scope-mode"));
         assert!(APP_CSS.contains(".scopes-table"));
+        assert!(APP_CSS.contains(".scope-resource-editor"));
+        assert!(APP_CSS.contains(".scope-resource-list-row"));
         assert!(APP_CSS.contains(".scope-detail-block"));
     }
 
@@ -4717,6 +4913,90 @@ private_target_ref = "service:app-api"
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], "unknown_package");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_scope_resource_update_adds_region_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("scope-resource-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/resources")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","field":"regions","value":"eu-central-1","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert!(state["draft"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|scope| scope["id"] == "db-scope"
+                && scope["regions"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::Value::String("eu-central-1".to_owned()))));
+        assert!(state["changes"]["added_scope_resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["scope"] == "db-scope"
+                && change["field"] == "regions"
+                && change["value"] == "eu-central-1"));
+        assert!(state["changes"]["semantic_diff"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["kind"] == "region" && grant["value"] == "eu-central-1"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_scope_resource_update_rejects_unknown_account() {
+        let (catalog_path, _content) = write_catalog_fixture("scope-resource-account");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/resources")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","field":"accounts","value":"missing","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "unknown_account");
         let _ = std::fs::remove_file(catalog_path);
     }
 

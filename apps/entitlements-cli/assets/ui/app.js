@@ -3,6 +3,7 @@ const state = {
   selectedPackage: null,
   selectedMembers: "0",
   selectedScope: null,
+  selectedScopeResourceField: "accounts",
   selectedAccount: null,
   selectedRole: null,
   accountRoleSelection: "account",
@@ -118,6 +119,20 @@ async function updateDraftGroupMapping(group, externalGroup, enabled) {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.error?.message || "draft group mapping update failed");
+  }
+  return response.json();
+}
+
+async function updateDraftScopeResource(scope, field, value, enabled) {
+  const response = await fetch("/api/draft/scopes/resources", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope, field, value, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft scope resource update failed");
   }
   return response.json();
 }
@@ -848,6 +863,22 @@ function renderScopes(scopes) {
   renderScopeInspector(scopes);
 }
 
+const SCOPE_RESOURCE_LABELS = {
+  accounts: "Accounts",
+  regions: "Regions",
+  log_group_arns: "Log Groups",
+  clusters: "ECS Clusters",
+  os_users: "OS Users",
+};
+
+const SCOPE_RESOURCE_PLACEHOLDERS = {
+  accounts: "account id from Accounts/Roles",
+  regions: "aws region, e.g. ap-northeast-1",
+  log_group_arns: "log group ARN or pattern",
+  clusters: "cluster name or pattern",
+  os_users: "linux user, e.g. ec2-user",
+};
+
 function scopeResourceCount(scope) {
   return (
     (scope.accounts?.length || 0) +
@@ -923,6 +954,7 @@ function renderScopeInspector(scopes) {
   setText("#scope-selected-ecs", String(selected?.clusters?.length || 0));
   setText("#scope-selected-db", String(selected?.database_scopes?.length || 0));
   setText("#scope-selected-mcp-ec2", String(selected?.mcp_ec2_diagnostic_scopes?.length || 0));
+  renderScopeResourceEditor(selected);
 
   const list = document.getElementById("scope-detail-list");
   if (!list) {
@@ -956,6 +988,54 @@ function renderScopeInspector(scopes) {
     ),
   ];
   list.replaceChildren(title, ...blocks);
+}
+
+function renderScopeResourceEditor(scope) {
+  const select = document.getElementById("scope-resource-field");
+  const input = document.getElementById("scope-resource-input");
+  const addButton = document.getElementById("scope-resource-add-button");
+  const list = document.getElementById("scope-resource-list");
+  const field = SCOPE_RESOURCE_LABELS[state.selectedScopeResourceField]
+    ? state.selectedScopeResourceField
+    : "accounts";
+  state.selectedScopeResourceField = field;
+
+  if (select) {
+    select.value = field;
+    select.disabled = !scope || !state.server?.capabilities?.draft_write;
+  }
+  if (input) {
+    input.placeholder = SCOPE_RESOURCE_PLACEHOLDERS[field] || "resource value";
+    input.disabled = !scope || !state.server?.capabilities?.draft_write;
+  }
+  if (addButton) {
+    addButton.disabled = !scope || !state.server?.capabilities?.draft_write;
+  }
+  if (!list) {
+    return;
+  }
+  if (!scope) {
+    list.replaceChildren(el("p", "", "No scope selected"));
+    return;
+  }
+  const values = [...(scope[field] || [])].sort();
+  if (!values.length) {
+    list.replaceChildren(el("p", "", `No ${SCOPE_RESOURCE_LABELS[field].toLowerCase()}`));
+    return;
+  }
+  list.replaceChildren(
+    ...values.map((value) => {
+      const row = el("div", "scope-resource-list-row");
+      row.append(el("span", "", value));
+      const removeButton = el("button", "", "×");
+      removeButton.type = "button";
+      removeButton.dataset.scopeResourceField = field;
+      removeButton.dataset.scopeResourceValue = value;
+      removeButton.setAttribute("aria-label", `Remove ${value}`);
+      row.append(removeButton);
+      return row;
+    }),
+  );
 }
 
 function scopeDetailBlock(title, values) {
@@ -1419,11 +1499,14 @@ function renderChanges(changes) {
   const removedMemberships = changes.removed_memberships || [];
   const addedMappings = changes.added_group_mappings || [];
   const removedMappings = changes.removed_group_mappings || [];
+  const addedScopeResources = changes.added_scope_resources || [];
+  const removedScopeResources = changes.removed_scope_resources || [];
   const identityCount =
     addedMemberships.length +
     removedMemberships.length +
     addedMappings.length +
     removedMappings.length;
+  const scopeResourceCount = addedScopeResources.length + removedScopeResources.length;
   const highRiskKeys = new Set(highRisk.map(grantKey));
   const summaryItems = document.querySelectorAll(".summary-grid strong");
   const changedGroups = new Set([
@@ -1435,19 +1518,21 @@ function renderChanges(changes) {
     ...removedMemberships.map((change) => change.group),
     ...addedMappings.map((change) => change.group),
     ...removedMappings.map((change) => change.group),
+    ...addedScopeResources.map((change) => `scope:${change.scope}`),
+    ...removedScopeResources.map((change) => `scope:${change.scope}`),
   ]);
   if (summaryItems[0]) {
     summaryItems[0].firstChild.textContent = String(changedGroups.size);
   }
   if (summaryItems[1]) summaryItems[1].firstChild.textContent = String(added.length);
   if (summaryItems[2]) summaryItems[2].firstChild.textContent = String(removed.length);
-  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount + identityCount);
+  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount + identityCount + scopeResourceCount);
 
   const pendingTitle = document.querySelector(".pending-block h3");
   const pendingBody = document.querySelector(".pending-block tbody");
   if (pendingTitle) {
     const riskLabel = highRisk.length ? `, ${highRisk.length} high risk` : "";
-    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount + identityCount}${riskLabel})`;
+    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount + identityCount + scopeResourceCount}${riskLabel})`;
   }
   if (!pendingBody) {
     return;
@@ -1459,6 +1544,8 @@ function renderChanges(changes) {
     ...removedMemberships.map((change) => identityChangeRow("Remove", "Direct membership", change.group, change.user_id)),
     ...addedMappings.map((change) => identityChangeRow("Add", "External mapping", change.group, change.external_group)),
     ...removedMappings.map((change) => identityChangeRow("Remove", "External mapping", change.group, change.external_group)),
+    ...addedScopeResources.map((change) => scopeResourceChangeRow("Add", change)),
+    ...removedScopeResources.map((change) => scopeResourceChangeRow("Remove", change)),
     ...semanticAdded.map((grant) =>
       semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
     ),
@@ -1694,7 +1781,10 @@ function renderOverview() {
     (changes.removed_memberships?.length || 0) +
     (changes.added_group_mappings?.length || 0) +
     (changes.removed_group_mappings?.length || 0);
-  const pendingCount = added.length + removed.length + semanticCount + identityCount;
+  const scopeResourceCount =
+    (changes.added_scope_resources?.length || 0) +
+    (changes.removed_scope_resources?.length || 0);
+  const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount;
   const packageHighRisk = packages.reduce(
     (count, pkg) => count + (pkg.high_risk_features?.length || 0),
     0,
@@ -1864,12 +1954,15 @@ function renderReviewApply() {
   const removedMemberships = changes.removed_memberships || [];
   const addedMappings = changes.added_group_mappings || [];
   const removedMappings = changes.removed_group_mappings || [];
+  const addedScopeResources = changes.added_scope_resources || [];
+  const removedScopeResources = changes.removed_scope_resources || [];
   const identityCount =
     addedMemberships.length +
     removedMemberships.length +
     addedMappings.length +
     removedMappings.length;
-  const pendingCount = added.length + removed.length + semanticCount + identityCount;
+  const scopeResourceCount = addedScopeResources.length + removedScopeResources.length;
+  const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount;
   const blocking = validation?.blocking_errors || [];
   const warnings = validation?.warnings || [];
   const dbIssues = databaseConnections.issues || [];
@@ -1960,6 +2053,8 @@ function renderReviewApply() {
     ...removedMappings.map((change) =>
       identityChangeRow("Remove", "External mapping", change.group, change.external_group),
     ),
+    ...addedScopeResources.map((change) => scopeResourceChangeRow("Add", change)),
+    ...removedScopeResources.map((change) => scopeResourceChangeRow("Remove", change)),
     ...semanticAdded.map((grant) =>
       semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
     ),
@@ -2136,6 +2231,32 @@ function identityChangeRow(type, changeLabel, group, value) {
     row.append(cell);
   });
   return row;
+}
+
+function scopeResourceChangeRow(type, change) {
+  const row = document.createElement("tr");
+  [
+    type,
+    `scope:${change.scope}`,
+    scopeResourceLabel(change.field),
+    "Scope resource",
+    change.value,
+  ].forEach((cellValue, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = cellValue;
+    if (index === 0) {
+      cell.className = type === "Add" ? "add" : "remove";
+    }
+    if (index === 4) {
+      cell.classList.add("grant-detail");
+    }
+    row.append(cell);
+  });
+  return row;
+}
+
+function scopeResourceLabel(field) {
+  return SCOPE_RESOURCE_LABELS[field] || field || "Scope";
 }
 
 function grantKey(grant) {
@@ -2354,6 +2475,66 @@ document.querySelectorAll("[data-overview-target]").forEach((button) => {
   });
 });
 
+async function updateScopeResource(field, value, enabled) {
+  const scope = state.selectedScope;
+  const trimmedValue = value.trim();
+  if (!scope || !field || !trimmedValue) {
+    setValidationStatus("Scope update unavailable", "select a scope and enter a resource value", false);
+    return;
+  }
+  try {
+    const payload = await updateDraftScopeResource(scope, field, trimmedValue, enabled);
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("scopes");
+    setValidationStatus(
+      enabled ? "Scope resource added" : "Scope resource removed",
+      `${scopeResourceLabel(field)} ${trimmedValue} ${enabled ? "is staged for" : "was removed from"} ${scope}`,
+      false,
+    );
+  } catch (error) {
+    setValidationStatus("Scope update failed", error.message, false);
+  }
+}
+
+document.getElementById("scope-resource-field")?.addEventListener("change", (event) => {
+  if (!(event.target instanceof HTMLSelectElement)) {
+    return;
+  }
+  state.selectedScopeResourceField = event.target.value;
+  renderScopeInspector(state.draft?.scopes || []);
+});
+
+document.getElementById("scope-resource-add-button")?.addEventListener("click", async () => {
+  const input = document.getElementById("scope-resource-input");
+  const select = document.getElementById("scope-resource-field");
+  const field =
+    select instanceof HTMLSelectElement ? select.value : state.selectedScopeResourceField;
+  const value = input?.value || "";
+  await updateScopeResource(field, value, true);
+  if (input) {
+    input.value = "";
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) {
+    return;
+  }
+  const button = event.target.closest("[data-scope-resource-field]");
+  if (!(button instanceof HTMLElement)) {
+    return;
+  }
+  updateScopeResource(
+    button.dataset.scopeResourceField || "",
+    button.dataset.scopeResourceValue || "",
+    false,
+  );
+});
+
 async function updateIdentityWiring(kind, value, enabled) {
   const group = state.selectedGroup;
   const trimmedValue = value.trim();
@@ -2405,7 +2586,7 @@ document.addEventListener("click", (event) => {
     return;
   }
   const button = event.target.closest("[data-identity-kind]");
-  if (!button) {
+  if (!(button instanceof HTMLElement)) {
     return;
   }
   updateIdentityWiring(button.dataset.identityKind, button.dataset.identityValue || "", false);
