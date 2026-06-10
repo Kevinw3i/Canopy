@@ -254,6 +254,10 @@ pub struct UiCommandArgs {
     #[arg(long = "deployment-config", value_name = "PATH")]
     pub deployment_config: Option<PathBuf>,
 
+    /// Canonical entitlements UI auth config.
+    #[arg(long = "auth-config", value_name = "PATH")]
+    pub auth_config: Option<PathBuf>,
+
     /// Local database connection snippet used by the UI draft workflow.
     #[arg(long = "db-config", value_name = "PATH")]
     pub db_config: Option<PathBuf>,
@@ -571,6 +575,7 @@ where
                 deployment_mode: args.deployment_mode,
                 tfvars: args.tfvars,
                 deployment_config: args.deployment_config,
+                auth_config: args.auth_config,
                 db_config: args.db_config,
                 dev_admin_group: args.dev_admin_group,
                 identity_source: args.identity_source,
@@ -672,6 +677,8 @@ mod tests {
             "infra/terraform.tfvars",
             "--deployment-config",
             "config.toml",
+            "--auth-config",
+            "/etc/canopy/entitlements-ui-auth.toml",
             "--db-config",
             "database_connections.local.toml",
             "--dev-admin-group",
@@ -701,6 +708,10 @@ mod tests {
             Some(PathBuf::from("entitlements.toml"))
         );
         assert_eq!(args.deployment_mode.as_deref(), Some("terraform"));
+        assert_eq!(
+            args.auth_config,
+            Some(PathBuf::from("/etc/canopy/entitlements-ui-auth.toml"))
+        );
         assert_eq!(args.dev_operator_external_groups, vec!["admin"]);
         assert!(args.allow_dev_identity);
         assert!(args.bind.ip().is_loopback());

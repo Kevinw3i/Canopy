@@ -57,6 +57,7 @@ pub struct UiArgs {
     pub deployment_mode: Option<String>,
     pub tfvars: Option<PathBuf>,
     pub deployment_config: Option<PathBuf>,
+    pub auth_config: Option<PathBuf>,
     pub db_config: Option<PathBuf>,
     pub dev_admin_group: String,
     pub identity_source: String,
@@ -236,6 +237,11 @@ struct ApplyFileDigest {
     exists: bool,
     sha256: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UiAuthConfigFile {
+    admin_group: Option<String>,
 }
 
 impl ApplyBaselineSnapshot {
@@ -591,6 +597,7 @@ struct UiIdentityState {
     operator_email_configured: bool,
     operator_external_group_count: usize,
     operator_jwt_configured: bool,
+    auth_config_configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2007,6 +2014,7 @@ impl UiAppState {
                 operator_email_configured: args.dev_operator_email.is_some(),
                 operator_external_group_count: args.dev_operator_external_groups.len(),
                 operator_jwt_configured: args.operator_jwt.is_some(),
+                auth_config_configured: args.auth_config.is_some(),
             },
             capabilities: UiCapabilities {
                 state: true,
@@ -4007,6 +4015,16 @@ fn apply_gate_status(
         return (StatusCode::FORBIDDEN, "locked", gate);
     }
 
+    match canonical_admin_group(args) {
+        Ok(admin_group) => gate.admin_group = admin_group,
+        Err(message) => {
+            gate.state = "admin_blocked";
+            gate.reason_code = "canonical_auth_config_invalid";
+            gate.message = message;
+            return (StatusCode::CONFLICT, "blocked", gate);
+        }
+    }
+
     let Some(baseline) = baseline else {
         gate.state = "admin_blocked";
         gate.reason_code = "baseline_catalog_unavailable";
@@ -4100,6 +4118,39 @@ fn apply_gate_status(
     gate.reason_code = "apply_transaction_unavailable";
     gate.message = "Apply remains locked until canonical operator authorization and the catalog/runtime transaction protocol are enabled.".to_owned();
     (StatusCode::FORBIDDEN, "locked", gate)
+}
+
+fn canonical_admin_group(args: &UiArgs) -> Result<String, String> {
+    let Some(path) = args.auth_config.as_deref() else {
+        return Ok("admin".to_owned());
+    };
+    validate_auth_config_file_path(path).map_err(|err| {
+        format!(
+            "canonical auth config '{}' failed protected file validation: {err:#}",
+            path.display()
+        )
+    })?;
+    let content = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "failed to read canonical auth config '{}': {err}",
+            path.display()
+        )
+    })?;
+    let config = toml::from_str::<UiAuthConfigFile>(&content).map_err(|err| {
+        format!(
+            "failed to parse canonical auth config '{}': {err}",
+            path.display()
+        )
+    })?;
+    let admin_group = config.admin_group.unwrap_or_else(|| "admin".to_owned());
+    let admin_group = admin_group.trim();
+    if admin_group.is_empty() {
+        return Err(format!(
+            "canonical auth config '{}' has an empty admin_group",
+            path.display()
+        ));
+    }
+    Ok(admin_group.to_owned())
 }
 
 fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
@@ -5700,39 +5751,44 @@ fn validate_ui_file_paths(args: &UiArgs) -> anyhow::Result<()> {
     if let Some(operator_jwt) = args.operator_jwt.as_deref() {
         validate_operator_jwt_file_path(operator_jwt)?;
     }
+    if let Some(auth_config) = args.auth_config.as_deref() {
+        validate_auth_config_file_path(auth_config)?;
+    }
 
     Ok(())
 }
 
 fn validate_operator_jwt_file_path(path: &Path) -> anyhow::Result<()> {
+    validate_protected_ui_file_path(path, "--operator-jwt file").map(|_| ())
+}
+
+fn validate_auth_config_file_path(path: &Path) -> anyhow::Result<()> {
+    validate_protected_ui_file_path(path, "--auth-config file").map(|_| ())
+}
+
+fn validate_protected_ui_file_path(path: &Path, label: &str) -> anyhow::Result<PathBuf> {
     let normalized = normalized_ui_path(path)?;
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to inspect --operator-jwt file '{}'", path.display()))?;
+        .with_context(|| format!("failed to inspect {label} '{}'", path.display()))?;
     if metadata.file_type().is_symlink() {
-        anyhow::bail!(
-            "--operator-jwt file '{}' must not be a symlink",
-            path.display()
-        );
+        anyhow::bail!("{label} '{}' must not be a symlink", path.display());
     }
     if !metadata.file_type().is_file() {
-        anyhow::bail!(
-            "--operator-jwt file '{}' must be a regular file",
-            path.display()
-        );
+        anyhow::bail!("{label} '{}' must be a regular file", path.display());
     }
     #[cfg(unix)]
     {
         let mode = metadata.permissions().mode();
         if mode & 0o022 != 0 {
             anyhow::bail!(
-                "--operator-jwt file '{}' must not be group/world writable",
+                "{label} '{}' must not be group/world writable",
                 path.display()
             );
         }
         let current_uid = unsafe { geteuid() };
         if metadata.uid() != current_uid {
             anyhow::bail!(
-                "--operator-jwt file '{}' must be owned by the current effective user",
+                "{label} '{}' must be owned by the current effective user",
                 path.display()
             );
         }
@@ -5740,13 +5796,13 @@ fn validate_operator_jwt_file_path(path: &Path) -> anyhow::Result<()> {
     if let Some(repo_root) = current_repo_root()? {
         if normalized.starts_with(&repo_root) {
             anyhow::bail!(
-                "--operator-jwt file '{}' must be outside the repository working tree '{}'",
+                "{label} '{}' must be outside the repository working tree '{}'",
                 path.display(),
                 repo_root.display()
             );
         }
     }
-    Ok(())
+    Ok(normalized)
 }
 
 fn current_repo_root() -> anyhow::Result<Option<PathBuf>> {
@@ -5813,6 +5869,7 @@ mod tests {
             deployment_mode: Some("config".to_owned()),
             tfvars: None,
             deployment_config: Some(PathBuf::from("config.toml")),
+            auth_config: None,
             db_config: Some(PathBuf::from("database_connections.local.toml")),
             dev_admin_group: "admin".to_owned(),
             identity_source: "dev-claims".to_owned(),
@@ -5910,21 +5967,37 @@ group = "RD"
         name: &str,
         admin_user_id: &str,
     ) -> (PathBuf, String) {
+        write_catalog_fixture_with_group_member(name, "admin", admin_user_id)
+    }
+
+    fn write_catalog_fixture_with_group_member(
+        name: &str,
+        group: &str,
+        user_id: &str,
+    ) -> (PathBuf, String) {
         let (path, mut content) = write_catalog_fixture(name);
         content.push_str(&format!(
             r#"
 
 [[bindings]]
-group = "admin"
+group = "{group}"
 package = "analytics"
 
 [[memberships]]
-user_id = "{admin_user_id}"
-group = "admin"
+user_id = "{user_id}"
+group = "{group}"
 "#
         ));
         std::fs::write(&path, &content).unwrap();
         (path, content)
+    }
+
+    fn write_auth_config_fixture(name: &str, admin_group: &str) -> PathBuf {
+        let path = catalog_fixture_path(name);
+        std::fs::write(&path, format!("admin_group = \"{admin_group}\"\n")).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
     }
 
     fn write_database_config_fixture(name: &str) -> PathBuf {
@@ -9071,6 +9144,160 @@ package = "mcp-ec2-diagnostics"
     }
 
     #[tokio::test]
+    async fn apply_uses_auth_config_admin_group_against_baseline_catalog() {
+        let (catalog_path, catalog_content) = write_catalog_fixture_with_group_member(
+            "apply-auth-config-admin-catalog",
+            "ops-admin",
+            "operator",
+        );
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-auth-config-admin-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-auth-config-admin-db");
+        let deployment_config_path =
+            write_database_config_fixture("apply-auth-config-admin-deploy");
+        let auth_config_path =
+            write_auth_config_fixture("apply-auth-config-admin-auth", "ops-admin");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.auth_config = Some(auth_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_admin_group = "admin".to_owned();
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_ready");
+        assert_eq!(apply["gate"]["admin_group"], "ops-admin");
+        assert_eq!(
+            apply["gate"]["reason_code"],
+            "apply_transaction_unavailable"
+        );
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(auth_config_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_rejects_auth_config_that_becomes_group_writable() {
+        let (catalog_path, catalog_content) = write_catalog_fixture_with_group_member(
+            "apply-auth-config-writable-catalog",
+            "ops-admin",
+            "operator",
+        );
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "apply-auth-config-writable-runtime",
+            &catalog_content,
+        );
+        let db_config_path = write_database_config_fixture("apply-auth-config-writable-db");
+        let deployment_config_path =
+            write_database_config_fixture("apply-auth-config-writable-deploy");
+        let auth_config_path =
+            write_auth_config_fixture("apply-auth-config-writable-auth", "ops-admin");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.auth_config = Some(auth_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        std::fs::set_permissions(&auth_config_path, std::fs::Permissions::from_mode(0o620))
+            .unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_blocked");
+        assert_eq!(
+            apply["gate"]["reason_code"],
+            "canonical_auth_config_invalid"
+        );
+        assert!(apply["gate"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must not be group/world writable"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(auth_config_path);
+    }
+
+    #[tokio::test]
     async fn apply_blocks_existing_transaction_lock_without_writing_files() {
         let (catalog_path, catalog_content) =
             write_catalog_fixture_with_admin_member("apply-lock-catalog", "operator");
@@ -9594,6 +9821,24 @@ require_tls = true
         args.operator_jwt = Some(path.clone());
 
         let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("outside the repository working tree"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auth_config_validation_rejects_repo_worktree_path() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!(".canopy-test-auth-{}.toml", random_url_token()));
+        std::fs::write(&path, "admin_group = \"admin\"\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut args = test_args();
+        args.auth_config = Some(path.clone());
+
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("--auth-config file"));
         assert!(err.contains("outside the repository working tree"));
 
         let _ = std::fs::remove_file(path);
