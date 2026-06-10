@@ -1771,7 +1771,8 @@ textarea {
   font-size: 16px;
 }
 
-.scope-db-fieldset {
+.scope-db-fieldset,
+.scope-mcp-ec2-fieldset {
   display: grid;
   gap: 12px;
   margin-top: 18px;
@@ -1779,20 +1780,25 @@ textarea {
   border-top: 1px solid var(--line);
 }
 
-.scope-db-fieldset label {
+.scope-db-fieldset label,
+.scope-mcp-ec2-fieldset label {
   display: grid;
   gap: 7px;
 }
 
 .scope-db-fieldset label > span,
-.scope-db-checks span {
+.scope-db-checks span,
+.scope-mcp-ec2-fieldset label > span {
   color: var(--muted);
   font-size: 12px;
   font-weight: 720;
 }
 
 .scope-db-fieldset select,
-.scope-db-fieldset input {
+.scope-db-fieldset input,
+.scope-mcp-ec2-fieldset select,
+.scope-mcp-ec2-fieldset input,
+.scope-mcp-ec2-fieldset textarea {
   width: 100%;
   min-width: 0;
 }
@@ -1854,6 +1860,53 @@ textarea {
 }
 
 .scope-db-actions button:disabled {
+  cursor: not-allowed;
+  border-color: var(--line-strong);
+  background: #dfe4e9;
+  color: #778290;
+}
+
+.scope-mcp-ec2-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.scope-mcp-ec2-lines {
+  display: grid;
+  gap: 10px;
+}
+
+.scope-mcp-ec2-lines textarea {
+  min-height: 58px;
+  resize: vertical;
+}
+
+.scope-mcp-ec2-actions {
+  display: grid;
+  grid-template-columns: 1fr 110px;
+  gap: 10px;
+}
+
+.scope-mcp-ec2-actions button {
+  min-height: 40px;
+  border-radius: 6px;
+  font-weight: 760;
+}
+
+#scope-mcp-ec2-save-button {
+  border: 1px solid var(--green);
+  background: var(--green);
+  color: #fff;
+}
+
+#scope-mcp-ec2-delete-button {
+  border: 1px solid #c45c5c;
+  background: #fff;
+  color: #9f3030;
+}
+
+.scope-mcp-ec2-actions button:disabled {
   cursor: not-allowed;
   border-color: var(--line-strong);
   background: #dfe4e9;

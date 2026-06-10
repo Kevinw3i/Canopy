@@ -26,7 +26,11 @@ use crate::catalog::{
     CatalogScope,
 };
 use entitlements::GroupMapping;
-use shared::dto::entitlements::DatabaseScope;
+use shared::dto::entitlements::{
+    DatabaseScope, McpEc2DiagnosticScope, McpEc2DnsRecordType, McpEc2DnsTargetScope,
+    McpEc2HttpQueryPolicy, McpEc2HttpUrlScope, McpEc2JournalUnitScope, McpEc2LogPathScope,
+    McpEc2TcpTargetScope,
+};
 
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
@@ -127,6 +131,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/draft/group-mappings", put(put_draft_group_mapping))
         .route("/api/draft/scopes/resources", put(put_draft_scope_resource))
         .route("/api/draft/scopes/database", put(put_draft_database_scope))
+        .route("/api/draft/scopes/mcp-ec2", put(put_draft_mcp_ec2_scope))
         .route("/api/draft/packages", put(put_draft_package))
         .route(
             "/api/draft/packages/features",
@@ -282,6 +287,28 @@ struct DraftDatabaseScopeRequest {
     max_examined_rows: u64,
     allow_full_table_scan: bool,
     allow_views: bool,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftMcpEc2ScopeRequest {
+    scope: String,
+    id: String,
+    allowed_log_paths: Vec<McpEc2LogPathScope>,
+    allowed_journal_units: Vec<McpEc2JournalUnitScope>,
+    allowed_http_urls: Vec<McpEc2HttpUrlScope>,
+    allowed_tcp_targets: Vec<McpEc2TcpTargetScope>,
+    allowed_dns_targets: Vec<McpEc2DnsTargetScope>,
+    private_target_refs: Vec<String>,
+    max_lines: u16,
+    max_since_seconds: u64,
+    max_timeout_seconds: u8,
+    max_matches: u16,
+    connectivity_probe_budget_per_window: u32,
+    budget_window_seconds: u64,
+    denylist_version: String,
+    allowlist_rule_id: String,
     enabled: bool,
 }
 
@@ -621,6 +648,11 @@ struct UiMcpEc2ScopeSummary {
     http_urls: Vec<String>,
     tcp_targets: Vec<String>,
     dns_targets: Vec<String>,
+    allowed_log_paths: Vec<UiMcpEc2LogPathSummary>,
+    allowed_journal_units: Vec<UiMcpEc2JournalUnitSummary>,
+    allowed_http_urls: Vec<UiMcpEc2HttpUrlSummary>,
+    allowed_tcp_targets: Vec<UiMcpEc2TcpTargetSummary>,
+    allowed_dns_targets: Vec<UiMcpEc2DnsTargetSummary>,
     private_target_refs: Vec<String>,
     max_lines: u16,
     max_since_seconds: u64,
@@ -631,6 +663,42 @@ struct UiMcpEc2ScopeSummary {
     denylist_version: String,
     allowlist_rule_id: String,
     unsafe_output_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMcpEc2LogPathSummary {
+    path_pattern: String,
+    canonical_safe_prefix: String,
+    safe_for_mcp_output: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMcpEc2JournalUnitSummary {
+    unit: String,
+    safe_for_mcp_output: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMcpEc2HttpUrlSummary {
+    normalized_url: String,
+    query_policy: McpEc2HttpQueryPolicy,
+    safe_for_mcp_output: bool,
+    private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMcpEc2TcpTargetSummary {
+    host: String,
+    port: u16,
+    private_target_ref: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiMcpEc2DnsTargetSummary {
+    host: String,
+    record_types: Vec<McpEc2DnsRecordType>,
+    safe_for_mcp_output: bool,
+    private_target_ref: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1015,6 +1083,38 @@ async fn put_draft_database_scope(
     };
 
     match state.update_database_scope(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn put_draft_mcp_ec2_scope(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftMcpEc2ScopeRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_mcp_ec2_scope_request",
+                "draft MCP EC2 scope request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_mcp_ec2_scope(request) {
         Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
         Err(err) => error_response(err.status, err.code, err.message),
     }
@@ -1474,6 +1574,17 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned");
         draft.update_database_scope(request)
+    }
+
+    fn update_mcp_ec2_scope(
+        &self,
+        request: DraftMcpEc2ScopeRequest,
+    ) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_mcp_ec2_scope(request)
     }
 
     fn update_package_feature(
@@ -2101,6 +2212,70 @@ impl DraftState {
         Ok(())
     }
 
+    fn update_mcp_ec2_scope(
+        &mut self,
+        request: DraftMcpEc2ScopeRequest,
+    ) -> Result<(), UiMutationError> {
+        let scope_id = request.scope.trim().to_owned();
+        let id = request.id.trim().to_owned();
+        if scope_id.is_empty() || id.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_mcp_ec2_scope_id",
+                "scope and MCP EC2 scope id are required",
+            ));
+        }
+        validate_mcp_ec2_scope_id(&id)?;
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let Some(scope) = draft
+            .scopes
+            .iter_mut()
+            .find(|candidate| candidate.id == scope_id)
+        else {
+            return Err(UiMutationError::bad_request(
+                "unknown_scope",
+                format!("scope '{scope_id}' does not exist in the draft"),
+            ));
+        };
+
+        let existing = scope
+            .mcp_ec2_diagnostic_scopes
+            .iter()
+            .position(|ec2_scope| ec2_scope.id == id);
+        let changed = if request.enabled {
+            let next = mcp_ec2_scope_from_request(&id, request)?;
+            match existing {
+                Some(index) if scope.mcp_ec2_diagnostic_scopes[index] == next => false,
+                Some(index) => {
+                    scope.mcp_ec2_diagnostic_scopes[index] = next;
+                    true
+                }
+                None => {
+                    scope.mcp_ec2_diagnostic_scopes.push(next);
+                    true
+                }
+            }
+        } else if let Some(index) = existing {
+            scope.mcp_ec2_diagnostic_scopes.remove(index);
+            true
+        } else {
+            false
+        };
+
+        if changed {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
     fn update_package_feature(
         &mut self,
         request: DraftPackageFeatureRequest,
@@ -2539,6 +2714,375 @@ fn database_scope_from_request(
         allow_full_table_scan: request.allow_full_table_scan,
         allow_views: request.allow_views,
     })
+}
+
+fn mcp_ec2_scope_from_request(
+    id: &str,
+    request: DraftMcpEc2ScopeRequest,
+) -> Result<McpEc2DiagnosticScope, UiMutationError> {
+    validate_mcp_ec2_range("max_lines", u64::from(request.max_lines), 1, 500)?;
+    validate_mcp_ec2_range("max_since_seconds", request.max_since_seconds, 1, 1800)?;
+    validate_mcp_ec2_range(
+        "max_timeout_seconds",
+        u64::from(request.max_timeout_seconds),
+        1,
+        120,
+    )?;
+    validate_mcp_ec2_range("max_matches", u64::from(request.max_matches), 1, 500)?;
+    validate_mcp_ec2_range(
+        "connectivity_probe_budget_per_window",
+        u64::from(request.connectivity_probe_budget_per_window),
+        1,
+        u64::MAX,
+    )?;
+    validate_mcp_ec2_range(
+        "budget_window_seconds",
+        request.budget_window_seconds,
+        1,
+        u64::MAX,
+    )?;
+
+    let private_target_refs = normalize_mcp_ec2_private_target_refs(request.private_target_refs)?;
+    let private_target_ref_set = private_target_refs
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let allowed_log_paths = normalize_mcp_ec2_log_paths(request.allowed_log_paths)?;
+    let allowed_journal_units = normalize_mcp_ec2_journal_units(request.allowed_journal_units)?;
+    let allowed_http_urls =
+        normalize_mcp_ec2_http_urls(request.allowed_http_urls, &private_target_ref_set)?;
+    let allowed_tcp_targets =
+        normalize_mcp_ec2_tcp_targets(request.allowed_tcp_targets, &private_target_ref_set)?;
+    let allowed_dns_targets =
+        normalize_mcp_ec2_dns_targets(request.allowed_dns_targets, &private_target_ref_set)?;
+
+    if allowed_log_paths.is_empty()
+        && allowed_journal_units.is_empty()
+        && allowed_http_urls.is_empty()
+        && allowed_tcp_targets.is_empty()
+        && allowed_dns_targets.is_empty()
+    {
+        return Err(UiMutationError::bad_request(
+            "empty_mcp_ec2_scope_commands",
+            "MCP EC2 diagnostic scope requires at least one log, journal, HTTP, TCP, or DNS target",
+        ));
+    }
+
+    let denylist_version =
+        required_nonempty_mcp_ec2_string("denylist_version", request.denylist_version)?;
+    let allowlist_rule_id =
+        required_nonempty_mcp_ec2_string("allowlist_rule_id", request.allowlist_rule_id)?;
+
+    Ok(McpEc2DiagnosticScope {
+        id: id.to_owned(),
+        allowed_log_paths,
+        allowed_journal_units,
+        allowed_http_urls,
+        allowed_tcp_targets,
+        allowed_dns_targets,
+        private_target_refs,
+        max_lines: request.max_lines,
+        max_since_seconds: request.max_since_seconds,
+        max_timeout_seconds: request.max_timeout_seconds,
+        max_matches: request.max_matches,
+        connectivity_probe_budget_per_window: request.connectivity_probe_budget_per_window,
+        budget_window_seconds: request.budget_window_seconds,
+        denylist_version,
+        allowlist_rule_id,
+    })
+}
+
+fn validate_mcp_ec2_range(
+    field: &'static str,
+    value: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<(), UiMutationError> {
+    if value < minimum || value > maximum {
+        return Err(UiMutationError::bad_request(
+            "invalid_mcp_ec2_scope_limit",
+            format!("MCP EC2 diagnostic scope {field} must be between {minimum} and {maximum}"),
+        ));
+    }
+    Ok(())
+}
+
+fn required_nonempty_mcp_ec2_string(
+    field: &'static str,
+    value: String,
+) -> Result<String, UiMutationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_mcp_ec2_scope_field",
+            format!("MCP EC2 diagnostic scope {field} is required"),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_mcp_ec2_private_target_refs(
+    values: Vec<String>,
+) -> Result<Vec<String>, UiMutationError> {
+    let mut refs = BTreeSet::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        validate_mcp_ec2_private_ref_identifier("MCP EC2 private target ref", value)?;
+        refs.insert(value.to_owned());
+    }
+    Ok(refs.into_iter().collect())
+}
+
+fn normalize_mcp_ec2_log_paths(
+    values: Vec<McpEc2LogPathScope>,
+) -> Result<Vec<McpEc2LogPathScope>, UiMutationError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let path_pattern =
+            required_nonempty_mcp_ec2_string("log path_pattern", value.path_pattern)?;
+        let canonical_safe_prefix = required_nonempty_mcp_ec2_string(
+            "log canonical_safe_prefix",
+            value.canonical_safe_prefix,
+        )?;
+        if !seen.insert(path_pattern.clone()) {
+            continue;
+        }
+        normalized.push(McpEc2LogPathScope {
+            path_pattern,
+            canonical_safe_prefix,
+            safe_for_mcp_output: value.safe_for_mcp_output,
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_mcp_ec2_journal_units(
+    values: Vec<McpEc2JournalUnitScope>,
+) -> Result<Vec<McpEc2JournalUnitScope>, UiMutationError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let unit = required_nonempty_mcp_ec2_string("journal unit", value.unit)?;
+        if !seen.insert(unit.clone()) {
+            continue;
+        }
+        normalized.push(McpEc2JournalUnitScope {
+            unit,
+            safe_for_mcp_output: value.safe_for_mcp_output,
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_mcp_ec2_http_urls(
+    values: Vec<McpEc2HttpUrlScope>,
+    private_target_refs: &BTreeSet<&str>,
+) -> Result<Vec<McpEc2HttpUrlScope>, UiMutationError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let normalized_url = required_nonempty_mcp_ec2_string("HTTP URL", value.normalized_url)?;
+        let private_target_ref =
+            normalize_mcp_ec2_optional_private_target_ref(value.private_target_ref)?;
+        validate_mcp_ec2_private_target_ref_defined(
+            "HTTP URL private_target_ref",
+            private_target_ref.as_deref(),
+            private_target_refs,
+        )?;
+        let query_policy_key = format!("{:?}", value.query_policy);
+        if !seen.insert((
+            normalized_url.clone(),
+            query_policy_key,
+            private_target_ref.clone(),
+        )) {
+            continue;
+        }
+        normalized.push(McpEc2HttpUrlScope {
+            normalized_url,
+            query_policy: value.query_policy,
+            safe_for_mcp_output: value.safe_for_mcp_output,
+            private_target_ref,
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_mcp_ec2_tcp_targets(
+    values: Vec<McpEc2TcpTargetScope>,
+    private_target_refs: &BTreeSet<&str>,
+) -> Result<Vec<McpEc2TcpTargetScope>, UiMutationError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let host = required_nonempty_mcp_ec2_string("TCP host", value.host)?;
+        if value.port == 0 {
+            return Err(UiMutationError::bad_request(
+                "invalid_mcp_ec2_scope_target",
+                "MCP EC2 TCP target port must be greater than zero",
+            ));
+        }
+        let private_target_ref =
+            normalize_mcp_ec2_optional_private_target_ref(value.private_target_ref)?;
+        validate_mcp_ec2_private_target_ref_defined(
+            "TCP target private_target_ref",
+            private_target_ref.as_deref(),
+            private_target_refs,
+        )?;
+        if !seen.insert((host.clone(), value.port, private_target_ref.clone())) {
+            continue;
+        }
+        normalized.push(McpEc2TcpTargetScope {
+            host,
+            port: value.port,
+            private_target_ref,
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_mcp_ec2_dns_targets(
+    values: Vec<McpEc2DnsTargetScope>,
+    private_target_refs: &BTreeSet<&str>,
+) -> Result<Vec<McpEc2DnsTargetScope>, UiMutationError> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let host = required_nonempty_mcp_ec2_string("DNS host", value.host)?;
+        if value.record_types.is_empty() {
+            return Err(UiMutationError::bad_request(
+                "empty_mcp_ec2_scope_field",
+                "MCP EC2 DNS target record_types requires at least one value",
+            ));
+        }
+        let private_target_ref =
+            normalize_mcp_ec2_optional_private_target_ref(value.private_target_ref)?;
+        validate_mcp_ec2_private_target_ref_defined(
+            "DNS target private_target_ref",
+            private_target_ref.as_deref(),
+            private_target_refs,
+        )?;
+        let record_key = value
+            .record_types
+            .iter()
+            .map(|record| format!("{record:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if !seen.insert((host.clone(), record_key, private_target_ref.clone())) {
+            continue;
+        }
+        normalized.push(McpEc2DnsTargetScope {
+            host,
+            record_types: value.record_types,
+            safe_for_mcp_output: value.safe_for_mcp_output,
+            private_target_ref,
+        });
+    }
+    Ok(normalized)
+}
+
+fn normalize_mcp_ec2_optional_private_target_ref(
+    value: Option<String>,
+) -> Result<Option<String>, UiMutationError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    validate_mcp_ec2_private_ref_identifier("MCP EC2 private target ref", value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn validate_mcp_ec2_private_target_ref_defined(
+    field: &'static str,
+    value: Option<&str>,
+    private_target_refs: &BTreeSet<&str>,
+) -> Result<(), UiMutationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !private_target_refs.contains(value) {
+        return Err(UiMutationError::bad_request(
+            "undefined_mcp_ec2_private_target_ref",
+            format!("{field} '{value}' is not listed in private_target_refs"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mcp_ec2_scope_id(value: &str) -> Result<(), UiMutationError> {
+    if value.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_mcp_ec2_scope_field",
+            "MCP EC2 scope id is required",
+        ));
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(UiMutationError::bad_request(
+            "empty_mcp_ec2_scope_field",
+            "MCP EC2 scope id is required",
+        ));
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(UiMutationError::bad_request(
+            "invalid_mcp_ec2_scope_identifier",
+            "MCP EC2 scope id must start with a lowercase ASCII letter or digit",
+        ));
+    }
+    if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') {
+        return Err(UiMutationError::bad_request(
+            "invalid_mcp_ec2_scope_identifier",
+            "MCP EC2 scope id may only contain lowercase ASCII letters, digits, '_' or '-'",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mcp_ec2_private_ref_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), UiMutationError> {
+    if value.is_empty() {
+        return Err(UiMutationError::bad_request(
+            "empty_mcp_ec2_scope_field",
+            format!("{field} is required"),
+        ));
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(UiMutationError::bad_request(
+            "empty_mcp_ec2_scope_field",
+            format!("{field} is required"),
+        ));
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(UiMutationError::bad_request(
+            "invalid_mcp_ec2_scope_identifier",
+            format!("{field} must start with a lowercase ASCII letter or digit"),
+        ));
+    }
+    if !chars.all(|ch| {
+        ch.is_ascii_lowercase()
+            || ch.is_ascii_digit()
+            || ch == '_'
+            || ch == '-'
+            || ch == ':'
+            || ch == '/'
+    }) {
+        return Err(UiMutationError::bad_request(
+            "invalid_mcp_ec2_scope_identifier",
+            format!(
+                "{field} may only contain lowercase ASCII letters, digits, '_', '-', ':' or '/'"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_database_scope_key(field: &'static str, value: &str) -> Result<(), UiMutationError> {
@@ -4092,6 +4636,52 @@ fn scope_summary(
                         format!("{} [{}]", target.host, records)
                     })
                     .collect(),
+                allowed_log_paths: ec2_scope
+                    .allowed_log_paths
+                    .iter()
+                    .map(|path| UiMcpEc2LogPathSummary {
+                        path_pattern: path.path_pattern.clone(),
+                        canonical_safe_prefix: path.canonical_safe_prefix.clone(),
+                        safe_for_mcp_output: path.safe_for_mcp_output,
+                    })
+                    .collect(),
+                allowed_journal_units: ec2_scope
+                    .allowed_journal_units
+                    .iter()
+                    .map(|unit| UiMcpEc2JournalUnitSummary {
+                        unit: unit.unit.clone(),
+                        safe_for_mcp_output: unit.safe_for_mcp_output,
+                    })
+                    .collect(),
+                allowed_http_urls: ec2_scope
+                    .allowed_http_urls
+                    .iter()
+                    .map(|url| UiMcpEc2HttpUrlSummary {
+                        normalized_url: url.normalized_url.clone(),
+                        query_policy: url.query_policy.clone(),
+                        safe_for_mcp_output: url.safe_for_mcp_output,
+                        private_target_ref: url.private_target_ref.clone(),
+                    })
+                    .collect(),
+                allowed_tcp_targets: ec2_scope
+                    .allowed_tcp_targets
+                    .iter()
+                    .map(|target| UiMcpEc2TcpTargetSummary {
+                        host: target.host.clone(),
+                        port: target.port,
+                        private_target_ref: target.private_target_ref.clone(),
+                    })
+                    .collect(),
+                allowed_dns_targets: ec2_scope
+                    .allowed_dns_targets
+                    .iter()
+                    .map(|target| UiMcpEc2DnsTargetSummary {
+                        host: target.host.clone(),
+                        record_types: target.record_types.clone(),
+                        safe_for_mcp_output: target.safe_for_mcp_output,
+                        private_target_ref: target.private_target_ref.clone(),
+                    })
+                    .collect(),
                 private_target_refs: ec2_scope.private_target_refs.clone(),
                 max_lines: ec2_scope.max_lines,
                 max_since_seconds: ec2_scope.max_since_seconds,
@@ -5005,17 +5595,24 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"id="scope-db-template""#));
         assert!(INDEX_HTML.contains(r#"id="scope-db-save-button""#));
         assert!(INDEX_HTML.contains(r#"id="scope-db-delete-button""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-mcp-ec2-template""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-mcp-ec2-save-button""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-mcp-ec2-delete-button""#));
 
         assert!(APP_JS.contains("function renderScopes("));
         assert!(APP_JS.contains("function renderScopeInspector("));
         assert!(APP_JS.contains("function updateDraftScopeResource("));
         assert!(APP_JS.contains("function updateDraftDatabaseScope("));
+        assert!(APP_JS.contains("function updateDraftMcpEc2Scope("));
         assert!(APP_JS.contains("function saveDatabaseScopeDraft("));
+        assert!(APP_JS.contains("function saveMcpEc2ScopeDraft("));
         assert!(APP_JS.contains("function renderScopeResourceEditor("));
         assert!(APP_JS.contains("function renderScopeDatabaseEditor("));
+        assert!(APP_JS.contains("function renderScopeMcpEc2Editor("));
         assert!(APP_JS.contains("mcpEc2ScopeLine"));
         assert!(APP_JS.contains("/api/draft/scopes/resources"));
         assert!(APP_JS.contains("/api/draft/scopes/database"));
+        assert!(APP_JS.contains("/api/draft/scopes/mcp-ec2"));
 
         assert!(APP_CSS.contains(".workspace.scope-mode"));
         assert!(APP_CSS.contains(".scopes-table"));
@@ -5023,6 +5620,8 @@ skip_tls_hostname_verification = true
         assert!(APP_CSS.contains(".scope-resource-list-row"));
         assert!(APP_CSS.contains(".scope-db-fieldset"));
         assert!(APP_CSS.contains(".scope-db-actions"));
+        assert!(APP_CSS.contains(".scope-mcp-ec2-fieldset"));
+        assert!(APP_CSS.contains(".scope-mcp-ec2-actions"));
         assert!(APP_CSS.contains(".scope-detail-block"));
     }
 
@@ -6220,6 +6819,300 @@ private_target_ref = "service:app-api"
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_content
         );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_mcp_ec2_scope_update_adds_scope_without_writing_catalog() {
+        let (catalog_path, content) = write_catalog_fixture("mcp-ec2-scope-add");
+        let original_content = content.replacen(
+            "\n[[group_mappings]]",
+            r#"
+[[scopes.mcp_ec2_diagnostic_scopes]]
+id = "base-diagnostics"
+private_target_refs = []
+max_lines = 50
+max_since_seconds = 600
+max_timeout_seconds = 15
+max_matches = 25
+connectivity_probe_budget_per_window = 10
+budget_window_seconds = 1200
+denylist_version = "builtin-v1"
+allowlist_rule_id = "base-diagnostics-v1"
+
+[[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+path_pattern = "/var/log/base/error.log"
+canonical_safe_prefix = "/var/log/base/"
+safe_for_mcp_output = true
+
+[[packages]]
+id = "mcp-ec2-diagnostics"
+features = ["mcp:use", "mcp:ec2"]
+scope = "db-scope"
+role = "readonly"
+
+[[bindings]]
+group = "RD"
+package = "mcp-ec2-diagnostics"
+
+[[group_mappings]]
+"#,
+            1,
+        );
+        std::fs::write(&catalog_path, &original_content).unwrap();
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/mcp-ec2")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "scope": "db-scope",
+                            "id": "app-diagnostics",
+                            "private_target_refs": ["service:app-api"],
+                            "allowed_log_paths": [{
+                                "path_pattern": "/var/log/app/error.log",
+                                "canonical_safe_prefix": "/var/log/app/",
+                                "safe_for_mcp_output": true
+                            }],
+                            "allowed_journal_units": [{
+                                "unit": "app.service",
+                                "safe_for_mcp_output": true
+                            }],
+                            "allowed_http_urls": [{
+                                "normalized_url": "https://example.com/health",
+                                "query_policy": "no_query",
+                                "safe_for_mcp_output": true
+                            }],
+                            "allowed_tcp_targets": [{
+                                "host": "example.com",
+                                "port": 443
+                            }],
+                            "allowed_dns_targets": [{
+                                "host": "example.com",
+                                "record_types": ["A", "AAAA"],
+                                "safe_for_mcp_output": true
+                            }],
+                            "max_lines": 100,
+                            "max_since_seconds": 900,
+                            "max_timeout_seconds": 30,
+                            "max_matches": 50,
+                            "connectivity_probe_budget_per_window": 20,
+                            "budget_window_seconds": 600,
+                            "denylist_version": "builtin-v1",
+                            "allowlist_rule_id": "app-diagnostics-v1",
+                            "enabled": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        let mcp_ec2_scope = state["draft"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == "db-scope")
+            .unwrap()["mcp_ec2_diagnostic_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == "app-diagnostics")
+            .unwrap()
+            .clone();
+        assert_eq!(mcp_ec2_scope["private_target_refs"][0], "service:app-api");
+        assert_eq!(
+            mcp_ec2_scope["allowed_log_paths"][0]["path_pattern"],
+            "/var/log/app/error.log"
+        );
+        assert_eq!(
+            mcp_ec2_scope["allowed_http_urls"][0]["normalized_url"],
+            "https://example.com/health"
+        );
+        assert_eq!(mcp_ec2_scope["allowed_tcp_targets"][0]["port"], 443);
+        assert_eq!(
+            mcp_ec2_scope["allowed_tcp_targets"][0]["host"],
+            "example.com"
+        );
+        assert_eq!(
+            mcp_ec2_scope["allowed_dns_targets"][0]["record_types"][1],
+            "AAAA"
+        );
+        assert!(state["changes"]["semantic_diff"]["high_risk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("mcp_ec2_"))
+                && grant["value"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("app-diagnostics"))));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_mcp_ec2_scope_update_removes_scope_without_writing_catalog() {
+        let (catalog_path, content) = write_catalog_fixture("mcp-ec2-scope-remove");
+        let enriched = content.replacen(
+            "\n[[group_mappings]]",
+            r#"
+[[scopes.mcp_ec2_diagnostic_scopes]]
+id = "base-diagnostics"
+private_target_refs = []
+max_lines = 50
+max_since_seconds = 600
+max_timeout_seconds = 15
+max_matches = 25
+connectivity_probe_budget_per_window = 10
+budget_window_seconds = 1200
+denylist_version = "builtin-v1"
+allowlist_rule_id = "base-diagnostics-v1"
+
+[[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+path_pattern = "/var/log/base/error.log"
+canonical_safe_prefix = "/var/log/base/"
+safe_for_mcp_output = true
+
+[[scopes.mcp_ec2_diagnostic_scopes]]
+id = "app-diagnostics"
+private_target_refs = ["service:app-api"]
+max_lines = 100
+max_since_seconds = 900
+max_timeout_seconds = 30
+max_matches = 50
+connectivity_probe_budget_per_window = 20
+budget_window_seconds = 600
+denylist_version = "builtin-v1"
+allowlist_rule_id = "app-diagnostics-v1"
+
+[[scopes.mcp_ec2_diagnostic_scopes.allowed_log_paths]]
+path_pattern = "/var/log/app/error.log"
+canonical_safe_prefix = "/var/log/app/"
+safe_for_mcp_output = true
+
+[[packages]]
+id = "mcp-ec2-diagnostics"
+features = ["mcp:use", "mcp:ec2"]
+scope = "db-scope"
+role = "readonly"
+
+[[bindings]]
+group = "RD"
+package = "mcp-ec2-diagnostics"
+
+[[group_mappings]]
+"#,
+            1,
+        );
+        std::fs::write(&catalog_path, &enriched).unwrap();
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/mcp-ec2")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","id":"app-diagnostics","private_target_refs":[],"allowed_log_paths":[],"allowed_journal_units":[],"allowed_http_urls":[],"allowed_tcp_targets":[],"allowed_dns_targets":[],"max_lines":1,"max_since_seconds":1,"max_timeout_seconds":1,"max_matches":1,"connectivity_probe_budget_per_window":1,"budget_window_seconds":1,"denylist_version":"remove","allowlist_rule_id":"remove","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        let scope = state["draft"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == "db-scope")
+            .unwrap();
+        assert!(!scope["mcp_ec2_diagnostic_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ec2_scope| ec2_scope["id"] == "app-diagnostics"));
+        assert!(state["changes"]["semantic_diff"]["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["kind"] == "mcp_ec2_diagnostic_scope"
+                && grant["value"] == "app-diagnostics"));
+        assert_eq!(std::fs::read_to_string(&catalog_path).unwrap(), enriched);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_mcp_ec2_scope_update_requires_session_cookie() {
+        let (catalog_path, _content) = write_catalog_fixture("mcp-ec2-scope-session");
+        let response = router(test_state_with_catalog(catalog_path.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/mcp-ec2")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","id":"app-diagnostics","private_target_refs":[],"allowed_log_paths":[],"allowed_journal_units":[],"allowed_http_urls":[],"allowed_tcp_targets":[],"allowed_dns_targets":[],"max_lines":1,"max_since_seconds":1,"max_timeout_seconds":1,"max_matches":1,"connectivity_probe_budget_per_window":1,"budget_window_seconds":1,"denylist_version":"builtin-v1","allowlist_rule_id":"app-diagnostics-v1","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_mcp_ec2_scope_update_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("mcp-ec2-scope-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/mcp-ec2")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","id":"app-diagnostics","private_target_refs":[],"allowed_log_paths":[],"allowed_journal_units":[],"allowed_http_urls":[],"allowed_tcp_targets":[],"allowed_dns_targets":[],"max_lines":1,"max_since_seconds":1,"max_timeout_seconds":1,"max_matches":1,"connectivity_probe_budget_per_window":1,"budget_window_seconds":1,"denylist_version":"builtin-v1","allowlist_rule_id":"app-diagnostics-v1","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let _ = std::fs::remove_file(catalog_path);
     }
 

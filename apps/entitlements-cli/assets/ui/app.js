@@ -5,6 +5,7 @@ const state = {
   selectedScope: null,
   selectedScopeResourceField: "accounts",
   selectedDatabaseScopeName: "",
+  selectedMcpEc2ScopeId: "",
   selectedAccount: null,
   selectedRole: null,
   accountRoleSelection: "account",
@@ -149,6 +150,20 @@ async function updateDraftDatabaseScope(scope, request) {
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.error?.message || "draft database scope update failed");
+  }
+  return response.json();
+}
+
+async function updateDraftMcpEc2Scope(scope, request) {
+  const response = await fetch("/api/draft/scopes/mcp-ec2", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope, ...request }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft MCP EC2 scope update failed");
   }
   return response.json();
 }
@@ -1087,6 +1102,7 @@ function renderScopeInspector(scopes) {
   setText("#scope-selected-mcp-ec2", String(selected?.mcp_ec2_diagnostic_scopes?.length || 0));
   renderScopeResourceEditor(selected);
   renderScopeDatabaseEditor(selected);
+  renderScopeMcpEc2Editor(selected);
 
   const list = document.getElementById("scope-detail-list");
   if (!list) {
@@ -1219,6 +1235,67 @@ function renderScopeDatabaseEditor(scope) {
   }
 }
 
+function renderScopeMcpEc2Editor(scope) {
+  const canWrite = Boolean(scope && state.server?.capabilities?.draft_write);
+  const mcpEc2Scopes = scope?.mcp_ec2_diagnostic_scopes || [];
+  const selector = document.getElementById("scope-mcp-ec2-template");
+  const selectedId = mcpEc2Scopes.some((item) => item.id === state.selectedMcpEc2ScopeId)
+    ? state.selectedMcpEc2ScopeId
+    : mcpEc2Scopes[0]?.id || "";
+  state.selectedMcpEc2ScopeId = selectedId;
+  const selected = mcpEc2Scopes.find((item) => item.id === selectedId) || null;
+
+  if (selector instanceof HTMLSelectElement) {
+    selector.replaceChildren(
+      optionElement("", "New MCP EC2 scope"),
+      ...mcpEc2Scopes.map((item) => optionElement(item.id, item.id)),
+    );
+    selector.value = selectedId;
+    selector.disabled = !scope;
+  }
+
+  setFormInputValue("scope-mcp-ec2-id", selected?.id || "", !canWrite);
+  setFormInputValue("scope-mcp-ec2-private-refs", (selected?.private_target_refs || []).join(", "), !canWrite);
+  setFormInputValue("scope-mcp-ec2-denylist", selected?.denylist_version || "builtin-v1", !canWrite);
+  setFormInputValue(
+    "scope-mcp-ec2-allowlist",
+    selected?.allowlist_rule_id || `${state.selectedScope || "scope"}-diagnostics-v1`,
+    !canWrite,
+  );
+  setFormInputValue("scope-mcp-ec2-max-lines", selected ? String(selected.max_lines) : "100", !canWrite);
+  setFormInputValue(
+    "scope-mcp-ec2-max-since",
+    selected ? String(selected.max_since_seconds) : "900",
+    !canWrite,
+  );
+  setFormInputValue("scope-mcp-ec2-timeout", selected ? String(selected.max_timeout_seconds) : "30", !canWrite);
+  setFormInputValue("scope-mcp-ec2-matches", selected ? String(selected.max_matches) : "50", !canWrite);
+  setFormInputValue(
+    "scope-mcp-ec2-probe-budget",
+    selected ? String(selected.connectivity_probe_budget_per_window) : "20",
+    !canWrite,
+  );
+  setFormInputValue(
+    "scope-mcp-ec2-budget-window",
+    selected ? String(selected.budget_window_seconds) : "600",
+    !canWrite,
+  );
+  setFormInputValue("scope-mcp-ec2-logs", mcpEc2LogPathLines(selected), !canWrite);
+  setFormInputValue("scope-mcp-ec2-journals", mcpEc2JournalLines(selected), !canWrite);
+  setFormInputValue("scope-mcp-ec2-http", mcpEc2HttpLines(selected), !canWrite);
+  setFormInputValue("scope-mcp-ec2-tcp", mcpEc2TcpLines(selected), !canWrite);
+  setFormInputValue("scope-mcp-ec2-dns", mcpEc2DnsLines(selected), !canWrite);
+
+  const saveButton = document.getElementById("scope-mcp-ec2-save-button");
+  if (saveButton) {
+    saveButton.disabled = !canWrite;
+  }
+  const deleteButton = document.getElementById("scope-mcp-ec2-delete-button");
+  if (deleteButton) {
+    deleteButton.disabled = !canWrite || !selected;
+  }
+}
+
 function optionElement(value, label) {
   const option = document.createElement("option");
   option.value = value;
@@ -1228,7 +1305,7 @@ function optionElement(value, label) {
 
 function setFormInputValue(id, value, disabled) {
   const input = document.getElementById(id);
-  if (input instanceof HTMLInputElement) {
+  if (input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement) {
     input.value = value;
     input.disabled = disabled;
   }
@@ -1276,6 +1353,225 @@ function databaseScopeDraftRequestFromForm() {
     allow_views: Boolean(document.getElementById("scope-db-allow-views")?.checked),
     enabled: true,
   };
+}
+
+function mcpEc2ScopeDraftRequestFromForm() {
+  return {
+    id: document.getElementById("scope-mcp-ec2-id")?.value.trim() || "",
+    private_target_refs: csvValues("scope-mcp-ec2-private-refs"),
+    allowed_log_paths: textareaLines("scope-mcp-ec2-logs").map(parseMcpEc2LogPathLine),
+    allowed_journal_units: textareaLines("scope-mcp-ec2-journals").map(parseMcpEc2JournalLine),
+    allowed_http_urls: textareaLines("scope-mcp-ec2-http").map(parseMcpEc2HttpLine),
+    allowed_tcp_targets: textareaLines("scope-mcp-ec2-tcp").map(parseMcpEc2TcpLine),
+    allowed_dns_targets: textareaLines("scope-mcp-ec2-dns").map(parseMcpEc2DnsLine),
+    max_lines: positiveIntegerFromInput("scope-mcp-ec2-max-lines"),
+    max_since_seconds: positiveIntegerFromInput("scope-mcp-ec2-max-since"),
+    max_timeout_seconds: positiveIntegerFromInput("scope-mcp-ec2-timeout"),
+    max_matches: positiveIntegerFromInput("scope-mcp-ec2-matches"),
+    connectivity_probe_budget_per_window: positiveIntegerFromInput("scope-mcp-ec2-probe-budget"),
+    budget_window_seconds: positiveIntegerFromInput("scope-mcp-ec2-budget-window"),
+    denylist_version: document.getElementById("scope-mcp-ec2-denylist")?.value.trim() || "",
+    allowlist_rule_id: document.getElementById("scope-mcp-ec2-allowlist")?.value.trim() || "",
+    enabled: true,
+  };
+}
+
+function textareaLines(id) {
+  const raw = document.getElementById(id)?.value || "";
+  return raw
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function lineParts(line) {
+  return line.split("|").map((part) => part.trim());
+}
+
+function parseMcpEc2SafeFlag(value) {
+  const normalized = (value || "safe").trim().toLowerCase();
+  if (!normalized || normalized === "safe" || normalized === "true" || normalized === "yes") {
+    return true;
+  }
+  if (normalized === "unsafe" || normalized === "false" || normalized === "no") {
+    return false;
+  }
+  throw new Error(`unknown safe output flag '${value}'`);
+}
+
+function isMcpEc2SafeFlagToken(value) {
+  if (!value) {
+    return false;
+  }
+  return ["safe", "unsafe", "true", "false", "yes", "no"].includes(value.trim().toLowerCase());
+}
+
+function inferMcpEc2SafePrefix(pathPattern) {
+  const index = pathPattern.lastIndexOf("/");
+  if (index <= 0) {
+    return "/";
+  }
+  return pathPattern.slice(0, index + 1);
+}
+
+function parseMcpEc2LogPathLine(line) {
+  const [pathPattern, canonicalSafePrefix, safeFlag] = lineParts(line);
+  if (!pathPattern) {
+    throw new Error("log path is required");
+  }
+  return {
+    path_pattern: pathPattern,
+    canonical_safe_prefix: canonicalSafePrefix || inferMcpEc2SafePrefix(pathPattern),
+    safe_for_mcp_output: parseMcpEc2SafeFlag(safeFlag),
+  };
+}
+
+function parseMcpEc2JournalLine(line) {
+  const [unit, safeFlag] = lineParts(line);
+  if (!unit) {
+    throw new Error("journal unit is required");
+  }
+  return {
+    unit,
+    safe_for_mcp_output: parseMcpEc2SafeFlag(safeFlag),
+  };
+}
+
+function parseMcpEc2HttpLine(line) {
+  const parts = lineParts(line);
+  const normalizedUrl = parts[0];
+  let queryPolicy = parts[1];
+  let safeFlag = parts[2];
+  let privateTargetRef = parts[3];
+  if (!normalizedUrl) {
+    throw new Error("HTTP URL is required");
+  }
+  if (isMcpEc2SafeFlagToken(queryPolicy)) {
+    privateTargetRef = safeFlag;
+    safeFlag = queryPolicy;
+    queryPolicy = "no_query";
+  }
+  return {
+    normalized_url: normalizedUrl,
+    query_policy: normalizeMcpEc2QueryPolicy(queryPolicy),
+    safe_for_mcp_output: parseMcpEc2SafeFlag(safeFlag),
+    private_target_ref: privateTargetRef || null,
+  };
+}
+
+function normalizeMcpEc2QueryPolicy(value) {
+  const normalized = (value || "no_query").trim().toLowerCase().replaceAll("-", "_");
+  if (normalized === "no_query" || normalized === "exact_only") {
+    return normalized;
+  }
+  throw new Error(`unknown HTTP query policy '${value}'`);
+}
+
+function parseMcpEc2TcpLine(line) {
+  const [target, privateTargetRef] = lineParts(line);
+  const separator = target.lastIndexOf(":");
+  if (separator <= 0) {
+    throw new Error("TCP target must use host:port");
+  }
+  const host = target.slice(0, separator).trim();
+  const port = Number(target.slice(separator + 1).trim());
+  if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error("TCP target must use a valid host:port");
+  }
+  return {
+    host,
+    port,
+    private_target_ref: privateTargetRef || null,
+  };
+}
+
+function parseMcpEc2DnsLine(line) {
+  const [host, records, safeFlag, privateTargetRef] = lineParts(line);
+  if (!host) {
+    throw new Error("DNS host is required");
+  }
+  const recordTypes = (records || "A")
+    .split(",")
+    .map((record) => record.trim().toUpperCase())
+    .filter(Boolean);
+  if (!recordTypes.length || recordTypes.some((record) => !["A", "AAAA", "CNAME"].includes(record))) {
+    throw new Error("DNS record types must be A, AAAA, or CNAME");
+  }
+  return {
+    host,
+    record_types: recordTypes,
+    safe_for_mcp_output: parseMcpEc2SafeFlag(safeFlag),
+    private_target_ref: privateTargetRef || null,
+  };
+}
+
+function mcpEc2LogPathLines(scope) {
+  return (scope?.allowed_log_paths || [])
+    .map((path) =>
+      [
+        path.path_pattern,
+        path.canonical_safe_prefix,
+        path.safe_for_mcp_output ? "safe" : "unsafe",
+      ].join(" | "),
+    )
+    .join("\n");
+}
+
+function mcpEc2JournalLines(scope) {
+  return (scope?.allowed_journal_units || [])
+    .map((unit) => [unit.unit, unit.safe_for_mcp_output ? "safe" : "unsafe"].join(" | "))
+    .join("\n");
+}
+
+function mcpEc2HttpLines(scope) {
+  return (scope?.allowed_http_urls || [])
+    .map((url) =>
+      [
+        url.normalized_url,
+        url.query_policy || "no_query",
+        url.safe_for_mcp_output ? "safe" : "unsafe",
+        url.private_target_ref || "",
+      ].join(" | "),
+    )
+    .join("\n");
+}
+
+function mcpEc2TcpLines(scope) {
+  return (scope?.allowed_tcp_targets || [])
+    .map((target) => [`${target.host}:${target.port}`, target.private_target_ref || ""].join(" | "))
+    .join("\n");
+}
+
+function mcpEc2DnsLines(scope) {
+  return (scope?.allowed_dns_targets || [])
+    .map((target) =>
+      [
+        target.host,
+        (target.record_types || []).join(","),
+        target.safe_for_mcp_output ? "safe" : "unsafe",
+        target.private_target_ref || "",
+      ].join(" | "),
+    )
+    .join("\n");
+}
+
+function mcpEc2CommandCount(request) {
+  return (
+    request.allowed_log_paths.length +
+    request.allowed_journal_units.length +
+    request.allowed_http_urls.length +
+    request.allowed_tcp_targets.length +
+    request.allowed_dns_targets.length
+  );
+}
+
+function mcpEc2UnsafeOutputCount(request) {
+  return [
+    ...request.allowed_log_paths,
+    ...request.allowed_journal_units,
+    ...request.allowed_http_urls,
+    ...request.allowed_dns_targets,
+  ].filter((item) => item.safe_for_mcp_output === false).length;
 }
 
 function scopeDetailBlock(title, values) {
@@ -3013,6 +3309,14 @@ document.getElementById("scope-db-template")?.addEventListener("change", (event)
   renderScopeInspector(state.draft?.scopes || []);
 });
 
+document.getElementById("scope-mcp-ec2-template")?.addEventListener("change", (event) => {
+  if (!(event.target instanceof HTMLSelectElement)) {
+    return;
+  }
+  state.selectedMcpEc2ScopeId = event.target.value;
+  renderScopeInspector(state.draft?.scopes || []);
+});
+
 async function saveDatabaseScopeDraft(enabled, button) {
   const scope = state.selectedScope;
   const request = databaseScopeDraftRequestFromForm();
@@ -3078,6 +3382,86 @@ document.getElementById("scope-db-save-button")?.addEventListener("click", async
 
 document.getElementById("scope-db-delete-button")?.addEventListener("click", async (event) => {
   await saveDatabaseScopeDraft(false, event.currentTarget);
+});
+
+async function saveMcpEc2ScopeDraft(enabled, button) {
+  const scope = state.selectedScope;
+  let request;
+  try {
+    request = mcpEc2ScopeDraftRequestFromForm();
+  } catch (error) {
+    setValidationStatus("MCP EC2 scope update unavailable", error.message, false);
+    return;
+  }
+  request.enabled = enabled;
+  if (!enabled) {
+    request.max_lines = request.max_lines || 1;
+    request.max_since_seconds = request.max_since_seconds || 1;
+    request.max_timeout_seconds = request.max_timeout_seconds || 1;
+    request.max_matches = request.max_matches || 1;
+    request.connectivity_probe_budget_per_window = request.connectivity_probe_budget_per_window || 1;
+    request.budget_window_seconds = request.budget_window_seconds || 1;
+    request.denylist_version = request.denylist_version || "remove";
+    request.allowlist_rule_id = request.allowlist_rule_id || "remove";
+  }
+  if (!scope || !request.id) {
+    setValidationStatus("MCP EC2 scope update unavailable", "select a scope and enter an MCP EC2 scope id", false);
+    return;
+  }
+  if (
+    enabled &&
+    (!request.max_lines ||
+      !request.max_since_seconds ||
+      !request.max_timeout_seconds ||
+      !request.max_matches ||
+      !request.connectivity_probe_budget_per_window ||
+      !request.budget_window_seconds ||
+      !request.denylist_version ||
+      !request.allowlist_rule_id ||
+      !mcpEc2CommandCount(request))
+  ) {
+    setValidationStatus(
+      "MCP EC2 scope update unavailable",
+      "targets, positive limits, denylist, and allowlist are required",
+      false,
+    );
+    return;
+  }
+  const originalLabel = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = enabled ? "Saving" : "Removing";
+  }
+  try {
+    const payload = await updateDraftMcpEc2Scope(scope, request);
+    state.selectedMcpEc2ScopeId = enabled ? request.id : "";
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("scopes");
+    setValidationStatus(
+      enabled ? "MCP EC2 scope draft saved" : "MCP EC2 scope draft removed",
+      `${request.id} ${enabled ? "is staged for" : "was removed from"} ${scope}`,
+      enabled ? mcpEc2UnsafeOutputCount(request) === 0 : true,
+    );
+  } catch (error) {
+    setValidationStatus("MCP EC2 scope update failed", error.message, false);
+  } finally {
+    if (button) {
+      button.textContent = originalLabel;
+    }
+    renderScopeInspector(state.draft?.scopes || []);
+  }
+}
+
+document.getElementById("scope-mcp-ec2-save-button")?.addEventListener("click", async (event) => {
+  await saveMcpEc2ScopeDraft(true, event.currentTarget);
+});
+
+document.getElementById("scope-mcp-ec2-delete-button")?.addEventListener("click", async (event) => {
+  await saveMcpEc2ScopeDraft(false, event.currentTarget);
 });
 
 document.addEventListener("click", (event) => {

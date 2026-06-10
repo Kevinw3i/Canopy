@@ -521,6 +521,39 @@
               </div>
             </fieldset>
 
+            <fieldset class="scope-mcp-ec2-fieldset">
+              <legend>MCP EC2 Scope Draft</legend>
+              <label>
+                <span>Template</span>
+                <select id="scope-mcp-ec2-template">
+                  <option value="">New MCP EC2 scope</option>
+                </select>
+              </label>
+              <div class="scope-mcp-ec2-grid">
+                <label><span>ID</span><input id="scope-mcp-ec2-id" autocomplete="off" /></label>
+                <label><span>Private Refs</span><input id="scope-mcp-ec2-private-refs" autocomplete="off" placeholder="service:app-api" /></label>
+                <label><span>Denylist</span><input id="scope-mcp-ec2-denylist" autocomplete="off" /></label>
+                <label><span>Allowlist</span><input id="scope-mcp-ec2-allowlist" autocomplete="off" /></label>
+                <label><span>Max Lines</span><input id="scope-mcp-ec2-max-lines" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Max Since</span><input id="scope-mcp-ec2-max-since" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Timeout</span><input id="scope-mcp-ec2-timeout" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Matches</span><input id="scope-mcp-ec2-matches" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Probe Budget</span><input id="scope-mcp-ec2-probe-budget" inputmode="numeric" autocomplete="off" /></label>
+                <label><span>Budget Window</span><input id="scope-mcp-ec2-budget-window" inputmode="numeric" autocomplete="off" /></label>
+              </div>
+              <div class="scope-mcp-ec2-lines">
+                <label><span>Logs</span><textarea id="scope-mcp-ec2-logs" autocomplete="off" placeholder="/var/log/app/error.log | /var/log/app/ | safe"></textarea></label>
+                <label><span>Journals</span><textarea id="scope-mcp-ec2-journals" autocomplete="off" placeholder="app.service | safe"></textarea></label>
+                <label><span>HTTP</span><textarea id="scope-mcp-ec2-http" autocomplete="off" placeholder="https://example.com/health | no_query | safe"></textarea></label>
+                <label><span>TCP</span><textarea id="scope-mcp-ec2-tcp" autocomplete="off" placeholder="example.com:443"></textarea></label>
+                <label><span>DNS</span><textarea id="scope-mcp-ec2-dns" autocomplete="off" placeholder="example.com | A,AAAA | safe"></textarea></label>
+              </div>
+              <div class="scope-mcp-ec2-actions">
+                <button id="scope-mcp-ec2-save-button" type="button">Save MCP EC2 Scope</button>
+                <button id="scope-mcp-ec2-delete-button" type="button">Remove</button>
+              </div>
+            </fieldset>
+
             <div class="scope-detail-list" id="scope-detail-list">
               <h3>Scope Details <span>0</span></h3>
               <p>No scope selected</p>
