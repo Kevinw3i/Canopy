@@ -7709,6 +7709,60 @@ skip_tls_hostname_verification = true
         state.store_session("session-token".to_owned());
     }
 
+    async fn authed_json_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json = serde_json::from_str(&text).unwrap();
+        (status, json, text)
+    }
+
+    async fn authed_empty_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let json = serde_json::from_str(&text).unwrap();
+        (status, json, text)
+    }
+
     #[test]
     fn bootstrap_prelude_hash_matches_embedded_inline_script() {
         let script_start = INDEX_HTML.find("<script>").unwrap() + "<script>".len();
@@ -10408,6 +10462,289 @@ package = "mcp-ec2-diagnostics"
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn rd_database_permission_flow_validates_previews_explains_dry_runs_and_applies() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("rd-db-e2e-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("rd-db-e2e-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("rd-db-e2e-db");
+        let deployment_config_path = write_database_config_fixture("rd-db-e2e-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        args.dev_operator_email = Some("operator@example.com".to_owned());
+        args.dev_operator_email_verified = true;
+        args.dev_operator_external_groups = vec!["canopy-rd".to_owned()];
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let app = router(state);
+        let mut response_texts = Vec::new();
+
+        let (status, state, body) = authed_json_request(
+            &app,
+            "PUT",
+            "/api/draft/scopes/database",
+            serde_json::json!({
+                "scope": "db-scope",
+                "name": "customer_read",
+                "connection": "orders",
+                "environment": "production",
+                "allowed_schemas": ["mart"],
+                "allowed_tables": ["customers"],
+                "allowed_actions": ["select"],
+                "max_rows": 250,
+                "statement_timeout_ms": 4000,
+                "require_explain": true,
+                "max_examined_rows": 15000,
+                "allow_full_table_scan": false,
+                "allow_views": false,
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert_eq!(state["draft"]["dirty"], true);
+        assert!(state["changes"]["semantic_diff"]["high_risk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["kind"] == "database_scope_allowed_table"
+                && grant["value"] == "customer_read|customers"));
+
+        let (status, state, body) = authed_json_request(
+            &app,
+            "PUT",
+            "/api/draft/packages",
+            serde_json::json!({
+                "id": "rd-customer-database",
+                "scope": "db-scope",
+                "role": "readonly",
+                "max_session_seconds": 900,
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert!(state["draft"]["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["id"] == "rd-customer-database"
+                && package["scope"] == "db-scope"
+                && package["role"] == "readonly"
+                && package["max_session_seconds"] == 900));
+
+        let (status, state, body) = authed_json_request(
+            &app,
+            "PUT",
+            "/api/draft/packages/features",
+            serde_json::json!({
+                "package": "rd-customer-database",
+                "feature": "mcp:database",
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        let package = state["draft"]["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["id"] == "rd-customer-database")
+            .unwrap();
+        assert!(package["features"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("mcp:use".to_owned())));
+        assert!(package["features"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("mcp:database".to_owned())));
+
+        let (status, state, body) = authed_json_request(
+            &app,
+            "PUT",
+            "/api/draft/bindings",
+            serde_json::json!({
+                "group": "RD",
+                "package": "rd-customer-database",
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert!(state["changes"]["semantic_diff"]["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["group"] == "RD"
+                && grant["package"] == "rd-customer-database"
+                && grant["kind"] == "database_scope_allowed_table"
+                && grant["value"] == "customer_read|customers"));
+        assert!(state["changes"]["semantic_diff"]["high_risk"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["group"] == "RD"
+                && grant["package"] == "rd-customer-database"
+                && grant["kind"] == "feature"
+                && grant["value"] == "mcp:database"));
+
+        let (status, validation, body) = authed_empty_request(&app, "POST", "/api/validate").await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert_eq!(validation["command"], "validate");
+        assert_eq!(validation["valid"], true);
+        assert_eq!(validation["generated"]["runtime_drift"], true);
+        assert_eq!(validation["generated"]["temp_runtime_removed"], true);
+        assert!(validation["database_connections"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("orders".to_owned())));
+
+        let (status, preview, body) = authed_json_request(
+            &app,
+            "POST",
+            "/api/preview",
+            serde_json::json!({"group": "RD"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert_eq!(preview["command"], "preview");
+        assert!(preview["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["package"] == "rd-customer-database"
+                && package["database_scopes"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::Value::String("customer_read".to_owned()))
+                && package["high_risk_features"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::Value::String("mcp:database".to_owned()))));
+
+        let (status, explain, body) = authed_json_request(
+            &app,
+            "POST",
+            "/api/explain",
+            serde_json::json!({
+                "sub": "operator",
+                "email": "operator@example.com",
+                "email_verified": true,
+                "external_groups": ["canopy-rd"]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert!(explain["resolved_groups"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::Value::String("RD".to_owned())));
+        assert!(explain["matched_packages"].as_array().unwrap().contains(
+            &serde_json::Value::String("rd-customer-database".to_owned())
+        ));
+
+        let (status, dry_run, body) = authed_json_request(
+            &app,
+            "POST",
+            "/api/dry-run",
+            serde_json::json!({
+                "operation": "mcp-database",
+                "sub": "operator",
+                "email": "operator@example.com",
+                "email_verified": true,
+                "external_groups": ["canopy-rd"],
+                "scope": "customer_read",
+                "connection": "orders",
+                "environment": "production",
+                "schema": "mart",
+                "table": "customers",
+                "action": "select"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert_eq!(dry_run["command"], "dry-run");
+        assert_eq!(dry_run["operation"], "mcp-database");
+        assert_eq!(dry_run["allow"], true);
+        assert_eq!(dry_run["matched_rule"], "catalog-rd-rd-customer-database");
+
+        let (status, apply, body) = authed_empty_request(&app, "POST", "/api/apply").await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert_eq!(apply["status"], "applied");
+        assert_eq!(apply["applied"], true);
+        assert_eq!(apply["gate"]["state"], "admin_ready");
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["transaction"]["state"], "applied");
+        assert_apply_payload_matches_file(&apply, "catalog", &catalog_path);
+        assert_apply_payload_matches_file(&apply, "runtime", &runtime_path);
+        assert_apply_payload_matches_file(&apply, "db_config", &db_config_path);
+        let catalog_backup = assert_apply_backup_matches(&apply, "catalog", &original_catalog);
+        let runtime_backup = assert_apply_backup_matches(&apply, "runtime", &original_runtime);
+        let db_backup = assert_apply_backup_matches(&apply, "db_config", &original_db_config);
+
+        let applied_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        assert!(applied_catalog.contains("customer_read"));
+        assert!(applied_catalog.contains("rd-customer-database"));
+        assert!(applied_catalog.contains("package = \"rd-customer-database\""));
+        let applied_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        assert!(applied_runtime.contains("catalog-rd-rd-customer-database"));
+        assert!(applied_runtime.contains("customer_read"));
+        let applied_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        assert!(applied_db_config.contains("secret_arn = \"orders-secret-ref\""));
+        assert!(applied_db_config.contains("readonly = true"));
+        assert!(applied_db_config.contains("require_tls = true"));
+        assert!(applied_db_config.contains("connect_timeout_ms = 3000"));
+        assert!(!applied_db_config.contains("password"));
+        assert!(!applied_db_config.contains("username"));
+
+        let (status, state, body) = authed_empty_request(&app, "GET", "/api/state").await;
+        assert_eq!(status, StatusCode::OK);
+        response_texts.push(body);
+        assert_eq!(state["draft"]["dirty"], false);
+        assert_eq!(state["database_connections"]["dirty"], false);
+        assert!(state["draft"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |binding| binding["group"] == "RD" && binding["package"] == "rd-customer-database"
+            ));
+
+        assert!(response_texts
+            .iter()
+            .all(|body| !body.contains("orders-secret-ref")));
+        assert!(!applied_catalog.contains("orders-secret-ref"));
+        assert!(!applied_runtime.contains("orders-secret-ref"));
+
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(catalog_backup);
+        let _ = std::fs::remove_file(runtime_backup);
+        let _ = std::fs::remove_file(db_backup);
     }
 
     #[tokio::test]
