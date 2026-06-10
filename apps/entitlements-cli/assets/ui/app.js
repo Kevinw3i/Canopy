@@ -1322,13 +1322,13 @@ function renderAccountRoleEditor(kind, selected) {
     secondaryRow.hidden = isRole;
   }
 
-  setInputValue(idInput, selected?.id || "", !canWrite);
-  setInputValue(
+  setElementInputValue(idInput, selected?.id || "", !canWrite);
+  setElementInputValue(
     primaryInput,
     isRole ? selected?.role_arn || "" : selected?.account_id || "",
     !canWrite,
   );
-  setInputValue(secondaryInput, isRole ? "" : selected?.name || "", !canWrite || isRole);
+  setElementInputValue(secondaryInput, isRole ? "" : selected?.name || "", !canWrite || isRole);
   if (saveButton) {
     saveButton.disabled = !canWrite;
   }
@@ -1337,7 +1337,7 @@ function renderAccountRoleEditor(kind, selected) {
   }
 }
 
-function setInputValue(input, value, disabled) {
+function setElementInputValue(input, value, disabled) {
   if (input instanceof HTMLInputElement) {
     input.value = value;
     input.disabled = disabled;

@@ -4564,6 +4564,7 @@ skip_tls_hostname_verification = true
         assert!(APP_JS.contains("function renderAccountRoleInspector("));
         assert!(APP_JS.contains("function updateDraftAccount("));
         assert!(APP_JS.contains("function updateDraftRole("));
+        assert!(APP_JS.contains("function setElementInputValue("));
         assert!(APP_JS.contains("accountRoleDetailBlock"));
         assert!(APP_JS.contains("/api/draft/accounts"));
         assert!(APP_JS.contains("/api/draft/roles"));
@@ -4572,6 +4573,12 @@ skip_tls_hostname_verification = true
         assert!(APP_CSS.contains(".account-role-table"));
         assert!(APP_CSS.contains(".account-role-editor"));
         assert!(APP_CSS.contains(".account-role-detail-block"));
+    }
+
+    #[test]
+    fn embedded_ui_assets_do_not_shadow_db_input_helper() {
+        assert_eq!(APP_JS.matches("function setInputValue(").count(), 1);
+        assert_eq!(APP_JS.matches("function setElementInputValue(").count(), 1);
     }
 
     #[tokio::test]
