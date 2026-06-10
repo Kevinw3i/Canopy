@@ -759,7 +759,7 @@ struct UiValidationIssue {
     path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct DbConnectionMetadata {
     engine: String,
     host: String,
@@ -3943,6 +3943,21 @@ fn validate_draft_catalog(
             None,
         ));
     }
+    if database_connections.load_error.is_none()
+        && (database_connections.source_path.is_some() || !database_connections.draft.is_empty())
+    {
+        if let Err(err) = format_connection_registry_toml(&database_connections.draft) {
+            let local_path = database_connections
+                .source_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("database connection draft"));
+            blocking_errors.push(validation_issue(
+                "db_config_encode_failed",
+                format!("database connection draft could not be encoded as TOML: {err:#}"),
+                Some(local_path.display().to_string()),
+            ));
+        }
+    }
 
     let mut deployment = UiValidateDeployment {
         mode: args.deployment_mode.clone(),
@@ -4531,6 +4546,27 @@ fn parse_connection_registry(
         );
     }
     Ok(registry)
+}
+
+#[derive(Serialize)]
+struct DatabaseConnectionsToml<'a> {
+    database_connections: &'a BTreeMap<String, DbConnectionMetadata>,
+}
+
+fn format_connection_registry_toml(
+    registry: &BTreeMap<String, DbConnectionMetadata>,
+) -> anyhow::Result<String> {
+    if registry.is_empty() {
+        return Ok(String::new());
+    }
+    let mut content = toml::to_string_pretty(&DatabaseConnectionsToml {
+        database_connections: registry,
+    })
+    .context("failed to encode database connection config")?;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Ok(content)
 }
 
 fn optional_toml_integer(
@@ -6134,6 +6170,24 @@ skip_tls_hostname_verification = true
         let path = catalog_fixture_path(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    fn test_database_connection(database: &str) -> DbConnectionMetadata {
+        DbConnectionMetadata {
+            engine: "mysql".to_owned(),
+            host: format!("{database}.example.internal"),
+            port: 3306,
+            database: database.to_owned(),
+            secret_arn: format!("{database}-secret-ref"),
+            readonly: true,
+            connect_timeout_ms: 3000,
+            statement_timeout_ms: 5000,
+            explain_timeout_ms: 3000,
+            max_connections: 4,
+            require_tls: true,
+            accept_invalid_tls_certs: false,
+            skip_tls_hostname_verification: false,
+        }
     }
 
     fn write_runtime_from_catalog_fixture(name: &str, catalog_content: &str) -> PathBuf {
@@ -10148,6 +10202,67 @@ require_tls = "true"
         let issue = parse_connection_registry(content, &path).unwrap_err();
         assert_eq!(issue.code, "database_connection_invalid_field_type");
         assert!(issue.message.contains("require_tls must be a boolean"));
+    }
+
+    #[test]
+    fn database_connection_registry_format_empty_registry_is_empty() {
+        let registry = BTreeMap::new();
+
+        let output = format_connection_registry_toml(&registry).unwrap();
+
+        assert_eq!(output, "");
+        let path = PathBuf::from("database_connections.local.toml");
+        let parsed = parse_connection_registry(&output, &path).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn database_connection_registry_format_round_trips_in_deterministic_order() {
+        let mut registry = BTreeMap::new();
+        registry.insert("orders".to_owned(), test_database_connection("orders"));
+        registry.insert(
+            "analytics".to_owned(),
+            test_database_connection("analytics"),
+        );
+
+        let output = format_connection_registry_toml(&registry).unwrap();
+
+        let analytics_pos = output
+            .find("[database_connections.analytics]")
+            .expect("analytics connection should be rendered");
+        let orders_pos = output
+            .find("[database_connections.orders]")
+            .expect("orders connection should be rendered");
+        assert!(analytics_pos < orders_pos);
+        assert!(output.contains("connect_timeout_ms = 3000"));
+        assert!(output.contains("statement_timeout_ms = 5000"));
+        assert!(output.contains("explain_timeout_ms = 3000"));
+        assert!(output.contains("max_connections = 4"));
+        assert!(output.ends_with('\n'));
+
+        let path = PathBuf::from("database_connections.local.toml");
+        let parsed = parse_connection_registry(&output, &path).unwrap();
+        assert_eq!(parsed, registry);
+    }
+
+    #[test]
+    fn database_connection_registry_format_preserves_unsafe_fields_for_validation() {
+        let mut metadata = test_database_connection("orders");
+        metadata.readonly = false;
+        metadata.require_tls = false;
+        metadata.accept_invalid_tls_certs = true;
+        metadata.skip_tls_hostname_verification = true;
+        let mut registry = BTreeMap::new();
+        registry.insert("orders".to_owned(), metadata.clone());
+
+        let output = format_connection_registry_toml(&registry).unwrap();
+        let path = PathBuf::from("database_connections.local.toml");
+        let parsed = parse_connection_registry(&output, &path).unwrap();
+
+        assert_eq!(parsed.get("orders"), Some(&metadata));
+        assert!(connection_has_blocking_safety_issue(
+            parsed.get("orders").unwrap()
+        ));
     }
 
     #[tokio::test]
