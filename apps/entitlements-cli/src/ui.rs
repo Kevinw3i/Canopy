@@ -3,10 +3,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use axum::body::{Body, Bytes};
@@ -157,7 +157,7 @@ fn router(state: UiAppState) -> Router {
 #[derive(Clone, Debug)]
 struct UiAppState {
     args: Arc<UiArgs>,
-    apply_baseline: Arc<ApplyBaselineSnapshot>,
+    apply_baseline: Arc<Mutex<ApplyBaselineSnapshot>>,
     bootstrap: Arc<Mutex<BootstrapState>>,
     sessions: Arc<Mutex<HashMap<String, SessionRecord>>>,
     draft: Arc<Mutex<DraftState>>,
@@ -170,7 +170,7 @@ impl UiAppState {
         let draft = DraftState::load(&args.catalog);
         let database_connections = DatabaseConnectionsDraftState::load(args.db_config.as_deref());
         Self {
-            apply_baseline: Arc::new(apply_baseline),
+            apply_baseline: Arc::new(Mutex::new(apply_baseline)),
             args: Arc::new(args),
             bootstrap: Arc::new(Mutex::new(BootstrapState {
                 code: Some(code),
@@ -305,7 +305,23 @@ impl ApplyBaselineSnapshot {
             baseline,
             baseline_mismatches,
             payload: None,
+            backups: Vec::new(),
+            error: None,
         }
+    }
+
+    fn current_mismatches(&self) -> Vec<UiApplyBaselineMismatch> {
+        let mut mismatches = Vec::new();
+        for file in [&self.catalog, &self.runtime]
+            .into_iter()
+            .chain(self.db_config.as_ref())
+        {
+            let current = ApplyFileDigest::read(&file.path);
+            if let Some(mismatch) = file.baseline_mismatch(&current) {
+                mismatches.push(mismatch);
+            }
+        }
+        mismatches
     }
 }
 
@@ -698,6 +714,8 @@ struct UiApplyTransactionStatus {
     baseline: Vec<UiApplyBaselineDigest>,
     baseline_mismatches: Vec<UiApplyBaselineMismatch>,
     payload: Option<UiApplyPayloadStatus>,
+    backups: Vec<UiApplyBackupStatus>,
+    error: Option<UiApplyTransactionError>,
 }
 
 #[derive(Debug, Serialize)]
@@ -722,17 +740,31 @@ struct UiApplyBaselineMismatch {
     current_sha256: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct UiApplyPayloadStatus {
     artifacts: Vec<UiApplyPayloadArtifactStatus>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct UiApplyPayloadArtifactStatus {
     artifact: &'static str,
     path: String,
     bytes: usize,
     sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyBackupStatus {
+    artifact: &'static str,
+    path: String,
+    backup_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyTransactionError {
+    code: &'static str,
+    message: String,
+    path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1963,17 +1995,59 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned")
             .clone_baseline();
-        let mut transaction = self.apply_baseline.transaction_status(self.args.as_ref());
+        let mut apply_baseline = self
+            .apply_baseline
+            .lock()
+            .expect("apply baseline mutex should not be poisoned");
+        let mut transaction = apply_baseline.transaction_status(self.args.as_ref());
         let (mut status, mut apply_status, mut gate) = apply_gate_status(
             self.args.as_ref(),
             &validation,
             baseline.as_ref(),
             &transaction,
         );
-        if gate.state == "admin_ready" && gate.reason_code == "apply_transaction_unavailable" {
+        let mut applied = false;
+        let mut output_revision = validation.revision;
+        if gate.can_apply {
             match prepare_apply_write_payload(self.args.as_ref(), &draft, &database_connections) {
                 Ok(payload) => {
-                    transaction.payload = Some(payload.status());
+                    let payload_status = payload.status();
+                    transaction.payload = Some(payload_status.clone());
+                    match execute_apply_transaction(self.args.as_ref(), &apply_baseline, &payload) {
+                        Ok(result) => {
+                            applied = true;
+                            status = StatusCode::OK;
+                            apply_status = "applied";
+                            gate.reason_code = "apply_completed";
+                            gate.message =
+                                "Apply transaction completed and wrote catalog/runtime artifacts."
+                                    .to_owned();
+                            gate.can_apply = true;
+                            output_revision = {
+                                let mut draft_state = self
+                                    .draft
+                                    .lock()
+                                    .expect("draft mutex should not be poisoned");
+                                draft_state.mark_applied(draft.clone());
+                                draft_state.revision
+                            };
+                            self.database_connections
+                                .lock()
+                                .expect("database connection draft mutex should not be poisoned")
+                                .mark_applied();
+                            *apply_baseline = ApplyBaselineSnapshot::capture(self.args.as_ref());
+                            transaction = apply_baseline.transaction_status(self.args.as_ref());
+                            transaction.state = "applied";
+                            transaction.payload = Some(payload_status);
+                            transaction.backups = result.backups;
+                            transaction.error = result.cleanup_error;
+                        }
+                        Err(error) => {
+                            status = StatusCode::CONFLICT;
+                            apply_status = "failed";
+                            transaction.error = Some(error);
+                        }
+                    }
                 }
                 Err(issue) => {
                     validation.status = "invalid";
@@ -1991,8 +2065,8 @@ impl UiAppState {
         let output = UiApplyOutput {
             status: apply_status,
             command: "apply",
-            applied: false,
-            revision: validation.revision,
+            applied,
+            revision: output_revision,
             transaction,
             gate,
             validation,
@@ -2077,7 +2151,7 @@ impl UiAppState {
                 import_runtime: args.import_runtime.is_some(),
                 draft_write,
                 validate: draft_write,
-                apply: false,
+                apply: draft_write,
             },
             draft,
             changes,
@@ -2758,6 +2832,14 @@ impl DraftState {
         self.revision = self.revision.saturating_add(1);
     }
 
+    fn mark_applied(&mut self, catalog: Catalog) {
+        self.baseline = Some(catalog.clone());
+        self.draft = Some(catalog);
+        self.load_error = None;
+        self.dirty = false;
+        self.revision = self.revision.saturating_add(1);
+    }
+
     fn mark_changed(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.dirty = self
@@ -2975,6 +3057,13 @@ impl DatabaseConnectionsDraftState {
             self.dirty = self.baseline != self.draft;
         }
         Ok(())
+    }
+
+    fn mark_applied(&mut self) {
+        self.baseline = self.draft.clone();
+        self.load_error = None;
+        self.dirty = false;
+        self.revision = self.revision.saturating_add(1);
     }
 }
 
@@ -4183,9 +4272,10 @@ fn apply_gate_status(
     }
 
     gate.state = "admin_ready";
-    gate.reason_code = "apply_transaction_unavailable";
-    gate.message = "Apply remains locked until canonical operator authorization and the catalog/runtime transaction protocol are enabled.".to_owned();
-    (StatusCode::FORBIDDEN, "locked", gate)
+    gate.reason_code = "apply_ready";
+    gate.message = "Apply can start the catalog, runtime, and DB config transaction.".to_owned();
+    gate.can_apply = true;
+    (StatusCode::OK, "ready", gate)
 }
 
 fn canonical_admin_group(args: &UiArgs) -> Result<String, String> {
@@ -4720,6 +4810,578 @@ fn format_catalog_toml(catalog: &Catalog) -> anyhow::Result<String> {
         content.push('\n');
     }
     Ok(content)
+}
+
+#[derive(Debug)]
+struct UiApplyTransactionResult {
+    backups: Vec<UiApplyBackupStatus>,
+    cleanup_error: Option<UiApplyTransactionError>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedApplyArtifact {
+    artifact: &'static str,
+    target_path: PathBuf,
+    temp_path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct UiApplyTransactionManifest<'a> {
+    state: &'static str,
+    nonce: &'a str,
+    started_unix_seconds: u64,
+    artifacts: Vec<UiApplyTransactionManifestArtifact<'a>>,
+}
+
+#[derive(Serialize)]
+struct UiApplyTransactionManifestArtifact<'a> {
+    artifact: &'static str,
+    path: String,
+    temp_path: String,
+    backup_path: Option<String>,
+    sha256: &'a str,
+    bytes: usize,
+}
+
+fn execute_apply_transaction(
+    args: &UiArgs,
+    baseline: &ApplyBaselineSnapshot,
+    payload: &UiApplyWritePayload,
+) -> Result<UiApplyTransactionResult, UiApplyTransactionError> {
+    let (lock_path, manifest_path) = transaction_artifact_paths(&args.catalog);
+    let nonce = random_url_token();
+    create_transaction_lock(&lock_path)?;
+    let result = execute_apply_transaction_with_lock(baseline, payload, &manifest_path, &nonce);
+    let lock_cleanup = fs::remove_file(&lock_path);
+    merge_lock_cleanup_result(result, lock_path, lock_cleanup)
+}
+
+fn merge_lock_cleanup_result(
+    result: Result<UiApplyTransactionResult, UiApplyTransactionError>,
+    lock_path: PathBuf,
+    lock_cleanup: io::Result<()>,
+) -> Result<UiApplyTransactionResult, UiApplyTransactionError> {
+    match (result, lock_cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(mut result), Err(err)) => {
+            result.cleanup_error = Some(transaction_error(
+                "transaction_lock_cleanup_failed",
+                format!(
+                    "apply transaction completed, but lock file '{}' could not be removed: {}",
+                    lock_path.display(),
+                    err.kind()
+                ),
+                Some(lock_path),
+            ));
+            Ok(result)
+        }
+        (Err(error), _) => Err(error),
+    }
+}
+
+fn execute_apply_transaction_with_lock(
+    baseline: &ApplyBaselineSnapshot,
+    payload: &UiApplyWritePayload,
+    manifest_path: &Path,
+    nonce: &str,
+) -> Result<UiApplyTransactionResult, UiApplyTransactionError> {
+    let (manifest_exists, manifest_error) = transaction_artifact_status(manifest_path);
+    if manifest_exists {
+        return Err(transaction_error(
+            "transaction_manifest_exists",
+            format!(
+                "transaction manifest '{}' already exists",
+                manifest_path.display()
+            ),
+            Some(manifest_path.to_path_buf()),
+        ));
+    }
+    if let Some(error) = manifest_error {
+        return Err(transaction_error(
+            "transaction_manifest_unavailable",
+            format!(
+                "transaction manifest '{}' could not be inspected: {error}",
+                manifest_path.display()
+            ),
+            Some(manifest_path.to_path_buf()),
+        ));
+    }
+
+    let baseline_mismatches = baseline.current_mismatches();
+    if !baseline_mismatches.is_empty() {
+        return Err(transaction_error(
+            "baseline_digest_mismatch",
+            "catalog, runtime, or DB config changed after the apply gate was checked",
+            None,
+        ));
+    }
+
+    let prepared = prepare_transaction_artifacts(payload, nonce)?;
+    write_transaction_manifest(manifest_path, "started", nonce, payload, &prepared)?;
+
+    let mut backups = Vec::new();
+    for artifact in &prepared {
+        write_secure_temp_file(
+            &artifact.temp_path,
+            payload_content(payload, artifact.artifact)?,
+        )?;
+        if artifact.target_path.exists() {
+            let backup_path = artifact.backup_path.as_ref().ok_or_else(|| {
+                transaction_error(
+                    "backup_path_unavailable",
+                    format!(
+                        "backup path for '{}' was not prepared",
+                        artifact.target_path.display()
+                    ),
+                    Some(artifact.target_path.clone()),
+                )
+            })?;
+            fs::copy(&artifact.target_path, backup_path).map_err(|err| {
+                transaction_error(
+                    "backup_write_failed",
+                    format!(
+                        "failed to back up '{}' to '{}': {}",
+                        artifact.target_path.display(),
+                        backup_path.display(),
+                        err.kind()
+                    ),
+                    Some(backup_path.clone()),
+                )
+            })?;
+            set_private_file_permissions(backup_path)?;
+            sync_file(backup_path)?;
+            backups.push(UiApplyBackupStatus {
+                artifact: artifact.artifact,
+                path: artifact.target_path.display().to_string(),
+                backup_path: Some(backup_path.display().to_string()),
+            });
+        } else {
+            backups.push(UiApplyBackupStatus {
+                artifact: artifact.artifact,
+                path: artifact.target_path.display().to_string(),
+                backup_path: None,
+            });
+        }
+    }
+
+    let mut applied_artifacts = Vec::new();
+    for artifact in &prepared {
+        if let Err(err) = fs::rename(&artifact.temp_path, &artifact.target_path) {
+            let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
+            return Err(transaction_error(
+                "artifact_rename_failed",
+                append_rollback_errors(
+                    format!(
+                        "failed to move temporary '{}' into '{}': {}",
+                        artifact.temp_path.display(),
+                        artifact.target_path.display(),
+                        err.kind()
+                    ),
+                    &rollback_errors,
+                ),
+                Some(artifact.target_path.clone()),
+            ));
+        }
+        applied_artifacts.push(artifact.clone());
+        if let Err(error) = sync_parent_dir(&artifact.target_path) {
+            let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
+            return Err(transaction_error(
+                error.code,
+                append_rollback_errors(error.message, &rollback_errors),
+                error.path.map(PathBuf::from),
+            ));
+        }
+    }
+
+    if let Err(error) =
+        write_transaction_manifest(manifest_path, "applied", nonce, payload, &prepared)
+    {
+        let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
+        return Err(transaction_error(
+            error.code,
+            append_rollback_errors(error.message, &rollback_errors),
+            error.path.map(PathBuf::from),
+        ));
+    }
+    if let Err(err) = fs::remove_file(manifest_path) {
+        let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
+        return Err(transaction_error(
+            "transaction_manifest_cleanup_failed",
+            append_rollback_errors(
+                format!(
+                    "apply transaction completed, but manifest '{}' could not be removed: {}",
+                    manifest_path.display(),
+                    err.kind()
+                ),
+                &rollback_errors,
+            ),
+            Some(manifest_path.to_path_buf()),
+        ));
+    }
+    if let Err(error) = sync_parent_dir(manifest_path) {
+        let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
+        return Err(transaction_error(
+            error.code,
+            append_rollback_errors(error.message, &rollback_errors),
+            error.path.map(PathBuf::from),
+        ));
+    }
+
+    Ok(UiApplyTransactionResult {
+        backups,
+        cleanup_error: None,
+    })
+}
+
+fn prepare_transaction_artifacts(
+    payload: &UiApplyWritePayload,
+    nonce: &str,
+) -> Result<Vec<PreparedApplyArtifact>, UiApplyTransactionError> {
+    payload
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            let parent = artifact_parent_dir(&artifact.path)?;
+            let backup_path = if artifact.path.exists() {
+                Some(parent.join(format!(
+                    "{}.bak.{nonce}",
+                    artifact_file_name(&artifact.path)?
+                )))
+            } else {
+                None
+            };
+            Ok(PreparedApplyArtifact {
+                artifact: artifact.artifact,
+                target_path: artifact.path.clone(),
+                temp_path: parent.join(format!(
+                    ".canopy-entitlements-transaction-{nonce}-{}.tmp",
+                    artifact.artifact
+                )),
+                backup_path,
+            })
+        })
+        .collect()
+}
+
+fn rollback_applied_artifacts(applied: &[PreparedApplyArtifact]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for artifact in applied.iter().rev() {
+        match artifact.backup_path.as_ref() {
+            Some(backup_path) => {
+                if backup_path.exists() {
+                    if let Err(err) = fs::rename(backup_path, &artifact.target_path) {
+                        errors.push(format!(
+                            "failed to restore '{}' from '{}': {}",
+                            artifact.target_path.display(),
+                            backup_path.display(),
+                            err.kind()
+                        ));
+                    } else if let Err(err) = sync_parent_dir(&artifact.target_path) {
+                        errors.push(err.message);
+                    }
+                } else {
+                    errors.push(format!(
+                        "backup '{}' for '{}' is missing; leaving current artifact in place",
+                        backup_path.display(),
+                        artifact.target_path.display()
+                    ));
+                }
+            }
+            None => {
+                if artifact.target_path.exists() {
+                    if let Err(err) = fs::remove_file(&artifact.target_path) {
+                        errors.push(format!(
+                            "failed to remove newly-created artifact '{}': {}",
+                            artifact.target_path.display(),
+                            err.kind()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    errors
+}
+
+fn append_rollback_errors(mut message: String, rollback_errors: &[String]) -> String {
+    if !rollback_errors.is_empty() {
+        message.push_str("; rollback errors: ");
+        message.push_str(&rollback_errors.join("; "));
+    }
+    message
+}
+
+fn payload_content<'a>(
+    payload: &'a UiApplyWritePayload,
+    artifact: &'static str,
+) -> Result<&'a str, UiApplyTransactionError> {
+    payload
+        .artifacts
+        .iter()
+        .find(|entry| entry.artifact == artifact)
+        .map(|entry| entry.content.as_str())
+        .ok_or_else(|| {
+            transaction_error(
+                "payload_artifact_missing",
+                format!("apply payload does not contain artifact '{artifact}'"),
+                None,
+            )
+        })
+}
+
+fn create_transaction_lock(lock_path: &Path) -> Result<(), UiApplyTransactionError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(lock_path).map_err(|err| {
+        let code = if err.kind() == io::ErrorKind::AlreadyExists {
+            "transaction_lock_exists"
+        } else {
+            "transaction_lock_create_failed"
+        };
+        transaction_error(
+            code,
+            format!(
+                "failed to create transaction lock '{}': {}",
+                lock_path.display(),
+                err.kind()
+            ),
+            Some(lock_path.to_path_buf()),
+        )
+    })?;
+    file.write_all(format!("pid={}\n", std::process::id()).as_bytes())
+        .map_err(|err| {
+            transaction_error(
+                "transaction_lock_write_failed",
+                format!(
+                    "failed to write transaction lock '{}': {}",
+                    lock_path.display(),
+                    err.kind()
+                ),
+                Some(lock_path.to_path_buf()),
+            )
+        })?;
+    file.sync_all().map_err(|err| {
+        transaction_error(
+            "transaction_lock_sync_failed",
+            format!(
+                "failed to sync transaction lock '{}': {}",
+                lock_path.display(),
+                err.kind()
+            ),
+            Some(lock_path.to_path_buf()),
+        )
+    })?;
+    sync_parent_dir(lock_path)
+}
+
+fn write_transaction_manifest(
+    manifest_path: &Path,
+    state: &'static str,
+    nonce: &str,
+    payload: &UiApplyWritePayload,
+    prepared: &[PreparedApplyArtifact],
+) -> Result<(), UiApplyTransactionError> {
+    let artifacts = prepared
+        .iter()
+        .map(|artifact| {
+            let payload_artifact = payload
+                .artifacts
+                .iter()
+                .find(|entry| entry.artifact == artifact.artifact)
+                .expect("prepared artifact must exist in payload");
+            UiApplyTransactionManifestArtifact {
+                artifact: artifact.artifact,
+                path: artifact.target_path.display().to_string(),
+                temp_path: artifact.temp_path.display().to_string(),
+                backup_path: artifact
+                    .backup_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                sha256: &payload_artifact.sha256,
+                bytes: payload_artifact.content.len(),
+            }
+        })
+        .collect();
+    let manifest = UiApplyTransactionManifest {
+        state,
+        nonce,
+        started_unix_seconds: unix_timestamp_seconds(),
+        artifacts,
+    };
+    let content = serde_json::to_string_pretty(&manifest)
+        .map(|content| format!("{content}\n"))
+        .map_err(|err| {
+            transaction_error(
+                "transaction_manifest_encode_failed",
+                format!("failed to encode transaction manifest: {err}"),
+                Some(manifest_path.to_path_buf()),
+            )
+        })?;
+    write_secure_file(manifest_path, &content, state == "started")
+}
+
+fn write_secure_temp_file(path: &Path, content: &str) -> Result<(), UiApplyTransactionError> {
+    write_secure_file(path, content, true)
+}
+
+fn write_secure_file(
+    path: &Path,
+    content: &str,
+    create_new: bool,
+) -> Result<(), UiApplyTransactionError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            transaction_error(
+                "artifact_parent_create_failed",
+                format!(
+                    "failed to create artifact parent directory '{}': {}",
+                    parent.display(),
+                    err.kind()
+                ),
+                Some(parent.to_path_buf()),
+            )
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(|err| {
+        transaction_error(
+            "artifact_temp_create_failed",
+            format!(
+                "failed to create temporary artifact '{}': {}",
+                path.display(),
+                err.kind()
+            ),
+            Some(path.to_path_buf()),
+        )
+    })?;
+    file.write_all(content.as_bytes()).map_err(|err| {
+        transaction_error(
+            "artifact_temp_write_failed",
+            format!(
+                "failed to write temporary artifact '{}': {}",
+                path.display(),
+                err.kind()
+            ),
+            Some(path.to_path_buf()),
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        transaction_error(
+            "artifact_temp_sync_failed",
+            format!(
+                "failed to sync temporary artifact '{}': {}",
+                path.display(),
+                err.kind()
+            ),
+            Some(path.to_path_buf()),
+        )
+    })?;
+    sync_parent_dir(path)
+}
+
+fn sync_file(path: &Path) -> Result<(), UiApplyTransactionError> {
+    fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| {
+            transaction_error(
+                "artifact_sync_failed",
+                format!("failed to sync '{}': {}", path.display(), err.kind()),
+                Some(path.to_path_buf()),
+            )
+        })
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), UiApplyTransactionError> {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    fs::File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|err| {
+            transaction_error(
+                "artifact_parent_sync_failed",
+                format!(
+                    "failed to sync artifact parent directory '{}': {}",
+                    parent.display(),
+                    err.kind()
+                ),
+                Some(parent.to_path_buf()),
+            )
+        })
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<(), UiApplyTransactionError> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+            transaction_error(
+                "artifact_permission_failed",
+                format!(
+                    "failed to set private permissions on '{}': {}",
+                    path.display(),
+                    err.kind()
+                ),
+                Some(path.to_path_buf()),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn artifact_parent_dir(path: &Path) -> Result<PathBuf, UiApplyTransactionError> {
+    Ok(path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf())
+}
+
+fn artifact_file_name(path: &Path) -> Result<String, UiApplyTransactionError> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            transaction_error(
+                "artifact_file_name_missing",
+                format!("artifact path '{}' has no file name", path.display()),
+                Some(path.to_path_buf()),
+            )
+        })
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn transaction_error(
+    code: &'static str,
+    message: impl Into<String>,
+    path: Option<PathBuf>,
+) -> UiApplyTransactionError {
+    UiApplyTransactionError {
+        code,
+        message: message.into(),
+        path: path.map(|path| path.display().to_string()),
+    }
 }
 
 fn optional_toml_integer(
@@ -6343,6 +7005,43 @@ skip_tls_hostname_verification = true
         }
     }
 
+    fn assert_apply_payload_matches_file(apply: &serde_json::Value, artifact: &str, path: &Path) {
+        let payload_artifact = apply["transaction"]["payload"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["artifact"] == artifact)
+            .unwrap_or_else(|| panic!("missing payload artifact {artifact}"));
+        assert_eq!(payload_artifact["path"], path.display().to_string());
+        assert_eq!(
+            payload_artifact["sha256"],
+            file_sha256(path).expect("applied artifact should be readable")
+        );
+        assert_eq!(
+            payload_artifact["bytes"],
+            std::fs::read(path).unwrap().len()
+        );
+    }
+
+    fn assert_apply_backup_matches(
+        apply: &serde_json::Value,
+        artifact: &str,
+        original_content: &str,
+    ) -> PathBuf {
+        let backup = apply["transaction"]["backups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["artifact"] == artifact)
+            .unwrap_or_else(|| panic!("missing backup artifact {artifact}"));
+        let backup_path = PathBuf::from(backup["backup_path"].as_str().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            original_content
+        );
+        backup_path
+    }
+
     fn write_runtime_from_catalog_fixture(name: &str, catalog_content: &str) -> PathBuf {
         let runtime_path = catalog_fixture_path(name);
         let generated = Catalog::from_toml_str(catalog_content)
@@ -6450,6 +7149,9 @@ skip_tls_hostname_verification = true
         assert!(APP_JS.contains("async function applyDraft()"));
         assert!(APP_JS.contains("review-validate-button"));
         assert!(APP_JS.contains("review-apply-button"));
+        assert!(APP_JS.contains("const transactionError = apply?.transaction?.error || null;"));
+        assert!(APP_JS.contains("Apply complete with cleanup warning"));
+        assert!(APP_JS.contains("Apply failed"));
 
         assert!(APP_CSS.contains(".workspace.review-mode"));
         assert!(APP_CSS.contains(".workspace.review-mode .review-strip"));
@@ -6730,6 +7432,7 @@ skip_tls_hostname_verification = true
         let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(state["draft"]["loaded"], true);
         assert_eq!(state["capabilities"]["draft_write"], true);
+        assert_eq!(state["capabilities"]["apply"], true);
         assert_eq!(state["draft"]["groups"][0]["id"], "RD");
         assert!(state["draft"]["packages"]
             .as_array()
@@ -9303,8 +10006,10 @@ package = "mcp-ec2-diagnostics"
         args.dev_operator_sub = Some("operator".to_owned());
         let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
         install_session(&state);
+        let app = router(state);
 
-        let response = router(state)
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -9431,7 +10136,7 @@ package = "mcp-ec2-diagnostics"
     }
 
     #[tokio::test]
-    async fn apply_baseline_admin_reaches_authorization_transaction_lock() {
+    async fn apply_baseline_admin_writes_transaction_artifacts() {
         let (catalog_path, catalog_content) =
             write_catalog_fixture_with_admin_member("apply-admin-catalog", "operator");
         let runtime_path =
@@ -9451,8 +10156,10 @@ package = "mcp-ec2-diagnostics"
         args.dev_operator_sub = Some("operator".to_owned());
         let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
         install_session(&state);
+        let app = router(state);
 
-        let response = router(state)
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -9466,43 +10173,59 @@ package = "mcp-ec2-diagnostics"
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["status"], "applied");
+        assert_eq!(apply["applied"], true);
+        assert_eq!(apply["revision"], 1);
         assert_eq!(apply["gate"]["state"], "admin_ready");
-        assert_eq!(
-            apply["gate"]["reason_code"],
-            "apply_transaction_unavailable"
-        );
+        assert_eq!(apply["gate"]["reason_code"], "apply_completed");
+        assert_eq!(apply["gate"]["can_apply"], true);
         assert_eq!(apply["validation"]["valid"], true);
-        assert_eq!(apply["transaction"]["state"], "not_started");
+        assert_eq!(apply["transaction"]["state"], "applied");
         assert_eq!(apply["transaction"]["lock_exists"], false);
         assert_eq!(apply["transaction"]["manifest_exists"], false);
+        assert_eq!(apply["transaction"]["error"], serde_json::Value::Null);
         let payload_artifacts = apply["transaction"]["payload"]["artifacts"]
             .as_array()
             .unwrap();
         assert_eq!(payload_artifacts.len(), 3);
-        assert_eq!(payload_artifacts[0]["artifact"], "catalog");
-        assert_eq!(payload_artifacts[1]["artifact"], "runtime");
-        assert_eq!(payload_artifacts[2]["artifact"], "db_config");
-        assert_eq!(payload_artifacts[0]["sha256"].as_str().unwrap().len(), 64);
-        assert_eq!(
-            std::fs::read_to_string(&catalog_path).unwrap(),
-            original_catalog
-        );
-        assert_eq!(
-            std::fs::read_to_string(&runtime_path).unwrap(),
-            original_runtime
-        );
-        assert_eq!(
-            std::fs::read_to_string(&db_config_path).unwrap(),
-            original_db_config
-        );
+        assert_apply_payload_matches_file(&apply, "catalog", &catalog_path);
+        assert_apply_payload_matches_file(&apply, "runtime", &runtime_path);
+        assert_apply_payload_matches_file(&apply, "db_config", &db_config_path);
+        let catalog_backup = assert_apply_backup_matches(&apply, "catalog", &original_catalog);
+        let runtime_backup = assert_apply_backup_matches(&apply, "runtime", &original_runtime);
+        let db_backup = assert_apply_backup_matches(&apply, "db_config", &original_db_config);
+        let lock_path = PathBuf::from(apply["transaction"]["lock_path"].as_str().unwrap());
+        let manifest_path = PathBuf::from(apply["transaction"]["manifest_path"].as_str().unwrap());
+        assert!(!lock_path.exists());
+        assert!(!manifest_path.exists());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/state")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], false);
+        assert_eq!(state["database_connections"]["dirty"], false);
         let _ = std::fs::remove_file(catalog_path);
         let _ = std::fs::remove_file(runtime_path);
         let _ = std::fs::remove_file(db_config_path);
         let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(catalog_backup);
+        let _ = std::fs::remove_file(runtime_backup);
+        let _ = std::fs::remove_file(db_backup);
     }
 
     #[tokio::test]
@@ -9550,34 +10273,30 @@ package = "mcp-ec2-diagnostics"
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["status"], "applied");
+        assert_eq!(apply["applied"], true);
         assert_eq!(apply["gate"]["state"], "admin_ready");
         assert_eq!(apply["gate"]["admin_group"], "ops-admin");
-        assert_eq!(
-            apply["gate"]["reason_code"],
-            "apply_transaction_unavailable"
-        );
+        assert_eq!(apply["gate"]["reason_code"], "apply_completed");
         assert_eq!(apply["validation"]["valid"], true);
-        assert_eq!(
-            std::fs::read_to_string(&catalog_path).unwrap(),
-            original_catalog
-        );
-        assert_eq!(
-            std::fs::read_to_string(&runtime_path).unwrap(),
-            original_runtime
-        );
-        assert_eq!(
-            std::fs::read_to_string(&db_config_path).unwrap(),
-            original_db_config
-        );
+        assert_eq!(apply["transaction"]["state"], "applied");
+        assert_apply_payload_matches_file(&apply, "catalog", &catalog_path);
+        assert_apply_payload_matches_file(&apply, "runtime", &runtime_path);
+        assert_apply_payload_matches_file(&apply, "db_config", &db_config_path);
+        let catalog_backup = assert_apply_backup_matches(&apply, "catalog", &original_catalog);
+        let runtime_backup = assert_apply_backup_matches(&apply, "runtime", &original_runtime);
+        let db_backup = assert_apply_backup_matches(&apply, "db_config", &original_db_config);
         let _ = std::fs::remove_file(catalog_path);
         let _ = std::fs::remove_file(runtime_path);
         let _ = std::fs::remove_file(db_config_path);
         let _ = std::fs::remove_file(deployment_config_path);
         let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(catalog_backup);
+        let _ = std::fs::remove_file(runtime_backup);
+        let _ = std::fs::remove_file(db_backup);
     }
 
     #[cfg(unix)]
@@ -10509,6 +11228,85 @@ require_tls = "true"
         assert_eq!(issue.code, "db_config_path_missing");
         assert!(issue.message.contains("--db-config"));
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[test]
+    fn transaction_lock_cleanup_failure_keeps_successful_apply_result() {
+        let lock_path = PathBuf::from("/tmp/canopy-entitlements-test.lock");
+        let result = UiApplyTransactionResult {
+            backups: Vec::new(),
+            cleanup_error: None,
+        };
+
+        let result = merge_lock_cleanup_result(
+            Ok(result),
+            lock_path.clone(),
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap();
+
+        let cleanup_error = result.cleanup_error.unwrap();
+        assert_eq!(cleanup_error.code, "transaction_lock_cleanup_failed");
+        assert_eq!(cleanup_error.path, Some(lock_path.display().to_string()));
+        assert!(cleanup_error.message.contains("transaction completed"));
+    }
+
+    #[test]
+    fn rollback_applied_artifacts_restores_backups_and_removes_new_files() {
+        let existing_path = catalog_fixture_path("rollback-existing");
+        let existing_backup = catalog_fixture_path("rollback-existing-backup");
+        let new_path = catalog_fixture_path("rollback-new");
+        std::fs::write(&existing_path, "new content").unwrap();
+        std::fs::write(&existing_backup, "old content").unwrap();
+        std::fs::write(&new_path, "created content").unwrap();
+        let applied = vec![
+            PreparedApplyArtifact {
+                artifact: "catalog",
+                target_path: existing_path.clone(),
+                temp_path: catalog_fixture_path("rollback-existing-tmp"),
+                backup_path: Some(existing_backup.clone()),
+            },
+            PreparedApplyArtifact {
+                artifact: "runtime",
+                target_path: new_path.clone(),
+                temp_path: catalog_fixture_path("rollback-new-tmp"),
+                backup_path: None,
+            },
+        ];
+
+        let errors = rollback_applied_artifacts(&applied);
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&existing_path).unwrap(),
+            "old content"
+        );
+        assert!(!existing_backup.exists());
+        assert!(!new_path.exists());
+        let _ = std::fs::remove_file(existing_path);
+    }
+
+    #[test]
+    fn rollback_applied_artifacts_keeps_target_when_expected_backup_is_missing() {
+        let existing_path = catalog_fixture_path("rollback-missing-backup-existing");
+        let missing_backup = catalog_fixture_path("rollback-missing-backup");
+        std::fs::write(&existing_path, "current content").unwrap();
+        let applied = vec![PreparedApplyArtifact {
+            artifact: "catalog",
+            target_path: existing_path.clone(),
+            temp_path: catalog_fixture_path("rollback-missing-backup-tmp"),
+            backup_path: Some(missing_backup.clone()),
+        }];
+
+        let errors = rollback_applied_artifacts(&applied);
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("is missing"));
+        assert_eq!(
+            std::fs::read_to_string(&existing_path).unwrap(),
+            "current content"
+        );
+        let _ = std::fs::remove_file(existing_path);
     }
 
     #[tokio::test]

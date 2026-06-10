@@ -2579,6 +2579,7 @@ function renderReviewApply() {
   const validation = state.validation;
   const apply = state.apply;
   const applyGate = apply?.gate || null;
+  const transactionError = apply?.transaction?.error || null;
   const server = state.server || {};
   const databaseConnections = state.databaseConnections || {};
   const added = changes.added_bindings || [];
@@ -2616,7 +2617,19 @@ function renderReviewApply() {
   setText(
     "#review-apply-status",
     applyGate
-      ? `${apply.applied ? "Applied" : apply.status === "blocked" ? "Apply blocked" : "Apply locked"}: ${applyGate.message}`
+      ? `${
+          apply.applied
+            ? transactionError
+              ? "Applied with cleanup warning"
+              : "Applied"
+            : apply.status === "failed"
+              ? "Apply failed"
+              : apply.status === "blocked"
+                ? "Apply blocked"
+                : applyGate.can_apply
+                  ? "Apply ready"
+                  : "Apply locked"
+        }: ${transactionError?.message || applyGate.message}`
       : validation
       ? validation.valid
         ? "Validation is clean for the current draft."
@@ -2628,7 +2641,11 @@ function renderReviewApply() {
   setText(
     "#review-apply-gate",
     applyGate
-      ? applyGate.state === "validation_blocked"
+      ? apply.applied
+        ? "Applied"
+        : applyGate.can_apply
+          ? "Ready"
+          : applyGate.state === "validation_blocked"
         ? "Blocked"
         : "Locked"
       : server.capabilities?.apply
@@ -2688,7 +2705,7 @@ function renderReviewApply() {
       ? applyGate.message
       : server.capabilities?.apply
       ? "Operator identity can apply this draft."
-      : "Production apply gate and transaction protocol are not enabled yet.",
+      : "Apply requires a loaded catalog draft.",
   );
 
   const highRiskKeys = new Set(highRisk.map(grantKey));
@@ -2724,7 +2741,16 @@ function renderReviewApply() {
   }
 
   const issues = [
-    ...(applyGate && !apply.applied
+    ...(transactionError
+      ? [
+          {
+            severity: apply.applied ? "warning" : "blocking",
+            code: transactionError.code,
+            message: transactionError.message,
+          },
+        ]
+      : []),
+    ...(applyGate && !apply.applied && !transactionError
       ? [
           {
             severity: "blocking",
@@ -2775,7 +2801,7 @@ function syncApplyButtons() {
       : "▢ Apply";
   applyButtons().forEach((button) => {
     button.disabled = !canCheckApply();
-    button.classList.toggle("apply-locked", locked || !apply?.applied);
+    button.classList.toggle("apply-locked", locked);
     button.textContent = label;
   });
 }
@@ -2845,9 +2871,18 @@ async function runApply(button) {
     renderReviewApply();
     renderOverview();
     const gate = apply.gate || {};
+    const transactionError = apply.transaction?.error || null;
     setValidationStatus(
-      apply.applied ? "Apply complete" : apply.status === "blocked" ? "Apply blocked" : "Apply locked",
-      gate.message || "Apply gate did not allow this draft",
+      apply.applied
+        ? transactionError
+          ? "Apply complete with cleanup warning"
+          : "Apply complete"
+        : apply.status === "failed"
+          ? "Apply failed"
+          : apply.status === "blocked"
+            ? "Apply blocked"
+            : "Apply locked",
+      transactionError?.message || gate.message || "Apply gate did not allow this draft",
       apply.applied,
     );
   } catch (error) {
