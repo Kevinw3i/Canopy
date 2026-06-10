@@ -1724,7 +1724,13 @@ impl UiAppState {
 
     fn apply_draft(&self) -> Result<(StatusCode, UiApplyOutput), UiMutationError> {
         let validation = self.validate_draft()?;
-        let (status, apply_status, gate) = apply_gate_status(self.args.as_ref(), &validation);
+        let baseline = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned")
+            .clone_baseline();
+        let (status, apply_status, gate) =
+            apply_gate_status(self.args.as_ref(), &validation, baseline.as_ref());
         let output = UiApplyOutput {
             status: apply_status,
             command: "apply",
@@ -2599,6 +2605,10 @@ impl DraftState {
             ));
         };
         Ok((draft.clone(), self.revision))
+    }
+
+    fn clone_baseline(&self) -> Option<Catalog> {
+        self.baseline.clone()
     }
 
     fn summarize(&self) -> (UiDraftResponse, UiPendingChanges) {
@@ -3778,6 +3788,7 @@ fn validate_draft_catalog(
 fn apply_gate_status(
     args: &UiArgs,
     validation: &UiValidateOutput,
+    baseline: Option<&Catalog>,
 ) -> (StatusCode, &'static str, UiApplyGate) {
     let admin_group = if args.allow_dev_identity {
         args.dev_admin_group.clone()
@@ -3809,9 +3820,65 @@ fn apply_gate_status(
         return (StatusCode::FORBIDDEN, "locked", gate);
     }
 
+    let Some(baseline) = baseline else {
+        gate.state = "admin_blocked";
+        gate.reason_code = "baseline_catalog_unavailable";
+        gate.message =
+            "Apply requires the persisted baseline catalog for the canonical admin gate."
+                .to_owned();
+        return (StatusCode::CONFLICT, "blocked", gate);
+    };
+
+    let operator = match startup_operator_explain_request(args) {
+        Ok(operator) => operator,
+        Err(message) => {
+            gate.state = "admin_blocked";
+            gate.reason_code = "operator_identity_unavailable";
+            gate.message = message;
+            return (StatusCode::FORBIDDEN, "locked", gate);
+        }
+    };
+    match baseline.explain(operator) {
+        Ok(explain) => {
+            if !explain
+                .resolved_groups
+                .iter()
+                .any(|group| group == &gate.admin_group)
+            {
+                gate.state = "admin_blocked";
+                gate.reason_code = "non_admin_identity";
+                gate.message = format!(
+                    "Operator identity did not resolve to canonical admin group '{}' in the persisted baseline catalog.",
+                    gate.admin_group
+                );
+                return (StatusCode::FORBIDDEN, "locked", gate);
+            }
+        }
+        Err(err) => {
+            gate.state = "admin_blocked";
+            gate.reason_code = "baseline_admin_resolution_failed";
+            gate.message = format!("baseline admin gate resolution failed: {err}");
+            return (StatusCode::CONFLICT, "blocked", gate);
+        }
+    }
+
+    gate.state = "admin_ready";
     gate.reason_code = "apply_transaction_unavailable";
     gate.message = "Apply remains locked until canonical operator authorization and the catalog/runtime transaction protocol are enabled.".to_owned();
     (StatusCode::FORBIDDEN, "locked", gate)
+}
+
+fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
+    explain_request_from_body(
+        args,
+        ExplainRequestBody {
+            sub: None,
+            email: None,
+            email_verified: None,
+            external_groups: None,
+        },
+    )
+    .map_err(|err| err.message)
 }
 
 fn validate_deployment_source(
@@ -5512,6 +5579,27 @@ group = "RD"
         .trim_start()
         .to_owned();
         let path = catalog_fixture_path(name);
+        std::fs::write(&path, &content).unwrap();
+        (path, content)
+    }
+
+    fn write_catalog_fixture_with_admin_member(
+        name: &str,
+        admin_user_id: &str,
+    ) -> (PathBuf, String) {
+        let (path, mut content) = write_catalog_fixture(name);
+        content.push_str(&format!(
+            r#"
+
+[[bindings]]
+group = "admin"
+package = "analytics"
+
+[[memberships]]
+user_id = "{admin_user_id}"
+group = "admin"
+"#
+        ));
         std::fs::write(&path, &content).unwrap();
         (path, content)
     }
@@ -8404,6 +8492,213 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(apply["status"], "locked");
         assert_eq!(apply["gate"]["reason_code"], "dev_identity_apply_disabled");
         assert_eq!(apply["gate"]["can_apply"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["transaction"]["state"], "not_started");
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_non_admin_operator_against_baseline_catalog() {
+        let (catalog_path, catalog_content) = write_catalog_fixture("apply-non-admin-catalog");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-non-admin-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-non-admin-db");
+        let deployment_config_path = write_database_config_fixture("apply-non-admin-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        args.dev_operator_external_groups = vec!["canopy-rd".to_owned()];
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "non_admin_identity");
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_admin_gate_ignores_draft_self_grant() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-self-grant-catalog", "other-admin");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-self-grant-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-self-grant-db");
+        let deployment_config_path = write_database_config_fixture("apply-self-grant-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/memberships")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"group":"admin","user_id":"operator","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "non_admin_identity");
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_baseline_admin_reaches_authorization_transaction_lock() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-admin-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-admin-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-admin-db");
+        let deployment_config_path = write_database_config_fixture("apply-admin-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_ready");
+        assert_eq!(
+            apply["gate"]["reason_code"],
+            "apply_transaction_unavailable"
+        );
         assert_eq!(apply["validation"]["valid"], true);
         assert_eq!(apply["transaction"]["state"], "not_started");
         assert_eq!(
