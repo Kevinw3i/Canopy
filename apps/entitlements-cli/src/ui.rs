@@ -125,6 +125,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/draft/memberships", put(put_draft_membership))
         .route("/api/draft/group-mappings", put(put_draft_group_mapping))
         .route("/api/draft/scopes/resources", put(put_draft_scope_resource))
+        .route("/api/draft/packages", put(put_draft_package))
         .route(
             "/api/draft/packages/features",
             put(put_draft_package_feature),
@@ -241,6 +242,16 @@ struct DraftAccountRequest {
 struct DraftRoleRequest {
     id: String,
     role_arn: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftPackageRequest {
+    id: String,
+    scope: String,
+    role: String,
+    max_session_seconds: Option<u64>,
     enabled: bool,
 }
 
@@ -623,6 +634,9 @@ struct UiPendingChanges {
     added_roles: Vec<UiRoleChange>,
     removed_roles: Vec<UiRoleChange>,
     updated_roles: Vec<UiRoleChange>,
+    added_packages: Vec<UiPackageChange>,
+    removed_packages: Vec<UiPackageChange>,
+    updated_packages: Vec<UiPackageChange>,
     high_risk_added: usize,
     high_risk_removed: usize,
     semantic_diff: UiSemanticDiff,
@@ -639,6 +653,15 @@ struct UiAccountChange {
 struct UiRoleChange {
     id: String,
     role_arn: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UiPackageChange {
+    id: String,
+    scope: String,
+    role: String,
+    features: Vec<String>,
+    max_session_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1205,6 +1228,38 @@ async fn put_draft_role(
     }
 }
 
+async fn put_draft_package(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftPackageRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_package_request",
+                "draft package request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_package(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn not_found() -> impl IntoResponse {
     let mut response = static_response("text/plain; charset=utf-8", "not found\n");
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -1366,6 +1421,14 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned");
         draft.update_package_feature(request)
+    }
+
+    fn update_package(&self, request: DraftPackageRequest) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_package(request)
     }
 
     fn update_database_connection(
@@ -1968,6 +2031,86 @@ impl DraftState {
 
         if package.features != next_features {
             package.features = next_features;
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    fn update_package(&mut self, request: DraftPackageRequest) -> Result<(), UiMutationError> {
+        let id = request.id.trim();
+        let scope = request.scope.trim();
+        let role = request.role.trim();
+        if id.is_empty() || (request.enabled && (scope.is_empty() || role.is_empty())) {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_package_id",
+                "package id, scope, and role are required when saving a package",
+            ));
+        }
+        if request.max_session_seconds == Some(0) {
+            return Err(UiMutationError::bad_request(
+                "invalid_package_session_cap",
+                "max_session_seconds must be greater than zero when configured",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let existing = draft.packages.iter().position(|package| package.id == id);
+        let changed = if request.enabled {
+            if !draft.scopes.iter().any(|candidate| candidate.id == scope) {
+                return Err(UiMutationError::bad_request(
+                    "unknown_scope",
+                    format!("scope '{scope}' does not exist in the draft"),
+                ));
+            }
+            if !draft.roles.iter().any(|candidate| candidate.id == role) {
+                return Err(UiMutationError::bad_request(
+                    "unknown_role",
+                    format!("role '{role}' does not exist in the draft"),
+                ));
+            }
+
+            let next = CatalogPackage {
+                id: id.to_owned(),
+                features: existing
+                    .map(|index| draft.packages[index].features.clone())
+                    .unwrap_or_default(),
+                scope: scope.to_owned(),
+                role: role.to_owned(),
+                max_session_seconds: request.max_session_seconds,
+            };
+            match existing {
+                Some(index) if draft.packages[index] == next => false,
+                Some(index) => {
+                    draft.packages[index] = next;
+                    true
+                }
+                None => {
+                    draft.packages.push(next);
+                    true
+                }
+            }
+        } else if let Some(index) = existing {
+            if draft.bindings.iter().any(|binding| binding.package == id) {
+                return Err(UiMutationError::bad_request(
+                    "package_in_use",
+                    format!("package '{id}' is still referenced by at least one binding"),
+                ));
+            }
+            draft.packages.remove(index);
+            true
+        } else {
+            false
+        };
+
+        if changed {
             self.mark_changed();
         }
         Ok(())
@@ -3291,6 +3434,9 @@ impl UiPendingChanges {
             added_roles: Vec::new(),
             removed_roles: Vec::new(),
             updated_roles: Vec::new(),
+            added_packages: Vec::new(),
+            removed_packages: Vec::new(),
+            updated_packages: Vec::new(),
             high_risk_added: 0,
             high_risk_removed: 0,
             semantic_diff: UiSemanticDiff::empty(),
@@ -3820,6 +3966,8 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
     let draft_accounts = account_map(draft);
     let baseline_roles = role_map(baseline);
     let draft_roles = role_map(draft);
+    let baseline_package_map = package_map(baseline);
+    let draft_package_map = package_map(draft);
     let draft_packages = package_index(draft);
     let baseline_packages = package_index(baseline);
     let added_bindings = draft_bindings
@@ -3912,6 +4060,25 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
         })
         .map(|(_, role)| role_change(role))
         .collect::<Vec<_>>();
+    let added_packages = draft_package_map
+        .iter()
+        .filter(|(id, _)| !baseline_package_map.contains_key(*id))
+        .map(|(_, package)| package_change(package))
+        .collect::<Vec<_>>();
+    let removed_packages = baseline_package_map
+        .iter()
+        .filter(|(id, _)| !draft_package_map.contains_key(*id))
+        .map(|(_, package)| package_change(package))
+        .collect::<Vec<_>>();
+    let updated_packages = draft_package_map
+        .iter()
+        .filter(|(id, package)| {
+            baseline_package_map
+                .get(*id)
+                .is_some_and(|baseline_package| baseline_package != *package)
+        })
+        .map(|(_, package)| package_change(package))
+        .collect::<Vec<_>>();
     let high_risk_added = added_bindings
         .iter()
         .filter(|change| change.high_risk)
@@ -3936,6 +4103,9 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
         added_roles,
         removed_roles,
         updated_roles,
+        added_packages,
+        removed_packages,
+        updated_packages,
         high_risk_added,
         high_risk_removed,
         semantic_diff,
@@ -3959,6 +4129,14 @@ fn package_index(catalog: &Catalog) -> BTreeMap<&str, &CatalogPackage> {
         .packages
         .iter()
         .map(|package| (package.id.as_str(), package))
+        .collect()
+}
+
+fn package_map(catalog: &Catalog) -> BTreeMap<String, CatalogPackage> {
+    catalog
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package.clone()))
         .collect()
 }
 
@@ -3990,6 +4168,16 @@ fn role_change(role: &CatalogRole) -> UiRoleChange {
     UiRoleChange {
         id: role.id.clone(),
         role_arn: role.role_arn.clone(),
+    }
+}
+
+fn package_change(package: &CatalogPackage) -> UiPackageChange {
+    UiPackageChange {
+        id: package.id.clone(),
+        scope: package.scope.clone(),
+        role: package.role.clone(),
+        features: package.features.clone(),
+        max_session_seconds: package.max_session_seconds,
     }
 }
 
@@ -4520,13 +4708,19 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"data-view="packages""#));
         assert!(INDEX_HTML.contains(r#"class="packages-view""#));
         assert!(INDEX_HTML.contains(r#"id="package-feature-toggles""#));
+        assert!(INDEX_HTML.contains(r#"id="package-save-button""#));
+        assert!(INDEX_HTML.contains(r#"id="package-edit-scope""#));
 
         assert!(APP_JS.contains("function renderPackages("));
+        assert!(APP_JS.contains("function updateDraftPackage("));
+        assert!(APP_JS.contains("function renderPackageEditor("));
         assert!(APP_JS.contains("function togglePackageFeature("));
+        assert!(APP_JS.contains("/api/draft/packages"));
         assert!(APP_JS.contains("/api/draft/packages/features"));
 
         assert!(APP_CSS.contains(".workspace.package-mode"));
         assert!(APP_CSS.contains(".packages-table"));
+        assert!(APP_CSS.contains(".package-editor"));
         assert!(APP_CSS.contains(".feature-toggle"));
     }
 
@@ -5834,6 +6028,198 @@ private_target_ref = "service:app-api"
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_content
         );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_update_adds_package_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("package-add");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"qa-database","scope":"db-scope","role":"readonly","max_session_seconds":900,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert!(state["draft"]["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| package["id"] == "qa-database"
+                && package["scope"] == "db-scope"
+                && package["role"] == "readonly"
+                && package["max_session_seconds"] == 900));
+        assert!(state["changes"]["added_packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["id"] == "qa-database" && change["max_session_seconds"] == 900));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_update_updates_metadata_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("package-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"analytics","scope":"db-scope","role":"readonly","max_session_seconds":600,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert!(state["changes"]["updated_packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["id"] == "analytics" && change["max_session_seconds"] == 600));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_update_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("package-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"qa-database","scope":"db-scope","role":"readonly","max_session_seconds":900,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_update_requires_session_cookie() {
+        let (catalog_path, _content) = write_catalog_fixture("package-session");
+        let response = router(test_state_with_catalog(catalog_path.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"qa-database","scope":"db-scope","role":"readonly","max_session_seconds":900,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_update_rejects_unknown_scope() {
+        let (catalog_path, _content) = write_catalog_fixture("package-unknown-scope");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"qa-database","scope":"missing","role":"readonly","max_session_seconds":null,"enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "unknown_scope");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_package_update_rejects_removing_bound_package() {
+        let (catalog_path, _content) = write_catalog_fixture("package-remove-bound");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/packages")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"analytics","scope":"","role":"","max_session_seconds":null,"enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "package_in_use");
         let _ = std::fs::remove_file(catalog_path);
     }
 

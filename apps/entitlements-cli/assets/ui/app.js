@@ -165,6 +165,26 @@ async function updateDraftRole(id, roleArn, enabled) {
   return response.json();
 }
 
+async function updateDraftPackage(id, scope, role, maxSessionSeconds, enabled) {
+  const response = await fetch("/api/draft/packages", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      id,
+      scope,
+      role,
+      max_session_seconds: maxSessionSeconds,
+      enabled,
+    }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft package update failed");
+  }
+  return response.json();
+}
+
 async function updateDraftPackageFeature(packageId, feature, enabled) {
   const response = await fetch("/api/draft/packages/features", {
     method: "PUT",
@@ -810,6 +830,7 @@ function renderPackageInspector(packages, availableFeatures) {
     badge.textContent = riskCount ? `${riskCount} high risk` : "No risk";
     badge.classList.toggle("badge-risk", riskCount > 0);
   }
+  renderPackageEditor(selected);
 
   const list = document.getElementById("package-feature-toggles");
   if (!list) {
@@ -827,6 +848,49 @@ function renderPackageInspector(packages, availableFeatures) {
     packageFeatureToggle(selected.id, feature, enabled.has(feature.id)),
   );
   list.replaceChildren(title, ...toggles);
+}
+
+function renderPackageEditor(selected) {
+  const canWrite = Boolean(state.server?.capabilities?.draft_write);
+  const scopes = state.draft?.scopes || [];
+  const roles = state.draft?.roles || [];
+  const idInput = document.getElementById("package-edit-id");
+  const scopeSelect = document.getElementById("package-edit-scope");
+  const roleSelect = document.getElementById("package-edit-role");
+  const sessionInput = document.getElementById("package-edit-session");
+  const saveButton = document.getElementById("package-save-button");
+  const deleteButton = document.getElementById("package-delete-button");
+
+  setElementInputValue(idInput, selected?.id || "", !canWrite);
+  setSelectOptions(scopeSelect, scopes.map((scope) => scope.id), selected?.scope || scopes[0]?.id || "", !canWrite);
+  setSelectOptions(roleSelect, roles.map((role) => role.id), selected?.role || roles[0]?.id || "", !canWrite);
+  setElementInputValue(
+    sessionInput,
+    selected?.max_session_seconds ? String(selected.max_session_seconds) : "",
+    !canWrite,
+  );
+  if (saveButton) {
+    saveButton.disabled = !canWrite || !scopes.length || !roles.length;
+  }
+  if (deleteButton) {
+    deleteButton.disabled = !canWrite || !selected?.id;
+  }
+}
+
+function setSelectOptions(select, values, selectedValue, disabled) {
+  if (!(select instanceof HTMLSelectElement)) {
+    return;
+  }
+  select.replaceChildren(
+    ...values.map((value) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      return option;
+    }),
+  );
+  select.value = selectedValue;
+  select.disabled = disabled || values.length === 0;
 }
 
 function packageFeatureToggle(packageId, feature, checked) {
@@ -1575,7 +1639,7 @@ function renderChanges(changes) {
   const removedMappings = changes.removed_group_mappings || [];
   const addedScopeResources = changes.added_scope_resources || [];
   const removedScopeResources = changes.removed_scope_resources || [];
-  const objectChanges = accountRoleChanges(changes);
+  const objectChanges = [...accountRoleChanges(changes), ...packageChanges(changes)];
   const identityCount =
     addedMemberships.length +
     removedMemberships.length +
@@ -1771,6 +1835,9 @@ function pendingChangeCount(changes) {
     changes.added_roles,
     changes.removed_roles,
     changes.updated_roles,
+    changes.added_packages,
+    changes.removed_packages,
+    changes.updated_packages,
     semantic.added,
     semantic.removed,
   ].reduce((count, items) => count + (items?.length || 0), 0);
@@ -1884,7 +1951,7 @@ function renderOverview() {
   const scopeResourceCount =
     (changes.added_scope_resources?.length || 0) +
     (changes.removed_scope_resources?.length || 0);
-  const objectCount = accountRoleChanges(changes).length;
+  const objectCount = accountRoleChanges(changes).length + packageChanges(changes).length;
   const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount + objectCount;
   const packageHighRisk = packages.reduce(
     (count, pkg) => count + (pkg.high_risk_features?.length || 0),
@@ -2057,7 +2124,7 @@ function renderReviewApply() {
   const removedMappings = changes.removed_group_mappings || [];
   const addedScopeResources = changes.added_scope_resources || [];
   const removedScopeResources = changes.removed_scope_resources || [];
-  const objectChanges = accountRoleChanges(changes);
+  const objectChanges = [...accountRoleChanges(changes), ...packageChanges(changes)];
   const identityCount =
     addedMemberships.length +
     removedMemberships.length +
@@ -2355,12 +2422,43 @@ function accountRoleChanges(changes) {
   ];
 }
 
+function packageChanges(changes) {
+  return [
+    ...(changes.added_packages || []).map((change) => ({
+      ...change,
+      type: "package",
+      action: "Add",
+      label: "Package added",
+      detail: packageChangeDetail(change),
+    })),
+    ...(changes.removed_packages || []).map((change) => ({
+      ...change,
+      type: "package",
+      action: "Remove",
+      label: "Package removed",
+      detail: packageChangeDetail(change),
+    })),
+    ...(changes.updated_packages || []).map((change) => ({
+      ...change,
+      type: "package",
+      action: "Update",
+      label: "Package updated",
+      detail: packageChangeDetail(change),
+    })),
+  ];
+}
+
+function packageChangeDetail(change) {
+  const session = change.max_session_seconds ? `${change.max_session_seconds}s` : "default";
+  return `${change.scope} / ${change.role}; ${change.features?.length || 0} feature(s); session ${session}`;
+}
+
 function accountRoleChangeRow(change) {
   const row = document.createElement("tr");
   [
     change.action,
     `${change.type}:${change.id}`,
-    change.type === "account" ? "account target" : "role target",
+    catalogObjectTargetLabel(change.type),
     change.label,
     change.detail,
   ].forEach((cellValue, index) => {
@@ -2375,6 +2473,16 @@ function accountRoleChangeRow(change) {
     row.append(cell);
   });
   return row;
+}
+
+function catalogObjectTargetLabel(type) {
+  if (type === "account") {
+    return "account target";
+  }
+  if (type === "package") {
+    return "package target";
+  }
+  return "role target";
 }
 
 function changeRow(type, change) {
@@ -2594,6 +2702,63 @@ async function togglePackageFeature(input) {
     input.disabled = !state.server?.capabilities?.draft_write;
   }
 }
+
+async function savePackageDraft(enabled) {
+  const id = document.getElementById("package-edit-id")?.value.trim() || "";
+  const scope = document.getElementById("package-edit-scope")?.value || "";
+  const role = document.getElementById("package-edit-role")?.value || "";
+  const sessionText = document.getElementById("package-edit-session")?.value.trim() || "";
+  const maxSessionSeconds = sessionText ? Number(sessionText) : null;
+  if (!id) {
+    setValidationStatus("Package update unavailable", "package id is required", false);
+    return;
+  }
+  if (sessionText && (!Number.isInteger(maxSessionSeconds) || maxSessionSeconds <= 0)) {
+    setValidationStatus(
+      "Package update unavailable",
+      "session cap must be a positive whole number of seconds",
+      false,
+    );
+    return;
+  }
+  try {
+    const payload = await updateDraftPackage(id, scope, role, maxSessionSeconds, enabled);
+    state.selectedPackage = enabled ? id : state.selectedPackage;
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("packages");
+    setValidationStatus(
+      enabled ? "Package draft saved" : "Package draft removed",
+      `${id} ${enabled ? "is staged in memory" : "was removed from draft"}`,
+      true,
+    );
+  } catch (error) {
+    setValidationStatus("Package update failed", error.message, false);
+  }
+}
+
+document.getElementById("package-save-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await savePackageDraft(true);
+  } finally {
+    renderPackageInspector(state.draft?.packages || [], state.draft?.available_features || []);
+  }
+});
+
+document.getElementById("package-delete-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await savePackageDraft(false);
+  } finally {
+    renderPackageInspector(state.draft?.packages || [], state.draft?.available_features || []);
+  }
+});
 
 function attachMatrixEvents() {
   document.querySelectorAll(".matrix tbody tr").forEach((row) => {

@@ -1400,6 +1400,85 @@ textarea {
   white-space: nowrap;
 }
 
+.package-editor {
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+  padding: 16px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.package-editor legend {
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  text-transform: uppercase;
+}
+
+.package-editor label {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.package-editor label span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 660;
+}
+
+.package-editor input,
+.package-editor select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--ink);
+  font: inherit;
+}
+
+.package-editor input:disabled,
+.package-editor select:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.package-editor-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.package-editor-actions button {
+  min-width: 0;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.package-editor-actions button:first-child {
+  border-color: var(--green);
+  background: var(--green);
+  color: white;
+}
+
+.package-editor-actions button:disabled {
+  border-color: var(--line);
+  background: #eef2f4;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .feature-toggle-list {
   display: grid;
   gap: 9px;

@@ -391,6 +391,30 @@
               </div>
             </div>
 
+            <fieldset class="package-editor">
+              <legend>Draft Package</legend>
+              <label>
+                <span>Package</span>
+                <input id="package-edit-id" autocomplete="off" />
+              </label>
+              <label>
+                <span>Scope</span>
+                <select id="package-edit-scope"></select>
+              </label>
+              <label>
+                <span>Role</span>
+                <select id="package-edit-role"></select>
+              </label>
+              <label>
+                <span>Session Cap</span>
+                <input id="package-edit-session" inputmode="numeric" autocomplete="off" placeholder="default" />
+              </label>
+              <div class="package-editor-actions">
+                <button id="package-save-button" type="button">Save Draft</button>
+                <button id="package-delete-button" type="button">Remove</button>
+              </div>
+            </fieldset>
+
             <div class="feature-toggle-list" id="package-feature-toggles">
               <h3>Feature Toggles <span>0</span></h3>
               <p>No package selected</p>
