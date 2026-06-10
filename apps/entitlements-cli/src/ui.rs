@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,6 +33,11 @@ use shared::dto::entitlements::{
     McpEc2HttpQueryPolicy, McpEc2HttpUrlScope, McpEc2JournalUnitScope, McpEc2LogPathScope,
     McpEc2TcpTargetScope,
 };
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn geteuid() -> u32;
+}
 
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
@@ -5721,6 +5726,13 @@ fn validate_operator_jwt_file_path(path: &Path) -> anyhow::Result<()> {
         if mode & 0o022 != 0 {
             anyhow::bail!(
                 "--operator-jwt file '{}' must not be group/world writable",
+                path.display()
+            );
+        }
+        let current_uid = unsafe { geteuid() };
+        if metadata.uid() != current_uid {
+            anyhow::bail!(
+                "--operator-jwt file '{}' must be owned by the current effective user",
                 path.display()
             );
         }
