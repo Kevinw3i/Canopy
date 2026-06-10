@@ -547,6 +547,26 @@
               <div><span id="account-role-role-label">Roles</span><strong id="account-role-role-count">0</strong></div>
             </div>
 
+            <fieldset class="account-role-editor">
+              <legend>Draft Target</legend>
+              <label>
+                <span id="account-role-edit-id-label">Account</span>
+                <input id="account-role-edit-id" autocomplete="off" />
+              </label>
+              <label>
+                <span id="account-role-edit-primary-label">AWS Account</span>
+                <input id="account-role-edit-primary" autocomplete="off" />
+              </label>
+              <label id="account-role-edit-secondary-row">
+                <span id="account-role-edit-secondary-label">Name</span>
+                <input id="account-role-edit-secondary" autocomplete="off" />
+              </label>
+              <div class="account-role-editor-actions">
+                <button id="account-role-save-button" type="button">Save Draft</button>
+                <button id="account-role-delete-button" type="button">Remove</button>
+              </div>
+            </fieldset>
+
             <div class="account-role-detail-list" id="account-role-detail-list">
               <h3>Account Details <span>0</span></h3>
               <p>No account selected</p>

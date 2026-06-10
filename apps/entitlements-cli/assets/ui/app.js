@@ -137,6 +137,34 @@ async function updateDraftScopeResource(scope, field, value, enabled) {
   return response.json();
 }
 
+async function updateDraftAccount(id, accountId, name, enabled) {
+  const response = await fetch("/api/draft/accounts", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, account_id: accountId, name, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft account update failed");
+  }
+  return response.json();
+}
+
+async function updateDraftRole(id, roleArn, enabled) {
+  const response = await fetch("/api/draft/roles", {
+    method: "PUT",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, role_arn: roleArn, enabled }),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message || "draft role update failed");
+  }
+  return response.json();
+}
+
 async function updateDraftPackageFeature(packageId, feature, enabled) {
   const response = await fetch("/api/draft/packages/features", {
     method: "PUT",
@@ -246,6 +274,7 @@ function applyServerState(payload) {
   const identity = payload.identity || {};
   const draft = payload.draft || {};
   const changes = payload.changes || {};
+  const pendingCount = pendingChangeCount(changes);
   const environment = document.querySelector(".env-picker select");
   const applyButton = document.querySelector(".review-actions button[disabled]");
   const validateButton = document.getElementById("validate-button");
@@ -301,10 +330,10 @@ function applyServerState(payload) {
         : `${blocking} blocking issue(s), ${warnings} warning(s)`,
       state.validation.valid,
     );
-  } else if ((changes.added_bindings?.length || 0) + (changes.removed_bindings?.length || 0) > 0) {
+  } else if (pendingCount > 0) {
     setValidationStatus(
       "Draft pending review",
-      `${changes.added_bindings?.length || 0} add / ${changes.removed_bindings?.length || 0} remove`,
+      `${pendingCount} staged change(s)`,
       false,
     );
   } else if (catalog.exists && runtime.exists) {
@@ -1199,7 +1228,7 @@ function emptyAccountRoleRow(colSpan, message) {
 function renderAccountRoleInspector(accounts, roles) {
   const selectedAccount = accounts.find((account) => account.id === state.selectedAccount) || null;
   const selectedRole = roles.find((role) => role.id === state.selectedRole) || null;
-  const showRole = state.accountRoleSelection === "role" && selectedRole;
+  const showRole = state.accountRoleSelection === "role";
   const title = document.getElementById("account-role-selected-name");
   const badge = document.getElementById("account-role-selected-mode");
   const detailList = document.getElementById("account-role-detail-list");
@@ -1209,24 +1238,29 @@ function renderAccountRoleInspector(accounts, roles) {
 
   if (showRole) {
     if (title) {
-      title.textContent = selectedRole.id;
+      title.textContent = selectedRole?.id || "Role";
     }
     if (badge) {
-      badge.textContent = selectedRole.mode;
-      badge.classList.toggle("badge-risk", selectedRole.mode === "concrete");
+      badge.textContent = selectedRole?.mode || "Role";
+      badge.classList.toggle("badge-risk", selectedRole?.mode === "concrete");
     }
     setText("#account-role-primary-label", "Role ARN");
-    setText("#account-role-primary-value", selectedRole.role_arn || "-");
+    setText("#account-role-primary-value", selectedRole?.role_arn || "-");
     setText("#account-role-secondary-label", "Mode");
-    setText("#account-role-secondary-value", selectedRole.mode || "-");
+    setText("#account-role-secondary-value", selectedRole?.mode || "-");
     setText("#account-role-scope-label", "Scopes");
     setText("#account-role-scope-count", "-");
     setText("#account-role-package-label", "Packages");
-    setText("#account-role-package-count", String(selectedRole.packages?.length || 0));
+    setText("#account-role-package-count", String(selectedRole?.packages?.length || 0));
     setText("#account-role-account-label", "Accounts");
-    setText("#account-role-account-count", String(selectedRole.accounts?.length || 0));
+    setText("#account-role-account-count", String(selectedRole?.accounts?.length || 0));
     setText("#account-role-role-label", "Role Type");
-    setText("#account-role-role-count", selectedRole.mode || "-");
+    setText("#account-role-role-count", selectedRole?.mode || "-");
+    renderAccountRoleEditor("role", selectedRole);
+    if (!selectedRole) {
+      detailList.replaceChildren(accountRoleDetailHeading("Role Details", 0), el("p", "", "No role selected"));
+      return;
+    }
     const blocks = [
       accountRoleDetailBlock("Role ARN", selectedRole.role_arn ? [selectedRole.role_arn] : []),
       accountRoleDetailBlock("Applies To Accounts", selectedRole.accounts || []),
@@ -1256,6 +1290,7 @@ function renderAccountRoleInspector(accounts, roles) {
   setText("#account-role-account-count", String(selectedAccount?.roles?.length || 0));
   setText("#account-role-role-label", "AWS Account");
   setText("#account-role-role-count", selectedAccount?.account_id || "-");
+  renderAccountRoleEditor("account", selectedAccount);
   if (!selectedAccount) {
     detailList.replaceChildren(accountRoleDetailHeading("Account Details", 0), el("p", "", "No account selected"));
     return;
@@ -1268,6 +1303,45 @@ function renderAccountRoleInspector(accounts, roles) {
   ];
   const heading = accountRoleDetailHeading("Account Details", blocks.length);
   detailList.replaceChildren(heading, ...blocks);
+}
+
+function renderAccountRoleEditor(kind, selected) {
+  const isRole = kind === "role";
+  const canWrite = Boolean(state.server?.capabilities?.draft_write);
+  const idInput = document.getElementById("account-role-edit-id");
+  const primaryInput = document.getElementById("account-role-edit-primary");
+  const secondaryInput = document.getElementById("account-role-edit-secondary");
+  const secondaryRow = document.getElementById("account-role-edit-secondary-row");
+  const saveButton = document.getElementById("account-role-save-button");
+  const deleteButton = document.getElementById("account-role-delete-button");
+
+  setText("#account-role-edit-id-label", isRole ? "Role" : "Account");
+  setText("#account-role-edit-primary-label", isRole ? "Role ARN" : "AWS Account");
+  setText("#account-role-edit-secondary-label", "Name");
+  if (secondaryRow) {
+    secondaryRow.hidden = isRole;
+  }
+
+  setInputValue(idInput, selected?.id || "", !canWrite);
+  setInputValue(
+    primaryInput,
+    isRole ? selected?.role_arn || "" : selected?.account_id || "",
+    !canWrite,
+  );
+  setInputValue(secondaryInput, isRole ? "" : selected?.name || "", !canWrite || isRole);
+  if (saveButton) {
+    saveButton.disabled = !canWrite;
+  }
+  if (deleteButton) {
+    deleteButton.disabled = !canWrite || !selected?.id;
+  }
+}
+
+function setInputValue(input, value, disabled) {
+  if (input instanceof HTMLInputElement) {
+    input.value = value;
+    input.disabled = disabled;
+  }
 }
 
 function accountRoleDetailHeading(title, count) {
@@ -1501,12 +1575,14 @@ function renderChanges(changes) {
   const removedMappings = changes.removed_group_mappings || [];
   const addedScopeResources = changes.added_scope_resources || [];
   const removedScopeResources = changes.removed_scope_resources || [];
+  const objectChanges = accountRoleChanges(changes);
   const identityCount =
     addedMemberships.length +
     removedMemberships.length +
     addedMappings.length +
     removedMappings.length;
   const scopeResourceCount = addedScopeResources.length + removedScopeResources.length;
+  const objectCount = objectChanges.length;
   const highRiskKeys = new Set(highRisk.map(grantKey));
   const summaryItems = document.querySelectorAll(".summary-grid strong");
   const changedGroups = new Set([
@@ -1520,19 +1596,20 @@ function renderChanges(changes) {
     ...removedMappings.map((change) => change.group),
     ...addedScopeResources.map((change) => `scope:${change.scope}`),
     ...removedScopeResources.map((change) => `scope:${change.scope}`),
+    ...objectChanges.map((change) => `${change.type}:${change.id}`),
   ]);
   if (summaryItems[0]) {
     summaryItems[0].firstChild.textContent = String(changedGroups.size);
   }
   if (summaryItems[1]) summaryItems[1].firstChild.textContent = String(added.length);
   if (summaryItems[2]) summaryItems[2].firstChild.textContent = String(removed.length);
-  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount + identityCount + scopeResourceCount);
+  if (summaryItems[3]) summaryItems[3].firstChild.textContent = String(semanticCount + identityCount + scopeResourceCount + objectCount);
 
   const pendingTitle = document.querySelector(".pending-block h3");
   const pendingBody = document.querySelector(".pending-block tbody");
   if (pendingTitle) {
     const riskLabel = highRisk.length ? `, ${highRisk.length} high risk` : "";
-    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount + identityCount + scopeResourceCount}${riskLabel})`;
+    pendingTitle.textContent = `Pending Changes (${added.length + removed.length + semanticCount + identityCount + scopeResourceCount + objectCount}${riskLabel})`;
   }
   if (!pendingBody) {
     return;
@@ -1546,6 +1623,7 @@ function renderChanges(changes) {
     ...removedMappings.map((change) => identityChangeRow("Remove", "External mapping", change.group, change.external_group)),
     ...addedScopeResources.map((change) => scopeResourceChangeRow("Add", change)),
     ...removedScopeResources.map((change) => scopeResourceChangeRow("Remove", change)),
+    ...objectChanges.map((change) => accountRoleChangeRow(change)),
     ...semanticAdded.map((grant) =>
       semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
     ),
@@ -1676,6 +1754,28 @@ function listFull(items) {
   return values.length ? values.join(", ") : "none";
 }
 
+function pendingChangeCount(changes) {
+  const semantic = changes.semantic_diff || {};
+  return [
+    changes.added_bindings,
+    changes.removed_bindings,
+    changes.added_memberships,
+    changes.removed_memberships,
+    changes.added_group_mappings,
+    changes.removed_group_mappings,
+    changes.added_scope_resources,
+    changes.removed_scope_resources,
+    changes.added_accounts,
+    changes.removed_accounts,
+    changes.updated_accounts,
+    changes.added_roles,
+    changes.removed_roles,
+    changes.updated_roles,
+    semantic.added,
+    semantic.removed,
+  ].reduce((count, items) => count + (items?.length || 0), 0);
+}
+
 function databaseConnectionStateLabel(connections) {
   const required = connections.required || [];
   const local = connections.local_config || [];
@@ -1784,7 +1884,8 @@ function renderOverview() {
   const scopeResourceCount =
     (changes.added_scope_resources?.length || 0) +
     (changes.removed_scope_resources?.length || 0);
-  const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount;
+  const objectCount = accountRoleChanges(changes).length;
+  const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount + objectCount;
   const packageHighRisk = packages.reduce(
     (count, pkg) => count + (pkg.high_risk_features?.length || 0),
     0,
@@ -1956,13 +2057,15 @@ function renderReviewApply() {
   const removedMappings = changes.removed_group_mappings || [];
   const addedScopeResources = changes.added_scope_resources || [];
   const removedScopeResources = changes.removed_scope_resources || [];
+  const objectChanges = accountRoleChanges(changes);
   const identityCount =
     addedMemberships.length +
     removedMemberships.length +
     addedMappings.length +
     removedMappings.length;
   const scopeResourceCount = addedScopeResources.length + removedScopeResources.length;
-  const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount;
+  const objectCount = objectChanges.length;
+  const pendingCount = added.length + removed.length + semanticCount + identityCount + scopeResourceCount + objectCount;
   const blocking = validation?.blocking_errors || [];
   const warnings = validation?.warnings || [];
   const dbIssues = databaseConnections.issues || [];
@@ -2055,6 +2158,7 @@ function renderReviewApply() {
     ),
     ...addedScopeResources.map((change) => scopeResourceChangeRow("Add", change)),
     ...removedScopeResources.map((change) => scopeResourceChangeRow("Remove", change)),
+    ...objectChanges.map((change) => accountRoleChangeRow(change)),
     ...semanticAdded.map((grant) =>
       semanticGrantRow("Grant", grant, highRiskKeys.has(grantKey(grant))),
     ),
@@ -2202,6 +2306,75 @@ function mcpDatabaseDryRunRequestForPackage(pkg) {
     table,
     action,
   };
+}
+
+function accountRoleChanges(changes) {
+  return [
+    ...(changes.added_accounts || []).map((change) => ({
+      ...change,
+      type: "account",
+      action: "Add",
+      label: "Account added",
+      detail: `${change.account_id} / ${change.name}`,
+    })),
+    ...(changes.removed_accounts || []).map((change) => ({
+      ...change,
+      type: "account",
+      action: "Remove",
+      label: "Account removed",
+      detail: `${change.account_id} / ${change.name}`,
+    })),
+    ...(changes.updated_accounts || []).map((change) => ({
+      ...change,
+      type: "account",
+      action: "Update",
+      label: "Account updated",
+      detail: `${change.account_id} / ${change.name}`,
+    })),
+    ...(changes.added_roles || []).map((change) => ({
+      ...change,
+      type: "role",
+      action: "Add",
+      label: "Role added",
+      detail: change.role_arn,
+    })),
+    ...(changes.removed_roles || []).map((change) => ({
+      ...change,
+      type: "role",
+      action: "Remove",
+      label: "Role removed",
+      detail: change.role_arn,
+    })),
+    ...(changes.updated_roles || []).map((change) => ({
+      ...change,
+      type: "role",
+      action: "Update",
+      label: "Role updated",
+      detail: change.role_arn,
+    })),
+  ];
+}
+
+function accountRoleChangeRow(change) {
+  const row = document.createElement("tr");
+  [
+    change.action,
+    `${change.type}:${change.id}`,
+    change.type === "account" ? "account target" : "role target",
+    change.label,
+    change.detail,
+  ].forEach((cellValue, index) => {
+    const cell = document.createElement("td");
+    cell.textContent = cellValue;
+    if (index === 0) {
+      cell.className = change.action === "Remove" ? "remove" : "add";
+    }
+    if (index === 4) {
+      cell.classList.add("grant-detail");
+    }
+    row.append(cell);
+  });
+  return row;
 }
 
 function changeRow(type, change) {
@@ -2533,6 +2706,65 @@ document.addEventListener("click", (event) => {
     button.dataset.scopeResourceValue || "",
     false,
   );
+});
+
+async function saveAccountRoleDraft(enabled) {
+  const isRole = state.accountRoleSelection === "role";
+  const idInput = document.getElementById("account-role-edit-id");
+  const primaryInput = document.getElementById("account-role-edit-primary");
+  const secondaryInput = document.getElementById("account-role-edit-secondary");
+  const id = idInput instanceof HTMLInputElement ? idInput.value.trim() : "";
+  const primary = primaryInput instanceof HTMLInputElement ? primaryInput.value.trim() : "";
+  const secondary = secondaryInput instanceof HTMLInputElement ? secondaryInput.value.trim() : "";
+  if (!id) {
+    setValidationStatus(
+      isRole ? "Role update unavailable" : "Account update unavailable",
+      isRole ? "role id is required" : "account id is required",
+      false,
+    );
+    return;
+  }
+  try {
+    const payload = isRole
+      ? await updateDraftRole(id, primary, enabled)
+      : await updateDraftAccount(id, primary, secondary, enabled);
+    state.accountRoleSelection = isRole ? "role" : "account";
+    state.selectedRole = isRole ? id : state.selectedRole;
+    state.selectedAccount = isRole ? state.selectedAccount : id;
+    state.validation = null;
+    state.preview = null;
+    state.explain = null;
+    state.dryRun = null;
+    applyServerState(payload);
+    setActiveView("accounts-roles");
+    setValidationStatus(
+      enabled ? "Draft target saved" : "Draft target removed",
+      `${isRole ? "role" : "account"} ${id} ${enabled ? "is staged" : "was removed from draft"}`,
+      enabled,
+    );
+  } catch (error) {
+    setValidationStatus("Draft target update failed", error.message, false);
+  }
+}
+
+document.getElementById("account-role-save-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await saveAccountRoleDraft(true);
+  } finally {
+    renderAccountRoleInspector(state.draft?.accounts || [], state.draft?.roles || []);
+  }
+});
+
+document.getElementById("account-role-delete-button")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await saveAccountRoleDraft(false);
+  } finally {
+    renderAccountRoleInspector(state.draft?.accounts || [], state.draft?.roles || []);
+  }
 });
 
 async function updateIdentityWiring(kind, value, enabled) {

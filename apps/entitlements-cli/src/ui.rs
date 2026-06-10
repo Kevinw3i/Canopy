@@ -22,7 +22,8 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
 use crate::catalog::{
-    self, Catalog, CatalogBinding, CatalogMembership, CatalogPackage, CatalogScope,
+    self, Catalog, CatalogAccount, CatalogBinding, CatalogMembership, CatalogPackage, CatalogRole,
+    CatalogScope,
 };
 use entitlements::GroupMapping;
 
@@ -118,6 +119,8 @@ fn router(state: UiAppState) -> Router {
         .route("/api/dry-run", post(post_dry_run))
         .route("/api/validate", post(post_validate))
         .route("/api/import-runtime", post(post_import_runtime))
+        .route("/api/draft/accounts", put(put_draft_account))
+        .route("/api/draft/roles", put(put_draft_role))
         .route("/api/draft/bindings", put(put_draft_binding))
         .route("/api/draft/memberships", put(put_draft_membership))
         .route("/api/draft/group-mappings", put(put_draft_group_mapping))
@@ -221,6 +224,23 @@ struct DraftMembershipRequest {
 struct DraftGroupMappingRequest {
     group: String,
     external_group: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftAccountRequest {
+    id: String,
+    account_id: String,
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftRoleRequest {
+    id: String,
+    role_arn: String,
     enabled: bool,
 }
 
@@ -597,9 +617,28 @@ struct UiPendingChanges {
     removed_group_mappings: Vec<UiGroupMappingChange>,
     added_scope_resources: Vec<UiScopeResourceChange>,
     removed_scope_resources: Vec<UiScopeResourceChange>,
+    added_accounts: Vec<UiAccountChange>,
+    removed_accounts: Vec<UiAccountChange>,
+    updated_accounts: Vec<UiAccountChange>,
+    added_roles: Vec<UiRoleChange>,
+    removed_roles: Vec<UiRoleChange>,
+    updated_roles: Vec<UiRoleChange>,
     high_risk_added: usize,
     high_risk_removed: usize,
     semantic_diff: UiSemanticDiff,
+}
+
+#[derive(Debug, Serialize)]
+struct UiAccountChange {
+    id: String,
+    account_id: String,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UiRoleChange {
+    id: String,
+    role_arn: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1102,6 +1141,70 @@ async fn post_import_runtime(
     }
 }
 
+async fn put_draft_account(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftAccountRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_account_request",
+                "draft account request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_account(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
+async fn put_draft_role(
+    State(state): State<UiAppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    let request = match serde_json::from_slice::<DraftRoleRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "malformed_draft_role_request",
+                "draft role request must be valid JSON",
+            );
+        }
+    };
+
+    match state.update_role(request) {
+        Ok(()) => json_response(StatusCode::OK, &state.sanitized_state()),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn not_found() -> impl IntoResponse {
     let mut response = static_response("text/plain; charset=utf-8", "not found\n");
     *response.status_mut() = StatusCode::NOT_FOUND;
@@ -1225,6 +1328,22 @@ impl UiAppState {
             .lock()
             .expect("draft mutex should not be poisoned");
         draft.update_group_mapping(request)
+    }
+
+    fn update_account(&self, request: DraftAccountRequest) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_account(request)
+    }
+
+    fn update_role(&self, request: DraftRoleRequest) -> Result<(), UiMutationError> {
+        let mut draft = self
+            .draft
+            .lock()
+            .expect("draft mutex should not be poisoned");
+        draft.update_role(request)
     }
 
     fn update_scope_resource(
@@ -1579,6 +1698,133 @@ impl DraftState {
                 true
             }
             _ => false,
+        };
+
+        if changed {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    fn update_account(&mut self, request: DraftAccountRequest) -> Result<(), UiMutationError> {
+        let id = request.id.trim();
+        let account_id = request.account_id.trim();
+        let name = request.name.trim();
+        if id.is_empty() || (request.enabled && (account_id.is_empty() || name.is_empty())) {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_account_id",
+                "account id, account_id, and name are required when saving an account",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let existing = draft.accounts.iter().position(|account| account.id == id);
+        let changed = if request.enabled {
+            if draft
+                .accounts
+                .iter()
+                .any(|account| account.id != id && account.account_id == account_id)
+            {
+                return Err(UiMutationError::bad_request(
+                    "duplicate_account_id",
+                    format!("account_id '{account_id}' is already used by another account"),
+                ));
+            }
+
+            let next = CatalogAccount {
+                id: id.to_owned(),
+                account_id: account_id.to_owned(),
+                name: name.to_owned(),
+            };
+            match existing {
+                Some(index) if draft.accounts[index] == next => false,
+                Some(index) => {
+                    draft.accounts[index] = next;
+                    true
+                }
+                None => {
+                    draft.accounts.push(next);
+                    true
+                }
+            }
+        } else if let Some(index) = existing {
+            if draft
+                .scopes
+                .iter()
+                .any(|scope| scope.accounts.iter().any(|account| account == id))
+            {
+                return Err(UiMutationError::bad_request(
+                    "account_in_use",
+                    format!("account '{id}' is still referenced by at least one scope"),
+                ));
+            }
+            draft.accounts.remove(index);
+            true
+        } else {
+            false
+        };
+
+        if changed {
+            self.mark_changed();
+        }
+        Ok(())
+    }
+
+    fn update_role(&mut self, request: DraftRoleRequest) -> Result<(), UiMutationError> {
+        let id = request.id.trim();
+        let role_arn = request.role_arn.trim();
+        if id.is_empty() || (request.enabled && role_arn.is_empty()) {
+            return Err(UiMutationError::bad_request(
+                "empty_draft_role_id",
+                "role id and role_arn are required when saving a role",
+            ));
+        }
+
+        let Some(draft) = self.draft.as_mut() else {
+            return Err(UiMutationError::conflict(
+                "draft_unavailable",
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| "catalog draft is unavailable".to_owned()),
+            ));
+        };
+
+        let existing = draft.roles.iter().position(|role| role.id == id);
+        let changed = if request.enabled {
+            let next = CatalogRole {
+                id: id.to_owned(),
+                role_arn: role_arn.to_owned(),
+            };
+            match existing {
+                Some(index) if draft.roles[index] == next => false,
+                Some(index) => {
+                    draft.roles[index] = next;
+                    true
+                }
+                None => {
+                    draft.roles.push(next);
+                    true
+                }
+            }
+        } else if let Some(index) = existing {
+            if draft.packages.iter().any(|package| package.role == id) {
+                return Err(UiMutationError::bad_request(
+                    "role_in_use",
+                    format!("role '{id}' is still referenced by at least one package"),
+                ));
+            }
+            draft.roles.remove(index);
+            true
+        } else {
+            false
         };
 
         if changed {
@@ -3039,6 +3285,12 @@ impl UiPendingChanges {
             removed_group_mappings: Vec::new(),
             added_scope_resources: Vec::new(),
             removed_scope_resources: Vec::new(),
+            added_accounts: Vec::new(),
+            removed_accounts: Vec::new(),
+            updated_accounts: Vec::new(),
+            added_roles: Vec::new(),
+            removed_roles: Vec::new(),
+            updated_roles: Vec::new(),
             high_risk_added: 0,
             high_risk_removed: 0,
             semantic_diff: UiSemanticDiff::empty(),
@@ -3564,6 +3816,10 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
     let draft_group_mappings = group_mapping_set(draft);
     let baseline_scope_resources = scope_resource_set(baseline);
     let draft_scope_resources = scope_resource_set(draft);
+    let baseline_accounts = account_map(baseline);
+    let draft_accounts = account_map(draft);
+    let baseline_roles = role_map(baseline);
+    let draft_roles = role_map(draft);
     let draft_packages = package_index(draft);
     let baseline_packages = package_index(baseline);
     let added_bindings = draft_bindings
@@ -3618,6 +3874,44 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
             value: value.clone(),
         })
         .collect::<Vec<_>>();
+    let added_accounts = draft_accounts
+        .iter()
+        .filter(|(id, _)| !baseline_accounts.contains_key(*id))
+        .map(|(_, account)| account_change(account))
+        .collect::<Vec<_>>();
+    let removed_accounts = baseline_accounts
+        .iter()
+        .filter(|(id, _)| !draft_accounts.contains_key(*id))
+        .map(|(_, account)| account_change(account))
+        .collect::<Vec<_>>();
+    let updated_accounts = draft_accounts
+        .iter()
+        .filter(|(id, account)| {
+            baseline_accounts
+                .get(*id)
+                .is_some_and(|baseline_account| baseline_account != *account)
+        })
+        .map(|(_, account)| account_change(account))
+        .collect::<Vec<_>>();
+    let added_roles = draft_roles
+        .iter()
+        .filter(|(id, _)| !baseline_roles.contains_key(*id))
+        .map(|(_, role)| role_change(role))
+        .collect::<Vec<_>>();
+    let removed_roles = baseline_roles
+        .iter()
+        .filter(|(id, _)| !draft_roles.contains_key(*id))
+        .map(|(_, role)| role_change(role))
+        .collect::<Vec<_>>();
+    let updated_roles = draft_roles
+        .iter()
+        .filter(|(id, role)| {
+            baseline_roles
+                .get(*id)
+                .is_some_and(|baseline_role| baseline_role != *role)
+        })
+        .map(|(_, role)| role_change(role))
+        .collect::<Vec<_>>();
     let high_risk_added = added_bindings
         .iter()
         .filter(|change| change.high_risk)
@@ -3636,6 +3930,12 @@ fn pending_changes(baseline: &Catalog, draft: &Catalog) -> UiPendingChanges {
         removed_group_mappings,
         added_scope_resources,
         removed_scope_resources,
+        added_accounts,
+        removed_accounts,
+        updated_accounts,
+        added_roles,
+        removed_roles,
+        updated_roles,
         high_risk_added,
         high_risk_removed,
         semantic_diff,
@@ -3660,6 +3960,37 @@ fn package_index(catalog: &Catalog) -> BTreeMap<&str, &CatalogPackage> {
         .iter()
         .map(|package| (package.id.as_str(), package))
         .collect()
+}
+
+fn account_map(catalog: &Catalog) -> BTreeMap<String, CatalogAccount> {
+    catalog
+        .accounts
+        .iter()
+        .map(|account| (account.id.clone(), account.clone()))
+        .collect()
+}
+
+fn role_map(catalog: &Catalog) -> BTreeMap<String, CatalogRole> {
+    catalog
+        .roles
+        .iter()
+        .map(|role| (role.id.clone(), role.clone()))
+        .collect()
+}
+
+fn account_change(account: &CatalogAccount) -> UiAccountChange {
+    UiAccountChange {
+        id: account.id.clone(),
+        account_id: account.account_id.clone(),
+        name: account.name.clone(),
+    }
+}
+
+fn role_change(role: &CatalogRole) -> UiRoleChange {
+    UiRoleChange {
+        id: role.id.clone(),
+        role_arn: role.role_arn.clone(),
+    }
 }
 
 fn scope_resource_set(catalog: &Catalog) -> BTreeSet<(String, String, String)> {
@@ -4226,13 +4557,20 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"data-view="accounts-roles""#));
         assert!(INDEX_HTML.contains(r#"class="accounts-roles-view""#));
         assert!(INDEX_HTML.contains(r#"id="account-role-detail-list""#));
+        assert!(INDEX_HTML.contains(r#"id="account-role-save-button""#));
+        assert!(INDEX_HTML.contains(r#"id="account-role-edit-primary""#));
 
         assert!(APP_JS.contains("function renderAccountsRoles("));
         assert!(APP_JS.contains("function renderAccountRoleInspector("));
+        assert!(APP_JS.contains("function updateDraftAccount("));
+        assert!(APP_JS.contains("function updateDraftRole("));
         assert!(APP_JS.contains("accountRoleDetailBlock"));
+        assert!(APP_JS.contains("/api/draft/accounts"));
+        assert!(APP_JS.contains("/api/draft/roles"));
 
         assert!(APP_CSS.contains(".workspace.account-role-mode"));
         assert!(APP_CSS.contains(".account-role-table"));
+        assert!(APP_CSS.contains(".account-role-editor"));
         assert!(APP_CSS.contains(".account-role-detail-block"));
     }
 
@@ -4913,6 +5251,204 @@ private_target_ref = "service:app-api"
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], "unknown_package");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_account_update_adds_account_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("account-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/accounts")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"qa","account_id":"222","name":"qa","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert!(state["draft"]["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|account| account["id"] == "qa"
+                && account["account_id"] == "222"
+                && account["name"] == "qa"));
+        assert!(state["changes"]["added_accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["id"] == "qa" && change["account_id"] == "222"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_account_update_rejects_removing_referenced_account() {
+        let (catalog_path, _content) = write_catalog_fixture("account-remove-referenced");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/accounts")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"prod","account_id":"","name":"","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "account_in_use");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_account_update_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("account-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/accounts")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"qa","account_id":"222","name":"qa","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_role_update_updates_role_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("role-update");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/roles")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"readonly","role_arn":"role/{account_id}/readonly-v2","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        assert!(state["draft"]["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|role| role["id"] == "readonly"
+                && role["role_arn"] == "role/{account_id}/readonly-v2"));
+        assert!(state["changes"]["updated_roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["id"] == "readonly"
+                && change["role_arn"] == "role/{account_id}/readonly-v2"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_role_update_rejects_removing_referenced_role() {
+        let (catalog_path, _content) = write_catalog_fixture("role-remove-referenced");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/roles")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"readonly","role_arn":"","enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "role_in_use");
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_role_update_requires_session_cookie() {
+        let (catalog_path, _content) = write_catalog_fixture("role-session");
+        let response = router(test_state_with_catalog(catalog_path.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/roles")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"id":"readonly","role_arn":"role/{account_id}/readonly-v2","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let _ = std::fs::remove_file(catalog_path);
     }
 
