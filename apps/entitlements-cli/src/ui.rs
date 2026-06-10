@@ -123,6 +123,7 @@ fn router(state: UiAppState) -> Router {
         .route("/api/explain", post(post_explain))
         .route("/api/dry-run", post(post_dry_run))
         .route("/api/validate", post(post_validate))
+        .route("/api/apply", post(post_apply))
         .route("/api/import-runtime", post(post_import_runtime))
         .route("/api/draft/accounts", put(put_draft_account))
         .route("/api/draft/roles", put(put_draft_role))
@@ -479,6 +480,38 @@ struct UiValidateDatabaseConnections {
     required: Vec<String>,
     local_config: Vec<String>,
     deployment_source: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyOutput {
+    status: &'static str,
+    command: &'static str,
+    applied: bool,
+    revision: u64,
+    gate: UiApplyGate,
+    transaction: UiApplyTransactionStatus,
+    validation: UiValidateOutput,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyGate {
+    state: &'static str,
+    reason_code: &'static str,
+    message: String,
+    identity_source: String,
+    admin_group: String,
+    dev_identity_allowed: bool,
+    can_apply: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyTransactionStatus {
+    state: &'static str,
+    catalog_path: String,
+    runtime_path: String,
+    db_config_path: Option<String>,
+    lock_path: Option<String>,
+    manifest_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1297,6 +1330,23 @@ async fn post_validate(State(state): State<UiAppState>, headers: HeaderMap) -> R
     }
 }
 
+async fn post_apply(State(state): State<UiAppState>, headers: HeaderMap) -> Response<Body> {
+    if let Err(err) = validate_local_host(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_local_origin(&headers) {
+        return err.into_response();
+    }
+    if let Err(err) = validate_session_headers(&state, &headers) {
+        return err.into_response();
+    }
+
+    match state.apply_draft() {
+        Ok((status, output)) => json_response(status, &output),
+        Err(err) => error_response(err.status, err.code, err.message),
+    }
+}
+
 async fn post_import_runtime(
     State(state): State<UiAppState>,
     headers: HeaderMap,
@@ -1670,6 +1720,32 @@ impl UiAppState {
             revision,
             &database_connections,
         ))
+    }
+
+    fn apply_draft(&self) -> Result<(StatusCode, UiApplyOutput), UiMutationError> {
+        let validation = self.validate_draft()?;
+        let (status, apply_status, gate) = apply_gate_status(self.args.as_ref(), &validation);
+        let output = UiApplyOutput {
+            status: apply_status,
+            command: "apply",
+            applied: false,
+            revision: validation.revision,
+            transaction: UiApplyTransactionStatus {
+                state: "not_started",
+                catalog_path: self.args.catalog.display().to_string(),
+                runtime_path: self.args.runtime.display().to_string(),
+                db_config_path: self
+                    .args
+                    .db_config
+                    .as_deref()
+                    .map(|path| path.display().to_string()),
+                lock_path: None,
+                manifest_path: None,
+            },
+            gate,
+            validation,
+        };
+        Ok((status, output))
     }
 
     fn import_runtime_draft(&self) -> Result<(), UiMutationError> {
@@ -3699,6 +3775,45 @@ fn validate_draft_catalog(
     }
 }
 
+fn apply_gate_status(
+    args: &UiArgs,
+    validation: &UiValidateOutput,
+) -> (StatusCode, &'static str, UiApplyGate) {
+    let admin_group = if args.allow_dev_identity {
+        args.dev_admin_group.clone()
+    } else {
+        "admin".to_owned()
+    };
+    let mut gate = UiApplyGate {
+        state: "locked",
+        reason_code: "apply_locked",
+        message: String::new(),
+        identity_source: args.identity_source.clone(),
+        admin_group,
+        dev_identity_allowed: args.allow_dev_identity,
+        can_apply: false,
+    };
+
+    if !validation.valid {
+        gate.state = "validation_blocked";
+        gate.reason_code = "validation_blocked";
+        gate.message =
+            "Apply requires a clean validation result; fix blocking validation issues first."
+                .to_owned();
+        return (StatusCode::CONFLICT, "blocked", gate);
+    }
+
+    if args.identity_source == "dev-claims" || args.allow_dev_identity {
+        gate.reason_code = "dev_identity_apply_disabled";
+        gate.message = "Development identity claims can preview, validate, explain, and dry-run drafts, but cannot apply true catalog or runtime files.".to_owned();
+        return (StatusCode::FORBIDDEN, "locked", gate);
+    }
+
+    gate.reason_code = "apply_transaction_unavailable";
+    gate.message = "Apply remains locked until canonical operator authorization and the catalog/runtime transaction protocol are enabled.".to_owned();
+    (StatusCode::FORBIDDEN, "locked", gate)
+}
+
 fn validate_deployment_source(
     args: &UiArgs,
     required: &[String],
@@ -5473,6 +5588,17 @@ skip_tls_hostname_verification = true
         "canopy_ui_session=session-token"
     }
 
+    fn embedded_js_function(name: &str) -> &'static str {
+        let start = APP_JS.find(name).expect("embedded function should exist");
+        let rest = &APP_JS[start..];
+        let end = rest[1..]
+            .find("\nfunction ")
+            .or_else(|| rest[1..].find("\nasync function "))
+            .map(|offset| offset + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     fn install_session(state: &UiAppState) {
         state.store_session("session-token".to_owned());
     }
@@ -5519,16 +5645,43 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"data-view="review-apply""#));
         assert!(INDEX_HTML.contains(r#"class="review-apply-view""#));
         assert!(INDEX_HTML.contains(r#"id="review-validate-button""#));
+        assert!(INDEX_HTML.contains(r#"id="review-apply-button""#));
+        assert!(INDEX_HTML.contains(r#"id="apply-button""#));
         assert!(INDEX_HTML.contains(r#"id="review-change-rows""#));
 
         assert!(APP_JS.contains("function renderReviewApply()"));
         assert!(APP_JS.contains("function runValidation(button)"));
+        assert!(APP_JS.contains("function runApply(button)"));
+        assert!(APP_JS.contains("async function applyDraft()"));
         assert!(APP_JS.contains("review-validate-button"));
+        assert!(APP_JS.contains("review-apply-button"));
 
         assert!(APP_CSS.contains(".workspace.review-mode"));
         assert!(APP_CSS.contains(".workspace.review-mode .review-strip"));
         assert!(APP_CSS.contains(".review-change-table"));
         assert!(APP_CSS.contains(".review-apply-view"));
+        assert!(APP_CSS.contains(".apply-locked"));
+    }
+
+    #[test]
+    fn embedded_review_apply_js_keeps_apply_state_scoped_to_each_view() {
+        let overview = embedded_js_function("function renderOverview()");
+        let review = embedded_js_function("function renderReviewApply()");
+
+        assert_eq!(overview.matches("const apply = state.apply;").count(), 1);
+        assert_eq!(
+            overview
+                .matches("const applyGate = apply?.gate || null;")
+                .count(),
+            0
+        );
+        assert_eq!(review.matches("const apply = state.apply;").count(), 1);
+        assert_eq!(
+            review
+                .matches("const applyGate = apply?.gate || null;")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -8119,6 +8272,156 @@ package = "mcp-ec2-diagnostics"
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn apply_requires_session_cookie() {
+        let (catalog_path, _content) = write_catalog_fixture("apply-session");
+        let state = test_state_with_catalog(catalog_path.clone());
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn apply_requires_local_origin() {
+        let (catalog_path, _content) = write_catalog_fixture("apply-origin");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_invalid_validation_without_writing_files() {
+        let (catalog_path, original_catalog) = write_catalog_fixture("apply-invalid-catalog");
+        let runtime_path = catalog_fixture_path("apply-invalid-runtime");
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = None;
+        args.deployment_mode = None;
+        args.deployment_config = None;
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["command"], "apply");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["status"], "blocked");
+        assert_eq!(apply["gate"]["reason_code"], "validation_blocked");
+        assert_eq!(apply["validation"]["valid"], false);
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert!(!runtime_path.exists());
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_dev_identity_without_writing_catalog_or_runtime() {
+        let (catalog_path, catalog_content) = write_catalog_fixture("apply-dev-catalog");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-dev-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-dev-db");
+        let deployment_config_path = write_database_config_fixture("apply-dev-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.allow_dev_identity = true;
+        args.identity_source = "dev-claims".to_owned();
+        args.dev_operator_external_groups = vec!["canopy-admin".to_owned()];
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["command"], "apply");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["status"], "locked");
+        assert_eq!(apply["gate"]["reason_code"], "dev_identity_apply_disabled");
+        assert_eq!(apply["gate"]["can_apply"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["transaction"]["state"], "not_started");
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
     }
 
     #[tokio::test]

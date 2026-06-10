@@ -19,6 +19,7 @@ const state = {
   changes: null,
   databaseConnections: null,
   validation: null,
+  apply: null,
   preview: null,
   explain: null,
   dryRun: null,
@@ -300,6 +301,20 @@ async function validateDraft() {
   return response.json();
 }
 
+async function applyDraft() {
+  const response = await fetch("/api/apply", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok && !payload?.gate) {
+    throw new Error(payload?.error?.message || "draft apply failed");
+  }
+  return payload;
+}
+
 async function importRuntimeDraft() {
   const response = await fetch("/api/import-runtime", {
     method: "POST",
@@ -327,7 +342,6 @@ function applyServerState(payload) {
   const changes = payload.changes || {};
   const pendingCount = pendingChangeCount(changes);
   const environment = document.querySelector(".env-picker select");
-  const applyButton = document.querySelector(".review-actions button[disabled]");
   const validateButton = document.getElementById("validate-button");
   const reviewValidateButton = document.getElementById("review-validate-button");
   const previewButton = document.getElementById("preview-button");
@@ -348,6 +362,9 @@ function applyServerState(payload) {
   }
   if (state.validation && state.validation.revision !== draft.revision) {
     state.validation = null;
+  }
+  if (state.apply && state.apply.revision !== draft.revision) {
+    state.apply = null;
   }
   if (state.explain && state.explain.revision !== draft.revision) {
     state.explain = null;
@@ -404,9 +421,7 @@ function applyServerState(payload) {
       false,
     );
   }
-  if (applyButton) {
-    applyButton.textContent = payload.capabilities?.apply ? "▢ Apply" : "▢ Apply (locked)";
-  }
+  syncApplyButtons();
   if (validateButton) {
     validateButton.disabled = !payload.capabilities?.validate;
   }
@@ -2372,6 +2387,7 @@ function renderOverview() {
   const draft = state.draft || {};
   const changes = state.changes || {};
   const validation = state.validation;
+  const apply = state.apply;
   const databaseConnections = state.databaseConnections || {};
   const groups = draft.groups || [];
   const packages = draft.packages || [];
@@ -2422,7 +2438,16 @@ function renderOverview() {
     "#overview-validation-state",
     validation ? (validation.valid ? "Validation clean" : "Validation blocked") : "Validation not run",
   );
-  setText("#overview-apply-state", server.capabilities?.apply ? "Apply ready" : "Apply locked");
+  setText(
+    "#overview-apply-state",
+    apply?.applied
+      ? "Apply complete"
+      : apply?.status === "blocked"
+        ? "Apply blocked"
+        : server.capabilities?.apply
+          ? "Apply ready"
+          : "Apply locked",
+  );
   setText("#overview-group-count", String(groups.length));
   setText("#overview-package-count", String(packages.length));
   setText("#overview-scope-count", String(scopes.length));
@@ -2552,6 +2577,8 @@ function renderReviewApply() {
   }
   const changes = state.changes || {};
   const validation = state.validation;
+  const apply = state.apply;
+  const applyGate = apply?.gate || null;
   const server = state.server || {};
   const databaseConnections = state.databaseConnections || {};
   const added = changes.added_bindings || [];
@@ -2588,7 +2615,9 @@ function renderReviewApply() {
 
   setText(
     "#review-apply-status",
-    validation
+    applyGate
+      ? `${apply.applied ? "Applied" : apply.status === "blocked" ? "Apply blocked" : "Apply locked"}: ${applyGate.message}`
+      : validation
       ? validation.valid
         ? "Validation is clean for the current draft."
         : "Validation found blocking issues before apply."
@@ -2598,7 +2627,13 @@ function renderReviewApply() {
   );
   setText(
     "#review-apply-gate",
-    server.capabilities?.apply ? "Ready" : "Locked",
+    applyGate
+      ? applyGate.state === "validation_blocked"
+        ? "Blocked"
+        : "Locked"
+      : server.capabilities?.apply
+        ? "Ready"
+        : "Locked",
   );
   setText(
     "#review-runtime-state",
@@ -2641,11 +2676,17 @@ function renderReviewApply() {
   );
   setText(
     "#review-admin-gate",
-    server.capabilities?.apply ? "Admin gate passed" : "Apply disabled",
+    applyGate
+      ? applyGate.reason_code
+      : server.capabilities?.apply
+        ? "Admin gate passed"
+        : "Apply disabled",
   );
   setText(
     "#review-admin-detail",
-    server.capabilities?.apply
+    applyGate
+      ? applyGate.message
+      : server.capabilities?.apply
       ? "Operator identity can apply this draft."
       : "Production apply gate and transaction protocol are not enabled yet.",
   );
@@ -2683,6 +2724,15 @@ function renderReviewApply() {
   }
 
   const issues = [
+    ...(applyGate && !apply.applied
+      ? [
+          {
+            severity: "blocking",
+            code: applyGate.reason_code,
+            message: applyGate.message,
+          },
+        ]
+      : []),
     ...blocking.map((issue) => ({ ...issue, severity: "blocking" })),
     ...warnings.map((issue) => ({ ...issue, severity: "warning" })),
     ...dbIssues.map((issue) => ({ ...issue, severity: "db" })),
@@ -2703,6 +2753,31 @@ function validationButtons() {
   return ["validate-button", "review-validate-button"]
     .map((id) => document.getElementById(id))
     .filter(Boolean);
+}
+
+function applyButtons() {
+  return ["apply-button", "review-apply-button"]
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+}
+
+function canCheckApply() {
+  return Boolean(state.draft?.loaded);
+}
+
+function syncApplyButtons() {
+  const apply = state.apply;
+  const locked = !state.server?.capabilities?.apply;
+  const label = apply?.applied
+    ? "▢ Applied"
+    : locked
+      ? "▢ Apply locked"
+      : "▢ Apply";
+  applyButtons().forEach((button) => {
+    button.disabled = !canCheckApply();
+    button.classList.toggle("apply-locked", locked || !apply?.applied);
+    button.textContent = label;
+  });
 }
 
 async function runValidation(button) {
@@ -2744,6 +2819,44 @@ async function runValidation(button) {
       item.disabled = !state.server?.capabilities?.validate;
     });
     button.textContent = originalLabel;
+  }
+}
+
+async function runApply(button) {
+  if (!canCheckApply()) {
+    setValidationStatus("Apply unavailable", "catalog draft is not loaded", false);
+    renderReviewApply();
+    renderOverview();
+    return;
+  }
+  applyButtons().forEach((item) => {
+    item.disabled = true;
+  });
+  button.textContent = "▢ Checking";
+  try {
+    const apply = await applyDraft();
+    apply.revision = state.draft?.revision ?? 0;
+    state.apply = apply;
+    if (apply.validation) {
+      apply.validation.revision = apply.revision;
+      state.validation = apply.validation;
+      renderValidateSummary(apply.validation);
+    }
+    renderReviewApply();
+    renderOverview();
+    const gate = apply.gate || {};
+    setValidationStatus(
+      apply.applied ? "Apply complete" : apply.status === "blocked" ? "Apply blocked" : "Apply locked",
+      gate.message || "Apply gate did not allow this draft",
+      apply.applied,
+    );
+  } catch (error) {
+    state.apply = null;
+    renderReviewApply();
+    renderOverview();
+    setValidationStatus("Apply failed", error.message, false);
+  } finally {
+    syncApplyButtons();
   }
 }
 
@@ -3677,6 +3790,14 @@ document.getElementById("validate-button")?.addEventListener("click", (event) =>
 
 document.getElementById("review-validate-button")?.addEventListener("click", (event) => {
   runValidation(event.currentTarget);
+});
+
+document.getElementById("apply-button")?.addEventListener("click", (event) => {
+  runApply(event.currentTarget);
+});
+
+document.getElementById("review-apply-button")?.addEventListener("click", (event) => {
+  runApply(event.currentTarget);
 });
 
 document.getElementById("preview-button")?.addEventListener("click", async (event) => {
