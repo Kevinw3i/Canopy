@@ -1213,6 +1213,10 @@ function renderScopeDatabaseEditor(scope) {
   if (saveButton) {
     saveButton.disabled = !canWrite;
   }
+  const deleteButton = document.getElementById("scope-db-delete-button");
+  if (deleteButton) {
+    deleteButton.disabled = !canWrite || !selected;
+  }
 }
 
 function optionElement(value, label) {
@@ -3009,14 +3013,20 @@ document.getElementById("scope-db-template")?.addEventListener("change", (event)
   renderScopeInspector(state.draft?.scopes || []);
 });
 
-document.getElementById("scope-db-save-button")?.addEventListener("click", async (event) => {
+async function saveDatabaseScopeDraft(enabled, button) {
   const scope = state.selectedScope;
   const request = databaseScopeDraftRequestFromForm();
+  request.enabled = enabled;
+  if (!enabled) {
+    request.max_rows = request.max_rows || 1;
+    request.statement_timeout_ms = request.statement_timeout_ms || 1;
+    request.max_examined_rows = request.max_examined_rows || 1;
+  }
   if (!scope || !request.name) {
     setValidationStatus("DB scope update unavailable", "select a scope and enter a DB scope name", false);
     return;
   }
-  if (
+  if (enabled && (
     !request.connection ||
     !request.environment ||
     !request.allowed_schemas.length ||
@@ -3025,7 +3035,7 @@ document.getElementById("scope-db-save-button")?.addEventListener("click", async
     !request.max_rows ||
     !request.statement_timeout_ms ||
     !request.max_examined_rows
-  ) {
+  )) {
     setValidationStatus(
       "DB scope update unavailable",
       "connection, environment, schemas, tables, actions, and positive limits are required",
@@ -3033,13 +3043,14 @@ document.getElementById("scope-db-save-button")?.addEventListener("click", async
     );
     return;
   }
-  const button = event.currentTarget;
-  const originalLabel = button.textContent;
-  button.disabled = true;
-  button.textContent = "Saving";
+  const originalLabel = button?.textContent;
+  if (button) {
+    button.disabled = true;
+    button.textContent = enabled ? "Saving" : "Removing";
+  }
   try {
     const payload = await updateDraftDatabaseScope(scope, request);
-    state.selectedDatabaseScopeName = request.name;
+    state.selectedDatabaseScopeName = enabled ? request.name : "";
     state.validation = null;
     state.preview = null;
     state.explain = null;
@@ -3047,16 +3058,26 @@ document.getElementById("scope-db-save-button")?.addEventListener("click", async
     applyServerState(payload);
     setActiveView("scopes");
     setValidationStatus(
-      "DB scope draft saved",
-      `${request.name} is staged for ${scope}`,
-      !(request.allow_full_table_scan || request.allow_views),
+      enabled ? "DB scope draft saved" : "DB scope draft removed",
+      `${request.name} ${enabled ? "is staged for" : "was removed from"} ${scope}`,
+      enabled ? !(request.allow_full_table_scan || request.allow_views) : true,
     );
   } catch (error) {
     setValidationStatus("DB scope update failed", error.message, false);
   } finally {
-    button.textContent = originalLabel;
+    if (button) {
+      button.textContent = originalLabel;
+    }
     renderScopeInspector(state.draft?.scopes || []);
   }
+}
+
+document.getElementById("scope-db-save-button")?.addEventListener("click", async (event) => {
+  await saveDatabaseScopeDraft(true, event.currentTarget);
+});
+
+document.getElementById("scope-db-delete-button")?.addEventListener("click", async (event) => {
+  await saveDatabaseScopeDraft(false, event.currentTarget);
 });
 
 document.addEventListener("click", (event) => {

@@ -1829,16 +1829,31 @@ textarea {
   width: auto;
 }
 
-#scope-db-save-button {
+.scope-db-actions {
+  display: grid;
+  grid-template-columns: 1fr 110px;
+  gap: 10px;
+}
+
+.scope-db-actions button {
   min-height: 40px;
-  border: 1px solid var(--green);
   border-radius: 6px;
-  background: var(--green);
-  color: #fff;
   font-weight: 760;
 }
 
-#scope-db-save-button:disabled {
+#scope-db-save-button {
+  border: 1px solid var(--green);
+  background: var(--green);
+  color: #fff;
+}
+
+#scope-db-delete-button {
+  border: 1px solid #c45c5c;
+  background: #fff;
+  color: #9f3030;
+}
+
+.scope-db-actions button:disabled {
   cursor: not-allowed;
   border-color: var(--line-strong);
   background: #dfe4e9;

@@ -5004,11 +5004,13 @@ skip_tls_hostname_verification = true
         assert!(INDEX_HTML.contains(r#"id="scope-resource-add-button""#));
         assert!(INDEX_HTML.contains(r#"id="scope-db-template""#));
         assert!(INDEX_HTML.contains(r#"id="scope-db-save-button""#));
+        assert!(INDEX_HTML.contains(r#"id="scope-db-delete-button""#));
 
         assert!(APP_JS.contains("function renderScopes("));
         assert!(APP_JS.contains("function renderScopeInspector("));
         assert!(APP_JS.contains("function updateDraftScopeResource("));
         assert!(APP_JS.contains("function updateDraftDatabaseScope("));
+        assert!(APP_JS.contains("function saveDatabaseScopeDraft("));
         assert!(APP_JS.contains("function renderScopeResourceEditor("));
         assert!(APP_JS.contains("function renderScopeDatabaseEditor("));
         assert!(APP_JS.contains("mcpEc2ScopeLine"));
@@ -5020,6 +5022,7 @@ skip_tls_hostname_verification = true
         assert!(APP_CSS.contains(".scope-resource-editor"));
         assert!(APP_CSS.contains(".scope-resource-list-row"));
         assert!(APP_CSS.contains(".scope-db-fieldset"));
+        assert!(APP_CSS.contains(".scope-db-actions"));
         assert!(APP_CSS.contains(".scope-detail-block"));
     }
 
@@ -6163,6 +6166,56 @@ private_target_ref = "service:app-api"
             .iter()
             .any(|grant| grant["kind"] == "database_scope_allow_views"
                 && grant["value"] == "customer_read|true"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_content
+        );
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_scope_update_removes_scope_without_writing_catalog() {
+        let (catalog_path, original_content) = write_catalog_fixture("database-scope-remove");
+        let state = test_state_with_catalog(catalog_path.clone());
+        install_session(&state);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/scopes/database")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"scope":"db-scope","name":"orders_read","connection":"","environment":"","allowed_schemas":[],"allowed_tables":[],"allowed_actions":[],"max_rows":0,"statement_timeout_ms":0,"require_explain":true,"max_examined_rows":0,"allow_full_table_scan":false,"allow_views":false,"enabled":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state["draft"]["dirty"], true);
+        assert_eq!(state["draft"]["revision"], 1);
+        let scope = state["draft"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["id"] == "db-scope")
+            .unwrap();
+        assert!(!scope["database_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|database_scope| database_scope["name"] == "orders_read"));
+        assert!(state["changes"]["semantic_diff"]["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|grant| grant["kind"] == "database_scope" && grant["value"] == "orders_read"));
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_content
