@@ -258,8 +258,11 @@ impl ApplyBaselineSnapshot {
         }
         let (lock_path, manifest_path) = transaction_artifact_paths(&args.catalog);
         let (lock_exists, lock_error) = transaction_lock_status(&lock_path);
+        let (manifest_exists, manifest_error) = transaction_artifact_status(&manifest_path);
         let state = if lock_exists || lock_error.is_some() {
             "lock_blocked"
+        } else if manifest_exists || manifest_error.is_some() {
+            "manifest_blocked"
         } else if baseline_mismatches.is_empty() {
             "not_started"
         } else {
@@ -277,6 +280,8 @@ impl ApplyBaselineSnapshot {
             manifest_path: Some(manifest_path.display().to_string()),
             lock_exists,
             lock_error,
+            manifest_exists,
+            manifest_error,
             baseline,
             baseline_mismatches,
         }
@@ -666,6 +671,8 @@ struct UiApplyTransactionStatus {
     manifest_path: Option<String>,
     lock_exists: bool,
     lock_error: Option<String>,
+    manifest_exists: bool,
+    manifest_error: Option<String>,
     baseline: Vec<UiApplyBaselineDigest>,
     baseline_mismatches: Vec<UiApplyBaselineMismatch>,
 }
@@ -4055,6 +4062,26 @@ fn apply_gate_status(
         return (StatusCode::CONFLICT, "blocked", gate);
     }
 
+    if transaction.manifest_exists {
+        gate.state = "transaction_blocked";
+        gate.reason_code = "transaction_manifest_exists";
+        gate.message = format!(
+            "Apply found transaction manifest '{}' from an incomplete transaction; recover or remove it before retrying.",
+            transaction.manifest_path.as_deref().unwrap_or("unknown")
+        );
+        return (StatusCode::CONFLICT, "blocked", gate);
+    }
+
+    if let Some(manifest_error) = transaction.manifest_error.as_deref() {
+        gate.state = "transaction_blocked";
+        gate.reason_code = "transaction_manifest_unavailable";
+        gate.message = format!(
+            "Apply could not inspect transaction manifest '{}': {manifest_error}.",
+            transaction.manifest_path.as_deref().unwrap_or("unknown")
+        );
+        return (StatusCode::CONFLICT, "blocked", gate);
+    }
+
     if !transaction.baseline_mismatches.is_empty() {
         gate.state = "transaction_blocked";
         gate.reason_code = "baseline_digest_mismatch";
@@ -4534,7 +4561,11 @@ fn transaction_artifact_paths(catalog_path: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn transaction_lock_status(lock_path: &Path) -> (bool, Option<String>) {
-    match fs::symlink_metadata(lock_path) {
+    transaction_artifact_status(lock_path)
+}
+
+fn transaction_artifact_status(path: &Path) -> (bool, Option<String>) {
+    match fs::symlink_metadata(path) {
         Ok(_) => (true, None),
         Err(err) if err.kind() == io::ErrorKind::NotFound => (false, None),
         Err(err) => (false, Some(err.kind().to_string())),
@@ -8949,6 +8980,7 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(apply["validation"]["valid"], true);
         assert_eq!(apply["transaction"]["state"], "not_started");
         assert_eq!(apply["transaction"]["lock_exists"], false);
+        assert_eq!(apply["transaction"]["manifest_exists"], false);
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
@@ -9032,6 +9064,77 @@ package = "mcp-ec2-diagnostics"
             original_db_config
         );
         let _ = std::fs::remove_file(lock_path);
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_existing_transaction_manifest_without_writing_files() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-manifest-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-manifest-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-manifest-db");
+        let deployment_config_path = write_database_config_fixture("apply-manifest-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let (_lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "os-allowlist".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        std::fs::write(&manifest_path, r#"{"state":"incomplete"}"#).unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["status"], "blocked");
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["gate"]["state"], "transaction_blocked");
+        assert_eq!(apply["gate"]["reason_code"], "transaction_manifest_exists");
+        assert_eq!(apply["transaction"]["state"], "manifest_blocked");
+        assert_eq!(apply["transaction"]["manifest_exists"], true);
+        assert_eq!(
+            apply["transaction"]["manifest_path"],
+            manifest_path.display().to_string()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(manifest_path);
         let _ = std::fs::remove_file(catalog_path);
         let _ = std::fs::remove_file(runtime_path);
         let _ = std::fs::remove_file(db_config_path);
