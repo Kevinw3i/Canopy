@@ -304,6 +304,7 @@ impl ApplyBaselineSnapshot {
             manifest_error,
             baseline,
             baseline_mismatches,
+            payload: None,
         }
     }
 }
@@ -696,6 +697,7 @@ struct UiApplyTransactionStatus {
     manifest_error: Option<String>,
     baseline: Vec<UiApplyBaselineDigest>,
     baseline_mismatches: Vec<UiApplyBaselineMismatch>,
+    payload: Option<UiApplyPayloadStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -718,6 +720,19 @@ struct UiApplyBaselineMismatch {
     message: String,
     startup_sha256: Option<String>,
     current_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyPayloadStatus {
+    artifacts: Vec<UiApplyPayloadArtifactStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiApplyPayloadArtifactStatus {
+    artifact: &'static str,
+    path: String,
+    bytes: usize,
+    sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1929,19 +1944,50 @@ impl UiAppState {
     }
 
     fn apply_draft(&self) -> Result<(StatusCode, UiApplyOutput), UiMutationError> {
-        let validation = self.validate_draft()?;
+        let (draft, revision) = {
+            let draft = self
+                .draft
+                .lock()
+                .expect("draft mutex should not be poisoned");
+            draft.clone_draft()?
+        };
+        let database_connections = self
+            .database_connections
+            .lock()
+            .expect("database connection draft mutex should not be poisoned")
+            .snapshot();
+        let mut validation =
+            validate_draft_catalog(self.args.as_ref(), &draft, revision, &database_connections);
         let baseline = self
             .draft
             .lock()
             .expect("draft mutex should not be poisoned")
             .clone_baseline();
-        let transaction = self.apply_baseline.transaction_status(self.args.as_ref());
-        let (status, apply_status, gate) = apply_gate_status(
+        let mut transaction = self.apply_baseline.transaction_status(self.args.as_ref());
+        let (mut status, mut apply_status, mut gate) = apply_gate_status(
             self.args.as_ref(),
             &validation,
             baseline.as_ref(),
             &transaction,
         );
+        if gate.state == "admin_ready" && gate.reason_code == "apply_transaction_unavailable" {
+            match prepare_apply_write_payload(self.args.as_ref(), &draft, &database_connections) {
+                Ok(payload) => {
+                    transaction.payload = Some(payload.status());
+                }
+                Err(issue) => {
+                    validation.status = "invalid";
+                    validation.valid = false;
+                    validation.blocking_errors.push(issue);
+                    (status, apply_status, gate) = apply_gate_status(
+                        self.args.as_ref(),
+                        &validation,
+                        baseline.as_ref(),
+                        &transaction,
+                    );
+                }
+            }
+        }
         let output = UiApplyOutput {
             status: apply_status,
             command: "apply",
@@ -4563,6 +4609,113 @@ fn format_connection_registry_toml(
         database_connections: registry,
     })
     .context("failed to encode database connection config")?;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Ok(content)
+}
+
+#[derive(Debug)]
+struct UiApplyWritePayload {
+    artifacts: Vec<UiApplyWriteArtifact>,
+}
+
+#[derive(Debug)]
+struct UiApplyWriteArtifact {
+    artifact: &'static str,
+    path: PathBuf,
+    content: String,
+    sha256: String,
+}
+
+impl UiApplyWritePayload {
+    fn status(&self) -> UiApplyPayloadStatus {
+        UiApplyPayloadStatus {
+            artifacts: self
+                .artifacts
+                .iter()
+                .map(|artifact| UiApplyPayloadArtifactStatus {
+                    artifact: artifact.artifact,
+                    path: artifact.path.display().to_string(),
+                    bytes: artifact.content.len(),
+                    sha256: artifact.sha256.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn prepare_apply_write_payload(
+    args: &UiArgs,
+    draft: &Catalog,
+    database_connections: &DatabaseConnectionsSnapshot,
+) -> Result<UiApplyWritePayload, UiValidationIssue> {
+    let catalog_toml = format_catalog_toml(draft).map_err(|err| {
+        validation_issue(
+            "catalog_encode_failed",
+            format!("catalog draft could not be encoded as TOML: {err:#}"),
+            Some(args.catalog.display().to_string()),
+        )
+    })?;
+    let generated = draft.generate_runtime().map_err(|err| {
+        validation_issue(
+            "runtime_generation_failed",
+            format!("runtime output could not be generated from draft catalog: {err:#}"),
+            Some(args.catalog.display().to_string()),
+        )
+    })?;
+
+    let mut artifacts = vec![
+        apply_write_artifact("catalog", args.catalog.clone(), catalog_toml),
+        apply_write_artifact("runtime", args.runtime.clone(), generated.toml),
+    ];
+
+    match args.db_config.as_ref() {
+        Some(path) => {
+            let db_config_toml = format_connection_registry_toml(&database_connections.draft)
+                .map_err(|err| {
+                    validation_issue(
+                        "db_config_encode_failed",
+                        format!("database connection draft could not be encoded as TOML: {err:#}"),
+                        Some(path.display().to_string()),
+                    )
+                })?;
+            artifacts.push(apply_write_artifact(
+                "db_config",
+                path.clone(),
+                db_config_toml,
+            ));
+        }
+        None if database_connections.dirty || !database_connections.draft.is_empty() => {
+            return Err(validation_issue(
+                "db_config_path_missing",
+                "database connection draft cannot be applied without starting the UI with --db-config",
+                None,
+            ));
+        }
+        None => {}
+    }
+
+    Ok(UiApplyWritePayload { artifacts })
+}
+
+fn apply_write_artifact(
+    artifact: &'static str,
+    path: PathBuf,
+    content: String,
+) -> UiApplyWriteArtifact {
+    let sha256 = hex::encode(Sha256::digest(content.as_bytes()));
+    UiApplyWriteArtifact {
+        artifact,
+        path,
+        content,
+        sha256,
+    }
+}
+
+fn format_catalog_toml(catalog: &Catalog) -> anyhow::Result<String> {
+    let mut content =
+        toml::to_string_pretty(catalog).context("failed to encode entitlement catalog")?;
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -9048,6 +9201,7 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(apply["gate"]["can_apply"], false);
         assert_eq!(apply["validation"]["valid"], true);
         assert_eq!(apply["transaction"]["state"], "not_started");
+        assert_eq!(apply["transaction"]["payload"], serde_json::Value::Null);
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
@@ -9109,6 +9263,7 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(apply["gate"]["state"], "admin_blocked");
         assert_eq!(apply["gate"]["reason_code"], "non_admin_identity");
         assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(apply["transaction"]["payload"], serde_json::Value::Null);
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
@@ -9324,6 +9479,14 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(apply["transaction"]["state"], "not_started");
         assert_eq!(apply["transaction"]["lock_exists"], false);
         assert_eq!(apply["transaction"]["manifest_exists"], false);
+        let payload_artifacts = apply["transaction"]["payload"]["artifacts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(payload_artifacts.len(), 3);
+        assert_eq!(payload_artifacts[0]["artifact"], "catalog");
+        assert_eq!(payload_artifacts[1]["artifact"], "runtime");
+        assert_eq!(payload_artifacts[2]["artifact"], "db_config");
+        assert_eq!(payload_artifacts[0]["sha256"].as_str().unwrap().len(), 64);
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
@@ -10263,6 +10426,89 @@ require_tls = "true"
         assert!(connection_has_blocking_safety_issue(
             parsed.get("orders").unwrap()
         ));
+    }
+
+    #[test]
+    fn apply_write_payload_formats_catalog_runtime_and_db_config_artifacts() {
+        let (catalog_path, _catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-payload-catalog", "operator");
+        let runtime_path = catalog_fixture_path("apply-payload-runtime");
+        let db_config_path = write_database_config_fixture("apply-payload-db");
+        let mut args = test_args();
+        args.catalog = catalog_path.clone();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        let catalog = Catalog::load(&catalog_path).unwrap();
+        let registry = load_connection_registry_from_file(&db_config_path).unwrap();
+        let database_connections = DatabaseConnectionsSnapshot {
+            source_path: Some(db_config_path.clone()),
+            draft: registry.clone(),
+            load_error: None,
+            dirty: false,
+            revision: 0,
+        };
+
+        let payload = prepare_apply_write_payload(&args, &catalog, &database_connections).unwrap();
+
+        assert_eq!(payload.artifacts.len(), 3);
+        assert_eq!(payload.artifacts[0].artifact, "catalog");
+        assert_eq!(payload.artifacts[0].path, catalog_path);
+        assert_eq!(
+            Catalog::from_toml_str(&payload.artifacts[0].content).unwrap(),
+            catalog
+        );
+        assert_eq!(payload.artifacts[1].artifact, "runtime");
+        assert_eq!(payload.artifacts[1].path, runtime_path);
+        assert!(payload.artifacts[1]
+            .content
+            .contains("[[rules.allowed_accounts]]"));
+        assert_eq!(payload.artifacts[2].artifact, "db_config");
+        assert_eq!(payload.artifacts[2].path, db_config_path);
+        let parsed_db_config =
+            parse_connection_registry(&payload.artifacts[2].content, &payload.artifacts[2].path)
+                .unwrap();
+        assert_eq!(parsed_db_config, registry);
+
+        let status = payload.status();
+        assert_eq!(status.artifacts.len(), 3);
+        assert_eq!(
+            status.artifacts[0].bytes,
+            payload.artifacts[0].content.len()
+        );
+        assert_eq!(
+            status.artifacts[0].sha256,
+            hex::encode(Sha256::digest(payload.artifacts[0].content.as_bytes()))
+        );
+
+        let _ = std::fs::remove_file(payload.artifacts[0].path.clone());
+        let _ = std::fs::remove_file(payload.artifacts[2].path.clone());
+    }
+
+    #[test]
+    fn apply_write_payload_requires_db_config_path_for_database_draft() {
+        let (catalog_path, _catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-payload-missing-db-path", "operator");
+        let mut args = test_args();
+        args.catalog = catalog_path.clone();
+        args.runtime = catalog_fixture_path("apply-payload-missing-db-runtime");
+        args.db_config = None;
+        let catalog = Catalog::load(&catalog_path).unwrap();
+        let mut registry = BTreeMap::new();
+        registry.insert("orders".to_owned(), test_database_connection("orders"));
+        let database_connections = DatabaseConnectionsSnapshot {
+            source_path: None,
+            draft: registry,
+            load_error: None,
+            dirty: true,
+            revision: 1,
+        };
+
+        let issue =
+            prepare_apply_write_payload(&args, &catalog, &database_connections).unwrap_err();
+
+        assert_eq!(issue.code, "db_config_path_missing");
+        assert!(issue.message.contains("--db-config"));
+        let _ = std::fs::remove_file(catalog_path);
     }
 
     #[tokio::test]
