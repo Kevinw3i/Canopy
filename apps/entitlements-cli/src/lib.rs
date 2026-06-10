@@ -266,7 +266,7 @@ pub struct UiCommandArgs {
     #[arg(long = "identity-source", default_value = "dev-claims")]
     pub identity_source: String,
 
-    /// Operator JWT file path. The first full auth slice validates this path.
+    /// Operator JWT file path. Must be a private regular file outside the repo working tree.
     #[arg(long = "operator-jwt", value_name = "PATH")]
     pub operator_jwt: Option<PathBuf>,
 

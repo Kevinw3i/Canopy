@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -5690,7 +5692,64 @@ fn validate_ui_file_paths(args: &UiArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some(operator_jwt) = args.operator_jwt.as_deref() {
+        validate_operator_jwt_file_path(operator_jwt)?;
+    }
+
     Ok(())
+}
+
+fn validate_operator_jwt_file_path(path: &Path) -> anyhow::Result<()> {
+    let normalized = normalized_ui_path(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect --operator-jwt file '{}'", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "--operator-jwt file '{}' must not be a symlink",
+            path.display()
+        );
+    }
+    if !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "--operator-jwt file '{}' must be a regular file",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "--operator-jwt file '{}' must not be group/world writable",
+                path.display()
+            );
+        }
+    }
+    if let Some(repo_root) = current_repo_root()? {
+        if normalized.starts_with(&repo_root) {
+            anyhow::bail!(
+                "--operator-jwt file '{}' must be outside the repository working tree '{}'",
+                path.display(),
+                repo_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn current_repo_root() -> anyhow::Result<Option<PathBuf>> {
+    let mut dir = normalized_ui_path(
+        &std::env::current_dir()
+            .context("failed to resolve current directory for operator JWT path validation")?,
+    )?;
+    loop {
+        if dir.join(".git").exists() {
+            return Ok(Some(dir));
+        }
+        if !dir.pop() {
+            return Ok(None);
+        }
+    }
 }
 
 fn normalized_ui_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -9495,6 +9554,70 @@ require_tls = true
         args.import_runtime = Some(PathBuf::from("./catalog.toml"));
         let err = validate_ui_file_paths(&args).unwrap_err().to_string();
         assert!(err.contains("--import-runtime and --catalog"));
+    }
+
+    #[test]
+    fn operator_jwt_validation_accepts_private_file_outside_repo() {
+        let path = catalog_fixture_path("operator-jwt-safe");
+        std::fs::write(&path, "header.payload.signature").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut args = test_args();
+        args.operator_jwt = Some(path.clone());
+
+        validate_ui_file_paths(&args).unwrap();
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn operator_jwt_validation_rejects_repo_worktree_path() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!(".canopy-test-operator-{}.jwt", random_url_token()));
+        std::fs::write(&path, "header.payload.signature").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut args = test_args();
+        args.operator_jwt = Some(path.clone());
+
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("outside the repository working tree"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_jwt_validation_rejects_group_or_world_writable_file() {
+        let path = catalog_fixture_path("operator-jwt-writable");
+        std::fs::write(&path, "header.payload.signature").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let mut args = test_args();
+        args.operator_jwt = Some(path.clone());
+
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("must not be group/world writable"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_jwt_validation_rejects_symlink() {
+        let target = catalog_fixture_path("operator-jwt-target");
+        let link = catalog_fixture_path("operator-jwt-link");
+        std::fs::write(&target, "header.payload.signature").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut args = test_args();
+        args.operator_jwt = Some(link.clone());
+
+        let err = validate_ui_file_paths(&args).unwrap_err().to_string();
+        assert!(err.contains("must not be a symlink"));
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_file(target);
     }
 
     #[test]
