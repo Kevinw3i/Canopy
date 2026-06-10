@@ -6,6 +6,100 @@
 
 第一版是本機 operator 工具，不做 control-plane 遠端 admin API。服務只綁 `127.0.0.1`，啟動時產生一次性 bootstrap code，瀏覽器只在 URL fragment 使用 `/#code=...` 完成一次性交換；server 不接受 query token，也不記錄 code。交換成功後只用 HttpOnly、SameSite=Strict cookie 操作 API。Production 的 admin gate group 必須來自 canonical auth/deployment config，預設固定為 `admin`：Apply 前必須用啟動時鎖定的 operator identity，在 apply 前已持久化的 baseline catalog 中解析確認屬於該 canonical admin group。
 
+## Implementation Phases
+
+每個階段完成後都要執行階段性 Review，優先修復 P0/P1/P2 問題，補上可防回歸的測試，並整理 Review Notes / 防回歸清單。下一階段開始前必須回顧前一階段 Review Notes，確認同類問題沒有重複出現。若階段內有行為、設定、API、測試方式或操作流程變更，必須同步更新文件；若沒有文件影響，Review 時要明確記錄本階段不需文件更新。
+
+### Phase 0 - Source split, ignored local artifacts, and safety baseline
+
+- 建立 catalog source 與 generated runtime 的分離模式：`entitlements.catalog.toml` 是 source of truth，`entitlements.generated.toml` 是產物。
+- 將真實 catalog、generated runtime、DB local snippet、transaction artifact、backup/temp file、operator token/JWT pattern 納入 `.gitignore`。
+- 確認 sample/config 文件只包含 sanitized 範例，不含真實 account、business scope、secret、token 或本機設定。
+- 完成條件：
+  - 產物與本機 secret 類檔案不會被一般 `git add` 納入。
+  - public push 前的 leak scan 沒有發現真實敏感資訊或 business scope 字串。
+  - 文件說明 source/generated/local snippet 的差異。
+
+### Phase 1 - UI command, embedded static assets, and read-only state
+
+- 新增 `canopy-entitlements ui` subcommand 與本機 `axum` server。
+- 靜態 HTML/CSS/JS 以 compile-time include 內嵌進 binary，不依賴執行時工作目錄外部 asset。
+- `GET /api/state` 提供 sanitized state：catalog、runtime path、import source、db config summary、draft overview、validation summary。
+- 完成條件：
+  - release/dev binary 在沒有外部 asset 檔案時仍可 render UI。
+  - read API 未授權時不洩漏 catalog content；授權後不回傳 raw secret value。
+  - Overview、Groups、Packages、Scopes、Accounts/Roles、DB Connections、Review & Apply 都有 nonblank 初始畫面。
+
+### Phase 2 - Import, preview, explain, dry-run, and validation plumbing
+
+- 支援 `--import-runtime` 將現有 runtime 保真匯入 catalog draft。
+- `POST /api/preview`、`POST /api/explain`、`POST /api/dry-run`、`POST /api/validate` 復用現有 catalog logic。
+- validate 使用暫存 runtime，不修改正式 catalog/runtime/db config。
+- 完成條件：
+  - import -> generate 後語意等價，role ARN/account/template 不跨 rule 錯合併。
+  - preview/explain/dry-run API 回傳 structured JSON，錯誤可定位到來源 id。
+  - validation 覆蓋 catalog validation、runtime drift、DB scope connection reference 與 deployment source cross-check。
+
+### Phase 3 - Catalog editing workflows
+
+- 完成 Groups、Packages、Scopes、Accounts/Roles 的 draft 編輯 API 與 UI。
+- Groups matrix 可快速新增/移除 group -> package binding。
+- Packages 可管理既有 feature toggles，Scopes 可管理 account、region、selectors、database scopes、MCP EC2 scopes。
+- 完成條件：
+  - invalid payload、duplicate id、dangling reference 都回 structured error。
+  - 所有 high-risk feature 與 guardrail weakening 都會被 validation/diff 標示。
+  - 編輯流程不會讓 UI state 與 server draft state 分歧。
+
+### Phase 4 - DB connection snippet editor
+
+- 完成 `[database_connections.*]` metadata 的 draft 編輯與 deterministic TOML 輸出。
+- 強制 `readonly=true`，production 預設 `require_tls=true`，拒絕 username/password/inline secret。
+- 與 deployment config/tfvars 中的 canonical DB connection source 交叉檢查。
+- 完成條件：
+  - DB connection round-trip 不遺失欄位，輸出排序 deterministic。
+  - unsafe TLS、inline secret、missing secret ARN、connection reference drift 都是 blocking validation。
+  - UI 不提供 password/username 欄位，也不顯示 secret value。
+
+### Phase 5 - Local session, write API protection, and production identity gates
+
+- 完成 bootstrap fragment exchange、HttpOnly SameSite=Strict cookie、Origin/Host 檢查與安全 headers。
+- Production `verified-jwt` 必須從受保護 auth config 讀取 trust root；`os-allowlist` 必須從受保護 auth config 讀取 OS user allowlist。
+- `dev-claims` 只允許本機 preview/dry-run，不可讓真實 apply 通過。
+- 完成條件：
+  - bootstrap code 具備高 entropy、短 TTL、single-use，且不進入 query、storage、log 或 browser history。
+  - auth config 與 operator JWT path 皆通過 owner/mode/repo/symlink 檢查。
+  - apply 前重新確認 verified JWT freshness 或 OS allowlist freshness；失效或被移除時 fail closed。
+
+### Phase 6 - Review & Apply transaction protocol
+
+- `POST /api/apply` 只在 validation clean、operator 屬於 canonical admin group、baseline catalog authorization 通過時執行。
+- 多檔寫入 catalog、runtime、db config 時使用 lock、baseline digest compare-and-swap、same-dir temp file、0600 permission、fsync、backup manifest、固定 rename order 與 recovery。
+- 任何 late failure 必須 restore backup；restore 失敗時回報 recovery manifest path。
+- 完成條件：
+  - apply 成功後 catalog、generated runtime、db config 三者一致，且產生 `.bak`/manifest。
+  - lock contention、baseline digest mismatch、temp write failure、backup/rename failure、incomplete transaction recovery 都有 regression test。
+  - draft 內 self-grant admin membership 或 group mapping 不會影響當次 apply gate。
+
+### Phase 7 - Browser smoke, e2e, and UX hardening
+
+- 使用 browser smoke 覆蓋主要頁面、RD database 權限新增流程、Review diff、validation、apply 成功與失敗狀態。
+- 驗證窄 viewport 下表格、表單、錯誤訊息與按鈕文字不重疊。
+- 補齊 end-to-end tests：新增 RD database scope/package/binding、validate、apply、preview/explain/dry-run 驗證。
+- 完成條件：
+  - Desktop 與 mobile-sized viewport 都可完成核心流程。
+  - UI 不顯示 secret value，錯誤與 high-risk change 可掃描且不遮住操作。
+  - release binary smoke test 通過，確認 embedded asset 行為。
+
+### Phase 8 - Final review, leak scan, and merge readiness
+
+- 依需求文件逐項做總 Review：功能、資料流、UI/UX、DB config、auth gate、transaction、測試、文件與先前 Review Notes。
+- 執行 regression/safety test plan 與 public repo leak scan。
+- 確認提交範圍只包含本階段應提交的檔案，不包含真實 catalog/runtime/db snippet/token/backup。
+- 完成條件：
+  - 沒有 P0/P1/P2 問題或未補 regression test 的可測試缺陷。
+  - 測試、文件、計畫書與實際行為一致。
+  - branch 具備可追溯 commit history，且可安全 merge/push public repo。
+
 ## Key Changes
 
 ### `canopy-entitlements ui` subcommand
@@ -30,7 +124,7 @@
   - repeatable `--dev-operator-external-group <group>`
   - `--bind 127.0.0.1:0`
 - 使用 `axum` 提供本機 HTTP API。
-- 靜態 HTML/CSS/JS 放在 `crates/canopy-entitlements/assets/ui/{index.html,app.css,app.js}`，由 Rust module 用 `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"))` 這類 compile-time include 內嵌，避免新增 Node build pipeline，也避免 release binary 依賴工作目錄外部 asset。
+- 靜態 HTML/CSS/JS 放在 `apps/entitlements-cli/assets/ui/{index.html,app.css,app.js}`，由 Rust module 用 `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"))` 這類 compile-time include 內嵌，避免新增 Node build pipeline，也避免 release binary 依賴工作目錄外部 asset。
 - `database_connections.local.toml`、apply backup、transaction manifest、temp file 必須加入 `.gitignore`；真實 secret 仍只放 Secrets Manager，UI 只保存 `secret_arn`。
 - UI server 啟動時固定 operator session identity；write API 不接受 client 自報 identity。正式 apply 只能使用 verified identity：`verified-jwt` 必須驗 issuer/audience/signature/email_verified/exp/nbf/iat、clock skew、最大 session age，且 apply 前必須重新確認 authorization freshness；`os-allowlist` 只能映射本機 OS user 到預先持久化 admin allowlist，且 apply 前必須重讀 canonical allowlist；`dev-claims` 只允許搭配 `--allow-dev-identity` 啟動，並且預設禁止 apply 真實 catalog/runtime。
 - Production trust root 不可由啟動 CLI flag 任意指定，也不可由 UI draft 修改。OIDC issuer/audience/JWKS 與 OS admin allowlist 必須來自受保護 canonical auth config，例如 `/etc/canopy/entitlements-ui-auth.toml` 或 control-plane deployment config；檔案必須通過 owner/mode 檢查、不可位於 repo working tree、不可 group/world writable。`--operator-jwt` 只提供 operator token，不提供信任根。
