@@ -39,6 +39,21 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+unsafe extern "C" {
+    fn __error() -> *mut i32;
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn __errno_location() -> *mut i32;
+}
+
 const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/index.html"));
 const APP_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.css"));
 const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui/app.js"));
@@ -166,7 +181,8 @@ struct UiAppState {
 
 impl UiAppState {
     fn new(args: UiArgs, code: String, expires_at: Instant) -> Self {
-        let apply_baseline = ApplyBaselineSnapshot::capture(&args);
+        let recovery = recover_startup_transaction(&args);
+        let apply_baseline = ApplyBaselineSnapshot::capture_with_recovery(&args, recovery);
         let draft = DraftState::load(&args.catalog);
         let database_connections = DatabaseConnectionsDraftState::load(args.db_config.as_deref());
         Self {
@@ -223,6 +239,7 @@ struct ApplyBaselineSnapshot {
     catalog: ApplyFileBaseline,
     runtime: ApplyFileBaseline,
     db_config: Option<ApplyFileBaseline>,
+    recovery: Option<UiApplyRecoveryStatus>,
 }
 
 #[derive(Debug)]
@@ -253,6 +270,10 @@ struct UiAuthOsAllowlist {
 
 impl ApplyBaselineSnapshot {
     fn capture(args: &UiArgs) -> Self {
+        Self::capture_with_recovery(args, None)
+    }
+
+    fn capture_with_recovery(args: &UiArgs, recovery: Option<UiApplyRecoveryStatus>) -> Self {
         Self {
             catalog: ApplyFileBaseline::capture("catalog", &args.catalog),
             runtime: ApplyFileBaseline::capture("runtime", &args.runtime),
@@ -260,6 +281,7 @@ impl ApplyBaselineSnapshot {
                 .db_config
                 .as_deref()
                 .map(|path| ApplyFileBaseline::capture("db_config", path)),
+            recovery,
         }
     }
 
@@ -307,6 +329,7 @@ impl ApplyBaselineSnapshot {
             payload: None,
             backups: Vec::new(),
             error: None,
+            recovery: self.recovery.clone(),
         }
     }
 
@@ -716,6 +739,7 @@ struct UiApplyTransactionStatus {
     payload: Option<UiApplyPayloadStatus>,
     backups: Vec<UiApplyBackupStatus>,
     error: Option<UiApplyTransactionError>,
+    recovery: Option<UiApplyRecoveryStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -765,6 +789,16 @@ struct UiApplyTransactionError {
     code: &'static str,
     message: String,
     path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UiApplyRecoveryStatus {
+    state: &'static str,
+    reason_code: &'static str,
+    message: String,
+    manifest_path: Option<String>,
+    lock_path: Option<String>,
+    rollback_errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4842,6 +4876,564 @@ struct UiApplyTransactionManifestArtifact<'a> {
     backup_path: Option<String>,
     sha256: &'a str,
     bytes: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryTransactionManifest {
+    state: String,
+    nonce: String,
+    artifacts: Vec<RecoveryTransactionManifestArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryTransactionManifestArtifact {
+    artifact: String,
+    path: String,
+    temp_path: String,
+    backup_path: Option<String>,
+    sha256: String,
+    bytes: usize,
+}
+
+fn recover_startup_transaction(args: &UiArgs) -> Option<UiApplyRecoveryStatus> {
+    let (lock_path, manifest_path) = transaction_artifact_paths(&args.catalog);
+    let (manifest_exists, manifest_error) = transaction_artifact_status(&manifest_path);
+    if manifest_exists {
+        if let Some(blocker) = active_startup_lock_blocker(&lock_path, Some(&manifest_path)) {
+            return Some(blocker);
+        }
+        return Some(recover_transaction_manifest(
+            args,
+            &manifest_path,
+            &lock_path,
+        ));
+    }
+    if let Some(error) = manifest_error {
+        return Some(recovery_failed(
+            "transaction_manifest_unavailable",
+            format!(
+                "transaction manifest '{}' could not be inspected during startup recovery: {error}",
+                manifest_path.display()
+            ),
+            Some(&manifest_path),
+            Some(&lock_path),
+            Vec::new(),
+        ));
+    }
+
+    let (lock_exists, lock_error) = transaction_lock_status(&lock_path);
+    if lock_exists {
+        return Some(remove_stale_startup_lock(&lock_path));
+    }
+    lock_error.map(|error| {
+        recovery_failed(
+            "transaction_lock_unavailable",
+            format!(
+                "transaction lock '{}' could not be inspected during startup recovery: {error}",
+                lock_path.display()
+            ),
+            Some(&manifest_path),
+            Some(&lock_path),
+            Vec::new(),
+        )
+    })
+}
+
+fn active_startup_lock_blocker(
+    lock_path: &Path,
+    manifest_path: Option<&Path>,
+) -> Option<UiApplyRecoveryStatus> {
+    let (lock_exists, lock_error) = transaction_lock_status(lock_path);
+    if let Some(error) = lock_error {
+        return Some(recovery_failed(
+            "transaction_lock_unavailable",
+            format!(
+                "transaction lock '{}' could not be inspected during startup recovery: {error}",
+                lock_path.display()
+            ),
+            manifest_path,
+            Some(lock_path),
+            Vec::new(),
+        ));
+    }
+    if !lock_exists {
+        return None;
+    }
+    match transaction_lock_pid(lock_path) {
+        Ok(pid) if process_is_running(pid) => Some(recovery_failed(
+            "transaction_lock_active",
+            format!(
+                "startup recovery found active transaction lock '{}' owned by pid {pid}; leaving it in place",
+                lock_path.display()
+            ),
+            manifest_path,
+            Some(lock_path),
+            Vec::new(),
+        )),
+        Ok(_) => None,
+        Err(message) => Some(recovery_failed(
+            "transaction_lock_read_failed",
+            message,
+            manifest_path,
+            Some(lock_path),
+            Vec::new(),
+        )),
+    }
+}
+
+fn recover_transaction_manifest(
+    args: &UiArgs,
+    manifest_path: &Path,
+    lock_path: &Path,
+) -> UiApplyRecoveryStatus {
+    let content = match fs::read_to_string(manifest_path) {
+        Ok(content) => content,
+        Err(err) => {
+            return recovery_failed(
+                "transaction_manifest_read_failed",
+                format!(
+                    "transaction manifest '{}' could not be read during startup recovery: {}",
+                    manifest_path.display(),
+                    err.kind()
+                ),
+                Some(manifest_path),
+                Some(lock_path),
+                Vec::new(),
+            )
+        }
+    };
+    let manifest = match serde_json::from_str::<RecoveryTransactionManifest>(&content) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            return recovery_failed(
+                "transaction_manifest_parse_failed",
+                format!(
+                    "transaction manifest '{}' could not be parsed during startup recovery: {err}",
+                    manifest_path.display()
+                ),
+                Some(manifest_path),
+                Some(lock_path),
+                Vec::new(),
+            )
+        }
+    };
+    if manifest.artifacts.is_empty() {
+        return recovery_failed(
+            "transaction_manifest_empty",
+            format!(
+                "transaction manifest '{}' has no artifacts to recover",
+                manifest_path.display()
+            ),
+            Some(manifest_path),
+            Some(lock_path),
+            Vec::new(),
+        );
+    }
+    if let Err(message) = validate_recovery_manifest_targets(args, &manifest) {
+        return recovery_failed(
+            "transaction_manifest_target_invalid",
+            message,
+            Some(manifest_path),
+            Some(lock_path),
+            Vec::new(),
+        );
+    }
+
+    let mut rollback_errors = rollback_recovery_manifest_artifacts(&manifest);
+    if !rollback_errors.is_empty() {
+        return recovery_failed(
+            "transaction_recovery_failed",
+            format!(
+                "startup recovery could not safely roll back transaction manifest '{}' ({}, nonce {})",
+                manifest_path.display(),
+                manifest.state,
+                manifest.nonce
+            ),
+            Some(manifest_path),
+            Some(lock_path),
+            rollback_errors,
+        );
+    }
+
+    if let Err(err) = fs::remove_file(manifest_path) {
+        rollback_errors.push(format!(
+            "failed to remove recovered transaction manifest '{}': {}",
+            manifest_path.display(),
+            err.kind()
+        ));
+        return recovery_failed(
+            "transaction_manifest_cleanup_failed",
+            "startup recovery rolled back artifacts, but could not remove the transaction manifest",
+            Some(manifest_path),
+            Some(lock_path),
+            rollback_errors,
+        );
+    }
+    if let Err(err) = sync_parent_dir(manifest_path) {
+        rollback_errors.push(err.message);
+        return recovery_failed(
+            "transaction_manifest_parent_sync_failed",
+            "startup recovery rolled back artifacts, but could not sync the manifest parent directory",
+            Some(manifest_path),
+            Some(lock_path),
+            rollback_errors,
+        );
+    }
+    match fs::remove_file(lock_path) {
+        Ok(()) => {
+            if let Err(err) = sync_parent_dir(lock_path) {
+                rollback_errors.push(err.message);
+                return recovery_failed(
+                    "transaction_lock_parent_sync_failed",
+                    "startup recovery rolled back artifacts, but could not sync the lock parent directory",
+                    Some(manifest_path),
+                    Some(lock_path),
+                    rollback_errors,
+                );
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            rollback_errors.push(format!(
+                "failed to remove recovered transaction lock '{}': {}",
+                lock_path.display(),
+                err.kind()
+            ));
+            return recovery_failed(
+                "transaction_lock_cleanup_failed",
+                "startup recovery rolled back artifacts, but could not remove the transaction lock",
+                Some(manifest_path),
+                Some(lock_path),
+                rollback_errors,
+            );
+        }
+    }
+
+    UiApplyRecoveryStatus {
+        state: "recovered",
+        reason_code: "transaction_recovered",
+        message: format!(
+            "Startup recovery rolled back incomplete apply transaction '{}' ({}, nonce {}).",
+            manifest_path.display(),
+            manifest.state,
+            manifest.nonce
+        ),
+        manifest_path: Some(manifest_path.display().to_string()),
+        lock_path: Some(lock_path.display().to_string()),
+        rollback_errors,
+    }
+}
+
+fn validate_recovery_manifest_targets(
+    args: &UiArgs,
+    manifest: &RecoveryTransactionManifest,
+) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for artifact in &manifest.artifacts {
+        if !seen.insert(artifact.artifact.as_str()) {
+            return Err(format!(
+                "transaction manifest contains duplicate artifact '{}'",
+                artifact.artifact
+            ));
+        }
+        let expected_path = match artifact.artifact.as_str() {
+            "catalog" => &args.catalog,
+            "runtime" => &args.runtime,
+            "db_config" => args.db_config.as_ref().ok_or_else(|| {
+                "transaction manifest contains db_config artifact, but --db-config is not configured"
+                    .to_owned()
+            })?,
+            other => {
+                return Err(format!(
+                    "transaction manifest contains unknown artifact '{other}'"
+                ))
+            }
+        };
+        let target_path = PathBuf::from(&artifact.path);
+        if lexically_normalized_path(&target_path) != lexically_normalized_path(expected_path) {
+            return Err(format!(
+                "transaction manifest artifact '{}' targets '{}', but startup args expect '{}'",
+                artifact.artifact,
+                target_path.display(),
+                expected_path.display()
+            ));
+        }
+        let target_parent = artifact_parent_dir(&target_path).map_err(|err| err.message)?;
+        let temp_path = PathBuf::from(&artifact.temp_path);
+        let temp_parent = artifact_parent_dir(&temp_path).map_err(|err| err.message)?;
+        if temp_parent != target_parent {
+            return Err(format!(
+                "transaction manifest temp path '{}' for artifact '{}' is not in the target directory '{}'",
+                temp_path.display(),
+                artifact.artifact,
+                target_parent.display()
+            ));
+        }
+        let temp_name = artifact_file_name(&temp_path).map_err(|err| err.message)?;
+        if !temp_name.starts_with(".canopy-entitlements-transaction-")
+            || !temp_name.ends_with(".tmp")
+        {
+            return Err(format!(
+                "transaction manifest temp path '{}' for artifact '{}' does not use the expected transaction temp naming",
+                temp_path.display(),
+                artifact.artifact
+            ));
+        }
+        if let Some(backup_path) = artifact.backup_path.as_ref().map(PathBuf::from) {
+            let backup_parent = artifact_parent_dir(&backup_path).map_err(|err| err.message)?;
+            if backup_parent != target_parent {
+                return Err(format!(
+                    "transaction manifest backup path '{}' for artifact '{}' is not in the target directory '{}'",
+                    backup_path.display(),
+                    artifact.artifact,
+                    target_parent.display()
+                ));
+            }
+            let backup_name = artifact_file_name(&backup_path).map_err(|err| err.message)?;
+            let target_name = artifact_file_name(&target_path).map_err(|err| err.message)?;
+            if !backup_name.starts_with(&format!("{target_name}.bak.")) {
+                return Err(format!(
+                    "transaction manifest backup path '{}' for artifact '{}' does not use the expected backup naming",
+                    backup_path.display(),
+                    artifact.artifact
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remove_stale_startup_lock(lock_path: &Path) -> UiApplyRecoveryStatus {
+    match transaction_lock_pid(lock_path) {
+        Ok(pid) if process_is_running(pid) => {
+            return recovery_failed(
+                "transaction_lock_active",
+                format!(
+                    "startup recovery found active transaction lock '{}' owned by pid {pid}; leaving it in place",
+                    lock_path.display()
+                ),
+                None,
+                Some(lock_path),
+                Vec::new(),
+            );
+        }
+        Ok(_) => {}
+        Err(message) => {
+            return recovery_failed(
+                "transaction_lock_read_failed",
+                message,
+                None,
+                Some(lock_path),
+                Vec::new(),
+            );
+        }
+    }
+    match fs::remove_file(lock_path) {
+        Ok(()) => {
+            let mut rollback_errors = Vec::new();
+            if let Err(err) = sync_parent_dir(lock_path) {
+                rollback_errors.push(err.message);
+                return recovery_failed(
+                    "transaction_lock_parent_sync_failed",
+                    "startup recovery removed a stale lock, but could not sync the lock parent directory",
+                    None,
+                    Some(lock_path),
+                    rollback_errors,
+                );
+            }
+            UiApplyRecoveryStatus {
+                state: "recovered",
+                reason_code: "stale_lock_removed",
+                message: format!(
+                    "Startup recovery removed stale transaction lock '{}'.",
+                    lock_path.display()
+                ),
+                manifest_path: None,
+                lock_path: Some(lock_path.display().to_string()),
+                rollback_errors,
+            }
+        }
+        Err(err) => recovery_failed(
+            "transaction_lock_cleanup_failed",
+            format!(
+                "startup recovery could not remove stale transaction lock '{}': {}",
+                lock_path.display(),
+                err.kind()
+            ),
+            None,
+            Some(lock_path),
+            Vec::new(),
+        ),
+    }
+}
+
+fn transaction_lock_pid(lock_path: &Path) -> Result<u32, String> {
+    let content = fs::read_to_string(lock_path).map_err(|err| {
+        format!(
+            "startup recovery could not read transaction lock '{}': {}",
+            lock_path.display(),
+            err.kind()
+        )
+    })?;
+    content
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("pid=")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        })
+        .ok_or_else(|| {
+            format!(
+                "startup recovery could not read pid owner from transaction lock '{}'",
+                lock_path.display()
+            )
+        })
+}
+
+fn process_is_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        let result = unsafe { kill(pid, 0) };
+        if result == 0 {
+            return true;
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+        {
+            last_errno() == 1
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+        {
+            true
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(unix)]
+fn last_errno() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        *__error()
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        *__errno_location()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+fn rollback_recovery_manifest_artifacts(manifest: &RecoveryTransactionManifest) -> Vec<String> {
+    let mut errors = Vec::new();
+    for artifact in manifest.artifacts.iter().rev() {
+        let target_path = PathBuf::from(&artifact.path);
+        let temp_path = PathBuf::from(&artifact.temp_path);
+        let target_sha = file_sha256(&target_path);
+        match artifact.backup_path.as_ref().map(PathBuf::from) {
+            Some(backup_path) => {
+                let backup_sha = file_sha256(&backup_path);
+                if backup_path.exists() {
+                    if target_sha.as_deref() == Some(artifact.sha256.as_str())
+                        || !target_path.exists()
+                    {
+                        if let Err(err) = fs::rename(&backup_path, &target_path) {
+                            errors.push(format!(
+                                "failed to restore '{}' from '{}': {}",
+                                target_path.display(),
+                                backup_path.display(),
+                                err.kind()
+                            ));
+                        } else if let Err(err) = sync_parent_dir(&target_path) {
+                            errors.push(err.message);
+                        }
+                    } else if target_sha.is_some() && target_sha == backup_sha {
+                        if let Err(err) = fs::remove_file(&backup_path) {
+                            errors.push(format!(
+                                "target '{}' already matches backup, but backup '{}' could not be removed: {}",
+                                target_path.display(),
+                                backup_path.display(),
+                                err.kind()
+                            ));
+                        }
+                    } else {
+                        errors.push(format!(
+                            "target '{}' does not match transaction payload for artifact '{}' ({} bytes) and backup '{}' still exists; leaving both files in place",
+                            target_path.display(),
+                            artifact.artifact,
+                            artifact.bytes,
+                            backup_path.display()
+                        ));
+                    }
+                } else if target_sha.as_deref() == Some(artifact.sha256.as_str()) {
+                    errors.push(format!(
+                        "backup '{}' for artifact '{}' is missing; leaving current target '{}' in place",
+                        backup_path.display(),
+                        artifact.artifact,
+                        target_path.display()
+                    ));
+                }
+            }
+            None => {
+                if target_sha.as_deref() == Some(artifact.sha256.as_str()) {
+                    if let Err(err) = fs::remove_file(&target_path) {
+                        errors.push(format!(
+                            "failed to remove newly-created artifact '{}': {}",
+                            target_path.display(),
+                            err.kind()
+                        ));
+                    } else if let Err(err) = sync_parent_dir(&target_path) {
+                        errors.push(err.message);
+                    }
+                } else if target_path.exists() {
+                    errors.push(format!(
+                        "new artifact '{}' no longer matches transaction payload for artifact '{}' ({} bytes); leaving it in place",
+                        target_path.display(),
+                        artifact.artifact,
+                        artifact.bytes
+                    ));
+                }
+            }
+        }
+        if temp_path.exists() {
+            if let Err(err) = fs::remove_file(&temp_path) {
+                errors.push(format!(
+                    "failed to remove temporary artifact '{}': {}",
+                    temp_path.display(),
+                    err.kind()
+                ));
+            } else if let Err(err) = sync_parent_dir(&temp_path) {
+                errors.push(err.message);
+            }
+        }
+    }
+    errors
+}
+
+fn recovery_failed(
+    reason_code: &'static str,
+    message: impl Into<String>,
+    manifest_path: Option<&Path>,
+    lock_path: Option<&Path>,
+    rollback_errors: Vec<String>,
+) -> UiApplyRecoveryStatus {
+    UiApplyRecoveryStatus {
+        state: "recovery_failed",
+        reason_code,
+        message: message.into(),
+        manifest_path: manifest_path.map(|path| path.display().to_string()),
+        lock_path: lock_path.map(|path| path.display().to_string()),
+        rollback_errors,
+    }
 }
 
 fn execute_apply_transaction(
@@ -11249,6 +11841,377 @@ require_tls = "true"
         assert_eq!(cleanup_error.code, "transaction_lock_cleanup_failed");
         assert_eq!(cleanup_error.path, Some(lock_path.display().to_string()));
         assert!(cleanup_error.message.contains("transaction completed"));
+    }
+
+    fn recovery_artifact_json(
+        artifact: &str,
+        path: &Path,
+        temp_path: &Path,
+        backup_path: Option<&Path>,
+        content: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "artifact": artifact,
+            "path": path.display().to_string(),
+            "temp_path": temp_path.display().to_string(),
+            "backup_path": backup_path.map(|path| path.display().to_string()),
+            "sha256": hex::encode(Sha256::digest(content.as_bytes())),
+            "bytes": content.len(),
+        })
+    }
+
+    fn write_recovery_manifest(
+        manifest_path: &Path,
+        state: &str,
+        artifacts: Vec<serde_json::Value>,
+    ) {
+        std::fs::write(
+            manifest_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "state": state,
+                "nonce": "startup-recovery-test",
+                "started_unix_seconds": 1,
+                "artifacts": artifacts,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn recovery_temp_path(target_path: &Path, artifact: &str) -> PathBuf {
+        artifact_parent_dir(target_path).unwrap().join(format!(
+            ".canopy-entitlements-transaction-startup-recovery-test-{artifact}.tmp"
+        ))
+    }
+
+    fn recovery_backup_path(target_path: &Path) -> PathBuf {
+        artifact_parent_dir(target_path).unwrap().join(format!(
+            "{}.bak.startup-recovery-test",
+            artifact_file_name(target_path).unwrap()
+        ))
+    }
+
+    #[test]
+    fn startup_recovery_rolls_back_manifest_artifacts_and_clears_lock() {
+        let (catalog_path, original_catalog) =
+            write_catalog_fixture_with_admin_member("startup-recovery-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("startup-recovery-runtime", &original_catalog);
+        let db_config_path = write_database_config_fixture("startup-recovery-db");
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let new_catalog = format!("{original_catalog}\n# transaction output\n");
+        let new_runtime = format!("{original_runtime}\n# transaction output\n");
+        let new_db_config = format!("{original_db_config}\n# transaction output\n");
+        let catalog_backup = recovery_backup_path(&catalog_path);
+        let runtime_backup = recovery_backup_path(&runtime_path);
+        let db_backup = recovery_backup_path(&db_config_path);
+        let catalog_temp = recovery_temp_path(&catalog_path, "catalog");
+        let runtime_temp = recovery_temp_path(&runtime_path, "runtime");
+        let db_temp = recovery_temp_path(&db_config_path, "db_config");
+        std::fs::write(&catalog_backup, &original_catalog).unwrap();
+        std::fs::write(&runtime_backup, &original_runtime).unwrap();
+        std::fs::write(&db_backup, &original_db_config).unwrap();
+        std::fs::write(&catalog_path, &new_catalog).unwrap();
+        std::fs::write(&runtime_path, &new_runtime).unwrap();
+        std::fs::write(&db_config_path, &new_db_config).unwrap();
+        std::fs::write(&catalog_temp, &new_catalog).unwrap();
+        std::fs::write(&runtime_temp, &new_runtime).unwrap();
+        std::fs::write(&db_temp, &new_db_config).unwrap();
+        let (lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        std::fs::write(&lock_path, "pid=0\n").unwrap();
+        write_recovery_manifest(
+            &manifest_path,
+            "started",
+            vec![
+                recovery_artifact_json(
+                    "catalog",
+                    &catalog_path,
+                    &catalog_temp,
+                    Some(&catalog_backup),
+                    &new_catalog,
+                ),
+                recovery_artifact_json(
+                    "runtime",
+                    &runtime_path,
+                    &runtime_temp,
+                    Some(&runtime_backup),
+                    &new_runtime,
+                ),
+                recovery_artifact_json(
+                    "db_config",
+                    &db_config_path,
+                    &db_temp,
+                    Some(&db_backup),
+                    &new_db_config,
+                ),
+            ],
+        );
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        let transaction = state
+            .apply_baseline
+            .lock()
+            .unwrap()
+            .transaction_status(state.args.as_ref());
+
+        let recovery = transaction.recovery.unwrap();
+        assert_eq!(recovery.state, "recovered");
+        assert_eq!(recovery.reason_code, "transaction_recovered");
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        assert!(!lock_path.exists());
+        assert!(!manifest_path.exists());
+        assert!(!catalog_backup.exists());
+        assert!(!runtime_backup.exists());
+        assert!(!db_backup.exists());
+        assert!(!catalog_temp.exists());
+        assert!(!runtime_temp.exists());
+        assert!(!db_temp.exists());
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+    }
+
+    #[test]
+    fn startup_recovery_removes_stale_lock_without_manifest() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("startup-recovery-lock-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("startup-recovery-lock-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("startup-recovery-lock-db");
+        let (lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        std::fs::write(&lock_path, "pid=0\n").unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        let transaction = state
+            .apply_baseline
+            .lock()
+            .unwrap()
+            .transaction_status(state.args.as_ref());
+
+        let recovery = transaction.recovery.unwrap();
+        assert_eq!(recovery.reason_code, "stale_lock_removed");
+        assert!(!lock_path.exists());
+        assert!(!manifest_path.exists());
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+    }
+
+    #[test]
+    fn startup_recovery_keeps_active_lock_without_manifest() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("startup-recovery-active-lock", "operator");
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "startup-recovery-active-lock-runtime",
+            &catalog_content,
+        );
+        let db_config_path = write_database_config_fixture("startup-recovery-active-lock-db");
+        let (lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        std::fs::write(&lock_path, format!("pid={}\n", std::process::id())).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        let transaction = state
+            .apply_baseline
+            .lock()
+            .unwrap()
+            .transaction_status(state.args.as_ref());
+
+        let recovery = transaction.recovery.unwrap();
+        assert_eq!(recovery.state, "recovery_failed");
+        assert_eq!(recovery.reason_code, "transaction_lock_active");
+        assert!(lock_path.exists());
+        assert!(!manifest_path.exists());
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn startup_recovery_keeps_manifest_when_lock_owner_is_active() {
+        let (catalog_path, original_catalog) =
+            write_catalog_fixture_with_admin_member("startup-recovery-active-manifest", "operator");
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "startup-recovery-active-manifest-runtime",
+            &original_catalog,
+        );
+        let db_config_path = write_database_config_fixture("startup-recovery-active-manifest-db");
+        let new_catalog = format!("{original_catalog}\n# transaction output\n");
+        let catalog_backup = recovery_backup_path(&catalog_path);
+        let catalog_temp = recovery_temp_path(&catalog_path, "catalog");
+        std::fs::write(&catalog_backup, &original_catalog).unwrap();
+        std::fs::write(&catalog_path, &new_catalog).unwrap();
+        let (lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        std::fs::write(&lock_path, format!("pid={}\n", std::process::id())).unwrap();
+        write_recovery_manifest(
+            &manifest_path,
+            "started",
+            vec![recovery_artifact_json(
+                "catalog",
+                &catalog_path,
+                &catalog_temp,
+                Some(&catalog_backup),
+                &new_catalog,
+            )],
+        );
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        let transaction = state
+            .apply_baseline
+            .lock()
+            .unwrap()
+            .transaction_status(state.args.as_ref());
+
+        let recovery = transaction.recovery.unwrap();
+        assert_eq!(recovery.state, "recovery_failed");
+        assert_eq!(recovery.reason_code, "transaction_lock_active");
+        assert!(manifest_path.exists());
+        assert!(lock_path.exists());
+        assert_eq!(std::fs::read_to_string(&catalog_path).unwrap(), new_catalog);
+        assert_eq!(
+            std::fs::read_to_string(&catalog_backup).unwrap(),
+            original_catalog
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(catalog_backup);
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn startup_recovery_keeps_manifest_when_backup_is_missing() {
+        let (catalog_path, original_catalog) =
+            write_catalog_fixture_with_admin_member("startup-recovery-missing-backup", "operator");
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "startup-recovery-missing-backup-runtime",
+            &original_catalog,
+        );
+        let db_config_path = write_database_config_fixture("startup-recovery-missing-backup-db");
+        let new_catalog = format!("{original_catalog}\n# transaction output\n");
+        let missing_backup = recovery_backup_path(&catalog_path);
+        let catalog_temp = recovery_temp_path(&catalog_path, "catalog");
+        std::fs::write(&catalog_path, &new_catalog).unwrap();
+        let (lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        std::fs::write(&lock_path, "pid=0\n").unwrap();
+        write_recovery_manifest(
+            &manifest_path,
+            "started",
+            vec![recovery_artifact_json(
+                "catalog",
+                &catalog_path,
+                &catalog_temp,
+                Some(&missing_backup),
+                &new_catalog,
+            )],
+        );
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        let transaction = state
+            .apply_baseline
+            .lock()
+            .unwrap()
+            .transaction_status(state.args.as_ref());
+
+        let recovery = transaction.recovery.unwrap();
+        assert_eq!(recovery.state, "recovery_failed");
+        assert_eq!(recovery.reason_code, "transaction_recovery_failed");
+        assert!(recovery.rollback_errors[0].contains("is missing"));
+        assert!(manifest_path.exists());
+        assert!(lock_path.exists());
+        assert_eq!(std::fs::read_to_string(&catalog_path).unwrap(), new_catalog);
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn startup_recovery_rejects_manifest_target_outside_startup_args() {
+        let (catalog_path, original_catalog) =
+            write_catalog_fixture_with_admin_member("startup-recovery-invalid-target", "operator");
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "startup-recovery-invalid-target-runtime",
+            &original_catalog,
+        );
+        let db_config_path = write_database_config_fixture("startup-recovery-invalid-target-db");
+        let outside_path = catalog_fixture_path("startup-recovery-outside-target");
+        let outside_original = "outside original\n";
+        let outside_new = "outside transaction output\n";
+        std::fs::write(&outside_path, outside_new).unwrap();
+        let outside_backup = recovery_backup_path(&outside_path);
+        let outside_temp = recovery_temp_path(&outside_path, "catalog");
+        std::fs::write(&outside_backup, outside_original).unwrap();
+        let (lock_path, manifest_path) = transaction_artifact_paths(&catalog_path);
+        std::fs::write(&lock_path, "pid=0\n").unwrap();
+        write_recovery_manifest(
+            &manifest_path,
+            "started",
+            vec![recovery_artifact_json(
+                "catalog",
+                &outside_path,
+                &outside_temp,
+                Some(&outside_backup),
+                outside_new,
+            )],
+        );
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        let transaction = state
+            .apply_baseline
+            .lock()
+            .unwrap()
+            .transaction_status(state.args.as_ref());
+
+        let recovery = transaction.recovery.unwrap();
+        assert_eq!(recovery.state, "recovery_failed");
+        assert_eq!(recovery.reason_code, "transaction_manifest_target_invalid");
+        assert!(manifest_path.exists());
+        assert!(lock_path.exists());
+        assert_eq!(std::fs::read_to_string(&outside_path).unwrap(), outside_new);
+        assert_eq!(
+            std::fs::read_to_string(&outside_backup).unwrap(),
+            outside_original
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(outside_path);
+        let _ = std::fs::remove_file(outside_backup);
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_file(lock_path);
     }
 
     #[test]
