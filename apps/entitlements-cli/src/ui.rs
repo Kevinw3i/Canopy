@@ -4166,6 +4166,9 @@ fn load_auth_config(path: &Path) -> Result<UiAuthConfigFile, String> {
 }
 
 fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
+    if args.identity_source == "verified-jwt" && !args.allow_dev_identity {
+        return Err("verified-jwt apply requires canonical JWT verification; issuer/audience/JWKS and freshness checks are not enabled yet".to_owned());
+    }
     if args.identity_source == "os-allowlist"
         && args.auth_config.is_some()
         && !args.allow_dev_identity
@@ -9052,6 +9055,73 @@ package = "mcp-ec2-diagnostics"
         assert_eq!(apply["gate"]["state"], "admin_blocked");
         assert_eq!(apply["gate"]["reason_code"], "non_admin_identity");
         assert_eq!(apply["validation"]["valid"], true);
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_verified_jwt_until_canonical_verification_is_enabled() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-verified-jwt-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-verified-jwt-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-verified-jwt-db");
+        let deployment_config_path = write_database_config_fixture("apply-verified-jwt-deploy");
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.identity_source = "verified-jwt".to_owned();
+        args.allow_dev_identity = false;
+        args.dev_operator_sub = Some("operator".to_owned());
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(apply["gate"]["state"], "admin_blocked");
+        assert_eq!(
+            apply["gate"]["reason_code"],
+            "operator_identity_unavailable"
+        );
+        assert!(apply["gate"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("canonical JWT verification"));
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
