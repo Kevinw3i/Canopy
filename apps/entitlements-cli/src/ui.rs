@@ -5518,31 +5518,8 @@ fn execute_apply_transaction_with_lock(
             &artifact.temp_path,
             payload_content(payload, artifact.artifact)?,
         )?;
-        if artifact.target_path.exists() {
-            let backup_path = artifact.backup_path.as_ref().ok_or_else(|| {
-                transaction_error(
-                    "backup_path_unavailable",
-                    format!(
-                        "backup path for '{}' was not prepared",
-                        artifact.target_path.display()
-                    ),
-                    Some(artifact.target_path.clone()),
-                )
-            })?;
-            fs::copy(&artifact.target_path, backup_path).map_err(|err| {
-                transaction_error(
-                    "backup_write_failed",
-                    format!(
-                        "failed to back up '{}' to '{}': {}",
-                        artifact.target_path.display(),
-                        backup_path.display(),
-                        err.kind()
-                    ),
-                    Some(backup_path.clone()),
-                )
-            })?;
-            set_private_file_permissions(backup_path)?;
-            sync_file(backup_path)?;
+        if let Some(backup_path) = artifact.backup_path.as_ref() {
+            write_secure_backup_file(&artifact.target_path, backup_path)?;
             backups.push(UiApplyBackupStatus {
                 artifact: artifact.artifact,
                 path: artifact.target_path.display().to_string(),
@@ -5559,6 +5536,20 @@ fn execute_apply_transaction_with_lock(
 
     let mut applied_artifacts = Vec::new();
     for artifact in &prepared {
+        if artifact.backup_path.is_none() && artifact.target_path.exists() {
+            let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
+            return Err(transaction_error(
+                "artifact_target_created_during_transaction",
+                append_rollback_errors(
+                    format!(
+                        "target '{}' was created before its transaction rename and has no prepared backup",
+                        artifact.target_path.display()
+                    ),
+                    &rollback_errors,
+                ),
+                Some(artifact.target_path.clone()),
+            ));
+        }
         if let Err(err) = fs::rename(&artifact.temp_path, &artifact.target_path) {
             let rollback_errors = rollback_applied_artifacts(&applied_artifacts);
             return Err(transaction_error(
@@ -5630,30 +5621,40 @@ fn prepare_transaction_artifacts(
     payload: &UiApplyWritePayload,
     nonce: &str,
 ) -> Result<Vec<PreparedApplyArtifact>, UiApplyTransactionError> {
-    payload
-        .artifacts
-        .iter()
-        .map(|artifact| {
-            let parent = artifact_parent_dir(&artifact.path)?;
-            let backup_path = if artifact.path.exists() {
-                Some(parent.join(format!(
-                    "{}.bak.{nonce}",
-                    artifact_file_name(&artifact.path)?
-                )))
-            } else {
-                None
-            };
-            Ok(PreparedApplyArtifact {
-                artifact: artifact.artifact,
-                target_path: artifact.path.clone(),
-                temp_path: parent.join(format!(
-                    ".canopy-entitlements-transaction-{nonce}-{}.tmp",
-                    artifact.artifact
-                )),
-                backup_path,
-            })
-        })
-        .collect()
+    let mut prepared = Vec::new();
+    let mut target_paths = BTreeSet::new();
+    for artifact in &payload.artifacts {
+        let normalized_target = lexically_normalized_path(&artifact.path);
+        if !target_paths.insert(normalized_target.clone()) {
+            return Err(transaction_error(
+                "duplicate_transaction_artifact_path",
+                format!(
+                    "transaction payload contains duplicate target path '{}'",
+                    normalized_target.display()
+                ),
+                Some(artifact.path.clone()),
+            ));
+        }
+        let parent = artifact_parent_dir(&artifact.path)?;
+        let backup_path = if artifact.path.exists() {
+            Some(parent.join(format!(
+                "{}.bak.{nonce}",
+                artifact_file_name(&artifact.path)?
+            )))
+        } else {
+            None
+        };
+        prepared.push(PreparedApplyArtifact {
+            artifact: artifact.artifact,
+            target_path: artifact.path.clone(),
+            temp_path: parent.join(format!(
+                ".canopy-entitlements-transaction-{nonce}-{}.tmp",
+                artifact.artifact
+            )),
+            backup_path,
+        });
+    }
+    Ok(prepared)
 }
 
 fn rollback_applied_artifacts(applied: &[PreparedApplyArtifact]) -> Vec<String> {
@@ -5819,6 +5820,81 @@ fn write_secure_temp_file(path: &Path, content: &str) -> Result<(), UiApplyTrans
     write_secure_file(path, content, true)
 }
 
+fn write_secure_backup_file(
+    source_path: &Path,
+    backup_path: &Path,
+) -> Result<(), UiApplyTransactionError> {
+    let content = fs::read(source_path).map_err(|err| {
+        transaction_error(
+            "backup_read_failed",
+            format!(
+                "failed to read '{}' for backup '{}': {}",
+                source_path.display(),
+                backup_path.display(),
+                err.kind()
+            ),
+            Some(source_path.to_path_buf()),
+        )
+    })?;
+    if let Some(parent) = backup_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            transaction_error(
+                "backup_parent_create_failed",
+                format!(
+                    "failed to create backup parent directory '{}': {}",
+                    parent.display(),
+                    err.kind()
+                ),
+                Some(parent.to_path_buf()),
+            )
+        })?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(backup_path).map_err(|err| {
+        transaction_error(
+            "backup_write_failed",
+            format!(
+                "failed to create backup '{}' from '{}': {}",
+                backup_path.display(),
+                source_path.display(),
+                err.kind()
+            ),
+            Some(backup_path.to_path_buf()),
+        )
+    })?;
+    file.write_all(&content).map_err(|err| {
+        transaction_error(
+            "backup_write_failed",
+            format!(
+                "failed to write backup '{}' from '{}': {}",
+                backup_path.display(),
+                source_path.display(),
+                err.kind()
+            ),
+            Some(backup_path.to_path_buf()),
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        transaction_error(
+            "backup_sync_failed",
+            format!(
+                "failed to sync backup '{}' from '{}': {}",
+                backup_path.display(),
+                source_path.display(),
+                err.kind()
+            ),
+            Some(backup_path.to_path_buf()),
+        )
+    })?;
+    sync_parent_dir(backup_path)
+}
+
 fn write_secure_file(
     path: &Path,
     content: &str,
@@ -5885,18 +5961,6 @@ fn write_secure_file(
     sync_parent_dir(path)
 }
 
-fn sync_file(path: &Path) -> Result<(), UiApplyTransactionError> {
-    fs::File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|err| {
-            transaction_error(
-                "artifact_sync_failed",
-                format!("failed to sync '{}': {}", path.display(), err.kind()),
-                Some(path.to_path_buf()),
-            )
-        })
-}
-
 fn sync_parent_dir(path: &Path) -> Result<(), UiApplyTransactionError> {
     let Some(parent) = path
         .parent()
@@ -5917,24 +5981,6 @@ fn sync_parent_dir(path: &Path) -> Result<(), UiApplyTransactionError> {
                 Some(parent.to_path_buf()),
             )
         })
-}
-
-fn set_private_file_permissions(path: &Path) -> Result<(), UiApplyTransactionError> {
-    #[cfg(unix)]
-    {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            transaction_error(
-                "artifact_permission_failed",
-                format!(
-                    "failed to set private permissions on '{}': {}",
-                    path.display(),
-                    err.kind()
-                ),
-                Some(path.to_path_buf()),
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn artifact_parent_dir(path: &Path) -> Result<PathBuf, UiApplyTransactionError> {
@@ -11841,6 +11887,162 @@ require_tls = "true"
         assert_eq!(cleanup_error.code, "transaction_lock_cleanup_failed");
         assert_eq!(cleanup_error.path, Some(lock_path.display().to_string()));
         assert!(cleanup_error.message.contains("transaction completed"));
+    }
+
+    fn transaction_test_args(catalog_path: PathBuf) -> UiArgs {
+        let mut args = test_args();
+        args.catalog = catalog_path;
+        args.runtime = catalog_fixture_path("transaction-helper-runtime");
+        args.db_config = None;
+        args.deployment_mode = None;
+        args.deployment_config = None;
+        args.tfvars = None;
+        args
+    }
+
+    #[test]
+    fn apply_transaction_temp_write_failure_does_not_modify_target() {
+        let target_path = catalog_fixture_path("apply-transaction-temp-target");
+        let manifest_path = catalog_fixture_path("apply-transaction-temp-manifest");
+        let original_content = "original catalog\n";
+        let new_content = "new catalog\n";
+        let nonce = random_url_token();
+        let temp_path = artifact_parent_dir(&target_path).unwrap().join(format!(
+            ".canopy-entitlements-transaction-{nonce}-catalog.tmp"
+        ));
+        std::fs::write(&target_path, original_content).unwrap();
+        std::fs::write(&temp_path, "pre-existing temp").unwrap();
+        let args = transaction_test_args(target_path.clone());
+        let baseline = ApplyBaselineSnapshot::capture(&args);
+        let payload = UiApplyWritePayload {
+            artifacts: vec![apply_write_artifact(
+                "catalog",
+                target_path.clone(),
+                new_content.to_owned(),
+            )],
+        };
+
+        let error =
+            execute_apply_transaction_with_lock(&baseline, &payload, &manifest_path, &nonce)
+                .unwrap_err();
+
+        assert_eq!(error.code, "artifact_temp_create_failed");
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            original_content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&temp_path).unwrap(),
+            "pre-existing temp"
+        );
+        assert!(manifest_path.exists());
+        let backup_path = artifact_parent_dir(&target_path).unwrap().join(format!(
+            "{}.bak.{nonce}",
+            artifact_file_name(&target_path).unwrap()
+        ));
+        assert!(!backup_path.exists());
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_file(temp_path);
+        let _ = std::fs::remove_file(manifest_path);
+    }
+
+    #[test]
+    fn apply_transaction_backup_failure_does_not_modify_target() {
+        let target_path = catalog_fixture_path("apply-transaction-backup-target");
+        let manifest_path = catalog_fixture_path("apply-transaction-backup-manifest");
+        let original_content = "original catalog\n";
+        let new_content = "new catalog\n";
+        let nonce = random_url_token();
+        let temp_path = artifact_parent_dir(&target_path).unwrap().join(format!(
+            ".canopy-entitlements-transaction-{nonce}-catalog.tmp"
+        ));
+        let backup_path = artifact_parent_dir(&target_path).unwrap().join(format!(
+            "{}.bak.{nonce}",
+            artifact_file_name(&target_path).unwrap()
+        ));
+        std::fs::write(&target_path, original_content).unwrap();
+        std::fs::create_dir(&backup_path).unwrap();
+        let args = transaction_test_args(target_path.clone());
+        let baseline = ApplyBaselineSnapshot::capture(&args);
+        let payload = UiApplyWritePayload {
+            artifacts: vec![apply_write_artifact(
+                "catalog",
+                target_path.clone(),
+                new_content.to_owned(),
+            )],
+        };
+
+        let error =
+            execute_apply_transaction_with_lock(&baseline, &payload, &manifest_path, &nonce)
+                .unwrap_err();
+
+        assert_eq!(error.code, "backup_write_failed");
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            original_content
+        );
+        assert_eq!(std::fs::read_to_string(&temp_path).unwrap(), new_content);
+        assert!(manifest_path.exists());
+        assert!(backup_path.is_dir());
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_file(temp_path);
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_dir(backup_path);
+    }
+
+    #[test]
+    fn apply_transaction_target_created_before_rename_rolls_back_applied_artifacts() {
+        let root_path = catalog_fixture_path("apply-transaction-rename-root");
+        let catalog_path = root_path.join("catalog.toml");
+        let runtime_path = root_path.clone();
+        let manifest_path = catalog_fixture_path("apply-transaction-rename-manifest");
+        let catalog_content = "new catalog\n";
+        let runtime_content = "new runtime\n";
+        let nonce = random_url_token();
+        let runtime_temp_path = artifact_parent_dir(&runtime_path).unwrap().join(format!(
+            ".canopy-entitlements-transaction-{nonce}-runtime.tmp"
+        ));
+        let mut args = transaction_test_args(catalog_path.clone());
+        args.runtime = runtime_path.clone();
+        let baseline = ApplyBaselineSnapshot::capture(&args);
+        let payload = UiApplyWritePayload {
+            artifacts: vec![
+                apply_write_artifact("catalog", catalog_path.clone(), catalog_content.to_owned()),
+                apply_write_artifact("runtime", runtime_path.clone(), runtime_content.to_owned()),
+            ],
+        };
+
+        let error =
+            execute_apply_transaction_with_lock(&baseline, &payload, &manifest_path, &nonce)
+                .unwrap_err();
+
+        assert_eq!(error.code, "artifact_target_created_during_transaction");
+        assert!(!catalog_path.exists());
+        assert!(root_path.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&runtime_temp_path).unwrap(),
+            runtime_content
+        );
+        assert!(manifest_path.exists());
+        let _ = std::fs::remove_file(runtime_temp_path);
+        let _ = std::fs::remove_file(manifest_path);
+        let _ = std::fs::remove_dir_all(root_path);
+    }
+
+    #[test]
+    fn apply_transaction_rejects_duplicate_target_paths() {
+        let target_path = catalog_fixture_path("apply-transaction-duplicate-target");
+        let payload = UiApplyWritePayload {
+            artifacts: vec![
+                apply_write_artifact("catalog", target_path.clone(), "catalog\n".to_owned()),
+                apply_write_artifact("runtime", target_path.clone(), "runtime\n".to_owned()),
+            ],
+        };
+
+        let error = prepare_transaction_artifacts(&payload, "duplicate-target").unwrap_err();
+
+        assert_eq!(error.code, "duplicate_transaction_artifact_path");
+        assert_eq!(error.path, Some(target_path.display().to_string()));
     }
 
     fn recovery_artifact_json(
