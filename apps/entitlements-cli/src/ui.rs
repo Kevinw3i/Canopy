@@ -4775,6 +4775,20 @@ skip_tls_hostname_verification = true
         assert_eq!(APP_JS.matches("function setElementInputValue(").count(), 1);
     }
 
+    #[test]
+    fn embedded_db_connection_assets_expose_new_connection_flow() {
+        assert!(INDEX_HTML.contains(r#"id="db-new-button""#));
+        assert!(INDEX_HTML.contains(r#"id="db-connection-name""#));
+        assert!(INDEX_HTML.contains(r#"id="db-save-button""#));
+
+        assert!(APP_JS.contains("draftingNewDbConnection"));
+        assert!(APP_JS.contains("dbConnectionDraftRequestFromForm"));
+        assert!(APP_JS.contains("/api/draft/db-connections"));
+
+        assert!(APP_CSS.contains(".db-panel-actions"));
+        assert!(APP_CSS.contains(".db-save-button"));
+    }
+
     #[tokio::test]
     async fn unknown_ui_route_returns_secured_404() {
         let response = router(test_state("missing-route-code"))
@@ -5326,6 +5340,73 @@ private_target_ref = "service:app-api"
         assert!(!String::from_utf8(body.to_vec())
             .unwrap()
             .contains(&["new", "-secret", "-ref"].concat()));
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    #[tokio::test]
+    async fn draft_database_connection_update_adds_optional_connection_draft() {
+        let (catalog_path, _content) = write_catalog_fixture("draft-db-add-optional-catalog");
+        let mut args = test_args();
+        args.db_config = None;
+        args.deployment_mode = None;
+        args.deployment_config = None;
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+        let secret_ref = ["analytics", "-secret", "-ref"].concat();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/draft/db-connections")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "name": "analytics",
+                            "engine": "mysql",
+                            "host": "analytics.example.internal",
+                            "port": 3306,
+                            "database": "analytics",
+                            "secret_arn": secret_ref,
+                            "readonly": true,
+                            "connect_timeout_ms": 3000,
+                            "statement_timeout_ms": 5000,
+                            "explain_timeout_ms": 3000,
+                            "max_connections": 4,
+                            "require_tls": true,
+                            "accept_invalid_tls_certs": false,
+                            "skip_tls_hostname_verification": false
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let state_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(state_json["database_connections"]["configured"], true);
+        assert_eq!(state_json["database_connections"]["dirty"], true);
+        assert!(state_json["database_connections"]["missing_required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|connection| connection == "orders"));
+        assert!(state_json["database_connections"]["local"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|connection| connection["name"] == "analytics"
+                && connection["safety"] == "unused"
+                && connection["secret_ref_configured"] == true));
+        assert!(!String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains(&secret_ref));
         let _ = std::fs::remove_file(catalog_path);
     }
 

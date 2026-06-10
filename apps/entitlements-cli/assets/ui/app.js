@@ -8,6 +8,7 @@ const state = {
   selectedRole: null,
   accountRoleSelection: "account",
   selectedDbConnection: null,
+  draftingNewDbConnection: false,
   currentView: "overview",
   filter: "all",
   search: "",
@@ -525,7 +526,7 @@ function renderDatabaseConnections(connections) {
   const hasSelected =
     local.some((connection) => connection.name === state.selectedDbConnection) ||
     missing.includes(state.selectedDbConnection);
-  if (!state.selectedDbConnection || !hasSelected) {
+  if (!state.draftingNewDbConnection && (!state.selectedDbConnection || !hasSelected)) {
     state.selectedDbConnection = local[0]?.name || missing[0] || null;
   }
 
@@ -546,6 +547,7 @@ function dbConnectionRow(connection, required) {
     connection.safety === "blocking" || connection.safety === "attention",
   );
   row.addEventListener("click", () => {
+    state.draftingNewDbConnection = false;
     state.selectedDbConnection = connection.name;
     renderDatabaseConnections(state.databaseConnections);
   });
@@ -573,6 +575,7 @@ function missingDbConnectionRow(connection) {
   row.classList.add("db-blocking-row");
   row.classList.toggle("selected", state.selectedDbConnection === connection);
   row.addEventListener("click", () => {
+    state.draftingNewDbConnection = false;
     state.selectedDbConnection = connection;
     renderDatabaseConnections(state.databaseConnections);
   });
@@ -616,11 +619,20 @@ function renderDbConnectionInspector(connections) {
     (connection) => connection === state.selectedDbConnection,
   );
   const issues = connections?.issues || [];
-  const editable = selected || missing;
-  setInputValue("db-connection-name", selected?.name || missing || "");
-  setInputValue("db-engine", selected?.engine || (missing ? "mysql" : ""));
+  const creating = state.draftingNewDbConnection;
+  const editable = selected || missing || creating;
+  const nameInput = document.getElementById("db-connection-name");
+  setInputValue("db-connection-name", creating ? "" : selected?.name || missing || "");
+  setInputPlaceholder(
+    "db-connection-name",
+    creating ? "lowercase-name" : selected?.name || missing || "",
+  );
+  if (nameInput) {
+    nameInput.readOnly = !creating;
+  }
+  setInputValue("db-engine", selected?.engine || (editable ? "mysql" : ""));
   setInputValue("db-host", selected?.host || "");
-  setInputValue("db-port", selected ? String(selected.port) : missing ? "3306" : "");
+  setInputValue("db-port", selected ? String(selected.port) : editable ? "3306" : "");
   setInputValue("db-name", selected?.database || "");
   setInputValue("db-secret-ref", "");
   setInputPlaceholder(
@@ -629,19 +641,19 @@ function renderDbConnectionInspector(connections) {
   );
   setInputValue(
     "db-connect-timeout",
-    selected ? String(selected.connect_timeout_ms) : missing ? "3000" : "",
+    selected ? String(selected.connect_timeout_ms) : editable ? "3000" : "",
   );
   setInputValue(
     "db-statement-timeout",
-    selected ? String(selected.statement_timeout_ms) : missing ? "5000" : "",
+    selected ? String(selected.statement_timeout_ms) : editable ? "5000" : "",
   );
   setInputValue(
     "db-explain-timeout",
-    selected ? String(selected.explain_timeout_ms) : missing ? "3000" : "",
+    selected ? String(selected.explain_timeout_ms) : editable ? "3000" : "",
   );
   setInputValue(
     "db-max-connections",
-    selected ? String(selected.max_connections) : missing ? "4" : "",
+    selected ? String(selected.max_connections) : editable ? "4" : "",
   );
   setCheckedValue("db-readonly", true);
   setCheckedValue("db-require-tls", true);
@@ -649,14 +661,14 @@ function renderDbConnectionInspector(connections) {
   const name = document.getElementById("db-selected-name");
   const badge = document.getElementById("db-selected-safety");
   if (name) {
-    name.textContent = selected?.name || missing || "Connection";
+    name.textContent = creating ? "New connection" : selected?.name || missing || "Connection";
   }
   if (badge) {
-    const safety = selected ? dbSafetyLabel(selected) : missing ? "blocking" : "Unknown";
+    const safety = creating ? "Draft" : selected ? dbSafetyLabel(selected) : missing ? "blocking" : "Unknown";
     badge.textContent = safety;
     badge.classList.toggle("badge-risk", safety === "blocking" || safety === "attention");
   }
-  renderDbSafetyList(selected, missing, issues);
+  renderDbSafetyList(selected, missing, issues, creating);
 }
 
 function setDbEditorDisabled(disabled) {
@@ -700,9 +712,19 @@ function setCheckedValue(id, value) {
   }
 }
 
-function renderDbSafetyList(connection, missing, issues) {
+function renderDbSafetyList(connection, missing, issues, creating = false) {
   const list = document.getElementById("db-safety-list");
   if (!list) {
+    return;
+  }
+  if (creating) {
+    const title = document.createElement("h3");
+    title.append("Safety Checks ");
+    title.append(el("span", "", "0"));
+    list.replaceChildren(
+      title,
+      el("p", "", "New connection drafts must stay readonly, TLS-required, and secret-ref only"),
+    );
     return;
   }
   const relevantIssues = issues.filter((issue) => {
@@ -3026,6 +3048,19 @@ document.getElementById("import-runtime-button")?.addEventListener("click", asyn
   }
 });
 
+document.getElementById("db-new-button")?.addEventListener("click", () => {
+  state.draftingNewDbConnection = true;
+  state.selectedDbConnection = null;
+  renderDatabaseConnections(state.databaseConnections);
+  setActiveView("db-connections");
+  document.getElementById("db-connection-name")?.focus();
+  setValidationStatus(
+    "DB connection draft ready",
+    "enter lowercase metadata and a secret reference before saving",
+    true,
+  );
+});
+
 document.getElementById("db-save-button")?.addEventListener("click", async (event) => {
   const button = event.currentTarget;
   const request = dbConnectionDraftRequestFromForm();
@@ -3039,6 +3074,7 @@ document.getElementById("db-save-button")?.addEventListener("click", async (even
   try {
     const payload = await updateDatabaseConnection(request);
     applyServerState(payload);
+    state.draftingNewDbConnection = false;
     state.selectedDbConnection = request.name;
     renderDatabaseConnections(state.databaseConnections);
     setActiveView("db-connections");

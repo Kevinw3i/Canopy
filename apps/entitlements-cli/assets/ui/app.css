@@ -1120,12 +1120,33 @@ textarea {
   color: var(--muted);
 }
 
+.db-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
 .db-status-stack {
   text-align: right;
 }
 
 .db-status-stack strong {
   color: var(--green);
+}
+
+.db-panel-actions button {
+  min-height: 38px;
+  padding: 0 14px;
+  border: 1px solid var(--green);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.db-panel-actions button:hover {
+  background: var(--green-soft);
 }
 
 .db-table {
