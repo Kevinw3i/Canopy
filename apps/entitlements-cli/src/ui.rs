@@ -16,10 +16,12 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, Validation};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
@@ -260,12 +262,44 @@ struct ApplyFileDigest {
 struct UiAuthConfigFile {
     admin_group: Option<String>,
     os_allowlist: Option<UiAuthOsAllowlist>,
+    verified_jwt: Option<UiAuthVerifiedJwt>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UiAuthOsAllowlist {
     #[serde(default)]
     users: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UiAuthVerifiedJwt {
+    issuer: String,
+    audience: String,
+    jwks_path: PathBuf,
+    #[serde(default = "default_verified_jwt_group_claim")]
+    group_claim: String,
+    #[serde(default = "default_verified_jwt_email_verified_required")]
+    email_verified_required: bool,
+    #[serde(default = "default_verified_jwt_max_session_age_seconds")]
+    max_session_age_seconds: u64,
+    #[serde(default = "default_verified_jwt_clock_skew_seconds")]
+    clock_skew_seconds: u64,
+}
+
+fn default_verified_jwt_group_claim() -> String {
+    "cognito:groups".to_owned()
+}
+
+fn default_verified_jwt_email_verified_required() -> bool {
+    true
+}
+
+fn default_verified_jwt_max_session_age_seconds() -> u64 {
+    8 * 60 * 60
+}
+
+fn default_verified_jwt_clock_skew_seconds() -> u64 {
+    300
 }
 
 impl ApplyBaselineSnapshot {
@@ -4352,7 +4386,7 @@ fn load_auth_config(path: &Path) -> Result<UiAuthConfigFile, String> {
 
 fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
     if args.identity_source == "verified-jwt" && !args.allow_dev_identity {
-        return Err("verified-jwt apply requires canonical JWT verification; issuer/audience/JWKS and freshness checks are not enabled yet".to_owned());
+        return verified_jwt_operator_explain_request(args);
     }
     if args.identity_source == "os-allowlist"
         && args.auth_config.is_some()
@@ -4370,6 +4404,198 @@ fn startup_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainReq
         },
     )
     .map_err(|err| err.message)
+}
+
+#[derive(Debug, Deserialize)]
+struct UiVerifiedJwtClaims {
+    sub: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    email_verified: Option<bool>,
+    #[serde(default)]
+    iat: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    exp: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    nbf: Option<u64>,
+    #[serde(flatten)]
+    extra_claims: HashMap<String, serde_json::Value>,
+}
+
+fn verified_jwt_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
+    let auth_path = args
+        .auth_config
+        .as_deref()
+        .ok_or_else(|| "verified-jwt identity requires --auth-config".to_owned())?;
+    let token_path = args
+        .operator_jwt
+        .as_deref()
+        .ok_or_else(|| "verified-jwt identity requires --operator-jwt".to_owned())?;
+    let auth = load_auth_config(auth_path)?;
+    let config = auth.verified_jwt.ok_or_else(|| {
+        format!(
+            "canonical auth config '{}' is missing [verified_jwt]",
+            auth_path.display()
+        )
+    })?;
+
+    validate_operator_jwt_file_path(token_path).map_err(|err| {
+        format!(
+            "operator JWT file '{}' failed protected file validation: {err:#}",
+            token_path.display()
+        )
+    })?;
+    let token = fs::read_to_string(token_path).map_err(|err| {
+        format!(
+            "failed to read operator JWT '{}': {err}",
+            token_path.display()
+        )
+    })?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(format!("operator JWT '{}' is empty", token_path.display()));
+    }
+
+    let claims = decode_verified_operator_jwt(token, &config)?;
+    let groups = verified_jwt_external_groups(&claims, &config.group_claim)?;
+    Ok(catalog::ExplainRequest {
+        sub: claims.sub,
+        email: claims.email,
+        email_verified: claims.email_verified.unwrap_or(false),
+        external_groups: groups,
+    })
+}
+
+fn decode_verified_operator_jwt(
+    token: &str,
+    config: &UiAuthVerifiedJwt,
+) -> Result<UiVerifiedJwtClaims, String> {
+    let issuer = config.issuer.trim();
+    if issuer.is_empty() {
+        return Err("verified_jwt.issuer must not be empty".to_owned());
+    }
+    let audience = config.audience.trim();
+    if audience.is_empty() {
+        return Err("verified_jwt.audience must not be empty".to_owned());
+    }
+    let group_claim = config.group_claim.trim();
+    if group_claim.is_empty() {
+        return Err("verified_jwt.group_claim must not be empty".to_owned());
+    }
+    if config.max_session_age_seconds == 0 {
+        return Err("verified_jwt.max_session_age_seconds must be greater than zero".to_owned());
+    }
+
+    let header =
+        decode_header(token).map_err(|err| format!("operator JWT header decode failed: {err}"))?;
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| "operator JWT header missing kid".to_owned())?;
+    let jwks_path = validate_protected_ui_file_path(&config.jwks_path, "verified_jwt.jwks_path")
+        .map_err(|err| {
+            format!(
+                "verified_jwt.jwks_path '{}' failed protected file validation: {err:#}",
+                config.jwks_path.display()
+            )
+        })?;
+    let jwks_content = fs::read_to_string(&jwks_path).map_err(|err| {
+        format!(
+            "failed to read verified_jwt.jwks_path '{}': {err}",
+            jwks_path.display()
+        )
+    })?;
+    let jwks: JwkSet = serde_json::from_str(&jwks_content).map_err(|err| {
+        format!(
+            "failed to parse verified_jwt.jwks_path '{}': {err}",
+            jwks_path.display()
+        )
+    })?;
+    let jwk = jwks
+        .find(kid)
+        .ok_or_else(|| format!("operator JWT kid '{kid}' not found in configured JWKS"))?;
+    let jwk_alg = jwk
+        .common
+        .key_algorithm
+        .ok_or_else(|| format!("configured JWKS key '{kid}' is missing alg"))?;
+    let alg = Algorithm::from_str(&jwk_alg.to_string())
+        .map_err(|err| format!("configured JWKS key '{kid}' has unsupported alg: {err}"))?;
+    if header.alg != alg {
+        return Err(format!(
+            "operator JWT alg {:?} does not match configured JWKS key alg {:?}",
+            header.alg, alg
+        ));
+    }
+    let decoding_key = DecodingKey::from_jwk(jwk)
+        .map_err(|err| format!("failed to construct decoding key for JWKS kid '{kid}': {err}"))?;
+
+    let mut validation = Validation::new(alg);
+    validation.leeway = config.clock_skew_seconds;
+    validation.validate_nbf = true;
+    validation.set_required_spec_claims(&["exp", "nbf", "aud", "iss", "sub"]);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+
+    let token_data = decode::<UiVerifiedJwtClaims>(token, &decoding_key, &validation)
+        .map_err(|err| format!("operator JWT verification failed: {err}"))?;
+    let claims = token_data.claims;
+    let email_verified = claims.email_verified.unwrap_or(false);
+    if config.email_verified_required && !email_verified {
+        return Err("operator JWT email_verified is required".to_owned());
+    }
+    let iat = claims
+        .iat
+        .ok_or_else(|| "operator JWT missing required iat claim".to_owned())?;
+    let now = unix_timestamp_seconds();
+    let earliest_allowed =
+        now.saturating_sub(config.max_session_age_seconds + config.clock_skew_seconds);
+    if iat < earliest_allowed {
+        return Err(
+            "operator JWT iat is older than verified_jwt.max_session_age_seconds".to_owned(),
+        );
+    }
+    if iat > now.saturating_add(config.clock_skew_seconds) {
+        return Err(
+            "operator JWT iat is in the future beyond verified_jwt.clock_skew_seconds".to_owned(),
+        );
+    }
+    Ok(claims)
+}
+
+fn verified_jwt_external_groups(
+    claims: &UiVerifiedJwtClaims,
+    claim_name: &str,
+) -> Result<Vec<String>, String> {
+    let claim_name = claim_name.trim();
+    let Some(value) = claims.extra_claims.get(claim_name) else {
+        return Ok(vec![]);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!(
+            "operator JWT group claim '{claim_name}' must be an array of strings"
+        ));
+    };
+    values
+        .iter()
+        .map(|value| {
+            let group = value.as_str().ok_or_else(|| {
+                format!("operator JWT group claim '{claim_name}' must be an array of strings")
+            })?;
+            trimmed_string(group.to_owned()).ok_or_else(|| {
+                format!("operator JWT group claim '{claim_name}' contains an empty group")
+            })
+        })
+        .collect()
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn os_allowlist_operator_explain_request(args: &UiArgs) -> Result<catalog::ExplainRequest, String> {
@@ -6003,13 +6229,6 @@ fn artifact_file_name(path: &Path) -> Result<String, UiApplyTransactionError> {
         })
 }
 
-fn unix_timestamp_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn transaction_error(
     code: &'static str,
     message: impl Into<String>,
@@ -7565,6 +7784,94 @@ group = "{group}"
         #[cfg(unix)]
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    fn write_protected_fixture_file(path: &Path, content: impl AsRef<[u8]>) {
+        std::fs::write(path, content).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn write_verified_jwt_fixture(
+        name: &str,
+        claims: serde_json::Value,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let key_material = format!("canopy-entitlements-ui-{name}-fixture-key-material");
+        let jwks_path = catalog_fixture_path(&format!("{name}-jwks"));
+        let token_path = catalog_fixture_path(&format!("{name}-token.jwt"));
+        let auth_config_path = catalog_fixture_path(&format!("{name}-auth"));
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "kid": "ui-test-key",
+                "alg": "HS256",
+                "k": URL_SAFE_NO_PAD.encode(key_material.as_bytes())
+            }]
+        });
+        write_protected_fixture_file(&jwks_path, serde_json::to_vec_pretty(&jwks).unwrap());
+        let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
+        header.kid = Some("ui-test-key".to_owned());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(key_material.as_bytes()),
+        )
+        .unwrap();
+        write_protected_fixture_file(&token_path, token);
+        write_protected_fixture_file(
+            &auth_config_path,
+            format!(
+                r#"admin_group = "admin"
+
+[verified_jwt]
+issuer = "https://issuer.example.com"
+audience = "canopy-entitlements-ui"
+jwks_path = "{}"
+group_claim = "cognito:groups"
+max_session_age_seconds = 3600
+clock_skew_seconds = 30
+"#,
+                jwks_path.display()
+            ),
+        );
+        (auth_config_path, token_path, jwks_path)
+    }
+
+    fn verified_jwt_claims(
+        sub: &str,
+        audience: &str,
+        email_verified: bool,
+        iat_offset_seconds: i64,
+        exp_offset_seconds: i64,
+    ) -> serde_json::Value {
+        let now = unix_timestamp_seconds() as i64;
+        serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "aud": audience,
+            "sub": sub,
+            "email": format!("{sub}@example.com"),
+            "email_verified": email_verified,
+            "iat": (now + iat_offset_seconds) as u64,
+            "nbf": (now - 10) as u64,
+            "exp": (now + exp_offset_seconds) as u64,
+            "cognito:groups": ["canopy-admin"]
+        })
+    }
+
+    #[test]
+    fn verified_jwt_rejects_stale_iat() {
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture(
+            "verified-jwt-stale-iat",
+            verified_jwt_claims("operator", "canopy-entitlements-ui", true, -7200, 600),
+        );
+        let auth = load_auth_config(&auth_config_path).unwrap();
+        let config = auth.verified_jwt.unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
+        assert!(err.contains("iat is older"));
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
     }
 
     fn write_database_config_fixture(name: &str) -> PathBuf {
@@ -10961,13 +11268,17 @@ package = "mcp-ec2-diagnostics"
     }
 
     #[tokio::test]
-    async fn apply_rejects_verified_jwt_until_canonical_verification_is_enabled() {
+    async fn apply_accepts_verified_jwt_from_protected_auth_config() {
         let (catalog_path, catalog_content) =
             write_catalog_fixture_with_admin_member("apply-verified-jwt-catalog", "operator");
         let runtime_path =
             write_runtime_from_catalog_fixture("apply-verified-jwt-runtime", &catalog_content);
         let db_config_path = write_database_config_fixture("apply-verified-jwt-db");
         let deployment_config_path = write_database_config_fixture("apply-verified-jwt-deploy");
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture(
+            "apply-verified-jwt",
+            verified_jwt_claims("operator", "canopy-entitlements-ui", true, -10, 600),
+        );
         let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
         let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
         let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
@@ -10976,7 +11287,9 @@ package = "mcp-ec2-diagnostics"
         args.db_config = Some(db_config_path.clone());
         args.deployment_mode = Some("config".to_owned());
         args.deployment_config = Some(deployment_config_path.clone());
+        args.auth_config = Some(auth_config_path.clone());
         args.identity_source = "verified-jwt".to_owned();
+        args.operator_jwt = Some(token_path.clone());
         args.allow_dev_identity = false;
         args.dev_operator_sub = Some("operator".to_owned());
         let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
@@ -10985,6 +11298,74 @@ package = "mcp-ec2-diagnostics"
 
         let response = app
             .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["status"], "applied");
+        assert_eq!(apply["applied"], true);
+        assert_eq!(apply["gate"]["state"], "admin_ready");
+        assert_eq!(apply["gate"]["identity_source"], "verified-jwt");
+        assert_eq!(apply["gate"]["reason_code"], "apply_completed");
+        assert_eq!(apply["validation"]["valid"], true);
+        assert_apply_payload_matches_file(&apply, "catalog", &catalog_path);
+        assert_apply_payload_matches_file(&apply, "runtime", &runtime_path);
+        assert_apply_payload_matches_file(&apply, "db_config", &db_config_path);
+        let catalog_backup = assert_apply_backup_matches(&apply, "catalog", &original_catalog);
+        let runtime_backup = assert_apply_backup_matches(&apply, "runtime", &original_runtime);
+        let db_backup = assert_apply_backup_matches(&apply, "db_config", &original_db_config);
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
+        let _ = std::fs::remove_file(catalog_backup);
+        let _ = std::fs::remove_file(runtime_backup);
+        let _ = std::fs::remove_file(db_backup);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_verified_jwt_wrong_audience_without_writing() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-verified-jwt-aud-catalog", "operator");
+        let runtime_path =
+            write_runtime_from_catalog_fixture("apply-verified-jwt-aud-runtime", &catalog_content);
+        let db_config_path = write_database_config_fixture("apply-verified-jwt-aud-db");
+        let deployment_config_path = write_database_config_fixture("apply-verified-jwt-aud-deploy");
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture(
+            "apply-verified-jwt-aud",
+            verified_jwt_claims("operator", "wrong-audience", true, -10, 600),
+        );
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.auth_config = Some(auth_config_path.clone());
+        args.identity_source = "verified-jwt".to_owned();
+        args.operator_jwt = Some(token_path.clone());
+        args.allow_dev_identity = false;
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -11010,7 +11391,7 @@ package = "mcp-ec2-diagnostics"
         assert!(apply["gate"]["message"]
             .as_str()
             .unwrap()
-            .contains("canonical JWT verification"));
+            .contains("operator JWT verification failed"));
         assert_eq!(
             std::fs::read_to_string(&catalog_path).unwrap(),
             original_catalog
@@ -11027,6 +11408,86 @@ package = "mcp-ec2-diagnostics"
         let _ = std::fs::remove_file(runtime_path);
         let _ = std::fs::remove_file(db_config_path);
         let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
+    }
+
+    #[tokio::test]
+    async fn apply_rejects_verified_jwt_unverified_email_without_writing() {
+        let (catalog_path, catalog_content) =
+            write_catalog_fixture_with_admin_member("apply-verified-jwt-email-catalog", "operator");
+        let runtime_path = write_runtime_from_catalog_fixture(
+            "apply-verified-jwt-email-runtime",
+            &catalog_content,
+        );
+        let db_config_path = write_database_config_fixture("apply-verified-jwt-email-db");
+        let deployment_config_path =
+            write_database_config_fixture("apply-verified-jwt-email-deploy");
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture(
+            "apply-verified-jwt-email",
+            verified_jwt_claims("operator", "canopy-entitlements-ui", false, -10, 600),
+        );
+        let original_catalog = std::fs::read_to_string(&catalog_path).unwrap();
+        let original_runtime = std::fs::read_to_string(&runtime_path).unwrap();
+        let original_db_config = std::fs::read_to_string(&db_config_path).unwrap();
+        let mut args = test_args();
+        args.runtime = runtime_path.clone();
+        args.db_config = Some(db_config_path.clone());
+        args.deployment_mode = Some("config".to_owned());
+        args.deployment_config = Some(deployment_config_path.clone());
+        args.auth_config = Some(auth_config_path.clone());
+        args.identity_source = "verified-jwt".to_owned();
+        args.operator_jwt = Some(token_path.clone());
+        args.allow_dev_identity = false;
+        let state = test_state_with_catalog_and_args(catalog_path.clone(), args);
+        install_session(&state);
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apply")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::ORIGIN, "http://127.0.0.1:8080")
+                    .header(header::COOKIE, state_cookie())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let apply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(apply["applied"], false);
+        assert_eq!(
+            apply["gate"]["reason_code"],
+            "operator_identity_unavailable"
+        );
+        assert!(apply["gate"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("email_verified is required"));
+        assert_eq!(
+            std::fs::read_to_string(&catalog_path).unwrap(),
+            original_catalog
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_path).unwrap(),
+            original_runtime
+        );
+        assert_eq!(
+            std::fs::read_to_string(&db_config_path).unwrap(),
+            original_db_config
+        );
+        let _ = std::fs::remove_file(catalog_path);
+        let _ = std::fs::remove_file(runtime_path);
+        let _ = std::fs::remove_file(db_config_path);
+        let _ = std::fs::remove_file(deployment_config_path);
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
     }
 
     #[tokio::test]

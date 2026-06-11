@@ -14,6 +14,7 @@ base64.workspace = true
 clap.workspace = true
 entitlements = { path = "../../crates/entitlements" }
 hex.workspace = true
+jsonwebtoken.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
