@@ -4523,6 +4523,12 @@ fn decode_verified_operator_jwt(
         .ok_or_else(|| format!("configured JWKS key '{kid}' is missing alg"))?;
     let alg = Algorithm::from_str(&jwk_alg.to_string())
         .map_err(|err| format!("configured JWKS key '{kid}' has unsupported alg: {err}"))?;
+    if !verified_jwt_algorithm_is_asymmetric(alg) {
+        return Err(format!(
+            "configured JWKS key '{kid}' uses disallowed symmetric JWT alg {:?}",
+            alg
+        ));
+    }
     if header.alg != alg {
         return Err(format!(
             "operator JWT alg {:?} does not match configured JWKS key alg {:?}",
@@ -4563,6 +4569,21 @@ fn decode_verified_operator_jwt(
         );
     }
     Ok(claims)
+}
+
+fn verified_jwt_algorithm_is_asymmetric(alg: Algorithm) -> bool {
+    matches!(
+        alg,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+            | Algorithm::EdDSA
+    )
 }
 
 fn verified_jwt_external_groups(
@@ -7626,6 +7647,9 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{header, Request};
     use base64::engine::general_purpose::STANDARD;
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::traits::PublicKeyParts;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
@@ -7804,6 +7828,56 @@ group = "{group}"
         claims: serde_json::Value,
         header_kid: Option<&str>,
     ) -> (PathBuf, PathBuf, PathBuf) {
+        let jwks_path = catalog_fixture_path(&format!("{name}-jwks"));
+        let token_path = catalog_fixture_path(&format!("{name}-token.jwt"));
+        let auth_config_path = catalog_fixture_path(&format!("{name}-auth"));
+        let mut rng = OsRng;
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = RsaPublicKey::from(&private_key);
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "ui-test-key",
+                "alg": "RS256",
+                "use": "sig",
+                "n": URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                "e": URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be())
+            }]
+        });
+        write_protected_fixture_file(&jwks_path, serde_json::to_vec_pretty(&jwks).unwrap());
+        let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+        header.kid = header_kid.map(str::to_owned);
+        let private_key_der = private_key.to_pkcs1_der().unwrap();
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_der(private_key_der.as_bytes()),
+        )
+        .unwrap();
+        write_protected_fixture_file(&token_path, token);
+        write_protected_fixture_file(
+            &auth_config_path,
+            format!(
+                r#"admin_group = "admin"
+
+[verified_jwt]
+issuer = "https://issuer.example.com"
+audience = "canopy-entitlements-ui"
+jwks_path = "{}"
+group_claim = "cognito:groups"
+max_session_age_seconds = 3600
+clock_skew_seconds = 30
+"#,
+                jwks_path.display()
+            ),
+        );
+        (auth_config_path, token_path, jwks_path)
+    }
+
+    fn write_verified_hmac_jwt_fixture(
+        name: &str,
+        claims: serde_json::Value,
+    ) -> (PathBuf, PathBuf, PathBuf) {
         let key_material = format!("canopy-entitlements-ui-{name}-fixture-key-material");
         let jwks_path = catalog_fixture_path(&format!("{name}-jwks"));
         let token_path = catalog_fixture_path(&format!("{name}-token.jwt"));
@@ -7818,7 +7892,7 @@ group = "{group}"
         });
         write_protected_fixture_file(&jwks_path, serde_json::to_vec_pretty(&jwks).unwrap());
         let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
-        header.kid = header_kid.map(str::to_owned);
+        header.kid = Some("ui-test-key".to_owned());
         let token = jsonwebtoken::encode(
             &header,
             &claims,
@@ -7944,6 +8018,22 @@ clock_skew_seconds = 30
         let token = std::fs::read_to_string(&token_path).unwrap();
         let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
         assert!(err.contains("operator JWT verification failed"));
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
+    }
+
+    #[test]
+    fn verified_jwt_rejects_symmetric_jwks_alg() {
+        let (auth_config_path, token_path, jwks_path) = write_verified_hmac_jwt_fixture(
+            "verified-jwt-hmac",
+            verified_jwt_claims("operator", "canopy-entitlements-ui", true, -10, 600),
+        );
+        let auth = load_auth_config(&auth_config_path).unwrap();
+        let config = auth.verified_jwt.unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
+        assert!(err.contains("disallowed symmetric JWT alg"));
         let _ = std::fs::remove_file(auth_config_path);
         let _ = std::fs::remove_file(token_path);
         let _ = std::fs::remove_file(jwks_path);

@@ -25,4 +25,5 @@ tokio.workspace = true
 toml = "0.8"
 
 [dev-dependencies]
+rsa = "0.9"
 tower.workspace = true
