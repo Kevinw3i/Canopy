@@ -7796,6 +7796,14 @@ group = "{group}"
         name: &str,
         claims: serde_json::Value,
     ) -> (PathBuf, PathBuf, PathBuf) {
+        write_verified_jwt_fixture_with_header_kid(name, claims, Some("ui-test-key"))
+    }
+
+    fn write_verified_jwt_fixture_with_header_kid(
+        name: &str,
+        claims: serde_json::Value,
+        header_kid: Option<&str>,
+    ) -> (PathBuf, PathBuf, PathBuf) {
         let key_material = format!("canopy-entitlements-ui-{name}-fixture-key-material");
         let jwks_path = catalog_fixture_path(&format!("{name}-jwks"));
         let token_path = catalog_fixture_path(&format!("{name}-token.jwt"));
@@ -7810,7 +7818,7 @@ group = "{group}"
         });
         write_protected_fixture_file(&jwks_path, serde_json::to_vec_pretty(&jwks).unwrap());
         let mut header = jsonwebtoken::Header::new(Algorithm::HS256);
-        header.kid = Some("ui-test-key".to_owned());
+        header.kid = header_kid.map(str::to_owned);
         let token = jsonwebtoken::encode(
             &header,
             &claims,
@@ -7844,6 +7852,24 @@ clock_skew_seconds = 30
         iat_offset_seconds: i64,
         exp_offset_seconds: i64,
     ) -> serde_json::Value {
+        verified_jwt_claims_with_nbf(
+            sub,
+            audience,
+            email_verified,
+            iat_offset_seconds,
+            -10,
+            exp_offset_seconds,
+        )
+    }
+
+    fn verified_jwt_claims_with_nbf(
+        sub: &str,
+        audience: &str,
+        email_verified: bool,
+        iat_offset_seconds: i64,
+        nbf_offset_seconds: i64,
+        exp_offset_seconds: i64,
+    ) -> serde_json::Value {
         let now = unix_timestamp_seconds() as i64;
         serde_json::json!({
             "iss": "https://issuer.example.com",
@@ -7852,7 +7878,7 @@ clock_skew_seconds = 30
             "email": format!("{sub}@example.com"),
             "email_verified": email_verified,
             "iat": (now + iat_offset_seconds) as u64,
-            "nbf": (now - 10) as u64,
+            "nbf": (now + nbf_offset_seconds) as u64,
             "exp": (now + exp_offset_seconds) as u64,
             "cognito:groups": ["canopy-admin"]
         })
@@ -7869,6 +7895,55 @@ clock_skew_seconds = 30
         let token = std::fs::read_to_string(&token_path).unwrap();
         let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
         assert!(err.contains("iat is older"));
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
+    }
+
+    #[test]
+    fn verified_jwt_rejects_missing_kid() {
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture_with_header_kid(
+            "verified-jwt-missing-kid",
+            verified_jwt_claims("operator", "canopy-entitlements-ui", true, -10, 600),
+            None,
+        );
+        let auth = load_auth_config(&auth_config_path).unwrap();
+        let config = auth.verified_jwt.unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
+        assert!(err.contains("missing kid"));
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
+    }
+
+    #[test]
+    fn verified_jwt_rejects_future_nbf() {
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture(
+            "verified-jwt-future-nbf",
+            verified_jwt_claims_with_nbf("operator", "canopy-entitlements-ui", true, -10, 120, 600),
+        );
+        let auth = load_auth_config(&auth_config_path).unwrap();
+        let config = auth.verified_jwt.unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
+        assert!(err.contains("operator JWT verification failed"));
+        let _ = std::fs::remove_file(auth_config_path);
+        let _ = std::fs::remove_file(token_path);
+        let _ = std::fs::remove_file(jwks_path);
+    }
+
+    #[test]
+    fn verified_jwt_rejects_expired_token() {
+        let (auth_config_path, token_path, jwks_path) = write_verified_jwt_fixture(
+            "verified-jwt-expired",
+            verified_jwt_claims("operator", "canopy-entitlements-ui", true, -120, -120),
+        );
+        let auth = load_auth_config(&auth_config_path).unwrap();
+        let config = auth.verified_jwt.unwrap();
+        let token = std::fs::read_to_string(&token_path).unwrap();
+        let err = decode_verified_operator_jwt(token.trim(), &config).unwrap_err();
+        assert!(err.contains("operator JWT verification failed"));
         let _ = std::fs::remove_file(auth_config_path);
         let _ = std::fs::remove_file(token_path);
         let _ = std::fs::remove_file(jwks_path);
