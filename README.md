@@ -391,6 +391,30 @@ cargo run -p canopy-entitlements -- dry-run \
 
 When using the catalog path, do not hand-edit `entitlements.generated.toml`; regenerate it from the catalog and deploy that generated file. Set `entitlements_file = "entitlements.generated.toml"` in `config.toml`, and pass the same path through `--entitlements` or `ENTITLEMENTS_FILE` when running deployment scripts. Cognito mappings belong in the catalog's `[[group_mappings]]`; the generated runtime carries them forward for login and refresh authorization.
 
+#### Local entitlement catalog Web UI
+
+`canopy-entitlements ui` starts a loopback-only operator UI for reviewing and editing the catalog draft. Static HTML, CSS, and JavaScript are embedded in the binary, so a release build can serve the UI without a separate Node or asset build step.
+
+```bash
+cargo run -p canopy-entitlements -- ui \
+  --catalog entitlements.catalog.toml \
+  --runtime entitlements.generated.toml \
+  --import-runtime entitlements.toml \
+  --db-config database_connections.local.toml \
+  --deployment-mode terraform \
+  --tfvars infra/terraform.tfvars \
+  --auth-config /etc/canopy/entitlements-ui-auth.toml \
+  --identity-source os-allowlist
+```
+
+The server prints a localhost URL with a one-time bootstrap code in the URL fragment. The browser exchanges that code for an HttpOnly, SameSite=Strict session cookie; the API does not accept query-string tokens. Write APIs require a local Host and Origin, and `GET /api/state` returns sanitized state instead of raw secrets.
+
+Use `--allow-dev-identity` only for local preview, explain, validate, and dry-run flows. Development identity claims cannot apply real catalog or runtime files. Production apply currently requires `--identity-source os-allowlist` with a protected auth config outside the repository; `admin_group` defaults to `admin`, and `[os_allowlist].users` must include the current OS user. `--identity-source verified-jwt` is fail-closed until canonical JWT verification is wired into this tool.
+
+`database_connections.local.toml` is a local DB connection snippet used by the UI draft and validation flow. It must use the same `[database_connections.<name>]` schema as `config.toml`, but it is not automatically loaded by the control-plane. For production validation and apply, the same connection metadata must also exist in the canonical deployment source selected by `--deployment-mode config|terraform`. The UI stores only metadata and `secret_arn`; it rejects inline usernames, passwords, writable connections, and unsafe production TLS settings.
+
+Apply writes the catalog, generated runtime, and optional DB snippet through a local transaction protocol with a lock file, baseline digest compare-and-swap, backups, and a recovery manifest. The generated runtime remains the deployable entitlement artifact; the UI is an authoring and review surface over the catalog workflow.
+
 ### TUI client config
 
 Prefer the setup script so the config is written to the OS-specific path the

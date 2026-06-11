@@ -388,6 +388,30 @@ cargo run -p canopy-entitlements -- dry-run \
 
 使用 catalog 流程時，不要手改 `entitlements.generated.toml`；要從 catalog 重新產生並部署 generated runtime。`config.toml` 的 `entitlements_file` 要設成 `entitlements.generated.toml`，部署腳本也要用同一個檔案，例如 `--entitlements` 或 `ENTITLEMENTS_FILE`。Cognito mapping 應寫在 catalog 的 `[[group_mappings]]`，generated runtime 會保留它們供登入與 refresh 授權使用。
 
+#### 本機 Entitlement Catalog Web UI
+
+`canopy-entitlements ui` 會啟動只綁 loopback 的 operator UI，用來 review 與編輯 catalog draft。靜態 HTML、CSS、JavaScript 都會編進 binary，所以 release build 不需要額外的 Node 或 asset build step 就能提供 UI。
+
+```bash
+cargo run -p canopy-entitlements -- ui \
+  --catalog entitlements.catalog.toml \
+  --runtime entitlements.generated.toml \
+  --import-runtime entitlements.toml \
+  --db-config database_connections.local.toml \
+  --deployment-mode terraform \
+  --tfvars infra/terraform.tfvars \
+  --auth-config /etc/canopy/entitlements-ui-auth.toml \
+  --identity-source os-allowlist
+```
+
+啟動後 server 會印出包含一次性 bootstrap code 的 localhost URL，code 只放在 URL fragment。Browser 會把 code 換成 HttpOnly、SameSite=Strict session cookie；API 不接受 query-string token。Write API 會檢查本機 Host / Origin，`GET /api/state` 只回 sanitized state，不回 raw secret。
+
+`--allow-dev-identity` 只適合本機 preview、explain、validate、dry-run。Development identity claims 不能 apply 真實 catalog 或 runtime 檔。Production apply 目前可用路徑是 `--identity-source os-allowlist` 搭配 repo 外受保護的 auth config；`admin_group` 預設為 `admin`，`[os_allowlist].users` 必須包含目前 OS user。`--identity-source verified-jwt` 在這個工具完成 canonical JWT verification 前會 fail closed。
+
+`database_connections.local.toml` 是 UI draft 與 validation 使用的本機 DB connection snippet，schema 與 `config.toml` 的 `[database_connections.<name>]` 相同，但不會被 control-plane 自動載入。Production validate / apply 時，同一份 connection metadata 也必須存在於 `--deployment-mode config|terraform` 選到的 canonical deployment source。UI 只保存 metadata 與 `secret_arn`；會拒絕 inline username、password、可寫連線，以及 production 不安全 TLS 設定。
+
+Apply 會用本機 transaction protocol 寫入 catalog、generated runtime 與選用的 DB snippet，包含 lock file、baseline digest compare-and-swap、backup 與 recovery manifest。Generated runtime 仍是部署用 entitlement artifact；UI 是 catalog workflow 上的 authoring 與 review surface。
+
 ### TUI 客戶端設定
 
 建議用腳本建立設定檔，避免不同作業系統路徑不一致。腳本接受位置參數、
