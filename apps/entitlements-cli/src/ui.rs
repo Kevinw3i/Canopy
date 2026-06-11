@@ -8248,6 +8248,41 @@ skip_tls_hostname_verification = true
     }
 
     #[test]
+    fn embedded_bootstrap_prelude_runs_before_any_external_asset() {
+        let script_index = INDEX_HTML.find("<script>").unwrap();
+        let css_index = INDEX_HTML.find(r#"<link rel="stylesheet""#).unwrap();
+        let app_script_index = INDEX_HTML.find(r#"<script src="/app.js""#);
+
+        assert!(script_index < css_index);
+        assert!(app_script_index.is_none() || script_index < app_script_index.unwrap());
+        assert!(INDEX_HTML[script_index..css_index].contains("history.replaceState"));
+        assert!(INDEX_HTML[script_index..css_index].contains("__CANOPY_BOOTSTRAP_CODE__"));
+    }
+
+    #[test]
+    fn embedded_frontend_does_not_persist_session_or_bootstrap_code_in_web_storage() {
+        for forbidden in ["localStorage", "sessionStorage", "document.cookie"] {
+            assert!(!INDEX_HTML.contains(forbidden), "{forbidden} found in HTML");
+            assert!(!APP_JS.contains(forbidden), "{forbidden} found in app JS");
+        }
+    }
+
+    #[test]
+    fn embedded_responsive_review_assets_keep_tables_scannable() {
+        let mobile_rules = APP_CSS
+            .find("@media (max-width: 900px)")
+            .map(|index| &APP_CSS[index..])
+            .expect("mobile breakpoint should exist");
+
+        assert!(APP_CSS.contains(".review-change-table"));
+        assert!(APP_CSS.contains("overflow-wrap: anywhere"));
+        assert!(mobile_rules.contains(".app-shell"));
+        assert!(mobile_rules.contains("grid-template-columns: 1fr"));
+        assert!(mobile_rules.contains(".review-change-table"));
+        assert!(mobile_rules.contains("min-width:"));
+    }
+
+    #[test]
     fn transaction_artifact_paths_are_catalog_specific() {
         let first = catalog_fixture_path("transaction-artifact-first");
         let second = catalog_fixture_path("transaction-artifact-second");

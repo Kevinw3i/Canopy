@@ -93,11 +93,14 @@ oidc_client_id  = "your-client-id"
 # STS ExternalId for cross-account AssumeRole (must match target trust policy)
 # sts_external_id = "my-custom-external-id"
 
-# Cross-account roles the control-plane can assume
-# assumable_role_arns = [
-#   "arn:aws:iam::111111111111:role/CanopyRole",
-#   "arn:aws:iam::222222222222:role/CanopyRole",
-# ]
+# Cross-account roles the control-plane can assume. These sanitized examples
+# match entitlements.catalog.sample.toml so the sample catalog validation
+# workflow can run end to end.
+assumable_role_arns = [
+  "arn:aws:iam::123456789012:role/CanopyReadOnlyRole",
+  "arn:aws:iam::123456789012:role/CanopyOperatorRole",
+  "arn:aws:iam::234567890123:role/CanopyReadOnlyRole",
+]
 #
 # Optional: allow AWS Organizations account discovery for same-named roles.
 # Use with entitlements account_id = "*" and role_arn containing {account_id}.
