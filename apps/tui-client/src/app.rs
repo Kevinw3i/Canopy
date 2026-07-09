@@ -3128,6 +3128,7 @@ exit "$rc"
 
                     // Run the command
                     let mut cmd = std::process::Command::new(&spawn_spec.command);
+                    local_deps::apply_standard_tool_path(&mut cmd);
                     cmd.args(&spawn_spec.args);
                     for (k, v) in &spawn_spec.env_vars {
                         cmd.env(k, v);
@@ -3424,6 +3425,7 @@ exit "$rc"
                 }
 
                 let mut cmd = std::process::Command::new(&spawn_spec.command);
+                local_deps::apply_standard_tool_path(&mut cmd);
                 cmd.args(&spawn_spec.args);
                 for (k, v) in &spawn_spec.env_vars {
                     cmd.env(k, v);

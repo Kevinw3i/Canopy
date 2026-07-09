@@ -13,6 +13,20 @@ const SSM_PLUGIN_MAC_X86_64_PKG_URL: &str =
     "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac/session-manager-plugin.pkg";
 const SSM_PLUGIN_MAC_ARM64_PKG_URL: &str =
     "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/session-manager-plugin.pkg";
+const STANDARD_TOOL_PATH_ENTRIES: &[&str] = &[
+    "/usr/local/bin",
+    "/usr/local/sessionmanagerplugin/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
+const SESSION_MANAGER_PLUGIN_COMMANDS: &[&str] = &[
+    "session-manager-plugin",
+    "/usr/local/bin/session-manager-plugin",
+    "/usr/local/sessionmanagerplugin/bin/session-manager-plugin",
+];
 // AWS macOS installers are expected to be signed by AMZN Mobile LLC.
 // If AWS rotates signing identity, update this value from AWS/Apple
 // official installer-signature guidance before shipping auto-install.
@@ -120,7 +134,9 @@ pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn output(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
-        let output = Command::new(program).args(args).output()?;
+        let output = command_with_standard_tool_path(program)
+            .args(args)
+            .output()?;
         Ok(CommandOutput {
             status_success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -129,8 +145,44 @@ impl CommandRunner for SystemCommandRunner {
     }
 
     fn status(&self, program: &str, args: &[String]) -> io::Result<bool> {
-        Ok(Command::new(program).args(args).status()?.success())
+        Ok(command_with_standard_tool_path(program)
+            .args(args)
+            .status()?
+            .success())
     }
+}
+
+pub fn standard_tool_path() -> String {
+    let mut paths: Vec<PathBuf> = STANDARD_TOOL_PATH_ENTRIES
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+
+    let mut deduped: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|seen| seen == &path) {
+            deduped.push(path);
+        }
+    }
+
+    std::env::join_paths(deduped)
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn apply_standard_tool_path(command: &mut Command) {
+    command.env("PATH", standard_tool_path());
+}
+
+fn command_with_standard_tool_path(program: &str) -> Command {
+    let mut command = Command::new(program);
+    apply_standard_tool_path(&mut command);
+    command
 }
 
 pub fn is_aws_cli_v2_version(version_output: &str) -> bool {
@@ -242,9 +294,12 @@ fn check_dependency<R: CommandRunner>(
     match dependency {
         LocalDependency::AwsCliV2 => check_aws_cli_v2(runner),
         LocalDependency::Ssh => check_executable(dependency, "ssh", &["-V"], runner),
-        LocalDependency::SessionManagerPlugin => {
-            check_executable(dependency, "session-manager-plugin", &["--version"], runner)
-        }
+        LocalDependency::SessionManagerPlugin => check_executable_candidates(
+            dependency,
+            SESSION_MANAGER_PLUGIN_COMMANDS,
+            &["--version"],
+            runner,
+        ),
     }
 }
 
@@ -252,7 +307,14 @@ fn check_aws_cli_v2<R: CommandRunner>(runner: &R) -> Option<DependencyIssue> {
     match runner.output("aws", &["--version"]) {
         Ok(output) => {
             let version = combined_output(&output);
-            if is_aws_cli_v2_version(&version) {
+            if !output.status_success {
+                let reason = if version.trim().is_empty() {
+                    "aws --version exited unsuccessfully".to_string()
+                } else {
+                    format!("aws --version failed: {}", version.trim())
+                };
+                Some(issue(LocalDependency::AwsCliV2, reason))
+            } else if is_aws_cli_v2_version(&version) {
                 None
             } else if version.trim().is_empty() {
                 Some(issue(
@@ -282,12 +344,46 @@ fn check_executable<R: CommandRunner>(
     args: &[&str],
     runner: &R,
 ) -> Option<DependencyIssue> {
-    match runner.output(program, args) {
-        Ok(_) => None,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Some(issue(dependency, format!("{program} command not found")))
+    check_executable_candidates(dependency, &[program], args, runner)
+}
+
+fn check_executable_candidates<R: CommandRunner>(
+    dependency: LocalDependency,
+    programs: &[&str],
+    args: &[&str],
+    runner: &R,
+) -> Option<DependencyIssue> {
+    let mut first_failure: Option<String> = None;
+
+    for program in programs {
+        match runner.output(program, args) {
+            Ok(output) if output.status_success => return None,
+            Ok(output) => {
+                if first_failure.is_none() {
+                    let output_text = combined_output(&output);
+                    let arg_text = args.join(" ");
+                    let reason = if output_text.trim().is_empty() {
+                        format!("{program} {arg_text} exited unsuccessfully")
+                    } else {
+                        format!("{program} {arg_text} failed: {}", output_text.trim())
+                    };
+                    first_failure = Some(reason);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                if first_failure.is_none() {
+                    first_failure = Some(format!("failed to run {program}: {e}"));
+                }
+            }
         }
-        Err(e) => Some(issue(dependency, format!("failed to run {program}: {e}"))),
+    }
+
+    if let Some(reason) = first_failure {
+        Some(issue(dependency, reason))
+    } else {
+        let primary = programs.first().copied().unwrap_or("command");
+        Some(issue(dependency, format!("{primary} command not found")))
     }
 }
 
@@ -779,6 +875,53 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].dependency, LocalDependency::AwsCliV2);
         assert!(issues[0].reason.contains("AWS CLI v2 is required"));
+    }
+
+    #[test]
+    fn aws_cli_unsuccessful_status_returns_dependency_issue() {
+        let runner = FakeRunner::default().with_output(
+            "aws",
+            &["--version"],
+            output_with_status(false, "", "illegal instruction"),
+        );
+        let issues = check_required_dependencies(&[LocalDependency::AwsCliV2], &runner);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].dependency, LocalDependency::AwsCliV2);
+        assert!(issues[0].reason.contains("aws --version failed"));
+    }
+
+    #[test]
+    fn executable_unsuccessful_status_returns_dependency_issue() {
+        let runner = FakeRunner::default().with_output(
+            "ssh",
+            &["-V"],
+            output_with_status(false, "", "bad executable"),
+        );
+        let issues = check_required_dependencies(&[LocalDependency::Ssh], &runner);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].dependency, LocalDependency::Ssh);
+        assert!(issues[0].reason.contains("ssh -V failed"));
+    }
+
+    #[test]
+    fn session_manager_plugin_falls_back_to_pkg_install_path() {
+        let runner = FakeRunner::default()
+            .with_missing("session-manager-plugin", &["--version"])
+            .with_output(
+                "/usr/local/sessionmanagerplugin/bin/session-manager-plugin",
+                &["--version"],
+                output("1.2.0.0", ""),
+            );
+        let issues = check_required_dependencies(&[LocalDependency::SessionManagerPlugin], &runner);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn standard_tool_path_includes_session_manager_plugin_install_dir() {
+        let path = std::env::split_paths(&standard_tool_path()).collect::<Vec<_>>();
+        assert!(path
+            .iter()
+            .any(|entry| entry == &PathBuf::from("/usr/local/sessionmanagerplugin/bin")));
     }
 
     #[test]

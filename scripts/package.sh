@@ -117,6 +117,8 @@ LOCAL_CONFIG="${SCRIPT_DIR}/config.toml"
 CONFIG_DIR="${HOME}/Library/Application Support/canopy"
 CONFIG_DST="${CONFIG_DIR}/config.toml"
 
+export PATH="/usr/local/bin:/usr/local/sessionmanagerplugin/bin:/opt/homebrew/bin:${HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
 show_launcher_error() {
     local message="Canopy executable not found.\n\nRun install.sh first, or keep Canopy.command next to tui-client."
     if command -v osascript >/dev/null 2>&1; then
@@ -174,6 +176,8 @@ BIN_DIR="${CANOPY_BIN_DIR:-$HOME/.local/bin}"
 BIN_DST="$BIN_DIR/canopy"
 RUN_CMD="canopy"
 CONFIG_SRC="$INSTALL_DIR/config.toml"
+
+export PATH="$BIN_DIR:/usr/local/bin:/usr/local/sessionmanagerplugin/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 resolve_config_dir() {
     case "$(uname -s)" in

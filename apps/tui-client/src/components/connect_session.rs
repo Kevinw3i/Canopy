@@ -264,6 +264,7 @@ impl ConnectSessionScreen {
         let pair = pty_system.openpty(pty_size)?;
 
         let mut cmd = CommandBuilder::new(&launch.spawn.command);
+        cmd.env("PATH", crate::local_deps::standard_tool_path());
         cmd.args(&launch.spawn.args);
         for (key, value) in &launch.spawn.env_vars {
             cmd.env(key, value);
